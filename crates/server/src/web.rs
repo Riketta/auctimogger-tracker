@@ -269,7 +269,15 @@ async fn error_page(message: String) -> Response {
     response
 }
 
+/// Adapter-side logging for a failed core call (the other half of the "core
+/// never logs" rule): the client sees the 500, the file log and Sentry see
+/// the cause.
+fn log_failure(op: &'static str, error: impl std::fmt::Display) {
+    tracing::error!(op, error = %error, "request failed");
+}
+
 async fn store_error_page(error: StoreError) -> Response {
+    log_failure("page", &error);
     let mut response = error_page(error.to_string()).await;
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;
     response
@@ -623,7 +631,10 @@ async fn api_health(State(state): State<Arc<AppState>>) -> Response {
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("health", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -665,7 +676,10 @@ async fn api_search(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("search", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -694,7 +708,10 @@ async fn api_opportunities(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("opportunities", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -723,7 +740,10 @@ async fn api_overview(
             }))
             .into_response()
         }
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("overview", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -753,7 +773,8 @@ async fn api_item_metrics(
             }
             Ok(None) => {}
             Err(error) => {
-                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+                log_failure("item-metrics", &error);
+                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
             }
         }
     }
@@ -770,9 +791,15 @@ async fn api_feed_json(
     match state.feed_export.build_feed(&target, &options) {
         Ok(feed) => match state.renderer.render(&feed, FeedFormat::Json) {
             Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
-            Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+            Err(error) => {
+                log_failure("feed-render", &error);
+                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+            }
         },
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("feed-build", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -830,7 +857,10 @@ async fn api_watchlist_get(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("watchlist-get", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -873,7 +903,10 @@ async fn api_watchlist_post(
             Json(serde_json::json!({ "ok": true, "addedAt": entry.added_at })).into_response()
         }
         Err(StoreError::Conflict(message)) => (StatusCode::CONFLICT, message).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("watchlist-add", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
@@ -891,7 +924,10 @@ async fn api_watchlist_delete(
     };
     match state.watchlist.remove(&TargetId(target.clone()), &ItemRef::Item { item_id }) {
         Ok(removed) => Json(serde_json::json!({ "ok": true, "removed": removed })).into_response(),
-        Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
+        Err(error) => {
+            log_failure("watchlist-remove", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
     }
 }
 
