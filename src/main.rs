@@ -1,22 +1,38 @@
 //! Composition root + CLI. The only place that names concrete adapter types;
 //! everything else works through `amtracker-core` port traits.
 
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::{
+    path::PathBuf,
+    sync::Arc,
+};
 
-use amtracker_core::domain::PayloadKind;
-use amtracker_core::ports::FeedRenderer;
-use amtracker_core::services::cycle::IngestCycleService;
-use amtracker_core::services::feed_export::FeedExportService;
-use amtracker_core::services::metrics::MetricsService;
-use amtracker_infra::blizzard_item_info::BlizzardItemInfo;
-use amtracker_infra::blizzard_source::BlizzardSource;
-use amtracker_infra::clock::SystemClock;
-use amtracker_infra::feed::{FeedCodec, FileFeedPublisher};
-use amtracker_infra::store::SqliteStore;
-use amtracker_server::config_file::load_config;
-use amtracker_server::web::AppState;
-use clap::{Parser, Subcommand};
+use amtracker_core::{
+    domain::PayloadKind,
+    ports::FeedRenderer,
+    services::{
+        cycle::IngestCycleService,
+        feed_export::FeedExportService,
+        metrics::MetricsService,
+    },
+};
+use amtracker_infra::{
+    blizzard_item_info::BlizzardItemInfo,
+    blizzard_source::BlizzardSource,
+    clock::SystemClock,
+    feed::{
+        FeedCodec,
+        FileFeedPublisher,
+    },
+    store::SqliteStore,
+};
+use amtracker_server::{
+    config_file::load_config,
+    web::AppState,
+};
+use clap::{
+    Parser,
+    Subcommand,
+};
 
 #[derive(Parser)]
 #[command(
@@ -110,14 +126,9 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            run_serve(config);
+            run_serve(&config);
         }
-        Commands::Metrics {
-            config,
-            target,
-            item,
-            span,
-        } => {
+        Commands::Metrics { config, target, item, span } => {
             let config = match load_config(&config) {
                 Ok(config) => config,
                 Err(error) => {
@@ -127,12 +138,7 @@ fn main() {
             };
             run_metrics(&config, &target, item, &span);
         }
-        Commands::ExportFeed {
-            config,
-            target,
-            out,
-            slim,
-        } => {
+        Commands::ExportFeed { config, target, out, slim } => {
             let config = match load_config(&config) {
                 Ok(config) => config,
                 Err(error) => {
@@ -145,7 +151,7 @@ fn main() {
     }
 }
 
-fn run_serve(config: amtracker_core::config::TrackerConfig) -> ! {
+fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
     let store = match SqliteStore::open(
         std::path::Path::new(&config.storage.database),
         std::path::Path::new(&config.storage.archive_dir),
@@ -157,13 +163,9 @@ fn run_serve(config: amtracker_core::config::TrackerConfig) -> ! {
         }
     };
     let clock = Arc::new(SystemClock);
-    let item_info = Arc::new(BlizzardItemInfo::from_config(&config));
-    let metrics = Arc::new(MetricsService::new(
-        store.clone(),
-        store.clone(),
-        store.clone(),
-        clock.clone(),
-    ));
+    let item_info = Arc::new(BlizzardItemInfo::from_config(config));
+    let metrics =
+        Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
 
     let state = Arc::new(AppState {
         config: config.clone(),
@@ -172,22 +174,18 @@ fn run_serve(config: amtracker_core::config::TrackerConfig) -> ! {
             config.clone(),
             clock.clone(),
         )),
-        search: Arc::new(amtracker_core::services::search::SearchService::new(
-            store.clone(),
-        )),
+        search: Arc::new(amtracker_core::services::search::SearchService::new(store.clone())),
         catalog: Arc::new(amtracker_core::services::catalog::CatalogService::new(
             store.clone(),
             item_info.clone(),
         )),
         metrics: metrics.clone(),
-        opportunities: Arc::new(
-            amtracker_core::services::opportunity::OpportunityService::new(
-                store.clone(),
-                store.clone(),
-                clock.clone(),
-                &config,
-            ),
-        ),
+        opportunities: Arc::new(amtracker_core::services::opportunity::OpportunityService::new(
+            store.clone(),
+            store.clone(),
+            clock.clone(),
+            config,
+        )),
         watchlist: Arc::new(amtracker_core::services::watchlist::WatchlistService::new(
             store.clone(),
             clock.clone(),
@@ -213,17 +211,22 @@ fn run_serve(config: amtracker_core::config::TrackerConfig) -> ! {
         item_info,
     });
 
-    amtracker_server::scheduler::spawn(&config, state.cycle.clone());
+    amtracker_server::scheduler::spawn(config, state.cycle.clone()).unwrap_or_else(|error| {
+        eprintln!("error: {error}");
+        std::process::exit(1);
+    });
 
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("tokio runtime");
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
     eprintln!("listening on http://{}", config.server.bind);
-    if let Err(error) = runtime.block_on(amtracker_server::web::serve(
-        state,
-        config.server.bind.clone(),
-    )) {
+    if let Err(error) =
+        runtime.block_on(amtracker_server::web::serve(state, config.server.bind.clone()))
+    {
         eprintln!("server error: {error}");
         std::process::exit(1);
     }
@@ -249,12 +252,8 @@ fn run_export_feed(
         }
     };
     let clock = Arc::new(SystemClock);
-    let metrics = Arc::new(MetricsService::new(
-        store.clone(),
-        store.clone(),
-        store.clone(),
-        clock.clone(),
-    ));
+    let metrics =
+        Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
     let export = FeedExportService::new(store.clone(), store.clone(), store, metrics, clock);
     let publisher = FileFeedPublisher::new(out_dir.to_path_buf());
     let codec = FeedCodec;
@@ -365,8 +364,7 @@ fn run_metrics(
                 block.qty_sum,
                 block
                     .sale_rate
-                    .map(|rate| format!("{rate:.3}"))
-                    .unwrap_or_else(|| "n/a".into()),
+                    .map_or_else(|| "n/a".into(), |rate| format!("{rate:.3}")),
             );
             std::process::exit(0);
         }
@@ -418,10 +416,7 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
                     report.entries,
                     report.dropped,
                     report.items_folded,
-                    report
-                        .snapshot_id
-                        .map(|id| format!(", snapshot #{id}"))
-                        .unwrap_or_default(),
+                    report.snapshot_id.map_or(String::new(), |id| format!(", snapshot #{id}")),
                 ),
                 Err(error) => {
                     failures += 1;

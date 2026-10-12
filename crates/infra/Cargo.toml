@@ -3,7 +3,11 @@ name = "amtracker-infra"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+publish = false
 description = "Driven adapters for the auctimogger-tracker: SQLite repositories, Blizzard-format source, item info, feed rendering/publishing, clock."
+
+[lints]
+workspace = true
 
 [dependencies]
 amtracker-core = { path = "../core" }

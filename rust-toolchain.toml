@@ -1,0 +1,7 @@
+# Workspace toolchain: stable for everything (build, clippy, tests).
+# Nightly is only needed for `cargo +nightly fmt` (rustfmt.toml uses unstable
+# options).
+[toolchain]
+channel = "stable"
+profile = "minimal"
+components = ["clippy", "rustfmt"]

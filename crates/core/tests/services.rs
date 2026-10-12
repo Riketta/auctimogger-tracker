@@ -1,37 +1,66 @@
 //! Application service specs over in-memory port fakes — the hexagon exercised
 //! exactly as the real adapters will drive it.
 
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+// Test fakes may unwrap/expect/index: fixed synthetic inputs, not hostile
+// data (the SecOutfall precedent).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-use amtracker_core::config::{TargetConfig, TargetKind};
-use amtracker_core::domain::{
-    FetchOutcome, ItemRef, ListingKind, NewWatchlistEntry, PayloadKind, SnapshotMeta,
-    SnapshotStatus, TargetId, TimeLeftBand,
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        Mutex,
+    },
 };
-use amtracker_core::error::{CycleError, SourceError, StoreError};
-use amtracker_core::fold::DayFold;
-use amtracker_core::ports::{
-    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository, SalesRepository,
-    SnapshotRepository, WatchlistRepository,
+
+use amtracker_core::{
+    config::{
+        TargetConfig,
+        TargetKind,
+    },
+    domain::{
+        FetchOutcome,
+        ItemRef,
+        ListingKind,
+        NewWatchlistEntry,
+        PayloadKind,
+        SnapshotMeta,
+        SnapshotStatus,
+        TargetId,
+        TimeLeftBand,
+    },
+    error::{
+        CycleError,
+        SourceError,
+        StoreError,
+    },
+    fold::DayFold,
+    ports::{
+        AuctionSourcePort,
+        ClockPort,
+        MetricsCacheRepository,
+        PriceHistoryRepository,
+        SalesRepository,
+        SnapshotRepository,
+        WatchlistRepository,
+    },
+    services::{
+        cycle::{
+            CycleOutcome,
+            IngestCycleService,
+        },
+        watchlist::WatchlistService,
+    },
 };
-use amtracker_core::services::cycle::{CycleOutcome, IngestCycleService};
-use amtracker_core::services::watchlist::WatchlistService;
 
 // ------------------------------------------------------------------ helpers
 
 fn target() -> TargetConfig {
     TargetConfig {
         id: TargetId("us-4".into()),
-        kind: TargetKind::BlizzardConnectedRealm {
-            region: "us".into(),
-            connected_realm_id: 4,
-        },
+        kind: TargetKind::BlizzardConnectedRealm { region: "us".into(), connected_realm_id: 4 },
         auth: None,
-        poll: amtracker_core::config::PollConfig {
-            commodities_secs: 3600,
-            auctions_secs: 1800,
-        },
+        poll: amtracker_core::config::PollConfig { commodities_secs: 3600, auctions_secs: 1800 },
     }
 }
 
@@ -85,15 +114,8 @@ impl AuctionSourcePort for FakeSource {
         _kind: PayloadKind,
         if_modified_since: Option<i64>,
     ) -> Result<FetchOutcome, SourceError> {
-        self.conditional_gets
-            .lock()
-            .unwrap()
-            .push(if_modified_since);
-        self.outcomes
-            .lock()
-            .unwrap()
-            .pop()
-            .expect("scripted source outcome missing")
+        self.conditional_gets.lock().unwrap().push(if_modified_since);
+        self.outcomes.lock().unwrap().pop().expect("scripted source outcome missing")
     }
 }
 
@@ -111,9 +133,7 @@ struct FakeSnapshots {
 
 impl FakeSnapshots {
     fn new() -> Self {
-        Self {
-            inner: Mutex::new(FakeSnapshotsInner::default()),
-        }
+        Self { inner: Mutex::new(FakeSnapshotsInner::default()) }
     }
 }
 
@@ -163,12 +183,7 @@ impl PriceHistoryRepository for FakeHistory {
         item: &ItemRef,
         day: i64,
     ) -> Result<Option<DayFold>, StoreError> {
-        Ok(self
-            .folds
-            .lock()
-            .unwrap()
-            .get(&(target.clone(), item.clone(), day))
-            .cloned())
+        Ok(self.folds.lock().unwrap().get(&(target.clone(), item.clone(), day)).cloned())
     }
 
     fn save_fold(
@@ -178,10 +193,7 @@ impl PriceHistoryRepository for FakeHistory {
         day: i64,
         fold: &DayFold,
     ) -> Result<(), StoreError> {
-        self.folds
-            .lock()
-            .unwrap()
-            .insert((target.clone(), item.clone(), day), fold.clone());
+        self.folds.lock().unwrap().insert((target.clone(), item.clone(), day), fold.clone());
         Ok(())
     }
 
@@ -247,11 +259,7 @@ struct FakeSales {
 
 impl FakeSales {
     fn with_credits(credits: Vec<amtracker_core::domain::SaleCredit>) -> Self {
-        Self {
-            observes: Mutex::new(0),
-            closes: Mutex::new(0),
-            credits: Mutex::new(credits),
-        }
+        Self { observes: Mutex::new(0), closes: Mutex::new(0), credits: Mutex::new(credits) }
     }
 }
 
@@ -318,14 +326,12 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
     let snapshots = Arc::new(FakeSnapshots::new());
     let history = Arc::new(FakeHistory::default());
     let cache = Arc::new(FakeCache::default());
-    let sales = Arc::new(FakeSales::with_credits(vec![
-        amtracker_core::domain::SaleCredit {
-            auction_id: 10,
-            item: item1.clone(),
-            quantity: 4,
-            at: 1_000_000,
-        },
-    ]));
+    let sales = Arc::new(FakeSales::with_credits(vec![amtracker_core::domain::SaleCredit {
+        auction_id: 10,
+        item: item1.clone(),
+        quantity: 4,
+        at: 1_000_000,
+    }]));
     let clock = Arc::new(FixedClock(1_000_000)); // day 11
 
     let service = IngestCycleService::new(
@@ -336,19 +342,14 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
         sales.clone(),
         clock,
     );
-    let report = service
-        .run_cycle(&target(), PayloadKind::Commodities)
-        .expect("cycle");
+    let report = service.run_cycle(&target(), PayloadKind::Commodities).expect("cycle");
 
     assert_eq!(report.outcome, CycleOutcome::Fetched);
     assert_eq!(report.entries, 4);
     assert_eq!(report.dropped, 1);
     assert_eq!(report.snapshot_id, Some(1));
     assert_eq!(report.items_folded, 2);
-    assert_eq!(
-        report.sale_credits, 1,
-        "credits from close_missing surface in the report"
-    );
+    assert_eq!(report.sale_credits, 1, "credits from close_missing surface in the report");
 
     // conditional GET saw no previous snapshot
     assert_eq!(source.conditional_gets(), vec![None]);
@@ -356,41 +357,21 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
     assert_eq!(*sales.closes.lock().unwrap(), 1);
 
     let stored = snapshots.inner.lock().unwrap();
-    assert_eq!(
-        stored
-            .latest
-            .as_ref()
-            .expect("snapshot recorded")
-            .entry_count,
-        4
-    );
+    assert_eq!(stored.latest.as_ref().expect("snapshot recorded").entry_count, 4);
     assert_eq!(stored.raws[0], b"raw-bytes".to_vec());
-    assert_eq!(
-        stored.listing_counts[0], 4,
-        "listings persist with the snapshot"
-    );
+    assert_eq!(stored.listing_counts[0], 4, "listings persist with the snapshot");
     drop(stored);
 
     let folds = history.folds.lock().unwrap();
     let day = amtracker_core::domain::utc_day(1_000_000);
-    let item1_fold = folds
-        .get(&(TargetId("us-4".into()), item1.clone(), day))
-        .expect("item 1 fold saved");
-    assert_eq!(
-        item1_fold.len(),
-        2,
-        "re-sighted auction folds into one entry"
-    );
-    let item2_fold = folds
-        .get(&(TargetId("us-4".into()), item2.clone(), day))
-        .expect("item 2 fold saved");
+    let item1_fold =
+        folds.get(&(TargetId("us-4".into()), item1.clone(), day)).expect("item 1 fold saved");
+    assert_eq!(item1_fold.len(), 2, "re-sighted auction folds into one entry");
+    let item2_fold =
+        folds.get(&(TargetId("us-4".into()), item2.clone(), day)).expect("item 2 fold saved");
     assert_eq!(item2_fold.len(), 1);
 
-    assert_eq!(
-        *cache.invalidations.lock().unwrap(),
-        1,
-        "fetched data invalidates the cache"
-    );
+    assert_eq!(*cache.invalidations.lock().unwrap(), 1, "fetched data invalidates the cache");
 }
 
 #[test]
@@ -427,23 +408,13 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
         clock,
     );
 
-    let report = service
-        .run_cycle(&target(), PayloadKind::Commodities)
-        .expect("cycle");
+    let report = service.run_cycle(&target(), PayloadKind::Commodities).expect("cycle");
 
     assert_eq!(report.outcome, CycleOutcome::NotModified);
     assert_eq!(report.snapshot_id, None);
     assert_eq!(source.conditional_gets(), vec![Some(500)]);
-    assert_eq!(
-        *cache.invalidations.lock().unwrap(),
-        0,
-        "304 must not invalidate"
-    );
-    assert_eq!(
-        *sales.observes.lock().unwrap(),
-        0,
-        "304 must not touch sell-through"
-    );
+    assert_eq!(*cache.invalidations.lock().unwrap(), 0, "304 must not invalidate");
+    assert_eq!(*sales.observes.lock().unwrap(), 0, "304 must not touch sell-through");
     assert_eq!(report.sale_credits, 0);
 }
 
@@ -462,14 +433,9 @@ fn ingest_cycle_maps_source_errors_without_touching_storage() {
         clock,
     );
 
-    let error = service
-        .run_cycle(&target(), PayloadKind::Auctions)
-        .expect_err("must fail");
+    let error = service.run_cycle(&target(), PayloadKind::Auctions).expect_err("must fail");
     assert!(matches!(error, CycleError::Source(_)));
-    assert!(
-        snapshots.inner.lock().unwrap().latest.is_none(),
-        "failed cycle writes nothing"
-    );
+    assert!(snapshots.inner.lock().unwrap().latest.is_none(), "failed cycle writes nothing");
 }
 
 #[derive(Default)]
@@ -483,10 +449,7 @@ impl WatchlistRepository for FakeWatchlist {
         entry: &NewWatchlistEntry,
     ) -> Result<amtracker_core::domain::WatchlistEntry, StoreError> {
         let mut entries = self.entries.lock().unwrap();
-        if entries
-            .iter()
-            .any(|e| e.target == entry.target && e.item == entry.item)
-        {
+        if entries.iter().any(|e| e.target == entry.target && e.item == entry.item) {
             return Err(StoreError::Conflict("already watched".into()));
         }
         let stored = amtracker_core::domain::WatchlistEntry {
@@ -510,14 +473,7 @@ impl WatchlistRepository for FakeWatchlist {
         &self,
         target: &TargetId,
     ) -> Result<Vec<amtracker_core::domain::WatchlistEntry>, StoreError> {
-        Ok(self
-            .entries
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| e.target == *target)
-            .cloned()
-            .collect())
+        Ok(self.entries.lock().unwrap().iter().filter(|e| e.target == *target).cloned().collect())
     }
 }
 
@@ -526,16 +482,9 @@ fn watchlist_service_adds_lists_and_rejects_duplicates() {
     let repo = Arc::new(FakeWatchlist::default());
     let service = WatchlistService::new(repo.clone(), Arc::new(FixedClock(77)));
     let target = TargetId("us-4".into());
-    let pet = ItemRef::Pet {
-        species: 2546,
-        level: 1,
-        quality: 3,
-        breed: 11,
-    };
+    let pet = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
 
-    let added = service
-        .add(&target, pet.clone(), Some("rare pet".into()))
-        .expect("add");
+    let added = service.add(&target, pet.clone(), Some("rare pet".into())).expect("add");
     assert_eq!(added.item, pet);
     assert_eq!(added.added_at, 77);
 
@@ -545,5 +494,5 @@ fn watchlist_service_adds_lists_and_rejects_duplicates() {
     assert_eq!(service.list(&target).expect("list").len(), 1);
     assert!(service.remove(&target, &pet).expect("remove"));
     assert!(!service.remove(&target, &pet).expect("remove again"));
-    assert!(service.list(&target).expect("list").is_empty());
+    assert_eq!(service.list(&target).expect("list").len(), 0);
 }

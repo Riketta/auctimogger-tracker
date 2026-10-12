@@ -2,50 +2,114 @@
 //! opportunities, overview, snapshots), the JSON API surface, feed downloads,
 //! and token-gated mutation endpoints.
 
-use std::collections::HashMap;
-use std::sync::Arc;
+// Handlers stay `async` even when they never await so every axum route
+// signature is uniform and stays forward-compatible with async extraction.
+#![allow(clippy::unused_async)]
 
-use axum::extract::{Path, Query, State};
-use axum::http::{header, HeaderMap, StatusCode};
-use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{get, post};
-use axum::{Json, Router};
+use std::{
+    collections::HashMap,
+    fmt::Write as _,
+    sync::Arc,
+};
+
+use amtracker_core::{
+    config::TrackerConfig,
+    domain::{
+        FeedFormat,
+        ItemRef,
+        PayloadKind,
+        Span,
+        TargetId,
+    },
+    error::StoreError,
+    ports::{
+        FeedPublisher,
+        FeedRenderer,
+        ItemInfoPort,
+        PriceHistoryRepository,
+    },
+    services::{
+        cycle::IngestCycleService,
+        feed_export::{
+            ExportOptions,
+            FeedExportService,
+        },
+        health::HealthService,
+        metrics::MetricsService,
+        opportunity::{
+            MoverRow,
+            OpportunityService,
+        },
+        watchlist::WatchlistService,
+    },
+};
+use axum::{
+    extract::{
+        Path,
+        Query,
+        State,
+    },
+    http::{
+        header,
+        HeaderMap,
+        StatusCode,
+    },
+    response::{
+        Html,
+        IntoResponse,
+        Response,
+    },
+    routing::{
+        get,
+        post,
+    },
+    Json,
+    Router,
+};
 use serde::Deserialize;
-
-use amtracker_core::config::TrackerConfig;
-use amtracker_core::domain::{FeedFormat, ItemRef, PayloadKind, Span, TargetId};
-use amtracker_core::error::StoreError;
-use amtracker_core::ports::{FeedPublisher, FeedRenderer, ItemInfoPort, PriceHistoryRepository};
-use amtracker_core::services::cycle::IngestCycleService;
-use amtracker_core::services::feed_export::{ExportOptions, FeedExportService};
-use amtracker_core::services::health::HealthService;
-use amtracker_core::services::metrics::MetricsService;
-use amtracker_core::services::opportunity::{MoverRow, OpportunityService};
-use amtracker_core::services::watchlist::WatchlistService;
 
 /// Shared handlers state. Everything is core-typed (port traits + services);
 /// concrete adapters are wired in `main.rs`.
 pub struct AppState {
+    /// Fully parsed runtime configuration: targets, spans and thresholds.
     pub config: TrackerConfig,
+    /// Snapshot freshness/age reporting for the dashboard and health API.
     pub health: Arc<HealthService>,
+    /// Case-insensitive item-name search over the catalog table.
     pub search: Arc<amtracker_core::services::search::SearchService>,
+    /// Item-name catalog backed by the store plus the Blizzard item API.
     pub catalog: Arc<amtracker_core::services::catalog::CatalogService>,
+    /// Precomputed per-span metric blocks (medians, VWAP, sale rate).
     pub metrics: Arc<MetricsService>,
+    /// Discount/opportunity ranking behind the opportunities pages.
     pub opportunities: Arc<OpportunityService>,
+    /// User-curated watch list that drives the slim feed export.
     pub watchlist: Arc<WatchlistService>,
+    /// Feed assembly shared by the JSON endpoint and the Lua downloads.
     pub feed_export: Arc<FeedExportService>,
+    /// Published feed bytes backing the cached `/feed.lua` download.
     pub publisher: Arc<dyn FeedPublisher>,
+    /// Feed serialization into Lua/JSON byte payloads.
     pub renderer: Arc<dyn FeedRenderer>,
+    /// Runs one ingestion cycle (fetch, fold, credit) against a source.
     pub cycle: Arc<IngestCycleService>,
+    /// Raw per-day price rows behind the item detail sparkline.
     pub history: Arc<dyn PriceHistoryRepository>,
+    /// Late item-name resolution for IDs missing from the catalog.
     pub item_info: Arc<dyn ItemInfoPort>,
 }
 
+/// Builds the full HTTP router (pages, JSON API, feed downloads, token-gated
+/// mutations) over `state`.
 pub fn build_router(state: AppState) -> Router {
     build_router_arc(Arc::new(state))
 }
 
 /// Serves the router until the process is interrupted (call from a runtime).
+///
+/// # Errors
+/// Returns the underlying [`std::io::Error`] when binding `bind` fails or
+/// when the accept loop surfaces a fatal IO error.
 pub async fn serve(state: Arc<AppState>, bind: String) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     axum::serve(listener, build_router_arc(state)).await
@@ -65,26 +129,17 @@ fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/api/search", get(api_search))
         .route("/api/opportunities", get(api_opportunities))
         .route("/api/overview", get(api_overview))
-        .route(
-            "/api/items/{target_id}/{item_id}/metrics",
-            get(api_item_metrics),
-        )
+        .route("/api/items/{target_id}/{item_id}/metrics", get(api_item_metrics))
         .route("/api/feed.json", get(api_feed_json))
-        .route(
-            "/api/watchlist",
-            get(api_watchlist_get).post(api_watchlist_post),
-        )
-        .route(
-            "/api/watchlist/{item_id}",
-            axum::routing::delete(api_watchlist_delete),
-        )
+        .route("/api/watchlist", get(api_watchlist_get).post(api_watchlist_post))
+        .route("/api/watchlist/{item_id}", axum::routing::delete(api_watchlist_delete))
         .route("/api/fetch", post(api_fetch))
         .with_state(state)
 }
 
 // ------------------------------------------------------------------ helpers
 
-const STYLES: &str = r#"<style>
+const STYLES: &str = r"<style>
 body { font-family: system-ui, sans-serif; margin: 1rem 2rem; color: #ddd; background: #16181d; }
 a { color: #7ab8ff; text-decoration: none; } a:hover { text-decoration: underline; }
 h1 { font-size: 1.3rem; } h2 { font-size: 1.1rem; margin-top: 1.4rem; }
@@ -96,7 +151,7 @@ nav a { margin-right: 1rem; }
 input[type=text] { background: #22262d; color: #ddd; border: 1px solid #444; padding: .25rem .5rem; width: 24rem; }
 .ok { color: #7ee787; } .bad { color: #ff7b72; } .muted { color: #888; }
 code { color: #ffa657; }
-</style>"#;
+</style>";
 
 fn layout(title: &str, body: &str) -> Response {
     Html(format!(
@@ -133,14 +188,11 @@ fn item_link(target: &TargetId, item: &ItemRef) -> String {
         ItemRef::Item { item_id } => *item_id,
         ItemRef::Pet { species, .. } => *species,
     };
-    format!(
-        "<a href=\"/items/{}/{}\">{}</a>",
-        target.as_str(),
-        item_id,
-        item_label(item)
-    )
+    format!("<a href=\"/items/{}/{}\">{}</a>", target.as_str(), item_id, item_label(item))
 }
 
+// SVG coordinates: the integer→float rounding loss is invisible at 120×30 px.
+#[allow(clippy::cast_precision_loss)]
 fn sparkline(values: &[i64]) -> String {
     if values.len() < 2 {
         return String::new();
@@ -164,10 +216,18 @@ fn sparkline(values: &[i64]) -> String {
 }
 
 fn target_param(params: &HashMap<String, String>, config: &TrackerConfig) -> TargetId {
-    params
-        .get("target")
-        .map(|t| TargetId(t.clone()))
-        .unwrap_or_else(|| config.targets[0].id.clone())
+    params.get("target").map_or_else(
+        || {
+            // `TrackerConfig::validate` requires at least one target, so the
+            // index is provably in bounds; a fallback would silently query
+            // the wrong market.
+            #[allow(clippy::indexing_slicing)]
+            {
+                config.targets[0].id.clone()
+            }
+        },
+        |t| TargetId(t.clone()),
+    )
 }
 
 async fn error_page(message: String) -> Response {
@@ -195,20 +255,26 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
     for target in &health {
         for kind in &target.kinds {
             match &kind.latest {
-                Some(meta) => body.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}s</td><td>{}</td><td>{}</td></tr>",
-                    target.target,
-                    kind.kind.as_str(),
-                    meta.fetched_at,
-                    kind.age_seconds.unwrap_or(0),
-                    meta.entry_count,
-                    meta.dropped_count,
-                )),
-                None => body.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td colspan=\"4\" class=\"muted\">no snapshot yet</td></tr>",
-                    target.target,
-                    kind.kind.as_str(),
-                )),
+                Some(meta) => {
+                    let _ = write!(
+                        body,
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}s</td><td>{}</td><td>{}</td></tr>",
+                        target.target,
+                        kind.kind.as_str(),
+                        meta.fetched_at,
+                        kind.age_seconds.unwrap_or(0),
+                        meta.entry_count,
+                        meta.dropped_count,
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        body,
+                        "<tr><td>{}</td><td>{}</td><td colspan=\"4\" class=\"muted\">no snapshot yet</td></tr>",
+                        target.target,
+                        kind.kind.as_str(),
+                    );
+                }
             }
         }
     }
@@ -232,21 +298,27 @@ async fn snapshots_page(State(state): State<Arc<AppState>>) -> Response {
     for target in &health {
         for kind in &target.kinds {
             match &kind.latest {
-                Some(meta) => body.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    target.target,
-                    kind.kind.as_str(),
-                    meta.fetched_at,
-                    meta.source_last_modified.unwrap_or(0),
-                    meta.entry_count,
-                    meta.dropped_count,
-                    meta.status.as_str(),
-                )),
-                None => body.push_str(&format!(
-                    "<tr><td>{}</td><td>{}</td><td colspan=\"5\" class=\"muted\">none yet</td></tr>",
-                    target.target,
-                    kind.kind.as_str(),
-                )),
+                Some(meta) => {
+                    let _ = write!(
+                        body,
+                        "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                        target.target,
+                        kind.kind.as_str(),
+                        meta.fetched_at,
+                        meta.source_last_modified.unwrap_or(0),
+                        meta.entry_count,
+                        meta.dropped_count,
+                        meta.status.as_str(),
+                    );
+                }
+                None => {
+                    let _ = write!(
+                        body,
+                        "<tr><td>{}</td><td>{}</td><td colspan=\"5\" class=\"muted\">none yet</td></tr>",
+                        target.target,
+                        kind.kind.as_str(),
+                    );
+                }
             }
         }
     }
@@ -274,13 +346,14 @@ async fn items_search_page(
             Ok(hits) => {
                 body.push_str("<h2>results</h2><ul>");
                 for hit in hits {
-                    body.push_str(&format!(
-                        "<li><a href=\"/items/{}/{}\">{}</a> <span class=\"muted\">{}</span></li>",
+                    let _ = write!(
+                        body,
+                        "<li><a href=\"/items/{}/{ }\">{}</a> <span class=\"muted\">{}</span></li>",
                         target.as_str(),
                         hit.item_id,
                         hit.name,
                         hit.item_class.as_deref().unwrap_or("")
-                    ));
+                    );
                 }
                 body.push_str("</ul>");
             }
@@ -303,10 +376,14 @@ async fn item_page(
     let title = name.unwrap_or_else(|| format!("item {item_id}"));
 
     let today = amtracker_core::domain::utc_day(
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0),
+        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| {
+            // Unix seconds from `now` fit `i64` for the plausible lifetime of
+            // this process; the wrap is unreachable.
+            #[allow(clippy::cast_possible_wrap)]
+            {
+                d.as_secs() as i64
+            }
+        }),
     );
     let item = ItemRef::Item { item_id };
     let rows = match state.history.item_day_rows(&target, today - 29) {
@@ -321,26 +398,29 @@ async fn item_page(
 
     let mut body =
         format!("<h2>{title}</h2><p class=\"muted\">target {target_id} · item id {item_id}</p>");
-    body.push_str(&format!("<h2>30-day median</h2><p>{chart}</p>"));
+    let _ = write!(body, "<h2>30-day median</h2><p>{chart}</p>");
     body.push_str("<h2>metric blocks</h2><table><tr><th>span</th><th>n</th><th>median</th><th>min</th><th>p05</th><th>p25</th><th>p75</th><th>p95</th><th>max</th><th>mad</th><th>vwap</th><th>qty</th><th>sale rate</th></tr>");
     for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
         match state.metrics.block(&target, &item, span) {
-            Ok(Some(block)) => body.push_str(&format!(
-                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                span.name(),
-                block.n,
-                money(block.median),
-                money(block.min),
-                money(block.p05),
-                money(block.p25),
-                money(block.p75),
-                money(block.p95),
-                money(block.max),
-                block.mad,
-                money(block.vwap),
-                block.qty_sum,
-                block.sale_rate.map(|r| format!("{r:.2}")).unwrap_or_else(|| "—".into())
-            )),
+            Ok(Some(block)) => {
+                let _ = write!(
+                    body,
+                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                    span.name(),
+                    block.n,
+                    money(block.median),
+                    money(block.min),
+                    money(block.p05),
+                    money(block.p25),
+                    money(block.p75),
+                    money(block.p95),
+                    money(block.max),
+                    block.mad,
+                    money(block.vwap),
+                    block.qty_sum,
+                    block.sale_rate.map_or_else(|| "—".into(), |r| format!("{r:.2}"))
+                );
+            }
             Ok(None) => {}
             Err(error) => return store_error_page(error).await,
         }
@@ -362,10 +442,7 @@ async fn opportunities_page(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let target = target_param(&params, &state.config);
-    let min_churn: f64 = params
-        .get("min_churn")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
+    let min_churn: f64 = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let data = match state.opportunities.opportunities(&target, min_churn, 50) {
         Ok(data) => data,
         Err(error) => return store_error_page(error).await,
@@ -377,7 +454,8 @@ async fn opportunities_page(
          <th>churn/day</th><th>stability</th><th>floor</th><th>median7</th></tr>"
     );
     for o in &data {
-        body.push_str(&format!(
+        let _ = write!(
+            body,
             "<tr><td>{}</td><td>{:.3}</td><td>{:.0}%</td><td>{}</td><td>{}</td><td>{:.1}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
             item_link(&target, &o.item),
             o.score,
@@ -388,7 +466,7 @@ async fn opportunities_page(
             component_bar("stab", o.stability),
             money(o.floor_now),
             money(o.median7),
-        ));
+        );
     }
     body.push_str("</table>");
     layout("opportunities", &body)
@@ -398,15 +476,14 @@ async fn overview_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let target = target_param(&params, &state.config);
-    let data = match state.opportunities.overview(&target, 15) {
-        Ok(data) => data,
-        Err(error) => return store_error_page(error).await,
-    };
+    // Display-only conversion: the f64 median feeds the i64 `money` and
+    // sparkline helpers, matching the previous `as i64` rendering.
+    #[allow(clippy::cast_possible_truncation)]
     fn table(rows: &[MoverRow], target: &TargetId) -> String {
         let mut out = String::from("<table><tr><th>item</th><th>median now</th><th>median 7d</th><th>change</th><th>churn/day</th><th>30d</th></tr>");
         for m in rows {
-            out.push_str(&format!(
+            let _ = write!(
+                out,
                 "<tr><td>{}</td><td>{}</td><td>{}</td><td>{:+.1}%</td><td>{:.1}</td><td>{}</td></tr>",
                 item_link(target, &m.item),
                 money(m.median_now),
@@ -414,11 +491,16 @@ async fn overview_page(
                 m.change * 100.0,
                 m.churn_per_day,
                 sparkline(&[m.median_now, m.median_prev as i64]),
-            ));
+            );
         }
         out.push_str("</table>");
         out
     }
+    let target = target_param(&params, &state.config);
+    let data = match state.opportunities.overview(&target, 15) {
+        Ok(data) => data,
+        Err(error) => return store_error_page(error).await,
+    };
     let body = format!(
         "<h2>rising</h2>{}<h2>falling</h2>{}<h2>most active</h2>{}",
         table(&data.movers_up, &target),
@@ -438,10 +520,8 @@ async fn feed_file(
     let target = target_param(&params, &state.config);
     let bytes = if slim {
         // slim is built on demand from the watchlist (no cached copy)
-        let options = ExportOptions {
-            spans: state.config.metrics.spans.clone(),
-            watchlist_only: true,
-        };
+        let options =
+            ExportOptions { spans: state.config.metrics.spans.clone(), watchlist_only: true };
         match state.feed_export.build_feed(&target, &options) {
             Ok(feed) => state
                 .renderer
@@ -528,12 +608,7 @@ fn default_limit() -> usize {
 fn item_json(item: &ItemRef) -> serde_json::Value {
     match item {
         ItemRef::Item { item_id } => serde_json::json!({ "type": "item", "itemID": item_id }),
-        ItemRef::Pet {
-            species,
-            level,
-            quality,
-            breed,
-        } => serde_json::json!({
+        ItemRef::Pet { species, level, quality, breed } => serde_json::json!({
             "type": "pet",
             "speciesID": species,
             "level": level,
@@ -568,18 +643,9 @@ async fn api_opportunities(
     let Some(target) = params.get("target") else {
         return (StatusCode::BAD_REQUEST, "missing ?target=").into_response();
     };
-    let min_churn = params
-        .get("min_churn")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(1.0);
-    let limit = params
-        .get("limit")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(50);
-    match state
-        .opportunities
-        .opportunities(&TargetId(target.clone()), min_churn, limit)
-    {
+    let min_churn = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    match state.opportunities.opportunities(&TargetId(target.clone()), min_churn, limit) {
         Ok(list) => Json(serde_json::json!({
             "opportunities": list.iter().map(|o| serde_json::json!({
                 "item": item_json(&o.item),
@@ -635,8 +701,7 @@ async fn api_item_metrics(
 ) -> Response {
     let spans: Vec<Span> = params
         .get("span")
-        .map(|s| s.split(',').filter_map(Span::parse).collect())
-        .unwrap_or_else(|| vec![Span::D1]);
+        .map_or_else(|| vec![Span::D1], |s| s.split(',').filter_map(Span::parse).collect());
     let target = TargetId(target_id);
     let item = ItemRef::Item { item_id };
     let mut out = serde_json::Map::new();
@@ -667,10 +732,8 @@ async fn api_feed_json(
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let target = target_param(&params, &state.config);
-    let options = ExportOptions {
-        spans: state.config.metrics.spans.clone(),
-        watchlist_only: false,
-    };
+    let options =
+        ExportOptions { spans: state.config.metrics.spans.clone(), watchlist_only: false };
     match state.feed_export.build_feed(&target, &options) {
         Ok(feed) => match state.renderer.render(&feed, FeedFormat::Json) {
             Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
@@ -690,11 +753,7 @@ struct WatchlistPost {
 }
 
 #[derive(Deserialize)]
-#[serde(
-    tag = "type",
-    rename_all = "kebab-case",
-    rename_all_fields = "camelCase"
-)]
+#[serde(tag = "type", rename_all = "kebab-case", rename_all_fields = "camelCase")]
 enum ApiItemRef {
     Item {
         #[serde(rename = "itemID")]
@@ -715,17 +774,9 @@ impl ApiItemRef {
     fn to_ref(&self) -> ItemRef {
         match self {
             ApiItemRef::Item { item_id } => ItemRef::Item { item_id: *item_id },
-            ApiItemRef::Pet {
-                species,
-                level,
-                quality,
-                breed,
-            } => ItemRef::Pet {
-                species: *species,
-                level: *level,
-                quality: *quality,
-                breed: *breed,
-            },
+            ApiItemRef::Pet { species, level, quality, breed } => {
+                ItemRef::Pet { species: *species, level: *level, quality: *quality, breed: *breed }
+            }
         }
     }
 }
@@ -754,9 +805,10 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>>
     let Some(env) = &state.config.server.token_env else {
         return Ok(());
     };
-    let expected = match std::env::var(env) {
-        Ok(token) => token,
-        Err(_) => return Ok(()), // env unset = open (documented)
+    // An unset (or non-unicode) token env leaves the endpoints open; this is
+    // the documented developer-mode behavior.
+    let Ok(expected) = std::env::var(env) else {
+        return Ok(());
     };
     let provided = headers
         .get(header::AUTHORIZATION)
@@ -765,15 +817,11 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>>
     match provided {
         Some(token) if token == expected => Ok(()),
         _ => {
-            let mut response = (
-                StatusCode::UNAUTHORIZED,
-                "invalid or missing bearer token\n",
-            )
-                .into_response();
-            response.headers_mut().insert(
-                header::WWW_AUTHENTICATE,
-                header::HeaderValue::from_static("Bearer"),
-            );
+            let mut response =
+                (StatusCode::UNAUTHORIZED, "invalid or missing bearer token\n").into_response();
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
             Err(Box::new(response))
         }
     }
@@ -787,11 +835,7 @@ async fn api_watchlist_post(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    match state.watchlist.add(
-        &TargetId(body.target.clone()),
-        body.item.to_ref(),
-        body.note,
-    ) {
+    match state.watchlist.add(&TargetId(body.target.clone()), body.item.to_ref(), body.note) {
         Ok(entry) => {
             Json(serde_json::json!({ "ok": true, "addedAt": entry.added_at })).into_response()
         }
@@ -812,10 +856,7 @@ async fn api_watchlist_delete(
     let Some(target) = params.get("target") else {
         return (StatusCode::BAD_REQUEST, "missing ?target=").into_response();
     };
-    match state
-        .watchlist
-        .remove(&TargetId(target.clone()), &ItemRef::Item { item_id })
-    {
+    match state.watchlist.remove(&TargetId(target.clone()), &ItemRef::Item { item_id }) {
         Ok(removed) => Json(serde_json::json!({ "ok": true, "removed": removed })).into_response(),
         Err(error) => (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response(),
     }

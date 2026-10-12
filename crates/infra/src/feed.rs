@@ -1,15 +1,30 @@
 //! Feed rendering (tracker feed v2: Lua + JSON) and publication to the feed
 //! directory served to the in-game sub-addon.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::sync::Mutex;
-
-use amtracker_core::domain::{
-    FeedEntry, FeedFormat, FeedSnapshot, ItemRef, MetricBlock, PublishedFeed, Span, TargetId,
+use std::{
+    collections::BTreeMap,
+    fmt::Write as _,
+    path::PathBuf,
+    sync::Mutex,
 };
-use amtracker_core::error::{RenderError, StoreError};
-use amtracker_core::ports::FeedPublisher;
+
+use amtracker_core::{
+    domain::{
+        FeedEntry,
+        FeedFormat,
+        FeedSnapshot,
+        ItemRef,
+        MetricBlock,
+        PublishedFeed,
+        Span,
+        TargetId,
+    },
+    error::{
+        RenderError,
+        StoreError,
+    },
+    ports::FeedPublisher,
+};
 
 /// Renders feed snapshots into the two contract serializations.
 pub struct FeedCodec;
@@ -17,7 +32,7 @@ pub struct FeedCodec;
 impl amtracker_core::ports::FeedRenderer for FeedCodec {
     fn render(&self, feed: &FeedSnapshot, format: FeedFormat) -> Result<Vec<u8>, RenderError> {
         match format {
-            FeedFormat::Lua => render_lua(feed),
+            FeedFormat::Lua => Ok(render_lua(feed)),
             FeedFormat::Json => render_json(feed),
         }
     }
@@ -29,7 +44,8 @@ fn metric_fields_lua(block: &MetricBlock) -> String {
         block.n, block.min, block.p05, block.p25, block.median, block.p75, block.p95, block.max, block.mad, block.vwap, block.qty_sum, block.listing_count
     );
     if let Some(rate) = block.sale_rate {
-        out.push_str(&format!(", saleRate = {rate:.4}"));
+        // `String`'s `fmt::Write` impl is infallible.
+        let _ = write!(out, ", saleRate = {rate:.4}");
     }
     out
 }
@@ -57,7 +73,7 @@ fn entry_lua(entry: &FeedEntry) -> String {
     format!("{{ {identity}, {} }}", metrics_lua(&entry.metrics))
 }
 
-fn render_lua(feed: &FeedSnapshot) -> Result<Vec<u8>, RenderError> {
+fn render_lua(feed: &FeedSnapshot) -> Vec<u8> {
     let items: Vec<String> = feed
         .entries
         .iter()
@@ -69,7 +85,7 @@ fn render_lua(feed: &FeedSnapshot) -> Result<Vec<u8>, RenderError> {
         feed.generated_at,
         items.join(",\n    ")
     );
-    Ok(lua.into_bytes())
+    lua.into_bytes()
 }
 
 // --------------------------------------------------------------- JSON side
@@ -97,46 +113,26 @@ fn entry_json(entry: &FeedEntry) -> serde_json::Value {
     for (span, block) in &entry.metrics {
         metrics.insert(span.name().to_string(), metric_json(block));
     }
-    let (identity, base): (serde_json::Value, serde_json::Value) = match &entry.item {
-        ItemRef::Item { item_id } => (
-            serde_json::json!({}),
-            serde_json::json!({ "itemID": item_id }),
-        ),
-        ItemRef::Pet {
-            species,
-            level,
-            quality,
-            breed,
-        } => (
-            serde_json::json!({ "kind": "pet" }),
-            serde_json::json!({
-                "speciesID": species,
-                "level": level,
-                "qualityID": quality,
-                "breedID": breed,
-            }),
-        ),
-    };
     let mut object = serde_json::Map::new();
-    if let Some(kind) = identity.as_object() {
-        for (key, value) in kind {
-            object.insert(key.clone(), value.clone());
+    match &entry.item {
+        ItemRef::Item { item_id } => {
+            object.insert("itemID".into(), serde_json::json!(item_id));
         }
-    }
-    for (key, value) in base.as_object().expect("base is an object") {
-        object.insert(key.clone(), value.clone());
+        ItemRef::Pet { species, level, quality, breed } => {
+            object.insert("kind".into(), serde_json::json!("pet"));
+            object.insert("speciesID".into(), serde_json::json!(species));
+            object.insert("level".into(), serde_json::json!(level));
+            object.insert("qualityID".into(), serde_json::json!(quality));
+            object.insert("breedID".into(), serde_json::json!(breed));
+        }
     }
     object.insert("metrics".into(), serde_json::Value::Object(metrics));
     serde_json::Value::Object(object)
 }
 
 fn render_json(feed: &FeedSnapshot) -> Result<Vec<u8>, RenderError> {
-    let items: Vec<serde_json::Value> = feed
-        .entries
-        .iter()
-        .filter(|entry| !entry.metrics.is_empty())
-        .map(entry_json)
-        .collect();
+    let items: Vec<serde_json::Value> =
+        feed.entries.iter().filter(|entry| !entry.metrics.is_empty()).map(entry_json).collect();
     let value = serde_json::json!({
         "version": 2,
         "generatedAt": feed.generated_at,
@@ -155,13 +151,14 @@ pub struct FileFeedPublisher {
 }
 
 impl FileFeedPublisher {
+    /// Publisher rooted at `dir`; every target gets a subdirectory.
+    #[must_use]
     pub fn new(dir: PathBuf) -> Self {
-        Self {
-            dir,
-            last: Mutex::new(std::collections::HashMap::new()),
-        }
+        Self { dir, last: Mutex::new(std::collections::HashMap::new()) }
     }
 
+    /// The feed root directory this publisher writes into.
+    #[must_use]
     pub fn dir(&self) -> &PathBuf {
         &self.dir
     }
@@ -190,9 +187,11 @@ impl FeedPublisher for FileFeedPublisher {
             .map_err(|e| StoreError::Backend(format!("feed rename: {e}")))?;
         let at = now_unix();
         let size = bytes.len() as u64;
+        // A poisoned lock means another thread panicked mid-publish; recovering
+        // the map is safe and matches the store's lock handling.
         self.last
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert((target.0.clone(), format), PublishedFeed { at, size });
         Ok(())
     }
@@ -205,16 +204,13 @@ impl FeedPublisher for FileFeedPublisher {
         Ok(self
             .last
             .lock()
-            .unwrap()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .get(&(target.0.clone(), format))
             .copied())
     }
 
     fn read(&self, target: &TargetId, format: FeedFormat) -> Result<Option<Vec<u8>>, StoreError> {
-        let path = self
-            .dir
-            .join(target.as_str())
-            .join(format!("feed.{}", extension(format)));
+        let path = self.dir.join(target.as_str()).join(format!("feed.{}", extension(format)));
         std::fs::read(&path).map(Some).or_else(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 Ok(None)
@@ -226,16 +222,21 @@ impl FeedPublisher for FileFeedPublisher {
 }
 
 fn now_unix() -> i64 {
+    // `u64` unix seconds only exceed `i64` far beyond any real date, so the
+    // conversion saturates; a clock before the epoch reads as 0.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    // Test assertions may unwrap: fixture-driven, deterministic inputs.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
     use amtracker_core::ports::FeedRenderer;
+
+    use super::*;
 
     fn sample_feed() -> FeedSnapshot {
         let block = MetricBlock {
@@ -261,17 +262,9 @@ mod tests {
             target: TargetId("us-4".into()),
             generated_at: 1_760_000_000,
             entries: vec![
+                FeedEntry { item: ItemRef::Item { item_id: 194_784 }, metrics },
                 FeedEntry {
-                    item: ItemRef::Item { item_id: 194784 },
-                    metrics,
-                },
-                FeedEntry {
-                    item: ItemRef::Pet {
-                        species: 2546,
-                        level: 1,
-                        quality: 3,
-                        breed: 11,
-                    },
+                    item: ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 },
                     metrics: pet_metrics,
                 },
             ],
@@ -297,13 +290,7 @@ mod tests {
         let mut feed = sample_feed();
         feed.entries.truncate(2);
         let d1_block = feed.entries[0].metrics[&Span::D1].clone();
-        feed.entries[1].metrics.insert(
-            Span::D7,
-            MetricBlock {
-                sale_rate: None,
-                ..d1_block
-            },
-        );
+        feed.entries[1].metrics.insert(Span::D7, MetricBlock { sale_rate: None, ..d1_block });
         let lua = String::from_utf8(FeedCodec.render(&feed, FeedFormat::Lua).expect("render"))
             .expect("utf-8");
         assert!(
@@ -322,7 +309,7 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
         assert_eq!(value["version"], 2);
         assert_eq!(value["generatedAt"], 1_760_000_000);
-        assert_eq!(value["items"][0]["itemID"], 194784);
+        assert_eq!(value["items"][0]["itemID"], 194_784);
         assert_eq!(value["items"][0]["metrics"]["d1"]["median"], 300);
         assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate"], 0.25);
         assert_eq!(value["items"][1]["kind"], "pet");

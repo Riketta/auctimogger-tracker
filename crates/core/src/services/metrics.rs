@@ -2,10 +2,23 @@
 
 use std::sync::Arc;
 
-use crate::domain::{utc_day, ItemRef, MetricBlock, Span, TargetId};
-use crate::error::StoreError;
-use crate::metrics::block_from_histograms;
-use crate::ports::{ClockPort, MetricsCacheRepository, PriceHistoryRepository, SalesRepository};
+use crate::{
+    domain::{
+        utc_day,
+        ItemRef,
+        MetricBlock,
+        Span,
+        TargetId,
+    },
+    error::StoreError,
+    metrics::block_from_histograms,
+    ports::{
+        ClockPort,
+        MetricsCacheRepository,
+        PriceHistoryRepository,
+        SalesRepository,
+    },
+};
 
 /// How long a memoized block may serve queries before recomputation. Ingest
 /// invalidates the whole target cache immediately; this bound only covers
@@ -15,6 +28,7 @@ const MAX_CACHE_AGE_SECONDS: i64 = 300;
 /// Window for the sell-through rate attached to every block.
 const SALE_RATE_WINDOW_DAYS: i64 = 14;
 
+/// Serves per-span metric blocks with cache-aside recomputation.
 pub struct MetricsService {
     history: Arc<dyn PriceHistoryRepository>,
     cache: Arc<dyn MetricsCacheRepository>,
@@ -23,22 +37,23 @@ pub struct MetricsService {
 }
 
 impl MetricsService {
+    /// Wires the service to history, cache, sales and clock ports.
     pub fn new(
         history: Arc<dyn PriceHistoryRepository>,
         cache: Arc<dyn MetricsCacheRepository>,
         sales: Arc<dyn SalesRepository>,
         clock: Arc<dyn ClockPort>,
     ) -> Self {
-        Self {
-            history,
-            cache,
-            sales,
-            clock,
-        }
+        Self { history, cache, sales, clock }
     }
 
     /// Computes (or serves from cache) the metric block for one item/span.
     /// `None` = no data in the window.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when folds, the cache or the sale rate
+    /// cannot be read, or a freshly computed block cannot be cached.
     pub fn block(
         &self,
         target: &TargetId,

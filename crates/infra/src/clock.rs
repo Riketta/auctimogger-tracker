@@ -8,17 +8,20 @@ pub struct SystemClock;
 
 impl ClockPort for SystemClock {
     fn now(&self) -> i64 {
+        // `u64` unix seconds only exceed `i64` ~292 billion years after the
+        // epoch, so the conversion saturates instead of wrapping; a clock
+        // before the epoch reads as 0.
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_secs() as i64)
-            .unwrap_or(0)
+            .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use amtracker_core::domain::utc_day;
+
+    use super::*;
 
     #[test]
     fn now_is_plausibly_current() {

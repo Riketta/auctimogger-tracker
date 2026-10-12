@@ -4,11 +4,16 @@
 //!    the compile-time guarantee that the core cannot touch infrastructure.
 //! 2. Core sources must not `use` any infrastructure crate name.
 
-use std::path::{Path, PathBuf};
+// Test walking may expect: the workspace layout is fixed, not hostile data.
+#![allow(clippy::expect_used)]
 
-const FORBIDDEN_CRATES: [&str; 7] = [
-    "reqwest", "rusqlite", "axum", "tokio", "serde", "toml", "clap",
-];
+use std::path::{
+    Path,
+    PathBuf,
+};
+
+const FORBIDDEN_CRATES: [&str; 7] =
+    ["reqwest", "rusqlite", "axum", "tokio", "serde", "toml", "clap"];
 
 #[test]
 fn core_manifest_has_no_dependencies_section() {
@@ -51,8 +56,5 @@ fn core_sources_reference_no_infrastructure() {
             scanned += 1;
         }
     }
-    assert!(
-        scanned >= 8,
-        "expected to scan the full core sources, saw {scanned}"
-    );
+    assert!(scanned >= 8, "expected to scan the full core sources, saw {scanned}");
 }

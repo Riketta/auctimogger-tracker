@@ -3,7 +3,11 @@ name = "amtracker-server"
 version = "0.1.0"
 edition = "2021"
 rust-version = "1.75"
+publish = false
 description = "Driving adapters for the auctimogger-tracker: TOML config loading, HTTP API + UI, poll-loop scheduler, CLI."
+
+[lints]
+workspace = true
 
 [dependencies]
 amtracker-core = { path = "../core" }

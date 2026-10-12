@@ -2,10 +2,15 @@
 //! quality and class for the search catalog. Data comes from the static
 //! game-data namespace and is cached permanently by the catalog repository.
 
-use amtracker_core::config::{TargetKind, TrackerConfig};
-use amtracker_core::domain::NameRecord;
-use amtracker_core::error::SourceError;
-use amtracker_core::ports::ItemInfoPort;
+use amtracker_core::{
+    config::{
+        TargetKind,
+        TrackerConfig,
+    },
+    domain::NameRecord,
+    error::SourceError,
+    ports::ItemInfoPort,
+};
 use serde::Deserialize;
 
 /// Blizzard item API (`data/wow/item/{id}`, static namespace).
@@ -19,6 +24,7 @@ pub struct BlizzardItemInfo {
 impl BlizzardItemInfo {
     /// Derives region/locale/token from the config's first Blizzard target;
     /// falls back to `us` + `AMT_TOKEN`.
+    #[must_use]
     pub fn from_config(config: &TrackerConfig) -> Self {
         let (region, token_env) = config
             .targets
@@ -29,8 +35,7 @@ impl BlizzardItemInfo {
                     target
                         .auth
                         .as_ref()
-                        .map(|auth| auth.env.clone())
-                        .unwrap_or_else(|| "AMT_TOKEN".into()),
+                        .map_or_else(|| "AMT_TOKEN".into(), |auth| auth.env.clone()),
                 )),
                 TargetKind::StaticUrls { .. } => None,
             })
@@ -117,5 +122,7 @@ impl ItemInfoPort for BlizzardItemInfo {
     }
 }
 
-use std::io::Read;
-use std::time::Duration;
+use std::{
+    io::Read,
+    time::Duration,
+};

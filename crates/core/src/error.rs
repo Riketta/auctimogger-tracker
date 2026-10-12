@@ -18,8 +18,12 @@ impl std::error::Error for ConfigError {}
 /// Fetch-side failures raised by `AuctionSourcePort` implementations.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SourceError {
+    /// The HTTP transport failed (non-success status, connection or timeout).
     Http(String),
+    /// The payload could not be parsed into the normalized listing shape.
     Parse(String),
+    /// The source cannot be reached with the given configuration (e.g. a
+    /// required URL or credential is missing).
     Config(String),
 }
 
@@ -39,8 +43,12 @@ impl std::error::Error for SourceError {}
 /// opaque: adapters stringify their backend specifics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StoreError {
+    /// The requested row/entity does not exist.
     NotFound,
+    /// The write violates a uniqueness or state constraint (e.g. a duplicate
+    /// watchlist entry).
     Conflict(String),
+    /// The storage backend failed for a reason unrelated to the request.
     Backend(String),
 }
 
@@ -71,7 +79,9 @@ impl std::error::Error for RenderError {}
 /// Ingestion cycle failures: anything any stage may raise.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CycleError {
+    /// The fetch stage failed; nothing was persisted.
     Source(SourceError),
+    /// A persistence stage failed; the cycle stopped where it failed.
     Store(StoreError),
 }
 

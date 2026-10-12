@@ -5,19 +5,43 @@
 //! item catalog are permanent; raw listing rows and archived payload files are
 //! a bounded working set (`prune_raw_before`).
 
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
-
-use amtracker_core::domain::{
-    utc_day, ItemDayRow, ItemRef, MetricBlock, NameRecord, NewSnapshot, NewWatchlistEntry,
-    NormalizedListing, PayloadKind, SaleCredit, SearchHit, SnapshotMeta, SnapshotStatus, Span,
-    TargetId, WatchlistEntry,
+use std::{
+    path::{
+        Path,
+        PathBuf,
+    },
+    sync::Mutex,
 };
-use amtracker_core::error::StoreError;
-use amtracker_core::fold::DayFold;
-use amtracker_core::ports::{
-    ItemCatalogRepository, MetricsCacheRepository, PriceHistoryRepository, SalesRepository,
-    SnapshotRepository, WatchlistRepository,
+
+use amtracker_core::{
+    domain::{
+        utc_day,
+        ItemDayRow,
+        ItemRef,
+        MetricBlock,
+        NameRecord,
+        NewSnapshot,
+        NewWatchlistEntry,
+        NormalizedListing,
+        PayloadKind,
+        SaleCredit,
+        SearchHit,
+        SnapshotMeta,
+        SnapshotStatus,
+        Span,
+        TargetId,
+        WatchlistEntry,
+    },
+    error::StoreError,
+    fold::DayFold,
+    ports::{
+        ItemCatalogRepository,
+        MetricsCacheRepository,
+        PriceHistoryRepository,
+        SalesRepository,
+        SnapshotRepository,
+        WatchlistRepository,
+    },
 };
 use rusqlite::Connection;
 
@@ -125,6 +149,10 @@ CREATE TABLE IF NOT EXISTS sales (
 );
 ";
 
+/// Single-connection SQLite store (WAL journal) implementing the snapshot,
+/// sales, metrics-cache, watchlist, catalog and price-history repositories.
+/// All access is serialized through one mutex; archive payloads land under
+/// `archive_dir`.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     archive_dir: PathBuf,
@@ -136,26 +164,30 @@ fn backend<E: std::fmt::Display>(context: &str, error: E) -> StoreError {
 
 impl SqliteStore {
     /// Opens (creating if needed) the database and applies the schema.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the data or archive directories
+    /// cannot be created, the database cannot be opened or configured (WAL,
+    /// synchronous pragma), or the schema batch cannot be applied.
     pub fn open(database: &Path, archive_dir: &Path) -> Result<Self, StoreError> {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent).map_err(|e| backend("create data dir", e))?;
         }
         std::fs::create_dir_all(archive_dir).map_err(|e| backend("create archive dir", e))?;
         let conn = Connection::open(database).map_err(|e| backend("open sqlite", e))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|e| backend("journal_mode", e))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")
-            .map_err(|e| backend("synchronous", e))?;
-        conn.execute_batch(SCHEMA)
-            .map_err(|e| backend("schema", e))?;
-        Ok(Self {
-            conn: Mutex::new(conn),
-            archive_dir: archive_dir.to_path_buf(),
-        })
+        conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| backend("journal_mode", e))?;
+        conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| backend("synchronous", e))?;
+        conn.execute_batch(SCHEMA).map_err(|e| backend("schema", e))?;
+        Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf() })
     }
 
-    fn open_transaction(&self) -> Result<std::sync::MutexGuard<'_, Connection>, StoreError> {
-        Ok(self.conn.lock().unwrap())
+    /// Lock the connection. A poisoned mutex (another thread panicked while
+    /// holding it) is recovered rather than propagated: the underlying
+    /// connection stays consistent because every multi-statement operation
+    /// runs in a transaction that is either committed or dropped.
+    fn open_transaction(&self) -> std::sync::MutexGuard<'_, Connection> {
+        self.conn.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
     fn archive_payload(
@@ -165,9 +197,8 @@ impl SqliteStore {
         sha: &str,
         raw: &[u8],
     ) -> Result<String, StoreError> {
-        let relative = PathBuf::from(target.as_str())
-            .join(kind.as_str())
-            .join(format!("{sha}.json"));
+        let relative =
+            PathBuf::from(target.as_str()).join(kind.as_str()).join(format!("{sha}.json"));
         let full = self.archive_dir.join(&relative);
         if !full.exists() {
             if let Some(parent) = full.parent() {
@@ -195,10 +226,8 @@ impl SnapshotRepository for SqliteStore {
         let archive_path = self.archive_payload(&snapshot.target, snapshot.kind, &sha, raw)?;
         let day = utc_day(snapshot.fetched_at);
 
-        let conn = self.open_transaction()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| backend("begin", e))?;
+        let conn = self.open_transaction();
+        let tx = conn.unchecked_transaction().map_err(|e| backend("begin", e))?;
         tx.execute(
             "INSERT INTO snapshots (target_id, kind, fetched_at, source_last_modified, sha256, archive_path, entry_count, dropped_count, status)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -209,8 +238,10 @@ impl SnapshotRepository for SqliteStore {
                 snapshot.source_last_modified,
                 sha,
                 archive_path,
-                snapshot.entry_count as i64,
-                snapshot.dropped_count as i64,
+                // Entry counts are far below `i64::MAX`; saturation is
+                // unreachable and preferred over wrapping.
+                i64::try_from(snapshot.entry_count).unwrap_or(i64::MAX),
+                i64::try_from(snapshot.dropped_count).unwrap_or(i64::MAX),
                 snapshot.status.as_str(),
             ],
         )
@@ -225,13 +256,12 @@ impl SnapshotRepository for SqliteStore {
             )
             .map_err(|e| backend("prepare listing", e))?;
         for listing in listings {
-            let item_ref_id = match item_ref_ids.get(&listing.item_ref) {
-                Some(id) => *id,
-                None => {
-                    let id = get_or_create_item_ref(&tx, &listing.item_ref)?;
-                    item_ref_ids.insert(&listing.item_ref, id);
-                    id
-                }
+            let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
+                *id
+            } else {
+                let id = get_or_create_item_ref(&tx, &listing.item_ref)?;
+                item_ref_ids.insert(&listing.item_ref, id);
+                id
             };
             insert_listing
                 .execute(rusqlite::params![
@@ -260,7 +290,7 @@ impl SnapshotRepository for SqliteStore {
         target: &TargetId,
         kind: PayloadKind,
     ) -> Result<Option<SnapshotMeta>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status
@@ -272,25 +302,22 @@ impl SnapshotRepository for SqliteStore {
             .query(rusqlite::params![target.as_str(), kind.as_str()])
             .map_err(|e| backend("query latest", e))?;
         if let Some(row) = rows.next().map_err(|e| backend("latest row", e))? {
+            // Counts are stored as non-negative i64; a corrupt negative value
+            // degrades to 0 instead of wrapping through a sign cast.
+            let entry_count =
+                u64::try_from(row.get::<_, i64>(5).map_err(|e| backend("entry_count", e))?)
+                    .unwrap_or(0);
+            let dropped_count =
+                u64::try_from(row.get::<_, i64>(6).map_err(|e| backend("dropped_count", e))?)
+                    .unwrap_or(0);
             return Ok(Some(SnapshotMeta {
                 id: row.get(0).map_err(|e| backend("latest id", e))?,
-                target: TargetId(
-                    row.get::<_, String>(1)
-                        .map_err(|e| backend("latest target", e))?,
-                ),
-                kind: parse_kind(
-                    &row.get::<_, String>(2)
-                        .map_err(|e| backend("latest kind", e))?,
-                ),
+                target: TargetId(row.get::<_, String>(1).map_err(|e| backend("latest target", e))?),
+                kind: parse_kind(&row.get::<_, String>(2).map_err(|e| backend("latest kind", e))?),
                 fetched_at: row.get(3).map_err(|e| backend("latest fetched_at", e))?,
                 source_last_modified: row.get(4).map_err(|e| backend("last_modified", e))?,
-                entry_count: row
-                    .get::<_, i64>(5)
-                    .map_err(|e| backend("entry_count", e))? as u64,
-                dropped_count: row
-                    .get::<_, i64>(6)
-                    .map_err(|e| backend("dropped_count", e))?
-                    as u64,
+                entry_count,
+                dropped_count,
                 status: parse_status(&row.get::<_, String>(7).map_err(|e| backend("status", e))?),
             }));
         }
@@ -306,20 +333,17 @@ impl SalesRepository for SqliteStore {
         snapshot_id: i64,
         at: i64,
     ) -> Result<(), StoreError> {
-        let conn = self.open_transaction()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| backend("begin observe", e))?;
+        let conn = self.open_transaction();
+        let tx = conn.unchecked_transaction().map_err(|e| backend("begin observe", e))?;
         let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
-        let mut new_sights: HashMap<i64, u64> = HashMap::new(); // item_ref_id -> count
+        let mut new_sights: HashMap<i64, i64> = HashMap::new(); // item_ref_id -> count
         for listing in listings {
-            let item_ref_id = match item_ref_ids.get(&listing.item_ref) {
-                Some(id) => *id,
-                None => {
-                    let id = get_or_create_item_ref(&tx, &listing.item_ref)?;
-                    item_ref_ids.insert(listing.item_ref.clone(), id);
-                    id
-                }
+            let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
+                *id
+            } else {
+                let id = get_or_create_item_ref(&tx, &listing.item_ref)?;
+                item_ref_ids.insert(listing.item_ref.clone(), id);
+                id
             };
             let updated = tx
                 .execute(
@@ -359,12 +383,7 @@ impl SalesRepository for SqliteStore {
                 target,
                 item_ref_id,
                 utc_day(at),
-                SalesDelta {
-                    listings: count as i64,
-                    closed: 0,
-                    credited: 0,
-                    qty_sold: 0,
-                },
+                &SalesDelta { listings: count, closed: 0, credited: 0, qty_sold: 0 },
             )?;
         }
         tx.commit().map_err(|e| backend("commit observe", e))?;
@@ -377,10 +396,8 @@ impl SalesRepository for SqliteStore {
         snapshot_id: i64,
         at: i64,
     ) -> Result<Vec<SaleCredit>, StoreError> {
-        let conn = self.open_transaction()?;
-        let tx = conn
-            .unchecked_transaction()
-            .map_err(|e| backend("begin close", e))?;
+        let conn = self.open_transaction();
+        let tx = conn.unchecked_transaction().map_err(|e| backend("begin close", e))?;
         let mut statement = tx
             .prepare(
                 "SELECT s.auction_id, s.item_ref_id, s.first_seen_at, s.last_seen_at, s.band, s.quantity,
@@ -433,7 +450,7 @@ impl SalesRepository for SqliteStore {
             tx.execute(
                 "UPDATE sight SET closed_at = ?3, credited = ?4
                  WHERE target_id = ?1 AND auction_id = ?2 AND closed_at IS NULL",
-                rusqlite::params![target.as_str(), auction_id, at, credited as i64],
+                rusqlite::params![target.as_str(), auction_id, at, i64::from(credited)],
             )
             .map_err(|e| backend("close update", e))?;
             bump_sales_row(
@@ -441,10 +458,10 @@ impl SalesRepository for SqliteStore {
                 target,
                 item_ref_id,
                 utc_day(at),
-                SalesDelta {
+                &SalesDelta {
                     listings: 0,
                     closed: 1,
-                    credited: credited as i64,
+                    credited: i64::from(credited),
                     qty_sold: if credited { quantity } else { 0 },
                 },
             )?;
@@ -474,7 +491,7 @@ impl SalesRepository for SqliteStore {
         item: &ItemRef,
         days: i64,
     ) -> Result<Option<f64>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
             return Ok(None);
         };
@@ -491,6 +508,10 @@ impl SalesRepository for SqliteStore {
         if listings == 0 {
             return Ok(None);
         }
+        // Daily counts are far below f64's exact-integer range (2^53), and the
+        // ratio is a display metric; precision loss on giant inputs is
+        // acceptable by design.
+        #[allow(clippy::cast_precision_loss)]
         Ok(Some(credited as f64 / listings as f64))
     }
 }
@@ -510,7 +531,7 @@ fn bump_sales_row(
     target: &TargetId,
     item_ref_id: i64,
     day: i64,
-    delta: SalesDelta,
+    delta: &SalesDelta,
 ) -> Result<(), StoreError> {
     tx.execute(
         "INSERT INTO sales (target_id, item_ref_id, day, listings, closed, credited, qty_sold)
@@ -534,6 +555,10 @@ fn bump_sales_row(
     Ok(())
 }
 
+/// Rebuild an [`ItemRef`] from its stored row. The pet fields were `i32`
+/// domain values before being widened for storage, so the narrowing casts
+/// below are exact.
+#[allow(clippy::cast_possible_truncation)]
 fn join_item_ref(
     kind: &str,
     item_id: i64,
@@ -554,10 +579,11 @@ fn join_item_ref(
 }
 
 fn now_unix() -> i64 {
+    // `u64` unix seconds only exceed `i64` far beyond any real date, so the
+    // conversion saturates; a clock before the epoch reads as 0.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 impl MetricsCacheRepository for SqliteStore {
@@ -567,7 +593,7 @@ impl MetricsCacheRepository for SqliteStore {
         item: &ItemRef,
         span: Span,
     ) -> Result<Option<amtracker_core::domain::CachedBlock>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
             return Ok(None);
         };
@@ -588,10 +614,7 @@ impl MetricsCacheRepository for SqliteStore {
         };
         let ser: SerMetricBlock =
             serde_json::from_str(&json).map_err(|e| backend("deserialize block", e))?;
-        Ok(Some(amtracker_core::domain::CachedBlock {
-            block: ser.into(),
-            computed_at,
-        }))
+        Ok(Some(amtracker_core::domain::CachedBlock { block: ser.into(), computed_at }))
     }
 
     fn put(
@@ -602,7 +625,7 @@ impl MetricsCacheRepository for SqliteStore {
         block: &MetricBlock,
         computed_at: i64,
     ) -> Result<(), StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let item_ref_id = get_or_create_item_ref(&conn, item)?;
         let json = serde_json::to_string(&SerMetricBlock::from(block))
             .map_err(|e| backend("serialize block", e))?;
@@ -616,7 +639,7 @@ impl MetricsCacheRepository for SqliteStore {
     }
 
     fn invalidate(&self, target: &TargetId) -> Result<(), StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         conn.execute(
             "DELETE FROM metrics_cache WHERE target_id = ?1",
             rusqlite::params![target.as_str()],
@@ -628,7 +651,7 @@ impl MetricsCacheRepository for SqliteStore {
 
 impl WatchlistRepository for SqliteStore {
     fn add(&self, entry: &NewWatchlistEntry) -> Result<WatchlistEntry, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let item_ref_id = get_or_create_item_ref(&conn, &entry.item)?;
         let added_at = now_unix();
         let inserted = conn
@@ -649,7 +672,7 @@ impl WatchlistRepository for SqliteStore {
     }
 
     fn remove(&self, target: &TargetId, item: &ItemRef) -> Result<bool, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
             return Ok(false);
         };
@@ -663,7 +686,7 @@ impl WatchlistRepository for SqliteStore {
     }
 
     fn list(&self, target: &TargetId) -> Result<Vec<WatchlistEntry>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, w.note, w.added_at
@@ -690,21 +713,19 @@ impl WatchlistRepository for SqliteStore {
             .map_err(|e| backend("watchlist row", e))?;
         Ok(rows
             .into_iter()
-            .map(
-                |(kind, item_id, species, level, quality, breed, note, added_at)| WatchlistEntry {
-                    target: TargetId(target.as_str().to_string()),
-                    item: join_item_ref(&kind, item_id, species, level, quality, breed),
-                    note,
-                    added_at,
-                },
-            )
+            .map(|(kind, item_id, species, level, quality, breed, note, added_at)| WatchlistEntry {
+                target: TargetId(target.as_str().to_string()),
+                item: join_item_ref(&kind, item_id, species, level, quality, breed),
+                note,
+                added_at,
+            })
             .collect())
     }
 }
 
 impl ItemCatalogRepository for SqliteStore {
     fn upsert(&self, records: &[NameRecord]) -> Result<(), StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         for record in records {
             conn.execute(
                 "INSERT INTO item_catalog (item_id, name, item_class, quality, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)
@@ -723,7 +744,7 @@ impl ItemCatalogRepository for SqliteStore {
     }
 
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let sanitized = query.replace(['%', '_'], "");
         let pattern = format!("%{sanitized}%");
         let prefix = format!("{sanitized}%");
@@ -736,7 +757,7 @@ impl ItemCatalogRepository for SqliteStore {
             )
             .map_err(|e| backend("prepare search", e))?;
         let mut rows = statement
-            .query(rusqlite::params![pattern, prefix, limit as i64])
+            .query(rusqlite::params![pattern, prefix, i64::try_from(limit).unwrap_or(i64::MAX)])
             .map_err(|e| backend("query search", e))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|e| backend("search next", e))? {
@@ -751,7 +772,7 @@ impl ItemCatalogRepository for SqliteStore {
     }
 
     fn by_id(&self, item_id: i64) -> Result<Option<NameRecord>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let row = conn
             .query_row(
                 "SELECT item_id, name, item_class, quality FROM item_catalog WHERE item_id = ?1",
@@ -781,7 +802,7 @@ impl PriceHistoryRepository for SqliteStore {
         item: &ItemRef,
         day: i64,
     ) -> Result<Option<DayFold>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let item_ref_id = lookup_item_ref(&conn, item)?;
         let Some(item_ref_id) = item_ref_id else {
             return Ok(None);
@@ -810,7 +831,7 @@ impl PriceHistoryRepository for SqliteStore {
         day: i64,
         fold: &DayFold,
     ) -> Result<(), StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let item_ref_id = get_or_create_item_ref(&conn, item)?;
         let ser = SerDayFold::from(fold);
         let json = serde_json::to_string(&ser).map_err(|e| backend("serialize fold", e))?;
@@ -823,7 +844,7 @@ impl PriceHistoryRepository for SqliteStore {
     }
 
     fn prune_raw_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let removed = conn
             .execute(
                 "DELETE FROM listing WHERE target_id = ?1 AND day < ?2",
@@ -837,11 +858,9 @@ impl PriceHistoryRepository for SqliteStore {
             )
             .map_err(|e| backend("prune query", e))?;
         let paths: Vec<String> = statement
-            .query_map(rusqlite::params![target.as_str(), day * 86_400], |row| {
-                row.get(0)
-            })
+            .query_map(rusqlite::params![target.as_str(), day * 86_400], |row| row.get(0))
             .map_err(|e| backend("prune rows", e))?
-            .filter_map(|r| r.ok())
+            .filter_map(Result::ok)
             .collect();
         for path in paths {
             let _ = std::fs::remove_file(self.archive_dir.join(path));
@@ -854,7 +873,7 @@ impl PriceHistoryRepository for SqliteStore {
         target: &TargetId,
         since_day: i64,
     ) -> Result<Vec<ItemRef>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT DISTINCT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
@@ -891,7 +910,7 @@ impl PriceHistoryRepository for SqliteStore {
         target: &TargetId,
         since_day: i64,
     ) -> Result<Vec<ItemDayRow>, StoreError> {
-        let conn = self.open_transaction()?;
+        let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
@@ -930,7 +949,9 @@ impl PriceHistoryRepository for SqliteStore {
                 .buckets
                 .iter()
                 .flat_map(|(price, bucket)| {
-                    std::iter::repeat(*price).take(bucket.listings as usize)
+                    // Listing counts are small non-negative values; a corrupt
+                    // negative count contributes no repeated prices.
+                    std::iter::repeat(*price).take(usize::try_from(bucket.listings).unwrap_or(0))
                 })
                 .collect();
             let (min, median, mad) = price_stats_sorted(&prices);
@@ -950,6 +971,11 @@ impl PriceHistoryRepository for SqliteStore {
 
 /// Nearest-rank p05/p25/p75/p95 helper for display tables.
 /// Prices must be sorted ascending.
+///
+/// Direct indexing is safe here: `n > 0` is ensured by the early return and
+/// `mid` lies in `1..=n`, so `mid - 1` and `0` are always valid indices — a
+/// `.get()` fallback would silently corrupt the statistics.
+#[allow(clippy::indexing_slicing)]
 fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64) {
     let n = prices.len();
     if n == 0 {
@@ -970,11 +996,17 @@ fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64) {
 use std::collections::HashMap;
 
 fn sha256_hex(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    use sha2::{
+        Digest,
+        Sha256,
+    };
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {
-        out.push_str(&format!("{byte:02x}"));
+        // `String`'s `fmt::Write` impl is infallible.
+        let _ = write!(out, "{byte:02x}");
     }
     out
 }
@@ -1003,9 +1035,7 @@ fn lookup_item_ref(conn: &Connection, item: &ItemRef) -> Result<Option<i64>, Sto
         )
         .map_err(|e| backend("prepare item_ref", e))?;
     let mut rows = statement
-        .query(rusqlite::params![
-            kind, item_id, species, level, quality, breed
-        ])
+        .query(rusqlite::params![kind, item_id, species, level, quality, breed])
         .map_err(|e| backend("query item_ref", e))?;
     match rows.next().map_err(|e| backend("item_ref row", e))? {
         Some(row) => Ok(Some(row.get(0).map_err(|e| backend("item_ref id", e))?)),
@@ -1029,19 +1059,9 @@ fn get_or_create_item_ref(conn: &Connection, item: &ItemRef) -> Result<i64, Stor
 fn split_item_ref(item: &ItemRef) -> (&'static str, i64, i64, i64, i64, i64) {
     match item {
         ItemRef::Item { item_id } => ("item", *item_id, 0, 0, 0, 0),
-        ItemRef::Pet {
-            species,
-            level,
-            quality,
-            breed,
-        } => (
-            "pet",
-            0,
-            *species,
-            *level as i64,
-            *quality as i64,
-            *breed as i64,
-        ),
+        ItemRef::Pet { species, level, quality, breed } => {
+            ("pet", 0, *species, i64::from(*level), i64::from(*quality), i64::from(*breed))
+        }
     }
 }
 
@@ -1050,15 +1070,8 @@ fn split_item_ref(item: &ItemRef) -> (&'static str, i64, i64, i64, i64, i64) {
 #[derive(serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 enum SerItemRef {
-    Item {
-        item_id: i64,
-    },
-    Pet {
-        species: i64,
-        level: i32,
-        quality: i32,
-        breed: i32,
-    },
+    Item { item_id: i64 },
+    Pet { species: i64, level: i32, quality: i32, breed: i32 },
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1080,17 +1093,9 @@ impl From<SerDayFold> for DayFold {
     fn from(ser: SerDayFold) -> Self {
         let item = match ser.item {
             SerItemRef::Item { item_id } => ItemRef::Item { item_id },
-            SerItemRef::Pet {
-                species,
-                level,
-                quality,
-                breed,
-            } => ItemRef::Pet {
-                species,
-                level,
-                quality,
-                breed,
-            },
+            SerItemRef::Pet { species, level, quality, breed } => {
+                ItemRef::Pet { species, level, quality, breed }
+            }
         };
         DayFold::from_parts(
             item,
@@ -1108,12 +1113,7 @@ impl From<&ItemRef> for SerItemRef {
     fn from(item: &ItemRef) -> Self {
         match item {
             ItemRef::Item { item_id } => SerItemRef::Item { item_id: *item_id },
-            ItemRef::Pet {
-                species,
-                level,
-                quality,
-                breed,
-            } => SerItemRef::Pet {
+            ItemRef::Pet { species, level, quality, breed } => SerItemRef::Pet {
                 species: *species,
                 level: *level,
                 quality: *quality,

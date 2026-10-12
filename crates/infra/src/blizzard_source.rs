@@ -14,17 +14,32 @@
 //!   and must be dropped;
 //! - payloads can be truncated mid-transfer → strict parse or reject.
 
-use std::io::Read;
-use std::path::Path;
-use std::time::{Duration, SystemTime};
-
-use amtracker_core::config::{TargetConfig, TargetKind};
-use amtracker_core::domain::{
-    FetchOutcome, FetchedPayload, ItemRef, ListingKind, NormalizedListing, PayloadKind,
-    TimeLeftBand,
+use std::{
+    io::Read,
+    path::Path,
+    time::{
+        Duration,
+        SystemTime,
+    },
 };
-use amtracker_core::error::SourceError;
-use amtracker_core::ports::AuctionSourcePort;
+
+use amtracker_core::{
+    config::{
+        TargetConfig,
+        TargetKind,
+    },
+    domain::{
+        FetchOutcome,
+        FetchedPayload,
+        ItemRef,
+        ListingKind,
+        NormalizedListing,
+        PayloadKind,
+        TimeLeftBand,
+    },
+    error::SourceError,
+    ports::AuctionSourcePort,
+};
 use serde::Deserialize;
 
 /// Pet cage item id: listings of this item are battle pets keyed by species.
@@ -32,6 +47,11 @@ const PET_CAGE_ITEM_ID: i64 = 82_800;
 /// Item modifier type carrying the battle pet species on cage rows.
 const MODIFIER_PET_SPECIES: i64 = 6;
 
+/// Blizzard auction source: authenticated conditional GET against the
+/// Blizzard auction endpoints with strict whole-payload parsing.
+///
+/// The adapter never panics on wire data: malformed documents surface as
+/// [`SourceError::Parse`], degenerate rows are dropped and counted.
 pub struct BlizzardSource {
     agent: ureq::Agent,
 }
@@ -43,6 +63,8 @@ impl Default for BlizzardSource {
 }
 
 impl BlizzardSource {
+    /// Source with production timeouts (15 s connect, 600 s total).
+    #[must_use]
     pub fn new() -> Self {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(15))
@@ -53,6 +75,11 @@ impl BlizzardSource {
 
     /// Build a feed fixture from a JSON file on disk (local testing against
     /// real dumps without the network).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SourceError::Http`] when the file cannot be read and
+    /// [`SourceError::Parse`] when the payload fails strict parsing.
     pub fn from_file(
         path: &Path,
         kind: PayloadKind,
@@ -69,44 +96,41 @@ impl BlizzardSource {
             raw: bytes,
         }))
     }
+}
 
-    fn build_url(&self, target: &TargetConfig, kind: PayloadKind) -> Result<String, SourceError> {
-        match (&target.kind, kind) {
-            (
-                TargetKind::BlizzardConnectedRealm {
-                    region,
-                    connected_realm_id: _,
-                },
-                PayloadKind::Commodities,
-            ) => Ok(format!(
-                "https://{region}.api.blizzard.com/data/wow/auctions/commodities?namespace=dynamic-{region}&locale=en_US"
-            )),
-            (
-                TargetKind::BlizzardConnectedRealm {
-                    region,
-                    connected_realm_id,
-                },
-                PayloadKind::Auctions,
-            ) => Ok(format!(
-                "https://{region}.api.blizzard.com/data/wow/connected-realm/{connected_realm_id}/auctions?namespace=dynamic-{region}&locale=en_US"
-            )),
-            (TargetKind::StaticUrls { commodities_url, auctions_url }, kind) => Ok(match kind {
-                PayloadKind::Commodities => commodities_url.clone(),
-                PayloadKind::Auctions => auctions_url.clone(),
-            }),
-        }
+fn bearer_token(target: &TargetConfig) -> Result<Option<String>, SourceError> {
+    match &target.auth {
+        None => Ok(None),
+        Some(auth) => std::env::var(&auth.env).map(Some).map_err(|_| {
+            SourceError::Config(format!("missing environment variable {} (bearer token)", auth.env))
+        }),
     }
+}
 
-    fn bearer_token(&self, target: &TargetConfig) -> Result<Option<String>, SourceError> {
-        match &target.auth {
-            None => Ok(None),
-            Some(auth) => std::env::var(&auth.env).map(Some).map_err(|_| {
-                SourceError::Config(format!(
-                    "missing environment variable {} (bearer token)",
-                    auth.env
-                ))
-            }),
-        }
+fn build_url(target: &TargetConfig, kind: PayloadKind) -> String {
+    match (&target.kind, kind) {
+        (
+            TargetKind::BlizzardConnectedRealm {
+                region,
+                connected_realm_id: _,
+            },
+            PayloadKind::Commodities,
+        ) => format!(
+            "https://{region}.api.blizzard.com/data/wow/auctions/commodities?namespace=dynamic-{region}&locale=en_US"
+        ),
+        (
+            TargetKind::BlizzardConnectedRealm {
+                region,
+                connected_realm_id,
+            },
+            PayloadKind::Auctions,
+        ) => format!(
+            "https://{region}.api.blizzard.com/data/wow/connected-realm/{connected_realm_id}/auctions?namespace=dynamic-{region}&locale=en_US"
+        ),
+        (TargetKind::StaticUrls { commodities_url, auctions_url }, kind) => match kind {
+            PayloadKind::Commodities => commodities_url.clone(),
+            PayloadKind::Auctions => auctions_url.clone(),
+        },
     }
 }
 
@@ -117,37 +141,36 @@ impl AuctionSourcePort for BlizzardSource {
         kind: PayloadKind,
         if_modified_since: Option<i64>,
     ) -> Result<FetchOutcome, SourceError> {
-        let url = self.build_url(target, kind)?;
+        let url = build_url(target, kind);
         let mut request = self.agent.get(&url);
-        if let Some(token) = self.bearer_token(target)? {
+        if let Some(token) = bearer_token(target)? {
             request = request.set("Authorization", &format!("Bearer {token}"));
         }
         if let Some(ims) = if_modified_since {
+            // `ims.max(0)` is non-negative, so the conversion is total.
             let date = httpdate::fmt_http_date(
-                SystemTime::UNIX_EPOCH + Duration::from_secs(ims.max(0) as u64),
+                SystemTime::UNIX_EPOCH
+                    + Duration::from_secs(u64::try_from(ims.max(0)).unwrap_or(0)),
             );
             request = request.set("If-Modified-Since", &date);
         }
 
-        let response = request
-            .call()
-            .map_err(|e| SourceError::Http(e.to_string()))?;
+        let response = request.call().map_err(|e| SourceError::Http(e.to_string()))?;
         let status = response.status();
         if status == 304 {
             return Ok(FetchOutcome::NotModified);
         }
         if status != 200 {
-            return Err(SourceError::Http(format!(
-                "unexpected status {status} from {url}"
-            )));
+            return Err(SourceError::Http(format!("unexpected status {status} from {url}")));
         }
         let source_last_modified = response
             .header("last-modified")
             .and_then(|value| httpdate::parse_http_date(value).ok())
             .map(|t| {
+                // `u64` unix seconds only exceed `i64` far beyond any real
+                // date, so the conversion saturates; pre-epoch dates read 0.
                 t.duration_since(SystemTime::UNIX_EPOCH)
-                    .map(|d| d.as_secs() as i64)
-                    .unwrap_or(0)
+                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
             });
         let mut bytes = Vec::new();
         response
@@ -219,6 +242,12 @@ struct WireModifier {
 /// snapshot (fetcher refuses truncated/spliced payloads). Per-row soft rules
 /// (degenerate cage rows, non-positive prices) drop and count the row only.
 /// Public: integration tests and tooling replay real dumps through it.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Parse`] when `bytes` is not a complete, structurally
+/// valid JSON document of the expected wire shape (truncated or spliced
+/// payloads are rejected wholesale rather than partially mapped).
 pub fn parse_payload(
     kind: PayloadKind,
     bytes: &[u8],
@@ -229,42 +258,44 @@ pub fn parse_payload(
     let mut dropped = 0u64;
     for auction in payload.auctions {
         match map_auction(kind, auction) {
-            Ok(Some(listing)) => listings.push(listing),
-            Ok(None) => dropped += 1,
-            Err(()) => dropped += 1,
+            Some(listing) => listings.push(listing),
+            None => dropped += 1,
         }
     }
     Ok((listings, dropped))
 }
 
-/// ACL rules for one row. `Ok(None)` = drop (degenerate), `Err` = drop.
-fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<Option<NormalizedListing>, ()> {
+/// Narrow a wire pet field to its domain range. The value is clamped into
+/// `0..=i32::MAX`, so the cast below is exact (never wraps or truncates).
+#[allow(clippy::cast_possible_truncation)]
+fn pet_field(value: Option<i64>) -> i32 {
+    value.unwrap_or(0).clamp(0, i64::from(i32::MAX)) as i32
+}
+
+/// ACL rules for one row. `None` = degenerate row, drop and count it.
+fn map_auction(kind: PayloadKind, a: WireAuction) -> Option<NormalizedListing> {
     let quantity = a.quantity.unwrap_or(0);
     if quantity <= 0 {
-        return Ok(None);
+        return None;
     }
 
     let species = a
         .item
         .pet_species_id
         .or_else(|| {
-            a.item
-                .modifiers
-                .iter()
-                .find(|m| m.kind == MODIFIER_PET_SPECIES)
-                .map(|m| m.value)
+            a.item.modifiers.iter().find(|m| m.kind == MODIFIER_PET_SPECIES).map(|m| m.value)
         })
         .filter(|s| *s > 0);
 
     let item_ref = match species {
         Some(species) => ItemRef::Pet {
             species,
-            level: a.item.pet_level.unwrap_or(0).clamp(0, i32::MAX as i64) as i32,
-            quality: a.item.pet_quality_id.unwrap_or(0).clamp(0, i32::MAX as i64) as i32,
-            breed: a.item.pet_breed_id.unwrap_or(0).clamp(0, i32::MAX as i64) as i32,
+            level: pet_field(a.item.pet_level),
+            quality: pet_field(a.item.pet_quality_id),
+            breed: pet_field(a.item.pet_breed_id),
         },
         None if a.item.id == PET_CAGE_ITEM_ID => {
-            return Ok(None); // cage row without species: degenerate, drop
+            return None; // cage row without species: degenerate, drop
         }
         None => ItemRef::Item { item_id: a.item.id },
     };
@@ -272,7 +303,7 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<Option<NormalizedLis
     let unit_price = match (kind, a.unit_price, a.buyout) {
         (PayloadKind::Commodities, Some(price), _) if price > 0 => price, // already per unit
         (PayloadKind::Auctions, _, Some(buyout)) if buyout > 0 => buyout / quantity,
-        _ => return Ok(None), // missing or non-positive price (incl. bid-only rows)
+        _ => return None, // missing or non-positive price (incl. bid-only rows)
     };
 
     let bid = match kind {
@@ -280,7 +311,7 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<Option<NormalizedLis
         PayloadKind::Commodities => None,
     };
 
-    Ok(Some(NormalizedListing {
+    Some(NormalizedListing {
         auction_id: a.id,
         item_ref,
         kind: match kind {
@@ -293,11 +324,20 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<Option<NormalizedLis
         time_left: TimeLeftBand::parse(a.time_left.as_deref().unwrap_or("SHORT")),
         context: a.item.context,
         bonus_lists: a.item.bonus_lists,
-    }))
+    })
 }
 
 #[cfg(test)]
 mod tests {
+    // Test assertions may unwrap: fixture-driven, deterministic inputs.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::assert_is_empty
+    )]
+
     use super::*;
 
     const AUCTIONS_SAMPLE: &str = include_str!("../../../fixtures/auctions_sample.json");
@@ -346,21 +386,11 @@ mod tests {
         assert_eq!(listings.len(), 2);
         assert_eq!(
             listings[0].item_ref,
-            ItemRef::Pet {
-                species: 2546,
-                level: 1,
-                quality: 3,
-                breed: 11
-            }
+            ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 }
         );
         assert_eq!(
             listings[1].item_ref,
-            ItemRef::Pet {
-                species: 81665,
-                level: 0,
-                quality: 0,
-                breed: 0
-            }
+            ItemRef::Pet { species: 81665, level: 0, quality: 0, breed: 0 }
         );
     }
 
@@ -371,19 +401,13 @@ mod tests {
 
         let (commodity_rows, _) =
             parse_payload(PayloadKind::Commodities, commodities.as_bytes()).expect("ok");
-        assert_eq!(
-            commodity_rows[0].unit_price, 170000,
-            "commodities are already per unit"
-        );
+        assert_eq!(commodity_rows[0].unit_price, 170_000, "commodities are already per unit");
         assert_eq!(commodity_rows[0].bid, None);
 
         let (auction_rows, _) =
             parse_payload(PayloadKind::Auctions, auctions.as_bytes()).expect("ok");
-        assert_eq!(
-            auction_rows[0].unit_price, 200000,
-            "buyout divides by quantity"
-        );
-        assert_eq!(auction_rows[0].bid, Some(700000));
+        assert_eq!(auction_rows[0].unit_price, 200_000, "buyout divides by quantity");
+        assert_eq!(auction_rows[0].bid, Some(700_000));
     }
 
     #[test]
@@ -401,17 +425,16 @@ mod tests {
 
     #[test]
     fn url_profiles_build_per_target_kind() {
-        let source = BlizzardSource::new();
         let blizzard = target(TargetKind::BlizzardConnectedRealm {
             region: "eu".into(),
             connected_realm_id: 609,
         });
         assert_eq!(
-            source.build_url(&blizzard, PayloadKind::Commodities).unwrap(),
+            build_url(&blizzard, PayloadKind::Commodities),
             "https://eu.api.blizzard.com/data/wow/auctions/commodities?namespace=dynamic-eu&locale=en_US"
         );
         assert_eq!(
-            source.build_url(&blizzard, PayloadKind::Auctions).unwrap(),
+            build_url(&blizzard, PayloadKind::Auctions),
             "https://eu.api.blizzard.com/data/wow/connected-realm/609/auctions?namespace=dynamic-eu&locale=en_US"
         );
 
@@ -419,10 +442,7 @@ mod tests {
             commodities_url: "https://wf.example/c.json".into(),
             auctions_url: "https://wf.example/a.json".into(),
         });
-        assert_eq!(
-            source.build_url(&custom, PayloadKind::Auctions).unwrap(),
-            "https://wf.example/a.json"
-        );
+        assert_eq!(build_url(&custom, PayloadKind::Auctions), "https://wf.example/a.json");
     }
 
     fn target(kind: TargetKind) -> TargetConfig {
@@ -430,10 +450,7 @@ mod tests {
             id: amtracker_core::domain::TargetId("test".into()),
             kind,
             auth: None,
-            poll: amtracker_core::config::PollConfig {
-                commodities_secs: 1,
-                auctions_secs: 1,
-            },
+            poll: amtracker_core::config::PollConfig { commodities_secs: 1, auctions_secs: 1 },
         }
     }
 }

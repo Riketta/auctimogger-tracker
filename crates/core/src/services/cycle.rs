@@ -4,17 +4,33 @@
 
 use std::sync::Arc;
 
-use crate::config::TargetConfig;
-use crate::domain::{
-    utc_day, FetchOutcome, NewSnapshot, PayloadKind, SaleCredit, SnapshotStatus, TargetId,
-};
-use crate::error::CycleError;
-use crate::fold::{group_by_item, DayFold};
-use crate::ports::{
-    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository, SalesRepository,
-    SnapshotRepository,
+use crate::{
+    config::TargetConfig,
+    domain::{
+        utc_day,
+        FetchOutcome,
+        NewSnapshot,
+        PayloadKind,
+        SaleCredit,
+        SnapshotStatus,
+        TargetId,
+    },
+    error::CycleError,
+    fold::{
+        group_by_item,
+        DayFold,
+    },
+    ports::{
+        AuctionSourcePort,
+        ClockPort,
+        MetricsCacheRepository,
+        PriceHistoryRepository,
+        SalesRepository,
+        SnapshotRepository,
+    },
 };
 
+/// Runs the fetch → record → fold pipeline for configured targets.
 pub struct IngestCycleService {
     source: Arc<dyn AuctionSourcePort>,
     snapshots: Arc<dyn SnapshotRepository>,
@@ -24,25 +40,38 @@ pub struct IngestCycleService {
     clock: Arc<dyn ClockPort>,
 }
 
+/// Terminal state of one cycle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum CycleOutcome {
+    /// A fresh payload was fetched, persisted and folded.
     Fetched,
+    /// The source answered 304 — nothing was written.
     NotModified,
 }
 
+/// Per-cycle counters and ids, for logs and HTTP responses.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CycleReport {
+    /// The target the cycle ran for.
     pub target: TargetId,
+    /// Which payload kind the cycle fetched.
     pub kind: PayloadKind,
+    /// Whether a fresh payload was ingested.
     pub outcome: CycleOutcome,
+    /// Listings that survived the ACL pass (0 for 304).
     pub entries: u64,
+    /// Listings dropped by the ACL pass (0 for 304).
     pub dropped: u64,
+    /// The new snapshot id (absent for 304 or failed cycles).
     pub snapshot_id: Option<i64>,
+    /// Distinct items whose day fold was updated.
     pub items_folded: usize,
+    /// Sale credits granted by `close_missing` in this cycle.
     pub sale_credits: usize,
 }
 
 impl IngestCycleService {
+    /// Wires the cycle to its ports (all driven adapters injected here).
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Arc<dyn AuctionSourcePort>,
@@ -52,26 +81,24 @@ impl IngestCycleService {
         sales: Arc<dyn SalesRepository>,
         clock: Arc<dyn ClockPort>,
     ) -> Self {
-        Self {
-            source,
-            snapshots,
-            history,
-            cache,
-            sales,
-            clock,
-        }
+        Self { source, snapshots, history, cache, sales, clock }
     }
 
     /// Runs one fetch+ingest cycle for a target and payload kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns `CycleError::Source` when the fetch or parse fails (nothing is
+    /// persisted then), and `CycleError::Store` when any persistence stage
+    /// fails — the cycle stops at the first failing write, leaving earlier
+    /// writes of this cycle in place.
     pub fn run_cycle(
         &self,
         target: &TargetConfig,
         kind: PayloadKind,
     ) -> Result<CycleReport, CycleError> {
-        let if_modified_since = self
-            .snapshots
-            .latest(&target.id, kind)?
-            .and_then(|meta| meta.source_last_modified);
+        let if_modified_since =
+            self.snapshots.latest(&target.id, kind)?.and_then(|meta| meta.source_last_modified);
 
         match self.source.fetch(target, kind, if_modified_since)? {
             FetchOutcome::NotModified => Ok(CycleReport {
@@ -114,8 +141,7 @@ impl IngestCycleService {
 
                 // Sell-through bookkeeping: register sightings, then close
                 // the ones absent from the newest snapshot (plan §4.2).
-                self.sales
-                    .observe(&target.id, &payload.listings, snapshot_id, now)?;
+                self.sales.observe(&target.id, &payload.listings, snapshot_id, now)?;
                 let credits: Vec<SaleCredit> =
                     self.sales.close_missing(&target.id, snapshot_id, now)?;
 

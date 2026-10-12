@@ -2,20 +2,28 @@
 
 use std::sync::Arc;
 
-use crate::domain::SearchHit;
-use crate::error::StoreError;
-use crate::ports::ItemCatalogRepository;
+use crate::{
+    domain::SearchHit,
+    error::StoreError,
+    ports::ItemCatalogRepository,
+};
 
+/// Name/id search over the item catalog (completions feed off the same port).
 pub struct SearchService {
     catalog: Arc<dyn ItemCatalogRepository>,
 }
 
 impl SearchService {
+    /// Creates the service over the catalog repository.
     pub fn new(catalog: Arc<dyn ItemCatalogRepository>) -> Self {
         Self { catalog }
     }
 
     /// Prefix-first search; `limit` bounds the completion list.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
         let query = query.trim();
         if query.is_empty() {

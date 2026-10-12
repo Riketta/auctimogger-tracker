@@ -2,7 +2,10 @@
 //! `domain/metrics.lua` (golden vectors are asserted in BOTH repos; changing
 //! either side without the other must fail a spec).
 
-use crate::domain::{ItemDayHistogram, MetricBlock};
+use crate::domain::{
+    ItemDayHistogram,
+    MetricBlock,
+};
 
 /// Computes one analytics block from the merged item-day histograms of the
 /// requested window. Returns `None` when there is no data at all.
@@ -13,6 +16,19 @@ use crate::domain::{ItemDayHistogram, MetricBlock};
 /// - nearest-rank percentiles: `idx = ceil(f · n)` clamped to `[1, n]`;
 /// - even-count median/MAD floor the middle-pair average;
 /// - `vwap = floor(Σ p·q / Σ q)` with median fallback when `Σ q = 0`.
+// Histogram-derived indices are clamped or derived from `samples.len()`, so
+// slicing cannot go out of bounds; a `.get()` fallback would silently corrupt
+// metrics on a logic bug, while a panic fails loudly. Sample counts sit far
+// below every cast boundary; `i64 → f64` only shapes the percentile *index*
+// fraction (prices stay `i64`), mirroring the addon's Lua doubles.
+#[allow(
+    clippy::indexing_slicing,
+    clippy::cast_possible_wrap,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+#[must_use]
 pub fn block_from_histograms(
     histograms: &[ItemDayHistogram],
     sale_rate: Option<f64>,
@@ -42,23 +58,12 @@ pub fn block_from_histograms(
         samples[idx - 1]
     };
     let mid = ((n + 1) / 2) as usize; // ceil(n / 2)
-    let median = if n % 2 == 1 {
-        samples[mid - 1]
-    } else {
-        (samples[mid - 1] + samples[mid]) / 2
-    };
+    let median = if n % 2 == 1 { samples[mid - 1] } else { (samples[mid - 1] + samples[mid]) / 2 };
     let mut deviations: Vec<i64> = samples.iter().map(|p| (p - median).abs()).collect();
     deviations.sort_unstable();
-    let mad = if n % 2 == 1 {
-        deviations[mid - 1]
-    } else {
-        (deviations[mid - 1] + deviations[mid]) / 2
-    };
-    let vwap = if qty_sum > 0 {
-        value_qty / qty_sum
-    } else {
-        median
-    };
+    let mad =
+        if n % 2 == 1 { deviations[mid - 1] } else { (deviations[mid - 1] + deviations[mid]) / 2 };
+    let vwap = if qty_sum > 0 { value_qty / qty_sum } else { median };
 
     Some(MetricBlock {
         n,
@@ -79,6 +84,17 @@ pub fn block_from_histograms(
 
 #[cfg(test)]
 mod tests {
+    // Golden-vector construction is allowed to unwrap, index, and cast:
+    // fixed synthetic inputs, not hostile data (the SecOutfall precedent).
+    #![allow(
+        clippy::unwrap_used,
+        clippy::expect_used,
+        clippy::panic,
+        clippy::indexing_slicing,
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss
+    )]
+
     use super::*;
     use crate::domain::PriceBucket;
 
@@ -87,10 +103,7 @@ mod tests {
     fn hist_from_samples(samples: &[(i64, i64)]) -> ItemDayHistogram {
         let mut hist = ItemDayHistogram::default();
         for (price, qty) in samples {
-            let bucket = hist.buckets.entry(*price).or_insert(PriceBucket {
-                listings: 0,
-                qty: 0,
-            });
+            let bucket = hist.buckets.entry(*price).or_insert(PriceBucket { listings: 0, qty: 0 });
             bucket.listings += 1;
             bucket.qty += qty;
         }
@@ -165,18 +178,9 @@ mod tests {
         let mut merged = ItemDayHistogram::default();
         merged.buckets.insert(
             100,
-            PriceBucket {
-                listings: 3,
-                qty: 60,
-            }, // 10 + 20 + 30
+            PriceBucket { listings: 3, qty: 60 }, // 10 + 20 + 30
         );
-        merged.buckets.insert(
-            250,
-            PriceBucket {
-                listings: 1,
-                qty: 5,
-            },
-        );
+        merged.buckets.insert(250, PriceBucket { listings: 1, qty: 5 });
         merged.listing_count = 4;
         merged.qty_sum = 65;
         let from_bucket = block_from_histograms(&[merged], None).expect("data present");

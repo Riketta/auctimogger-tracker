@@ -1,15 +1,36 @@
 //! SQLite repository integration tests: atomic snapshot+listing records,
 //! fold round-trips through the serialization mirror, retention pruning.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+// Test assertions may unwrap: fixture-driven, deterministic inputs.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use amtracker_core::domain::{
-    ItemRef, ListingKind, NewSnapshot, NormalizedListing, PayloadKind, SnapshotStatus, Span,
-    TargetId, TimeLeftBand,
+use std::{
+    path::PathBuf,
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
 };
-use amtracker_core::fold::DayFold;
-use amtracker_core::ports::{MetricsCacheRepository, PriceHistoryRepository, SnapshotRepository};
+
+use amtracker_core::{
+    domain::{
+        ItemRef,
+        ListingKind,
+        NewSnapshot,
+        NormalizedListing,
+        PayloadKind,
+        SnapshotStatus,
+        Span,
+        TargetId,
+        TimeLeftBand,
+    },
+    fold::DayFold,
+    ports::{
+        MetricsCacheRepository,
+        PriceHistoryRepository,
+        SnapshotRepository,
+    },
+};
 use amtracker_infra::store::SqliteStore;
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -59,28 +80,20 @@ fn record_persists_snapshot_listings_and_latest() {
                 dropped_count: 1,
                 status: SnapshotStatus::Ok,
             },
-            &[
-                listing(10, &item(1), 100, 20),
-                listing(11, &item(1), 200, 1),
-            ],
+            &[listing(10, &item(1), 100, 20), listing(11, &item(1), 200, 1)],
             b"payload".as_slice(),
         )
         .expect("record");
 
     assert_eq!(snapshot_id, 1);
-    let latest = store
-        .latest(&target, PayloadKind::Commodities)
-        .expect("latest")
-        .expect("snapshot present");
+    let latest =
+        store.latest(&target, PayloadKind::Commodities).expect("latest").expect("snapshot present");
     assert_eq!(latest.entry_count, 2);
     assert_eq!(latest.dropped_count, 1);
     assert_eq!(latest.source_last_modified, Some(999_000));
 
     // different target/kind combination has nothing
-    assert!(store
-        .latest(&target, PayloadKind::Auctions)
-        .expect("latest")
-        .is_none());
+    assert!(store.latest(&target, PayloadKind::Auctions).expect("latest").is_none());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -91,28 +104,17 @@ fn fold_round_trips_through_storage() {
     let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
 
     let target = TargetId("us-4".into());
-    let pet = ItemRef::Pet {
-        species: 2546,
-        level: 1,
-        quality: 3,
-        breed: 11,
-    };
+    let pet = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
     let mut fold = DayFold::new(pet.clone());
     fold.apply(&[listing(7, &pet, 900_000, 1), listing(8, &pet, 900_000, 2)]);
     store.save_fold(&target, &pet, 11, &fold).expect("save");
 
-    let loaded = store
-        .load_fold(&target, &pet, 11)
-        .expect("load")
-        .expect("fold present");
+    let loaded = store.load_fold(&target, &pet, 11).expect("load").expect("fold present");
     assert_eq!(loaded, fold, "fold survives the serialization round-trip");
     assert_eq!(loaded.histogram().listing_count, 2);
 
     // unknown item/day has no fold
-    assert!(store
-        .load_fold(&TargetId("other".into()), &pet, 11)
-        .expect("load")
-        .is_none());
+    assert!(store.load_fold(&TargetId("other".into()), &pet, 11).expect("load").is_none());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -161,28 +163,24 @@ fn prune_removes_only_the_raw_working_set() {
     assert_eq!(removed, 1, "only the old-day raw rows are removed");
 
     // metadata survives the prune (permanent by design)
-    assert!(store
-        .latest(&target, PayloadKind::Commodities)
-        .expect("latest")
-        .is_some());
+    assert!(store.latest(&target, PayloadKind::Commodities).expect("latest").is_some());
 
     // old fold rows are permanent too
     let old_item = item(1);
-    store
-        .save_fold(&target, &old_item, 10, &DayFold::new(old_item.clone()))
-        .expect("save");
-    assert!(store
-        .load_fold(&target, &old_item, 10)
-        .expect("load")
-        .is_some());
+    store.save_fold(&target, &old_item, 10, &DayFold::new(old_item.clone())).expect("save");
+    assert!(store.load_fold(&target, &old_item, 10).expect("load").is_some());
 
     std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
 fn sell_through_credits_band_violations_only() {
+    use std::time::{
+        SystemTime,
+        UNIX_EPOCH,
+    };
+
     use amtracker_core::ports::SalesRepository;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     let dir = temp_dir("sales");
     let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
@@ -191,16 +189,12 @@ fn sell_through_credits_band_violations_only() {
     // rows (its window is relative to real now inside the adapter).
     let t0 = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         - 1_200; // cycle 1 timestamp, 20 minutes ago
 
     // Three MEDIUM-band listings opened at t0 (band lower bound: 30 min).
-    let batch = [
-        listing(1, &item(1), 100, 1),
-        listing(2, &item(1), 200, 2),
-        listing(3, &item(1), 300, 3),
-    ];
+    let batch =
+        [listing(1, &item(1), 100, 1), listing(2, &item(1), 200, 2), listing(3, &item(1), 300, 3)];
     store
         .record(
             &NewSnapshot {
@@ -237,15 +231,9 @@ fn sell_through_credits_band_violations_only() {
             b"s2".as_slice(),
         )
         .expect("record s2");
-    store
-        .observe(&target, &survivor, 2, t1)
-        .expect("observe s2");
+    store.observe(&target, &survivor, 2, t1).expect("observe s2");
     let credits = store.close_missing(&target, 2, t1).expect("close");
-    assert_eq!(
-        credits.len(),
-        2,
-        "vanished after 10 min < 30 min band floor"
-    );
+    assert_eq!(credits.len(), 2, "vanished after 10 min < 30 min band floor");
     assert!(credits.iter().all(|c| c.item == item(1)));
 
     // Later closure past the band floor is NOT credited: reopen auction 3's
@@ -272,17 +260,11 @@ fn sell_through_credits_band_violations_only() {
     store.close_missing(&target, 3, t3).expect("close late");
 
     // sale_rate over the trailing window: item 1 = 2 credited / 2 listings.
-    let rate = store
-        .sale_rate(&target, &item(1), 14)
-        .expect("rate")
-        .expect("rate");
+    let rate = store.sale_rate(&target, &item(1), 14).expect("rate").expect("rate");
     assert!((rate - 1.0).abs() < 1e-9, "all vanishings credited so far");
 
     // item 2 closed past its band floor: credited stays 0, denominator 1.
-    let rate2 = store
-        .sale_rate(&target, &item(2), 14)
-        .expect("rate")
-        .expect("rate");
+    let rate2 = store.sale_rate(&target, &item(2), 14).expect("rate").expect("rate");
     assert_eq!(rate2, 0.0);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -295,7 +277,7 @@ fn metrics_cache_round_trips_and_invalidates() {
     let dir = temp_dir("cache");
     let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
     let target = TargetId("us-4".into());
-    let item = item(194784);
+    let item = item(194_784);
 
     assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
 
@@ -314,19 +296,11 @@ fn metrics_cache_round_trips_and_invalidates() {
         listing_count: 42,
         sale_rate: None,
     };
-    store
-        .put(&target, &item, Span::D1, &block, 1234)
-        .expect("put");
+    store.put(&target, &item, Span::D1, &block, 1234).expect("put");
 
-    let cached = store
-        .get(&target, &item, Span::D1)
-        .expect("get")
-        .expect("cached");
+    let cached = store.get(&target, &item, Span::D1).expect("get").expect("cached");
     assert_eq!(cached.computed_at, 1234);
-    assert_eq!(
-        cached.block, block,
-        "block survives the serialization round-trip"
-    );
+    assert_eq!(cached.block, block, "block survives the serialization round-trip");
 
     store.invalidate(&target).expect("invalidate");
     assert!(store.get(&target, &item, Span::D1).expect("get").is_none());

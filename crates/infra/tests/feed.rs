@@ -1,16 +1,38 @@
 //! Feed publication integration: rendered Lua must load as Lua, pass the
 //! contract verifier script, and the publisher must persist atomically.
 
-use std::collections::BTreeMap;
-use std::path::PathBuf;
-use std::process::Command;
-use std::sync::atomic::{AtomicU64, Ordering};
+// Test assertions may unwrap: fixture-driven, deterministic inputs.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use amtracker_core::domain::{
-    FeedEntry, FeedFormat, FeedSnapshot, ItemRef, MetricBlock, Span, TargetId,
+use std::{
+    collections::BTreeMap,
+    path::PathBuf,
+    process::Command,
+    sync::atomic::{
+        AtomicU64,
+        Ordering,
+    },
 };
-use amtracker_core::ports::{FeedPublisher, FeedRenderer};
-use amtracker_infra::feed::{FeedCodec, FileFeedPublisher};
+
+use amtracker_core::{
+    domain::{
+        FeedEntry,
+        FeedFormat,
+        FeedSnapshot,
+        ItemRef,
+        MetricBlock,
+        Span,
+        TargetId,
+    },
+    ports::{
+        FeedPublisher,
+        FeedRenderer,
+    },
+};
+use amtracker_infra::feed::{
+    FeedCodec,
+    FileFeedPublisher,
+};
 
 fn temp_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -34,17 +56,9 @@ fn sample_feed() -> FeedSnapshot {
         target: TargetId("us-4".into()),
         generated_at: 1_760_000_000,
         entries: vec![
+            FeedEntry { item: ItemRef::Item { item_id: 194_784 }, metrics: item_metrics },
             FeedEntry {
-                item: ItemRef::Item { item_id: 194784 },
-                metrics: item_metrics,
-            },
-            FeedEntry {
-                item: ItemRef::Pet {
-                    species: 2546,
-                    level: 1,
-                    quality: 3,
-                    breed: 11,
-                },
+                item: ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 },
                 metrics: pet_metrics,
             },
         ],
@@ -70,15 +84,9 @@ fn sample_block_holder(n: i64) -> MetricBlock {
 }
 
 fn find_lua() -> Option<&'static str> {
-    ["lua", "lua5.4", "lua5.3", "lua5.1"]
-        .into_iter()
-        .find(|candidate| {
-            Command::new(candidate)
-                .arg("-v")
-                .output()
-                .map(|out| out.status.success())
-                .unwrap_or(false)
-        })
+    ["lua", "lua5.4", "lua5.3", "lua5.1"].into_iter().find(|candidate| {
+        Command::new(candidate).arg("-v").output().is_ok_and(|out| out.status.success())
+    })
 }
 
 #[test]
@@ -95,11 +103,7 @@ fn generated_lua_passes_the_contract_verifier() {
     std::fs::write(&path, &bytes).expect("write feed");
 
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/verify_feed.lua");
-    let output = Command::new(lua)
-        .arg(&script)
-        .arg(&path)
-        .output()
-        .expect("run verify_feed.lua");
+    let output = Command::new(lua).arg(&script).arg(&path).output().expect("run verify_feed.lua");
     assert!(
         output.status.success(),
         "verifier rejected the feed: {}",
@@ -122,17 +126,13 @@ fn verifier_rejects_a_broken_feed() {
     // ordering violation: p25 above median
     std::fs::write(
         &path,
-        r#"AuctiMoggerTrackerFeed = { version = 2, generatedAt = 123, items = {
+        r"AuctiMoggerTrackerFeed = { version = 2, generatedAt = 123, items = {
         { itemID = 1, metrics = { d1 = { n = 5, min = 1, p05 = 1, p25 = 99, median = 10, p75 = 20, p95 = 30, max = 40, mad = 1, vwap = 10, qtySum = 5, listingCount = 5 } } },
-} }"#,
+} }",
     )
     .expect("write bad feed");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/verify_feed.lua");
-    let output = Command::new(lua)
-        .arg(&script)
-        .arg(&path)
-        .output()
-        .expect("run verifier");
+    let output = Command::new(lua).arg(&script).arg(&path).output().expect("run verifier");
     assert!(!output.status.success(), "broken feed must be rejected");
 
     std::fs::remove_dir_all(&dir).ok();
@@ -144,30 +144,20 @@ fn publisher_writes_files_and_tracks_last_publication() {
     let publisher = FileFeedPublisher::new(dir.join("feeds"));
     let target = TargetId("us-4".into());
 
-    assert!(publisher
-        .last_published(&target, FeedFormat::Lua)
-        .expect("last")
-        .is_none());
+    assert!(publisher.last_published(&target, FeedFormat::Lua).expect("last").is_none());
 
     let feed = sample_feed();
     let lua = FeedCodec.render(&feed, FeedFormat::Lua).expect("render");
-    publisher
-        .publish(&target, FeedFormat::Lua, &lua)
-        .expect("publish lua");
+    publisher.publish(&target, FeedFormat::Lua, &lua).expect("publish lua");
     let json = FeedCodec.render(&feed, FeedFormat::Json).expect("render");
-    publisher
-        .publish(&target, FeedFormat::Json, &json)
-        .expect("publish json");
+    publisher.publish(&target, FeedFormat::Json, &json).expect("publish json");
 
     let written = dir.join("feeds").join("us-4").join("feed.lua");
     assert_eq!(std::fs::read(&written).expect("read"), lua);
     let written_json = dir.join("feeds").join("us-4").join("feed.json");
     assert_eq!(std::fs::read(&written_json).expect("read"), json);
 
-    let last = publisher
-        .last_published(&target, FeedFormat::Lua)
-        .expect("last")
-        .expect("recorded");
+    let last = publisher.last_published(&target, FeedFormat::Lua).expect("last").expect("recorded");
     assert_eq!(last.size, lua.len() as u64);
     assert!(last.at > 0);
 
