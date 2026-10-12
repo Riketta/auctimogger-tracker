@@ -191,7 +191,35 @@ pub fn init(settings: &ObservabilitySettings) -> ObservabilityGuards {
         None => registry.init(),
     }
 
+    install_panic_hook();
+
     ObservabilityGuards { _sentry: guard, _file: file_guard }
+}
+
+/// Routes panics through the tracing stack (the Sentry layer turns the
+/// error-grade record into an Issue) while keeping the default hook's stderr
+/// line: journald captures it even when no subscriber exists yet, and the
+/// file/Sentry layers must never be the only witness to a crash. Installed
+/// after the subscriber is up, so `init`'s own fail-fast panics keep the
+/// default behavior.
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let thread_name = std::thread::current().name().unwrap_or("<unnamed>").to_owned();
+        let location = info.location().map_or_else(|| "unknown".to_owned(), ToString::to_string);
+        let message = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|message| (*message).to_owned())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "non-string panic payload".to_owned());
+        eprintln!("thread '{thread_name}' panicked at {location}: {message}");
+        tracing::error!(
+            thread = %thread_name,
+            location = %location,
+            panic = %message,
+            "panic"
+        );
+    }));
 }
 
 /// The file layer's filter directives: an explicit `[logging].level` is used
