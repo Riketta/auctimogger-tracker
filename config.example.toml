@@ -1,0 +1,37 @@
+# auctimogger-tracker example configuration.
+# Copy to config.toml and adjust. Tokens are read from the environment only —
+# never put secrets in this file.
+
+[server]
+bind = "127.0.0.1:8080"
+token_env = "AMT_API_TOKEN" # unset = mutating endpoints are open (localhost use)
+
+[storage]
+database = "./data/tracker.sqlite3"
+raw_listing_days = 7      # raw listing working set; snapshot metadata live forever
+archive_dir = "./data/raw"
+
+[metrics]
+spans = ["d1", "d7", "d14", "d30"]
+
+[opportunities]
+min_samples = 30
+weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
+
+# --- targets: region+realm pairs or raw URLs; add as many as you like ---
+
+[[targets]]
+id = "us-4"
+kind = "blizzard-connected-realm"
+region = "us"
+connected_realm_id = 4
+auth = { type = "bearer", env = "AMT_TOKEN" }
+poll = { commodities_secs = 3600, auctions_secs = 1800 }
+
+[[targets]]
+id = "wowforever-main" # future: any conforming endpoint, world-wide
+kind = "static-urls"
+commodities_url = "https://example.org/api/commodities.json"
+auctions_url = "https://example.org/api/auctions.json"
+# auth = { type = "bearer", env = "AMT_WF_TOKEN" } # optional
+poll = { commodities_secs = 3600, auctions_secs = 3600 }

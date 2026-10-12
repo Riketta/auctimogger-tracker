@@ -1,0 +1,20 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/infra", "crates/server"]
+
+[package]
+name = "auctimogger-tracker"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Standalone market memory for the AuctiMogger ecosystem: fetches auction dumps, stores history in SQLite, computes per-span analytics, publishes the tracker feed and a decision-support web UI."
+
+[dependencies]
+amtracker-core = { path = "crates/core" }
+amtracker-infra = { path = "crates/infra" }
+amtracker-server = { path = "crates/server" }
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = true
+strip = true

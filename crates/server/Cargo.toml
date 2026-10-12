@@ -1,0 +1,12 @@
+[package]
+name = "amtracker-server"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+description = "Driving adapters for the auctimogger-tracker: TOML config loading, HTTP API + UI, poll-loop scheduler, CLI."
+
+[dependencies]
+amtracker-core = { path = "../core" }
+serde = { version = "1", features = ["derive"] }
+thiserror = "2"
+toml = "0.8"
