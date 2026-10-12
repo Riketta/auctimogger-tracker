@@ -135,3 +135,46 @@ fn rejects_negative_weights() {
     let error = parse_config_str(&text).expect_err("negative weight must fail");
     assert!(error.to_string().contains("non-negative"), "{error}");
 }
+
+#[test]
+fn unknown_top_level_key_is_rejected_by_path() {
+    // Prepended: a bare key after `[[targets]]` would belong to that table.
+    let text = format!("loging = true\n{EXAMPLE}");
+    let error = parse_config_str(&text).expect_err("unknown top-level key must fail");
+    assert!(error.to_string().contains("unknown config keys: loging"), "{error}");
+}
+
+#[test]
+fn unknown_section_key_is_rejected_by_path() {
+    let text = format!("{EXAMPLE}\n[sentry]\ndsn = \"\"\nenvironment2 = \"production\"\n");
+    let error = parse_config_str(&text).expect_err("unknown sentry key must fail");
+    assert!(error.to_string().contains("unknown config keys: sentry.environment2"), "{error}");
+}
+
+#[test]
+fn unknown_target_key_is_rejected_by_path() {
+    let text = format!(
+        "{EXAMPLE}\n[[targets]]\nid = \"typo\"\nkind = \"static-urls\"\n\
+         commidities_url = \"https://example.org/a.json\"\
+         \nauctions_url = \"https://example.org/b.json\"\
+         \npoll = {{ commodities_secs = 60, auctions_secs = 60 }}\n"
+    );
+    let error = parse_config_str(&text).expect_err("unknown target key must fail");
+    assert!(
+        error.to_string().contains("unknown config keys: targets[2].commidities_url"),
+        "{error}"
+    );
+}
+
+#[test]
+fn both_kind_profiles_keys_are_accepted_in_targets() {
+    // The kind enum is flattened, so either profile's keys are legal in the
+    // table; the check must not reject a blizzard target for having them.
+    let text = format!(
+        "{EXAMPLE}\n[[targets]]\nid = \"us-5\"\nkind = \"blizzard-connected-realm\"\
+         \nregion = \"eu\"\nconnected_realm_id = 5\
+         \npoll = {{ commodities_secs = 60, auctions_secs = 60 }}\n"
+    );
+    let loaded = parse_config_str(&text).expect("known kind keys must parse");
+    assert_eq!(loaded.tracker.targets.len(), 3);
+}

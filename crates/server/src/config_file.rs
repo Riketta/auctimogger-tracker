@@ -30,6 +30,9 @@ pub enum ConfigLoadError {
     /// The file exists but its contents are not valid TOML.
     #[error("cannot parse config TOML: {0}")]
     Toml(String),
+    /// The file parsed, but contains keys the model does not know.
+    #[error("unknown config keys: {0}")]
+    UnknownKeys(String),
     /// The file parsed but violated a structural rule of the core model.
     #[error("{0}")]
     Validation(#[from] ConfigError),
@@ -378,15 +381,127 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
     })
 }
 
+/// Keys the file model accepts at the top level.
+const TOP_KEYS: &[&str] =
+    &["debug", "server", "storage", "metrics", "opportunities", "targets", "logging", "sentry"];
+
+/// Rejects keys the file model does not know: a typo like `enviroment` must
+/// fail startup naming the path instead of silently disabling the setting
+/// (the same reasoning as the fail-fast `[logging].level` directive check).
+/// Kind-specific target keys share the target table (the `kind` enum is
+/// flattened), so the union of both profiles is accepted there.
+///
+/// # Errors
+/// Returns [`ConfigLoadError::UnknownKeys`] naming every unknown path.
+fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
+    let mut unknown = Vec::new();
+    collect_unknown(root, "", TOP_KEYS, &mut unknown);
+
+    if let Some(server) = section(root, "server") {
+        collect_unknown(server, "server", &["bind", "token_env"], &mut unknown);
+    }
+    if let Some(storage) = section(root, "storage") {
+        collect_unknown(
+            storage,
+            "storage",
+            &["database", "raw_listing_days", "archive_dir"],
+            &mut unknown,
+        );
+    }
+    if let Some(metrics) = section(root, "metrics") {
+        collect_unknown(metrics, "metrics", &["spans"], &mut unknown);
+    }
+    if let Some(opportunities) = section(root, "opportunities") {
+        collect_unknown(opportunities, "opportunities", &["min_samples", "weights"], &mut unknown);
+        if let Some(weights) = opportunities.get("weights").and_then(toml::Value::as_table) {
+            collect_unknown(
+                weights,
+                "opportunities.weights",
+                &["discount", "sale", "churn", "stability"],
+                &mut unknown,
+            );
+        }
+    }
+    if let Some(logging) = section(root, "logging") {
+        collect_unknown(logging, "logging", &["dir", "rotation", "level"], &mut unknown);
+    }
+    if let Some(sentry) = section(root, "sentry") {
+        collect_unknown(
+            sentry,
+            "sentry",
+            &["dsn", "environment", "traces_sample_rate"],
+            &mut unknown,
+        );
+    }
+    if let Some(targets) = root.get("targets").and_then(toml::Value::as_array) {
+        for (index, target) in targets.iter().enumerate() {
+            let Some(target) = target.as_table() else { continue };
+            let path = format!("targets[{index}]");
+            collect_unknown(
+                target,
+                &path,
+                &[
+                    "id",
+                    "kind",
+                    "auth",
+                    "poll",
+                    "region",
+                    "connected_realm_id",
+                    "commodities_url",
+                    "auctions_url",
+                ],
+                &mut unknown,
+            );
+            if let Some(poll) = target.get("poll").and_then(toml::Value::as_table) {
+                collect_unknown(
+                    poll,
+                    &format!("{path}.poll"),
+                    &["commodities_secs", "auctions_secs"],
+                    &mut unknown,
+                );
+            }
+            if let Some(auth) = target.get("auth").and_then(toml::Value::as_table) {
+                collect_unknown(auth, &format!("{path}.auth"), &["type", "env"], &mut unknown);
+            }
+        }
+    }
+
+    if unknown.is_empty() {
+        Ok(())
+    } else {
+        Err(ConfigLoadError::UnknownKeys(unknown.join(", ")))
+    }
+}
+
+/// Appends `path.key` for every table key not in `allowed` (`path` is empty
+/// at the root, where keys are reported bare).
+fn collect_unknown(table: &toml::Table, path: &str, allowed: &[&str], unknown: &mut Vec<String>) {
+    for key in table.keys() {
+        if !allowed.contains(&key.as_str()) {
+            unknown.push(if path.is_empty() { key.clone() } else { format!("{path}.{key}") });
+        }
+    }
+}
+
+/// The named section when it is present and a table (shape errors inside are
+/// the deserializer's job, not this check's).
+fn section<'a>(root: &'a toml::Table, name: &str) -> Option<&'a toml::Table> {
+    root.get(name).and_then(toml::Value::as_table)
+}
+
 /// Parses and validates a config from string form (tests + file loader share
 /// this path).
 ///
 /// # Errors
-/// Returns [`ConfigLoadError::Toml`] when `text` is not valid TOML and
+/// Returns [`ConfigLoadError::Toml`] when `text` is not valid TOML,
+/// [`ConfigLoadError::UnknownKeys`] when the file contains unknown keys, and
 /// [`ConfigLoadError::Validation`] when the parsed model fails validation.
 pub fn parse_config_str(text: &str) -> Result<LoadedConfig, ConfigLoadError> {
-    let file: FileConfig =
+    let table: toml::Table =
         toml::from_str(text).map_err(|e| ConfigLoadError::Toml(e.to_string()))?;
+    check_unknown_keys(&table)?;
+    let file: FileConfig =
+        toml::Value::Table(table).try_into().map_err(|e| ConfigLoadError::Toml(e.to_string()))?;
     let loaded = map_loaded(file)?;
     loaded.tracker.validate().map_err(ConfigLoadError::Validation)?;
     Ok(loaded)
@@ -396,7 +511,8 @@ pub fn parse_config_str(text: &str) -> Result<LoadedConfig, ConfigLoadError> {
 ///
 /// # Errors
 /// Returns [`ConfigLoadError::Io`] when the file cannot be read,
-/// [`ConfigLoadError::Toml`] when its contents are not valid TOML, and
+/// [`ConfigLoadError::Toml`] when its contents are not valid TOML,
+/// [`ConfigLoadError::UnknownKeys`] when the file contains unknown keys, and
 /// [`ConfigLoadError::Validation`] when the parsed model fails validation.
 pub fn load_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
     let text = std::fs::read_to_string(path)
