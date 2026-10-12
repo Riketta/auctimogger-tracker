@@ -100,6 +100,7 @@ impl AuctionSourcePort for FakeSource {
 struct FakeSnapshotsInner {
     latest: Option<SnapshotMeta>,
     raws: Vec<Vec<u8>>,
+    listing_counts: Vec<u64>,
     next_id: i64,
 }
 
@@ -119,6 +120,7 @@ impl SnapshotRepository for FakeSnapshots {
     fn record(
         &self,
         snapshot: &amtracker_core::domain::NewSnapshot,
+        listings: &[amtracker_core::domain::NormalizedListing],
         raw: &[u8],
     ) -> Result<i64, StoreError> {
         let mut inner = self.inner.lock().unwrap();
@@ -135,6 +137,7 @@ impl SnapshotRepository for FakeSnapshots {
             status: snapshot.status,
         });
         inner.raws.push(raw.to_vec());
+        inner.listing_counts.push(listings.len() as u64);
         Ok(id)
     }
 
@@ -243,6 +246,10 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
         4
     );
     assert_eq!(stored.raws[0], b"raw-bytes".to_vec());
+    assert_eq!(
+        stored.listing_counts[0], 4,
+        "listings persist with the snapshot"
+    );
     drop(stored);
 
     let folds = history.folds.lock().unwrap();
@@ -276,6 +283,7 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
                 dropped_count: 0,
                 status: SnapshotStatus::Ok,
             },
+            &[],
             b"old".as_slice(),
         )
         .expect("seed");

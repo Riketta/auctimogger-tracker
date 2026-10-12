@@ -45,6 +45,17 @@ impl DayFold {
         self.entries.is_empty()
     }
 
+    /// Iterates the fold's auction entries (id, price, qty) — the shape
+    /// storage adapters serialize.
+    pub fn entries(&self) -> impl Iterator<Item = (i64, DayEntry)> + '_ {
+        self.entries.iter().map(|(id, entry)| (*id, *entry))
+    }
+
+    /// Rebuilds a fold from serialized parts.
+    pub fn from_parts(item: ItemRef, entries: HashMap<i64, DayEntry>) -> Self {
+        Self { item, entries }
+    }
+
     /// Applies one snapshot batch for this item. Listings for other items are
     /// ignored (callers may pass whole batches). Last observation of an
     /// auction wins; prices are stable per auction on the wire, quantities may

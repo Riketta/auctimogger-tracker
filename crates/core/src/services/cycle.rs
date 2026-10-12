@@ -83,6 +83,7 @@ impl IngestCycleService {
                         dropped_count: payload.dropped_count,
                         status: SnapshotStatus::Ok,
                     },
+                    &payload.listings,
                     &payload.raw,
                 )?;
 

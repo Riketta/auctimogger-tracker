@@ -318,7 +318,7 @@ auctimogger-tracker/
 | | Deliverable | Done when |
 |---|---|---|
 | R0 ✅ | Workspace scaffold, ports/traits, config TOML, boundary test | `cargo test` green (17 specs: fold semantics, ingest cycle over fakes, watchlist, config parsing, boundary); example config parses; `config-check` CLI works |
-| R1 | Blizzard source adapter + ingest cycle + snapshots + item_day | live fetch populates histograms; corrupted fixture rejected; 304 handled |
+| R1 ✅ | Blizzard source adapter + ingest cycle + snapshots + item_day | live fetch verified against the real API (commodities 266 258 entries → 10 124 folds; auctions 12 948 → 6 199); 304 → NotModified; corrupted/truncated fixtures rejected (tests); SQLite store with atomic snapshot+listing records, fold round-trip, retention prune |
 | R2 | Metric engine + golden vectors | Rust == Lua addon numbers on shared fixtures |
 | R3 | Sell-through | synthetic sight sequences credit/deny per band rules |
 | R4 | Feed export (lua+json, full+slim) + watchlist API | generated `feed.lua` passes `luac -p`, shape asserts, and the addon's ingestor specs |
@@ -346,3 +346,9 @@ auctimogger-tracker/
   `DayFold` unique-auction fold semantics (D5) with tests, ingest cycle service
   over fakes, boundary tests, CI workflow, `config-check` CLI. D13 (sync core)
   locked during implementation.
+- 2026-10-12: R1 implemented — Blizzard-format source adapter (ACL + conditional
+  GET via `If-Modified-Since`, strict parse, degenerate-row rules; `ureq` chosen
+  over `reqwest` because the core is synchronous per D13), SQLite repositories
+  (atomic snapshot+listing+item_ref records, fold JSON round-trip, retention
+  pruning of the raw working set while metadata/folds stay permanent), real
+  `fetch` CLI, live-verified end-to-end against the real API. 27 specs green.

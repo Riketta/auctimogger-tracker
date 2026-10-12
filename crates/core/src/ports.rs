@@ -33,10 +33,17 @@ pub trait ItemInfoPort: Send + Sync {
     fn describe(&self, item_id: i64) -> Result<Option<NameRecord>, SourceError>;
 }
 
-/// Outbound: snapshot metadata + raw payload archival.
+/// Outbound: snapshot metadata, raw payload archival, and the raw listing
+/// working set — persisted atomically in one call.
 pub trait SnapshotRepository: Send + Sync {
-    /// Persists metadata and the raw bytes; returns the snapshot id.
-    fn record(&self, snapshot: &NewSnapshot, raw: &[u8]) -> Result<i64, StoreError>;
+    /// Persists metadata, the listing batch, and the raw bytes; returns the
+    /// snapshot id.
+    fn record(
+        &self,
+        snapshot: &NewSnapshot,
+        listings: &[NormalizedListing],
+        raw: &[u8],
+    ) -> Result<i64, StoreError>;
     /// Newest snapshot for a target/kind, if any.
     fn latest(
         &self,
