@@ -153,8 +153,8 @@ impl OpportunityService {
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when history rows cannot be read or the
-    /// scan cache is poisoned.
+    /// Returns `StoreError::Backend` when history rows cannot be read, a
+    /// sale-rate lookup fails, or the scan cache is poisoned.
     pub fn opportunities(
         &self,
         target: &TargetId,
@@ -162,14 +162,17 @@ impl OpportunityService {
         limit: usize,
     ) -> Result<Vec<Opportunity>, StoreError> {
         let scan = self.scan(target)?;
-        let mut out: Vec<Opportunity> = scan
-            .rows
-            .iter()
-            .filter_map(|scan| self.opportunity_for(scan, target))
-            .filter(|o| {
-                o.samples7 >= i64::from(self.min_samples) && o.churn_per_day >= min_churn_per_day
-            })
-            .collect();
+        let mut out: Vec<Opportunity> = Vec::new();
+        for row in scan.rows.iter() {
+            let Some(opportunity) = self.opportunity_for(row, target)? else {
+                continue;
+            };
+            if opportunity.samples7 >= i64::from(self.min_samples)
+                && opportunity.churn_per_day >= min_churn_per_day
+            {
+                out.push(opportunity);
+            }
+        }
         out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         out.truncate(limit.max(1));
         Ok(out)
@@ -281,17 +284,27 @@ impl OpportunityService {
         }
     }
 
-    fn opportunity_for(&self, scan: &ItemScan, target: &TargetId) -> Option<Opportunity> {
+    /// Builds one opportunity from a scan row. `Ok(None)` = the row is not
+    /// rankable (no price evidence). Sale-rate lookup errors propagate: a
+    /// failing sales store must zero the reliability visibly, not silently.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the 14-day sale-rate lookup fails.
+    fn opportunity_for(
+        &self,
+        scan: &ItemScan,
+        target: &TargetId,
+    ) -> Result<Option<Opportunity>, StoreError> {
         if scan.median7 <= 0.0 || scan.floor_now <= 0 {
-            return None;
+            return Ok(None);
         }
         // Discount is rounded to 3 decimals for feed/UI stability.
         #[allow(clippy::cast_precision_loss)]
         let discount = ((1.0 - scan.floor_now as f64 / scan.median7).clamp(0.0, 1.0) * 1000.0)
             .round()
             / 1000.0;
-        let reliability =
-            self.sales.sale_rate(target, &scan.item, 14).ok().flatten().unwrap_or(0.0);
+        let reliability = self.sales.sale_rate(target, &scan.item, 14)?.unwrap_or(0.0);
         let churn_score = (scan.churn_per_day / CHURN_ANCHOR).min(1.0);
         let stability = 1.0 - (scan.mad7 / scan.median7).min(1.0);
         // Confidence compares evidence against the u32 floor; f64 is exact at
@@ -306,7 +319,7 @@ impl OpportunityService {
         // the floored integer median, matching the addon's display rule.
         #[allow(clippy::cast_possible_truncation)]
         let median7 = scan.median7 as i64;
-        Some(Opportunity {
+        Ok(Some(Opportunity {
             item: scan.item.clone(),
             median7,
             floor_now: scan.floor_now,
@@ -318,7 +331,7 @@ impl OpportunityService {
             samples7: scan.samples7,
             confidence,
             score,
-        })
+        }))
     }
 
     fn mover_for(scan: &ItemScan, _target: &TargetId) -> Option<MoverRow> {
