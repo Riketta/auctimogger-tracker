@@ -83,6 +83,7 @@ only — never put secrets in this file.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `debug` | `false` | louder stdout defaults for the tracker's own crates; `RUST_LOG` overrides entirely |
 | `server.bind` | `127.0.0.1:8080` | web UI/API listen address |
 | `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset = open (localhost use) |
 | `storage.database` | `./data/tracker.sqlite3` | SQLite database (WAL) |
@@ -91,6 +92,8 @@ only — never put secrets in this file.
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
 | `opportunities.min_samples` | `30` | samples before an item is scored |
 | `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | score mix, tunable without code changes |
+| `[logging]` | absent | optional file logging: `dir` (created at boot, failure aborts), `rotation` = `daily`\|`never`, independent `level` (EnvFilter directives) |
+| `[sentry]` | absent | optional Sentry/GlitchTip reporting: `dsn` (empty = off), `environment`, `traces_sample_rate` (0.0..=1.0; absent = error-only) |
 | `[[targets]]` | — | see below |
 
 Targets (one block each, any number):
@@ -293,9 +296,18 @@ example (nightly, keep 14):
 
 ### Operations
 
-- `systemctl status auctimogger-tracker` · `journalctl -u auctimogger-tracker`
+- `systemctl status auctimogger-tracker` · `journalctl -u auctimogger-tracker`.
+- All runtime events flow through `tracing`: every ingest cycle logs its
+  outcome (info), source failures warn, CLI commands emit structured
+  startup/summary lines. `RUST_LOG` retunes stdout without touching the
+  config; the optional `[logging]` section adds an independent file layer.
+- With `[sentry]` configured, error-grade events become Issues and info/warn
+  ship as breadcrumbs (Sentry or self-hosted GlitchTip — any Sentry-protocol
+  DSN). No DSN = stdout/journald only.
 - Restarts on failure (`Restart=on-failure`, 5 s backoff); probe
   `GET /api/health`.
+- `Ctrl+C` / `SIGTERM` shut down gracefully: in-flight requests finish and
+  queued log/Sentry events are flushed before exit.
 - Reads are open on the loopback bind; mutations (`POST /api/fetch`,
   watchlist changes) require the `AMT_API_TOKEN` value. For LAN access, bind
   `0.0.0.0` only behind a reverse proxy with TLS + auth.

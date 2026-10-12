@@ -158,9 +158,11 @@ impl AuctionSourcePort for BlizzardSource {
         let response = request.call().map_err(|e| SourceError::Http(e.to_string()))?;
         let status = response.status();
         if status == 304 {
+            tracing::debug!(url = %url, "source returned not-modified");
             return Ok(FetchOutcome::NotModified);
         }
         if status != 200 {
+            tracing::warn!(status = status, url = %url, "unexpected source status");
             return Err(SourceError::Http(format!("unexpected status {status} from {url}")));
         }
         let source_last_modified = response
@@ -178,6 +180,13 @@ impl AuctionSourcePort for BlizzardSource {
             .read_to_end(&mut bytes)
             .map_err(|e| SourceError::Http(format!("read body: {e}")))?;
         let (listings, dropped_count) = parse_payload(kind, &bytes)?;
+        tracing::info!(
+            kind = ?kind,
+            bytes = bytes.len(),
+            listings = listings.len(),
+            dropped = dropped_count,
+            "payload fetched"
+        );
         Ok(FetchOutcome::Payload(FetchedPayload {
             kind,
             source_last_modified,

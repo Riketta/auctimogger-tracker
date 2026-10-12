@@ -21,7 +21,7 @@ undocumented_unsafe_blocks = "warn"
 name = "auctimogger-tracker"
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.89"
 publish = false
 description = "Standalone market memory for the AuctiMogger ecosystem: fetches auction dumps, stores history in SQLite, computes per-span analytics, publishes the tracker feed and a decision-support web UI."
 
@@ -33,7 +33,19 @@ amtracker-core = { path = "crates/core" }
 amtracker-infra = { path = "crates/infra" }
 amtracker-server = { path = "crates/server" }
 clap = { version = "4", features = ["derive"] }
+sentry = { version = "0.49", default-features = false, features = [
+    "ureq",
+    "rustls",
+    "backtrace",
+    "contexts",
+    "panic",
+    "tracing",
+] }
+sentry-tracing = { version = "0.49", features = ["logs"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true

@@ -951,7 +951,7 @@ impl PriceHistoryRepository for SqliteStore {
                 .flat_map(|(price, bucket)| {
                     // Listing counts are small non-negative values; a corrupt
                     // negative count contributes no repeated prices.
-                    std::iter::repeat(*price).take(usize::try_from(bucket.listings).unwrap_or(0))
+                    std::iter::repeat_n(*price, usize::try_from(bucket.listings).unwrap_or(0))
                 })
                 .collect();
             let (min, median, mad) = price_stats_sorted(&prices);

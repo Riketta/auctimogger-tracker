@@ -2,6 +2,11 @@
 # Copy to config.toml and adjust. Tokens are read from the environment only —
 # never put secrets in this file.
 
+# Louder stdout defaults for the tracker's own crates. RUST_LOG overrides
+# this entirely: RUST_LOG=debug brings the noise back, or tune per crate,
+# e.g. RUST_LOG="info,amtracker_infra=debug".
+# debug = false
+
 [server]
 bind = "127.0.0.1:8080"
 token_env = "AMT_API_TOKEN" # unset = mutating endpoints are open (localhost use)
@@ -17,6 +22,33 @@ spans = ["d1", "d7", "d14", "d30"]
 [opportunities]
 min_samples = 30
 weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
+
+# Optional: persistent file logging. Startup-only: the subscriber is
+# installed once at boot, changes require a restart. Remove the section
+# to log to stdout only (systemd's journald usually suffices; otherwise
+# mount a volume to keep the files).
+# [logging]
+# Log directory - created at boot; failure to create it aborts startup.
+# dir = "logs"
+# "daily" writes one file per day (auctimogger-tracker.log.2026-10-12);
+# "never" appends to a single auctimogger-tracker.log (pair with an
+# external rotator). Files are never pruned automatically.
+# rotation = "daily"
+# Independent filter for the file layer (RUST_LOG never affects it).
+# Default: the tracker's own crates at debug regardless of stdout.
+# level = "info,auctimogger_tracker=debug,amtracker_infra=debug,amtracker_server=debug"
+
+# Optional: Sentry-protocol endpoint: Sentry SaaS or self-hosted GlitchTip.
+# The address to report to is the DSN host - no separate URL needed.
+# Remove the section (or leave dsn empty) to disable reporting entirely.
+# Error-grade log lines surface as Issues; info/warn ride along as log
+# breadcrumbs. Startup-only.
+# [sentry]
+# dsn = "http://your-key@localhost:9000/1"
+# environment = "production"
+# Performance-transaction sample rate (0.0..=1.0); omit for error-only
+# reporting. Low rates like 0.01 keep the data volume down.
+# traces_sample_rate = 0.01
 
 # --- targets: region+realm pairs or raw URLs; add as many as you like ---
 

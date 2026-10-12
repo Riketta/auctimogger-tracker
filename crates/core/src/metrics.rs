@@ -58,11 +58,17 @@ pub fn block_from_histograms(
         samples[idx - 1]
     };
     let mid = ((n + 1) / 2) as usize; // ceil(n / 2)
-    let median = if n % 2 == 1 { samples[mid - 1] } else { (samples[mid - 1] + samples[mid]) / 2 };
+                                      // `midpoint` (not `(a + b) / 2`): prices/deviations are non-negative, so
+                                      // it floors identically while staying overflow-free (clippy::manual_midpoint).
+    let median =
+        if n % 2 == 1 { samples[mid - 1] } else { i64::midpoint(samples[mid - 1], samples[mid]) };
     let mut deviations: Vec<i64> = samples.iter().map(|p| (p - median).abs()).collect();
     deviations.sort_unstable();
-    let mad =
-        if n % 2 == 1 { deviations[mid - 1] } else { (deviations[mid - 1] + deviations[mid]) / 2 };
+    let mad = if n % 2 == 1 {
+        deviations[mid - 1]
+    } else {
+        i64::midpoint(deviations[mid - 1], deviations[mid])
+    };
     let vwap = if qty_sum > 0 { value_qty / qty_sum } else { median };
 
     Some(MetricBlock {

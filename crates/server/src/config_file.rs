@@ -38,9 +38,13 @@ pub enum ConfigLoadError {
 // ------------------------------------------------------------- file shapes
 
 /// Root shape of the config file exactly as it appears on disk; the
-/// [`TryFrom`] mapping below turns this into the core [`TrackerConfig`].
+/// mapping below turns this into the loaded-config pair for the binary.
 #[derive(Deserialize)]
 pub struct FileConfig {
+    /// Louder stdout defaults for the tracker's own crates; `RUST_LOG`
+    /// overrides this entirely. Defaults to `false`.
+    #[serde(default)]
+    pub debug: bool,
     /// `[server]` section: bind address and optional bearer-token env var.
     pub server: FileServer,
     /// `[storage]` section: database, archive directory and retention.
@@ -51,6 +55,115 @@ pub struct FileConfig {
     pub opportunities: FileOpportunities,
     /// `[[targets]]` array: one entry per polled market source.
     pub targets: Vec<FileTarget>,
+    /// Optional `[logging]` section: persistent file logging. Absent = stdout
+    /// (and Sentry) only.
+    #[serde(default)]
+    pub logging: Option<FileLogging>,
+    /// Optional `[sentry]` section: Sentry-protocol error reporting (the
+    /// hosted Sentry service or self-hosted `GlitchTip`). Absent or empty
+    /// `dsn` = disabled.
+    #[serde(default)]
+    pub sentry: Option<FileSentry>,
+}
+
+/// File shape of the optional `[logging]` section (startup-only: the tracing
+/// subscriber is installed once at boot, so changes require a restart).
+#[derive(Deserialize)]
+pub struct FileLogging {
+    /// Directory for the log files; created at boot. Failure aborts startup:
+    /// an operator-declared local sink must not silently degrade to stdout.
+    pub dir: String,
+    /// `"daily"` (default) writes one file per day; `"never"` appends to a
+    /// single file (pair with an external rotator).
+    #[serde(default)]
+    pub rotation: FileRotation,
+    /// Independent filter directives for the file layer (`EnvFilter` syntax,
+    /// used verbatim; invalid directives abort startup). `RUST_LOG` never
+    /// affects the file. Default: the tracker's own crates at debug.
+    #[serde(default)]
+    pub level: Option<String>,
+}
+
+/// File-log rotation policy (`rotation` in the `[logging]` section).
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum FileRotation {
+    /// One file per day (`auctimogger-tracker.log.2026-10-12`).
+    #[default]
+    Daily,
+    /// A single append-only file (`auctimogger-tracker.log`).
+    Never,
+}
+
+/// File shape of the optional `[sentry]` section.
+#[derive(Deserialize)]
+pub struct FileSentry {
+    /// Sentry-protocol DSN (the hosted Sentry service or self-hosted
+    /// `GlitchTip`); the
+    /// address to report to is encoded in the DSN host. Empty = disabled.
+    pub dsn: String,
+    /// Environment label attached to reported events (e.g. `production`).
+    #[serde(default)]
+    pub environment: Option<String>,
+    /// Performance-transaction sample rate (0.0..=1.0). Absent = error-only
+    /// reporting; out-of-range values disable performance monitoring with a
+    /// warning instead of aborting.
+    #[serde(default)]
+    pub traces_sample_rate: Option<f32>,
+}
+
+/// Composition-root observability settings mapped from the file: what the
+/// binary's logging/Sentry bootstrap consumes. Plain model, no serde - the
+/// file shapes above are the ACL.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ObservabilitySettings {
+    /// Louder stdout defaults for the tracker's own crates.
+    pub debug: bool,
+    /// Optional persistent file logging.
+    pub logging: Option<LoggingSettings>,
+    /// Optional Sentry-protocol reporting.
+    pub sentry: Option<SentrySettings>,
+}
+
+/// Mapped `[logging]` settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LoggingSettings {
+    /// Directory for the log files.
+    pub dir: String,
+    /// Rotation policy.
+    pub rotation: Rotation,
+    /// Independent `EnvFilter` directives for the file layer.
+    pub level: Option<String>,
+}
+
+/// Runtime rotation policy (file layer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rotation {
+    /// One file per day.
+    Daily,
+    /// A single append-only file.
+    Never,
+}
+
+/// Mapped `[sentry]` settings.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SentrySettings {
+    /// Sentry-protocol DSN.
+    pub dsn: String,
+    /// Environment label for reported events.
+    pub environment: Option<String>,
+    /// Performance-transaction sample rate.
+    pub traces_sample_rate: Option<f32>,
+}
+
+/// A config file loaded and validated: the core model plus the
+/// composition-root observability settings that the binary consumes.
+#[derive(Debug, Clone)]
+pub struct LoadedConfig {
+    /// The core tracker model (validated).
+    pub tracker: TrackerConfig,
+    /// Logging/Sentry bootstrap settings.
+    pub observability: ObservabilitySettings,
 }
 
 /// File shape of the `[server]` section.
@@ -166,75 +279,103 @@ pub struct FileTarget {
 
 // ------------------------------------------------------------- mapping
 
-impl TryFrom<FileConfig> for TrackerConfig {
-    type Error = ConfigError;
+/// Maps the file-shaped model onto the loaded-config pair: the core
+/// [`TrackerConfig`] for the services and the observability settings for
+/// the binary's logging/Sentry bootstrap.
+///
+/// # Errors
+/// Returns [`ConfigError`] when a configured span name is not one of
+/// `d1|d7|d14|d30`.
+fn map_loaded(file: FileConfig) -> Result<LoadedConfig, ConfigError> {
+    let mut file = file;
+    let debug = file.debug;
+    let logging = file.logging.take();
+    let sentry = file.sentry.take();
+    let observability = ObservabilitySettings {
+        debug,
+        logging: logging.map(|logging| LoggingSettings {
+            dir: logging.dir,
+            rotation: match logging.rotation {
+                FileRotation::Daily => Rotation::Daily,
+                FileRotation::Never => Rotation::Never,
+            },
+            level: logging.level,
+        }),
+        sentry: sentry.map(|sentry| SentrySettings {
+            dsn: sentry.dsn,
+            environment: sentry.environment,
+            traces_sample_rate: sentry.traces_sample_rate,
+        }),
+    };
+    let tracker = build_tracker(file)?;
+    Ok(LoadedConfig { tracker, observability })
+}
 
-    /// Maps the file-shaped model onto the core config, applying the Blizzard
-    /// default auth env (`AMT_TOKEN`) and parsing the configured span names.
-    ///
-    /// # Errors
-    /// Returns [`ConfigError`] when a configured span name is not one of
-    /// `d1|d7|d14|d30`.
-    fn try_from(file: FileConfig) -> Result<Self, ConfigError> {
-        let mut targets = Vec::with_capacity(file.targets.len());
-        for target in file.targets {
-            let kind = match target.kind {
-                FileTargetKind::BlizzardConnectedRealm { region, connected_realm_id } => {
-                    TargetKind::BlizzardConnectedRealm { region, connected_realm_id }
+/// Builds the core config from the file shapes, applying the Blizzard
+/// default auth env (`AMT_TOKEN`) and parsing the configured span names.
+///
+/// # Errors
+/// Returns [`ConfigError`] when a configured span name is not one of
+/// `d1|d7|d14|d30`.
+fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
+    let mut targets = Vec::with_capacity(file.targets.len());
+    for target in file.targets {
+        let kind = match target.kind {
+            FileTargetKind::BlizzardConnectedRealm { region, connected_realm_id } => {
+                TargetKind::BlizzardConnectedRealm { region, connected_realm_id }
+            }
+            FileTargetKind::StaticUrls { commodities_url, auctions_url } => {
+                TargetKind::StaticUrls { commodities_url, auctions_url }
+            }
+        };
+        let auth = target
+            .auth
+            .map(|auth| match auth {
+                FileAuth::Bearer { env } => AuthConfig { env },
+            })
+            .or_else(|| match &kind {
+                // Blizzard targets default to the shared token variable.
+                TargetKind::BlizzardConnectedRealm { .. } => {
+                    Some(AuthConfig { env: "AMT_TOKEN".to_string() })
                 }
-                FileTargetKind::StaticUrls { commodities_url, auctions_url } => {
-                    TargetKind::StaticUrls { commodities_url, auctions_url }
-                }
-            };
-            let auth = target
-                .auth
-                .map(|auth| match auth {
-                    FileAuth::Bearer { env } => AuthConfig { env },
-                })
-                .or_else(|| match &kind {
-                    // Blizzard targets default to the shared token variable.
-                    TargetKind::BlizzardConnectedRealm { .. } => {
-                        Some(AuthConfig { env: "AMT_TOKEN".to_string() })
-                    }
-                    TargetKind::StaticUrls { .. } => None,
-                });
-            targets.push(TargetConfig {
-                id: amtracker_core::domain::TargetId(target.id),
-                kind,
-                auth,
-                poll: PollConfig {
-                    commodities_secs: target.poll.commodities_secs,
-                    auctions_secs: target.poll.auctions_secs,
-                },
+                TargetKind::StaticUrls { .. } => None,
             });
-        }
-        let mut spans = Vec::with_capacity(file.metrics.spans.len());
-        for name in &file.metrics.spans {
-            let span = Span::parse(name).ok_or_else(|| {
-                ConfigError(format!("unknown span '{name}' (expected d1|d7|d14|d30)"))
-            })?;
-            spans.push(span);
-        }
-        Ok(TrackerConfig {
-            server: ServerConfig { bind: file.server.bind, token_env: file.server.token_env },
-            storage: StorageConfig {
-                database: file.storage.database,
-                raw_listing_days: file.storage.raw_listing_days,
-                archive_dir: file.storage.archive_dir,
+        targets.push(TargetConfig {
+            id: amtracker_core::domain::TargetId(target.id),
+            kind,
+            auth,
+            poll: PollConfig {
+                commodities_secs: target.poll.commodities_secs,
+                auctions_secs: target.poll.auctions_secs,
             },
-            metrics: MetricsConfig { spans },
-            opportunities: OpportunitiesConfig {
-                min_samples: file.opportunities.min_samples,
-                weights: ScoreWeights {
-                    discount: file.opportunities.weights.discount,
-                    sale: file.opportunities.weights.sale,
-                    churn: file.opportunities.weights.churn,
-                    stability: file.opportunities.weights.stability,
-                },
-            },
-            targets,
-        })
+        });
     }
+    let mut spans = Vec::with_capacity(file.metrics.spans.len());
+    for name in &file.metrics.spans {
+        let span = Span::parse(name).ok_or_else(|| {
+            ConfigError(format!("unknown span '{name}' (expected d1|d7|d14|d30)"))
+        })?;
+        spans.push(span);
+    }
+    Ok(TrackerConfig {
+        server: ServerConfig { bind: file.server.bind, token_env: file.server.token_env },
+        storage: StorageConfig {
+            database: file.storage.database,
+            raw_listing_days: file.storage.raw_listing_days,
+            archive_dir: file.storage.archive_dir,
+        },
+        metrics: MetricsConfig { spans },
+        opportunities: OpportunitiesConfig {
+            min_samples: file.opportunities.min_samples,
+            weights: ScoreWeights {
+                discount: file.opportunities.weights.discount,
+                sale: file.opportunities.weights.sale,
+                churn: file.opportunities.weights.churn,
+                stability: file.opportunities.weights.stability,
+            },
+        },
+        targets,
+    })
 }
 
 /// Parses and validates a config from string form (tests + file loader share
@@ -243,12 +384,12 @@ impl TryFrom<FileConfig> for TrackerConfig {
 /// # Errors
 /// Returns [`ConfigLoadError::Toml`] when `text` is not valid TOML and
 /// [`ConfigLoadError::Validation`] when the parsed model fails validation.
-pub fn parse_config_str(text: &str) -> Result<TrackerConfig, ConfigLoadError> {
+pub fn parse_config_str(text: &str) -> Result<LoadedConfig, ConfigLoadError> {
     let file: FileConfig =
         toml::from_str(text).map_err(|e| ConfigLoadError::Toml(e.to_string()))?;
-    let config = TrackerConfig::try_from(file)?;
-    config.validate().map_err(ConfigLoadError::Validation)?;
-    Ok(config)
+    let loaded = map_loaded(file)?;
+    loaded.tracker.validate().map_err(ConfigLoadError::Validation)?;
+    Ok(loaded)
 }
 
 /// Loads and validates a TOML config file from disk.
@@ -257,7 +398,7 @@ pub fn parse_config_str(text: &str) -> Result<TrackerConfig, ConfigLoadError> {
 /// Returns [`ConfigLoadError::Io`] when the file cannot be read,
 /// [`ConfigLoadError::Toml`] when its contents are not valid TOML, and
 /// [`ConfigLoadError::Validation`] when the parsed model fails validation.
-pub fn load_config(path: &Path) -> Result<TrackerConfig, ConfigLoadError> {
+pub fn load_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ConfigLoadError::Io(format!("{}: {e}", path.display())))?;
     parse_config_str(&text)

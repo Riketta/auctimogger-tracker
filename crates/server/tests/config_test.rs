@@ -9,13 +9,19 @@ use amtracker_core::{
     config::TargetKind,
     domain::Span,
 };
-use amtracker_server::config_file::parse_config_str;
+use amtracker_server::config_file::{
+    parse_config_str,
+    LoggingSettings,
+    Rotation,
+    SentrySettings,
+};
 
 const EXAMPLE: &str = include_str!("../../../config.example.toml");
 
 #[test]
 fn parses_the_committed_example_config() {
-    let config = parse_config_str(EXAMPLE).expect("example config must parse and validate");
+    let loaded = parse_config_str(EXAMPLE).expect("example config must parse and validate");
+    let config = &loaded.tracker;
 
     assert_eq!(config.server.bind, "127.0.0.1:8080");
     assert_eq!(config.server.token_env.as_deref(), Some("AMT_API_TOKEN"));
@@ -49,6 +55,56 @@ fn parses_the_committed_example_config() {
     assert_eq!(second.id.as_str(), "wowforever-main");
     assert!(matches!(second.kind, TargetKind::StaticUrls { .. }));
     assert!(second.auth.is_none(), "static-urls stay unauthenticated unless declared");
+}
+
+#[test]
+fn the_example_config_has_observability_off_by_default() {
+    let loaded = parse_config_str(EXAMPLE).expect("example config must parse");
+    assert!(!loaded.observability.debug);
+    assert!(loaded.observability.logging.is_none(), "no [logging] section committed");
+    assert!(loaded.observability.sentry.is_none(), "no [sentry] section committed");
+}
+
+#[test]
+fn parses_observability_sections() {
+    let text = format!(
+        "debug = true\n\n{EXAMPLE}\n\
+         [logging]\n\
+         dir = \"logs\"\n\
+         rotation = \"never\"\n\
+         level = \"info,amtracker_infra=debug\"\n\
+         [sentry]\n\
+         dsn = \"http://your-key@localhost:9000/1\"\n\
+         environment = \"production\"\n\
+         traces_sample_rate = 0.01\n"
+    );
+    let loaded = parse_config_str(&text).expect("observability sections must parse");
+    let observability = &loaded.observability;
+
+    assert!(observability.debug);
+    assert_eq!(
+        observability.logging,
+        Some(LoggingSettings {
+            dir: "logs".to_string(),
+            rotation: Rotation::Never,
+            level: Some("info,amtracker_infra=debug".to_string()),
+        })
+    );
+    assert_eq!(
+        observability.sentry,
+        Some(SentrySettings {
+            dsn: "http://your-key@localhost:9000/1".to_string(),
+            environment: Some("production".to_string()),
+            traces_sample_rate: Some(0.01),
+        })
+    );
+}
+
+#[test]
+fn unknown_rotation_is_rejected() {
+    let text = format!("{EXAMPLE}\n[logging]\ndir = \"logs\"\nrotation = \"weekly\"\n");
+    let error = parse_config_str(&text).expect_err("unknown rotation must fail");
+    assert!(error.to_string().contains("unknown variant"), "{error}");
 }
 
 #[test]

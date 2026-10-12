@@ -26,7 +26,8 @@ const TICK: Duration = Duration::from_secs(30);
 
 /// Spawns the background poll loop that runs ingestion cycles for every
 /// configured target on its configured cadence. The thread runs forever on a
-/// 30-second tick and logs per-cycle outcomes to stderr.
+/// 30-second tick and emits per-cycle outcomes via `tracing` (info on
+/// success, warn on failures — the warn path is what surfaces in Sentry).
 ///
 /// # Errors
 /// Returns the [`std::io::Error`] from [`thread::Builder::spawn`] when the OS
@@ -57,22 +58,22 @@ pub fn spawn(
                         continue;
                     }
                     match cycle.run_cycle(target, kind) {
-                        Ok(report) => eprintln!(
-                            "[scheduler] {} {}: {:?} — {} entries (+{} dropped), {} sale credits",
-                            report.target,
-                            kind.as_str(),
-                            report.outcome,
-                            report.entries,
-                            report.dropped,
-                            report.sale_credits,
+                        Ok(report) => tracing::info!(
+                            target = %report.target.0,
+                            kind = kind.as_str(),
+                            outcome = ?report.outcome,
+                            entries = report.entries,
+                            dropped = report.dropped,
+                            folds = report.items_folded,
+                            sale_credits = report.sale_credits,
+                            "ingest cycle complete"
                         ),
-                        Err(error) => {
-                            eprintln!(
-                                "[scheduler] {} {}: error: {error}",
-                                target.id,
-                                kind.as_str()
-                            );
-                        }
+                        Err(error) => tracing::warn!(
+                            target = %target.id.0,
+                            kind = kind.as_str(),
+                            error = %error,
+                            "ingest cycle failed"
+                        ),
                     }
                     last_run
                         .lock()

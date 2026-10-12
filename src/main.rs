@@ -1,8 +1,11 @@
 //! Composition root + CLI. The only place that names concrete adapter types;
-//! everything else works through `amtracker-core` port traits.
+//! everything else works through `amtracker_core` port traits.
 
 use std::{
-    path::PathBuf,
+    path::{
+        Path,
+        PathBuf,
+    },
     sync::Arc,
 };
 
@@ -26,13 +29,18 @@ use amtracker_infra::{
     store::SqliteStore,
 };
 use amtracker_server::{
-    config_file::load_config,
+    config_file::{
+        load_config,
+        LoadedConfig,
+    },
     web::AppState,
 };
 use clap::{
     Parser,
     Subcommand,
 };
+
+mod observability;
 
 #[derive(Parser)]
 #[command(
@@ -56,7 +64,7 @@ enum Commands {
         #[arg(long)]
         target: Option<String>,
     },
-    /// Run the poll loop + web UI (lands in R5).
+    /// Run the poll loop + web UI.
     Serve {
         #[arg(long)]
         config: PathBuf,
@@ -89,78 +97,68 @@ enum Commands {
 fn main() {
     let cli = Cli::parse();
     match cli.command {
-        Commands::ConfigCheck { path } => {
-            let config = match load_config(&path) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            println!("config ok: {} target(s)", config.targets.len());
-            for target in &config.targets {
-                println!(
-                    "  {} : {}, poll commodities={}s auctions={}s",
-                    target.id,
-                    target.describe(),
-                    target.poll.commodities_secs,
-                    target.poll.auctions_secs
-                );
-            }
-        }
+        Commands::ConfigCheck { path } => run_config_check(&path),
         Commands::Fetch { config, target } => {
-            let config = match load_config(&config) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            run_fetch(&config, target.as_deref());
+            with_observability(&config, |loaded| run_fetch(&loaded.tracker, target.as_deref()));
         }
         Commands::Serve { config } => {
-            let config = match load_config(&config) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            run_serve(&config);
+            with_observability(&config, |loaded| run_serve(&loaded.tracker));
         }
         Commands::Metrics { config, target, item, span } => {
-            let config = match load_config(&config) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            run_metrics(&config, &target, item, &span);
+            with_observability(&config, |loaded| {
+                run_metrics(&loaded.tracker, &target, item, &span);
+            });
         }
         Commands::ExportFeed { config, target, out, slim } => {
-            let config = match load_config(&config) {
-                Ok(config) => config,
-                Err(error) => {
-                    eprintln!("error: {error}");
-                    std::process::exit(1);
-                }
-            };
-            run_export_feed(&config, target.as_deref(), &out, slim);
+            with_observability(&config, |loaded| {
+                run_export_feed(&loaded.tracker, target.as_deref(), &out, slim);
+            });
         }
     }
 }
 
+/// Loads the config, installs logging/Sentry, and runs `command` with the
+/// loaded pair. The observability guards live in this frame; the command
+/// diverges (`-> !`), so explicit flushes on the exit paths (see
+/// [`observability::exit_with_flush`]) are what carry queued events out.
+/// Loads the config, installs logging/Sentry, and runs `command` with the
+/// loaded pair. The observability guards live in this frame: when the
+/// command returns (it normally exits the process itself via
+/// [`observability::exit_with_flush`]), dropping them flushes queued events.
+fn with_observability(path: &Path, command: impl FnOnce(&LoadedConfig)) {
+    let loaded = match load_config(path) {
+        Ok(loaded) => loaded,
+        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+    };
+    let _guards = observability::init(&loaded.observability);
+    tracing::debug!(config = %path.display(), "configuration loaded");
+    tracing::info!(version = env!("CARGO_PKG_VERSION"), "auctimogger-tracker starting");
+    command(&loaded);
+}
+
+fn run_config_check(path: &Path) -> ! {
+    let loaded = match load_config(path) {
+        Ok(loaded) => loaded,
+        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+    };
+    let config = &loaded.tracker;
+    println!("config ok: {} target(s)", config.targets.len());
+    for target in &config.targets {
+        println!(
+            "  {} : {}, poll commodities={}s auctions={}s",
+            target.id,
+            target.describe(),
+            target.poll.commodities_secs,
+            target.poll.auctions_secs
+        );
+    }
+    observability::exit_with_flush(0, "");
+}
+
 fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
-    let store = match SqliteStore::open(
-        std::path::Path::new(&config.storage.database),
-        std::path::Path::new(&config.storage.archive_dir),
-    ) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
+    let store = match open_store(config) {
+        Ok(store) => store,
+        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
     let clock = Arc::new(SystemClock);
     let item_info = Arc::new(BlizzardItemInfo::from_config(config));
@@ -211,26 +209,36 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
         item_info,
     });
 
-    amtracker_server::scheduler::spawn(config, state.cycle.clone()).unwrap_or_else(|error| {
-        eprintln!("error: {error}");
-        std::process::exit(1);
-    });
+    if let Err(error) = amtracker_server::scheduler::spawn(config, state.cycle.clone()) {
+        tracing::error!(error = %error, "scheduler thread failed to start");
+        observability::exit_with_flush(1, "");
+    }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
+            tracing::error!(error = %error, "tokio runtime build failed");
+            observability::exit_with_flush(1, "");
         }
     };
-    eprintln!("listening on http://{}", config.server.bind);
+    tracing::info!(bind = %config.server.bind, "listening");
     if let Err(error) =
         runtime.block_on(amtracker_server::web::serve(state, config.server.bind.clone()))
     {
-        eprintln!("server error: {error}");
-        std::process::exit(1);
+        tracing::error!(error = %error, "server error");
+        observability::exit_with_flush(1, "");
     }
-    std::process::exit(0);
+    observability::exit_with_flush(0, "");
+}
+
+/// Opens the SQLite store (shared by every command that touches state).
+fn open_store(config: &amtracker_core::config::TrackerConfig) -> Result<Arc<SqliteStore>, String> {
+    SqliteStore::open(
+        std::path::Path::new(&config.storage.database),
+        std::path::Path::new(&config.storage.archive_dir),
+    )
+    .map(Arc::new)
+    .map_err(|error| error.to_string())
 }
 
 fn run_export_feed(
@@ -241,15 +249,9 @@ fn run_export_feed(
 ) -> ! {
     use amtracker_core::ports::FeedPublisher;
 
-    let store = match SqliteStore::open(
-        std::path::Path::new(&config.storage.database),
-        std::path::Path::new(&config.storage.archive_dir),
-    ) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
+    let store = match open_store(config) {
+        Ok(store) => store,
+        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
     let clock = Arc::new(SystemClock);
     let metrics =
@@ -279,34 +281,43 @@ fn run_export_feed(
                         Ok(bytes) => {
                             if let Err(error) = publisher.publish(&target.id, format, &bytes) {
                                 failures += 1;
-                                eprintln!("[{}] publish {format:?}: {error}", target.id);
+                                tracing::error!(
+                                    target = %target.id.0,
+                                    format = ?format,
+                                    error = %error,
+                                    "feed publish failed"
+                                );
                             }
                         }
                         Err(error) => {
                             failures += 1;
-                            eprintln!("[{}] render {format:?}: {error}", target.id);
+                            tracing::error!(
+                                target = %target.id.0,
+                                format = ?format,
+                                error = %error,
+                                "feed render failed"
+                            );
                         }
                     }
                 }
-                println!(
-                    "[{}] feed exported: {} items, generatedAt {}",
-                    target.id,
-                    feed.entries.len(),
-                    feed.generated_at
+                tracing::info!(
+                    target = %target.id.0,
+                    items = feed.entries.len(),
+                    generated_at = feed.generated_at,
+                    "feed exported"
                 );
             }
             Err(error) => {
                 failures += 1;
-                eprintln!("[{}] export error: {error}", target.id);
+                tracing::error!(target = %target.id.0, error = %error, "feed export failed");
             }
         }
     }
-    println!("feeds written to {}", out_dir.display());
+    tracing::info!(out = %out_dir.display(), "feeds written");
     if failures > 0 {
-        eprintln!("{failures} export(s) failed");
-        std::process::exit(1);
+        observability::exit_with_flush(1, &format!("{failures} export(s) failed"));
     }
-    std::process::exit(0);
+    observability::exit_with_flush(0, "");
 }
 
 fn run_metrics(
@@ -316,26 +327,23 @@ fn run_metrics(
     span_name: &str,
 ) -> ! {
     let Some(span) = amtracker_core::domain::Span::parse(span_name) else {
-        eprintln!("error: unknown span '{span_name}' (expected d1|d7|d14|d30)");
-        std::process::exit(1);
+        observability::exit_with_flush(
+            1,
+            &format!("error: unknown span '{span_name}' (expected d1|d7|d14|d30)"),
+        );
     };
     if !config.metrics.spans.contains(&span) {
-        eprintln!("error: span {} is not enabled in the config", span.name());
-        std::process::exit(1);
+        observability::exit_with_flush(
+            1,
+            &format!("error: span {} is not enabled in the config", span.name()),
+        );
     }
     let Some(target) = config.targets.iter().find(|t| t.id.as_str() == target_id) else {
-        eprintln!("error: unknown target '{target_id}'");
-        std::process::exit(1);
+        observability::exit_with_flush(1, &format!("error: unknown target '{target_id}'"));
     };
-    let store = match SqliteStore::open(
-        std::path::Path::new(&config.storage.database),
-        std::path::Path::new(&config.storage.archive_dir),
-    ) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
+    let store = match open_store(config) {
+        Ok(store) => store,
+        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
     let metrics = amtracker_core::services::metrics::MetricsService::new(
         store.clone(),
@@ -366,29 +374,25 @@ fn run_metrics(
                     .sale_rate
                     .map_or_else(|| "n/a".into(), |rate| format!("{rate:.3}")),
             );
-            std::process::exit(0);
+            observability::exit_with_flush(0, "");
         }
         Ok(None) => {
-            eprintln!("no data for item {item_id} in the {} window", span.name());
-            std::process::exit(1);
+            observability::exit_with_flush(
+                1,
+                &format!("no data for item {item_id} in the {} window", span.name()),
+            );
         }
         Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
+            tracing::error!(error = %error, "metrics query failed");
+            observability::exit_with_flush(1, "");
         }
     }
 }
 
 fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option<&str>) -> ! {
-    let store = match SqliteStore::open(
-        std::path::Path::new(&config.storage.database),
-        std::path::Path::new(&config.storage.archive_dir),
-    ) {
-        Ok(store) => Arc::new(store),
-        Err(error) => {
-            eprintln!("error: {error}");
-            std::process::exit(1);
-        }
+    let store = match open_store(config) {
+        Ok(store) => store,
+        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
     let cycle = IngestCycleService::new(
         Arc::new(BlizzardSource::new()),
@@ -408,26 +412,30 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
         }
         for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
             match cycle.run_cycle(target, kind) {
-                Ok(report) => println!(
-                    "[{}] {}: {:?} — {} entries (+{} dropped), {} item-day folds{}",
-                    report.target,
-                    kind.as_str(),
-                    report.outcome,
-                    report.entries,
-                    report.dropped,
-                    report.items_folded,
-                    report.snapshot_id.map_or(String::new(), |id| format!(", snapshot #{id}")),
+                Ok(report) => tracing::info!(
+                    target = %report.target.0,
+                    kind = kind.as_str(),
+                    outcome = ?report.outcome,
+                    entries = report.entries,
+                    dropped = report.dropped,
+                    folds = report.items_folded,
+                    snapshot = ?report.snapshot_id,
+                    "ingest cycle complete"
                 ),
                 Err(error) => {
                     failures += 1;
-                    eprintln!("[{}] {}: error: {error}", target.id, kind.as_str());
+                    tracing::error!(
+                        target = %target.id.0,
+                        kind = kind.as_str(),
+                        error = %error,
+                        "ingest cycle failed"
+                    );
                 }
             }
         }
     }
     if failures > 0 {
-        eprintln!("{failures} cycle(s) failed");
-        std::process::exit(1);
+        observability::exit_with_flush(1, &format!("{failures} cycle(s) failed"));
     }
-    std::process::exit(0);
+    observability::exit_with_flush(0, "");
 }

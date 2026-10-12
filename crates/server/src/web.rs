@@ -108,11 +108,44 @@ pub fn build_router(state: AppState) -> Router {
 /// Serves the router until the process is interrupted (call from a runtime).
 ///
 /// # Errors
+/// Serves the router on `bind` until a shutdown signal arrives: `Ctrl+C`
+/// anywhere, or `SIGTERM` on Unix (systemd stop). Graceful shutdown lets
+/// in-flight requests finish; the binary then flushes queued logs/Sentry
+/// events before exiting.
+///
+/// # Errors
 /// Returns the underlying [`std::io::Error`] when binding `bind` fails or
 /// when the accept loop surfaces a fatal IO error.
 pub async fn serve(state: Arc<AppState>, bind: String) -> std::io::Result<()> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
-    axum::serve(listener, build_router_arc(state)).await
+    axum::serve(listener, build_router_arc(state)).with_graceful_shutdown(shutdown_signal()).await
+}
+
+/// Resolves on `Ctrl+C` (all platforms) or `SIGTERM` (Unix).
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let terminate = async {
+        use tokio::signal::unix::{
+            signal,
+            SignalKind,
+        };
+        match signal(SignalKind::terminate()) {
+            Ok(mut stream) => {
+                stream.recv().await;
+            }
+            Err(error) => tracing::warn!(error = %error, "SIGTERM handler unavailable"),
+        }
+    };
+    #[cfg(not(unix))]
+    let terminate = std::future::pending::<()>();
+    tokio::select! {
+        () = ctrl_c => {},
+        () = terminate => {},
+    }
+    tracing::info!("shutdown signal received");
 }
 
 fn build_router_arc(state: Arc<AppState>) -> Router {
