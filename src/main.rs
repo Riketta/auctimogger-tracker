@@ -209,6 +209,18 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
         item_info,
     });
 
+    // The open-without-token fallback is documented developer-mode behavior,
+    // but an operator who configured `token_env` and forgot the variable must
+    // still see one loud line at startup.
+    if let Some(token_env) = &config.server.token_env {
+        if std::env::var(token_env).is_err() {
+            tracing::warn!(
+                env = %token_env,
+                "bearer token env unset - mutating API endpoints are OPEN"
+            );
+        }
+    }
+
     if let Err(error) = amtracker_server::scheduler::spawn(config, state.cycle.clone()) {
         tracing::error!(error = %error, "scheduler thread failed to start");
         observability::exit_with_flush(1, "");
