@@ -39,6 +39,17 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Print the analytics block for one item/span (debug aid).
+    Metrics {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        target: String,
+        #[arg(long)]
+        item: i64,
+        #[arg(long, default_value = "d1")]
+        span: String,
+    },
 }
 
 fn main() {
@@ -87,6 +98,87 @@ fn main() {
             );
             std::process::exit(2);
         }
+        Commands::Metrics {
+            config,
+            target,
+            item,
+            span,
+        } => {
+            let config = match load_config(&config) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            run_metrics(&config, &target, item, &span);
+        }
+    }
+}
+
+fn run_metrics(
+    config: &amtracker_core::config::TrackerConfig,
+    target_id: &str,
+    item_id: i64,
+    span_name: &str,
+) -> ! {
+    let Some(span) = amtracker_core::domain::Span::parse(span_name) else {
+        eprintln!("error: unknown span '{span_name}' (expected d1|d7|d14|d30)");
+        std::process::exit(1);
+    };
+    if !config.metrics.spans.contains(&span) {
+        eprintln!("error: span {} is not enabled in the config", span.name());
+        std::process::exit(1);
+    }
+    let Some(target) = config.targets.iter().find(|t| t.id.as_str() == target_id) else {
+        eprintln!("error: unknown target '{target_id}'");
+        std::process::exit(1);
+    };
+    let store = match SqliteStore::open(
+        std::path::Path::new(&config.storage.database),
+        std::path::Path::new(&config.storage.archive_dir),
+    ) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let metrics = amtracker_core::services::metrics::MetricsService::new(
+        store.clone(),
+        store,
+        Arc::new(SystemClock),
+    );
+    let item = amtracker_core::domain::ItemRef::Item { item_id };
+    match metrics.block(&target.id, &item, span) {
+        Ok(Some(block)) => {
+            println!(
+                "{} {} span {} : n={} median={} min={} p05={} p25={} p75={} p95={} max={} mad={} vwap={} qty={}",
+                target_id,
+                item_id,
+                span.name(),
+                block.n,
+                block.median,
+                block.min,
+                block.p05,
+                block.p25,
+                block.p75,
+                block.p95,
+                block.max,
+                block.mad,
+                block.vwap,
+                block.qty_sum,
+            );
+            std::process::exit(0);
+        }
+        Ok(None) => {
+            eprintln!("no data for item {item_id} in the {} window", span.name());
+            std::process::exit(1);
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -103,6 +195,7 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
     };
     let cycle = IngestCycleService::new(
         Arc::new(BlizzardSource::new()),
+        store.clone(),
         store.clone(),
         store,
         Arc::new(SystemClock),

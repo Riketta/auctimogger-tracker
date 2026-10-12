@@ -9,12 +9,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use amtracker_core::domain::{
-    utc_day, ItemRef, NewSnapshot, NormalizedListing, PayloadKind, SnapshotMeta, SnapshotStatus,
-    TargetId,
+    utc_day, ItemRef, MetricBlock, NewSnapshot, NormalizedListing, PayloadKind, SnapshotMeta,
+    SnapshotStatus, Span, TargetId,
 };
 use amtracker_core::error::StoreError;
 use amtracker_core::fold::DayFold;
-use amtracker_core::ports::{PriceHistoryRepository, SnapshotRepository};
+use amtracker_core::ports::{MetricsCacheRepository, PriceHistoryRepository, SnapshotRepository};
 use rusqlite::Connection;
 
 const SCHEMA: &str = "
@@ -65,6 +65,15 @@ CREATE TABLE IF NOT EXISTS item_day (
     day INTEGER NOT NULL,
     fold_json TEXT NOT NULL,
     PRIMARY KEY (target_id, item_ref_id, day)
+);
+
+CREATE TABLE IF NOT EXISTS metrics_cache (
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    span TEXT NOT NULL,
+    computed_at INTEGER NOT NULL,
+    block_json TEXT NOT NULL,
+    PRIMARY KEY (target_id, item_ref_id, span)
 );
 ";
 
@@ -238,6 +247,72 @@ impl SnapshotRepository for SqliteStore {
             }));
         }
         Ok(None)
+    }
+}
+
+impl MetricsCacheRepository for SqliteStore {
+    fn get(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        span: Span,
+    ) -> Result<Option<amtracker_core::domain::CachedBlock>, StoreError> {
+        let conn = self.open_transaction()?;
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(None);
+        };
+        let row = conn
+            .query_row(
+                "SELECT computed_at, block_json FROM metrics_cache
+                 WHERE target_id = ?1 AND item_ref_id = ?2 AND span = ?3",
+                rusqlite::params![target.as_str(), item_ref_id, span.name()],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(backend("metrics cache get", other)),
+            })?;
+        let Some((computed_at, json)) = row else {
+            return Ok(None);
+        };
+        let ser: SerMetricBlock =
+            serde_json::from_str(&json).map_err(|e| backend("deserialize block", e))?;
+        Ok(Some(amtracker_core::domain::CachedBlock {
+            block: ser.into(),
+            computed_at,
+        }))
+    }
+
+    fn put(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        span: Span,
+        block: &MetricBlock,
+        computed_at: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.open_transaction()?;
+        let item_ref_id = get_or_create_item_ref(&conn, item)?;
+        let json = serde_json::to_string(&SerMetricBlock::from(block))
+            .map_err(|e| backend("serialize block", e))?;
+        conn.execute(
+            "INSERT OR REPLACE INTO metrics_cache (target_id, item_ref_id, span, computed_at, block_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![target.as_str(), item_ref_id, span.name(), computed_at, json],
+        )
+        .map_err(|e| backend("metrics cache put", e))?;
+        Ok(())
+    }
+
+    fn invalidate(&self, target: &TargetId) -> Result<(), StoreError> {
+        let conn = self.open_transaction()?;
+        conn.execute(
+            "DELETE FROM metrics_cache WHERE target_id = ?1",
+            rusqlite::params![target.as_str()],
+        )
+        .map_err(|e| backend("metrics cache invalidate", e))?;
+        Ok(())
     }
 }
 
@@ -471,6 +546,63 @@ impl From<&ItemRef> for SerItemRef {
                 quality: *quality,
                 breed: *breed,
             },
+        }
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SerMetricBlock {
+    n: i64,
+    min: i64,
+    p05: i64,
+    p25: i64,
+    median: i64,
+    p75: i64,
+    p95: i64,
+    max: i64,
+    mad: i64,
+    vwap: i64,
+    qty_sum: i64,
+    listing_count: i64,
+    sale_rate: Option<f64>,
+}
+
+impl From<&MetricBlock> for SerMetricBlock {
+    fn from(block: &MetricBlock) -> Self {
+        SerMetricBlock {
+            n: block.n,
+            min: block.min,
+            p05: block.p05,
+            p25: block.p25,
+            median: block.median,
+            p75: block.p75,
+            p95: block.p95,
+            max: block.max,
+            mad: block.mad,
+            vwap: block.vwap,
+            qty_sum: block.qty_sum,
+            listing_count: block.listing_count,
+            sale_rate: block.sale_rate,
+        }
+    }
+}
+
+impl From<SerMetricBlock> for MetricBlock {
+    fn from(ser: SerMetricBlock) -> Self {
+        MetricBlock {
+            n: ser.n,
+            min: ser.min,
+            p05: ser.p05,
+            p25: ser.p25,
+            median: ser.median,
+            p75: ser.p75,
+            p95: ser.p95,
+            max: ser.max,
+            mad: ser.mad,
+            vwap: ser.vwap,
+            qty_sum: ser.qty_sum,
+            listing_count: ser.listing_count,
+            sale_rate: ser.sale_rate,
         }
     }
 }

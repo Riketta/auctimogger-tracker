@@ -206,6 +206,14 @@ pub struct SaleCredit {
     pub at: i64,
 }
 
+/// Memoized analytics block with its computation timestamp (the cache
+/// consumer decides staleness).
+#[derive(Clone, Debug, PartialEq)]
+pub struct CachedBlock {
+    pub block: MetricBlock,
+    pub computed_at: i64,
+}
+
 /// Analytics time spans. Declaration order defines ordering (D1 < D7 < ...).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Span {

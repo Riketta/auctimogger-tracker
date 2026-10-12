@@ -106,13 +106,14 @@ pub trait MetricsCacheRepository: Send + Sync {
         target: &TargetId,
         item: &ItemRef,
         span: Span,
-    ) -> Result<Option<MetricBlock>, StoreError>;
+    ) -> Result<Option<crate::domain::CachedBlock>, StoreError>;
     fn put(
         &self,
         target: &TargetId,
         item: &ItemRef,
         span: Span,
         block: &MetricBlock,
+        computed_at: i64,
     ) -> Result<(), StoreError>;
     fn invalidate(&self, target: &TargetId) -> Result<(), StoreError>;
 }

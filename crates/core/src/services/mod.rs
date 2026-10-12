@@ -3,5 +3,6 @@
 
 pub mod cycle;
 pub mod health;
+pub mod metrics;
 pub mod search;
 pub mod watchlist;

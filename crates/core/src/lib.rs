@@ -12,5 +12,6 @@ pub mod config;
 pub mod domain;
 pub mod error;
 pub mod fold;
+pub mod metrics;
 pub mod ports;
 pub mod services;

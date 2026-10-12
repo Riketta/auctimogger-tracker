@@ -319,7 +319,7 @@ auctimogger-tracker/
 |---|---|---|
 | R0 ✅ | Workspace scaffold, ports/traits, config TOML, boundary test | `cargo test` green (17 specs: fold semantics, ingest cycle over fakes, watchlist, config parsing, boundary); example config parses; `config-check` CLI works |
 | R1 ✅ | Blizzard source adapter + ingest cycle + snapshots + item_day | live fetch verified against the real API (commodities 266 258 entries → 10 124 folds; auctions 12 948 → 6 199); 304 → NotModified; corrupted/truncated fixtures rejected (tests); SQLite store with atomic snapshot+listing records, fold round-trip, retention prune |
-| R2 | Metric engine + golden vectors | Rust == Lua addon numbers on shared fixtures |
+| R2 ✅ | Metric engine + golden vectors | `core::metrics::block_from_histograms` + `MetricsService` (cache-aside, 5-min staleness bound, invalidated on ingest); golden vectors V1–V4 asserted in Rust AND in the addon's `spec/metrics_parity_spec.lua` (addon commit `2107299`); parity verified on live data (item 237364: median 82 900, p05 55 000, p95 247 500, MAD 18 300, n 1 125 — identical to an independent computation over the stored fold) |
 | R3 | Sell-through | synthetic sight sequences credit/deny per band rules |
 | R4 | Feed export (lua+json, full+slim) + watchlist API | generated `feed.lua` passes `luac -p`, shape asserts, and the addon's ingestor specs |
 | R5 | Web UI: dashboard, search/completions, item page, opportunities, overview | all tabs render live data |
@@ -352,3 +352,9 @@ auctimogger-tracker/
   (atomic snapshot+listing+item_ref records, fold JSON round-trip, retention
   pruning of the raw working set while metadata/folds stay permanent), real
   `fetch` CLI, live-verified end-to-end against the real API. 27 specs green.
+- 2026-10-12: R2 implemented — span metric engine (`block_from_histograms`,
+  bit-identical to the addon's `Metrics.summarize`, which became order-agnostic
+  in addon commit `2107299`), `MetricsService` with the metrics cache
+  (5-minute staleness bound, invalidated per target by the ingest cycle),
+  SQLite cache implementation, `metrics` debug CLI. 35 specs green. Parity
+  spot-checked on live data against an independent computation.

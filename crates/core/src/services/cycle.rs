@@ -8,12 +8,16 @@ use crate::config::TargetConfig;
 use crate::domain::{utc_day, FetchOutcome, NewSnapshot, PayloadKind, SnapshotStatus, TargetId};
 use crate::error::CycleError;
 use crate::fold::{group_by_item, DayFold};
-use crate::ports::{AuctionSourcePort, ClockPort, PriceHistoryRepository, SnapshotRepository};
+use crate::ports::{
+    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository,
+    SnapshotRepository,
+};
 
 pub struct IngestCycleService {
     source: Arc<dyn AuctionSourcePort>,
     snapshots: Arc<dyn SnapshotRepository>,
     history: Arc<dyn PriceHistoryRepository>,
+    cache: Arc<dyn MetricsCacheRepository>,
     clock: Arc<dyn ClockPort>,
 }
 
@@ -39,12 +43,14 @@ impl IngestCycleService {
         source: Arc<dyn AuctionSourcePort>,
         snapshots: Arc<dyn SnapshotRepository>,
         history: Arc<dyn PriceHistoryRepository>,
+        cache: Arc<dyn MetricsCacheRepository>,
         clock: Arc<dyn ClockPort>,
     ) -> Self {
         Self {
             source,
             snapshots,
             history,
+            cache,
             clock,
         }
     }
@@ -96,6 +102,8 @@ impl IngestCycleService {
                     fold.apply(listings);
                     self.history.save_fold(&target.id, item_ref, day, &fold)?;
                 }
+                // Fold state changed: memoized span metrics are stale.
+                self.cache.invalidate(&target.id)?;
 
                 Ok(CycleReport {
                     target: target.id.clone(),

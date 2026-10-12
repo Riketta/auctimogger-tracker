@@ -12,7 +12,8 @@ use amtracker_core::domain::{
 use amtracker_core::error::{CycleError, SourceError, StoreError};
 use amtracker_core::fold::DayFold;
 use amtracker_core::ports::{
-    AuctionSourcePort, ClockPort, PriceHistoryRepository, SnapshotRepository, WatchlistRepository,
+    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository,
+    SnapshotRepository, WatchlistRepository,
 };
 use amtracker_core::services::cycle::{CycleOutcome, IngestCycleService};
 use amtracker_core::services::watchlist::WatchlistService;
@@ -189,6 +190,38 @@ impl PriceHistoryRepository for FakeHistory {
     }
 }
 
+#[derive(Default)]
+struct FakeCache {
+    invalidations: Mutex<usize>,
+}
+
+impl MetricsCacheRepository for FakeCache {
+    fn get(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _span: amtracker_core::domain::Span,
+    ) -> Result<Option<amtracker_core::domain::CachedBlock>, StoreError> {
+        Ok(None)
+    }
+
+    fn put(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _span: amtracker_core::domain::Span,
+        _block: &amtracker_core::domain::MetricBlock,
+        _computed_at: i64,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn invalidate(&self, _target: &TargetId) -> Result<(), StoreError> {
+        *self.invalidations.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
 struct FixedClock(i64);
 
 impl ClockPort for FixedClock {
@@ -219,10 +252,16 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
     ))]));
     let snapshots = Arc::new(FakeSnapshots::new());
     let history = Arc::new(FakeHistory::default());
+    let cache = Arc::new(FakeCache::default());
     let clock = Arc::new(FixedClock(1_000_000)); // day 11
 
-    let service =
-        IngestCycleService::new(source.clone(), snapshots.clone(), history.clone(), clock);
+    let service = IngestCycleService::new(
+        source.clone(),
+        snapshots.clone(),
+        history.clone(),
+        cache.clone(),
+        clock,
+    );
     let report = service
         .run_cycle(&target(), PayloadKind::Commodities)
         .expect("cycle");
@@ -266,6 +305,12 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
         .get(&(TargetId("us-4".into()), item2.clone(), day))
         .expect("item 2 fold saved");
     assert_eq!(item2_fold.len(), 1);
+
+    assert_eq!(
+        *cache.invalidations.lock().unwrap(),
+        1,
+        "fetched data invalidates the cache"
+    );
 }
 
 #[test]
@@ -290,8 +335,9 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
 
     let source = Arc::new(FakeSource::new(vec![Ok(FetchOutcome::NotModified)]));
     let history = Arc::new(FakeHistory::default());
+    let cache = Arc::new(FakeCache::default());
     let clock = Arc::new(FixedClock(1_000));
-    let service = IngestCycleService::new(source.clone(), snapshots, history, clock);
+    let service = IngestCycleService::new(source.clone(), snapshots, history, cache.clone(), clock);
 
     let report = service
         .run_cycle(&target(), PayloadKind::Commodities)
@@ -300,6 +346,11 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
     assert_eq!(report.outcome, CycleOutcome::NotModified);
     assert_eq!(report.snapshot_id, None);
     assert_eq!(source.conditional_gets(), vec![Some(500)]);
+    assert_eq!(
+        *cache.invalidations.lock().unwrap(),
+        0,
+        "304 must not invalidate"
+    );
 }
 
 #[test]
@@ -308,7 +359,13 @@ fn ingest_cycle_maps_source_errors_without_touching_storage() {
     let snapshots = Arc::new(FakeSnapshots::new());
     let history = Arc::new(FakeHistory::default());
     let clock = Arc::new(FixedClock(0));
-    let service = IngestCycleService::new(source, snapshots.clone(), history, clock);
+    let service = IngestCycleService::new(
+        source,
+        snapshots.clone(),
+        history,
+        Arc::new(FakeCache::default()),
+        clock,
+    );
 
     let error = service
         .run_cycle(&target(), PayloadKind::Auctions)

@@ -5,11 +5,11 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use amtracker_core::domain::{
-    ItemRef, ListingKind, NewSnapshot, NormalizedListing, PayloadKind, SnapshotStatus, TargetId,
-    TimeLeftBand,
+    ItemRef, ListingKind, NewSnapshot, NormalizedListing, PayloadKind, SnapshotStatus, Span,
+    TargetId, TimeLeftBand,
 };
 use amtracker_core::fold::DayFold;
-use amtracker_core::ports::{PriceHistoryRepository, SnapshotRepository};
+use amtracker_core::ports::{MetricsCacheRepository, PriceHistoryRepository, SnapshotRepository};
 use amtracker_infra::store::SqliteStore;
 
 fn temp_dir(tag: &str) -> PathBuf {
@@ -175,6 +175,52 @@ fn prune_removes_only_the_raw_working_set() {
         .load_fold(&target, &old_item, 10)
         .expect("load")
         .is_some());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn metrics_cache_round_trips_and_invalidates() {
+    use amtracker_core::domain::MetricBlock;
+
+    let dir = temp_dir("cache");
+    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let target = TargetId("us-4".into());
+    let item = item(194784);
+
+    assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
+
+    let block = MetricBlock {
+        n: 42,
+        min: 100,
+        p05: 100,
+        p25: 150,
+        median: 200,
+        p75: 250,
+        p95: 300,
+        max: 400,
+        mad: 30,
+        vwap: 210,
+        qty_sum: 900,
+        listing_count: 42,
+        sale_rate: None,
+    };
+    store
+        .put(&target, &item, Span::D1, &block, 1234)
+        .expect("put");
+
+    let cached = store
+        .get(&target, &item, Span::D1)
+        .expect("get")
+        .expect("cached");
+    assert_eq!(cached.computed_at, 1234);
+    assert_eq!(
+        cached.block, block,
+        "block survives the serialization round-trip"
+    );
+
+    store.invalidate(&target).expect("invalidate");
+    assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
 
     std::fs::remove_dir_all(&dir).ok();
 }
