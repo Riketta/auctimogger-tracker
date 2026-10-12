@@ -9,14 +9,15 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use amtracker_core::domain::{
-    utc_day, ItemRef, MetricBlock, NewSnapshot, NewWatchlistEntry, NormalizedListing, PayloadKind,
-    SaleCredit, SnapshotMeta, SnapshotStatus, Span, TargetId, WatchlistEntry,
+    utc_day, ItemDayRow, ItemRef, MetricBlock, NameRecord, NewSnapshot, NewWatchlistEntry,
+    NormalizedListing, PayloadKind, SaleCredit, SearchHit, SnapshotMeta, SnapshotStatus, Span,
+    TargetId, WatchlistEntry,
 };
 use amtracker_core::error::StoreError;
 use amtracker_core::fold::DayFold;
 use amtracker_core::ports::{
-    MetricsCacheRepository, PriceHistoryRepository, SalesRepository, SnapshotRepository,
-    WatchlistRepository,
+    ItemCatalogRepository, MetricsCacheRepository, PriceHistoryRepository, SalesRepository,
+    SnapshotRepository, WatchlistRepository,
 };
 use rusqlite::Connection;
 
@@ -86,6 +87,15 @@ CREATE TABLE IF NOT EXISTS watchlist (
     added_at INTEGER NOT NULL,
     PRIMARY KEY (target_id, item_ref_id)
 );
+
+CREATE TABLE IF NOT EXISTS item_catalog (
+    item_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    item_class TEXT,
+    quality TEXT,
+    fetched_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_item_catalog_name ON item_catalog(name);
 
 CREATE TABLE IF NOT EXISTS sight (
     target_id TEXT NOT NULL,
@@ -692,6 +702,78 @@ impl WatchlistRepository for SqliteStore {
     }
 }
 
+impl ItemCatalogRepository for SqliteStore {
+    fn upsert(&self, records: &[NameRecord]) -> Result<(), StoreError> {
+        let conn = self.open_transaction()?;
+        for record in records {
+            conn.execute(
+                "INSERT INTO item_catalog (item_id, name, item_class, quality, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT (item_id) DO UPDATE SET name = excluded.name, item_class = excluded.item_class, quality = excluded.quality, fetched_at = excluded.fetched_at",
+                rusqlite::params![
+                    record.item_id,
+                    record.name,
+                    record.item_class,
+                    record.quality,
+                    now_unix(),
+                ],
+            )
+            .map_err(|e| backend("catalog upsert", e))?;
+        }
+        Ok(())
+    }
+
+    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
+        let conn = self.open_transaction()?;
+        let sanitized = query.replace(['%', '_'], "");
+        let pattern = format!("%{sanitized}%");
+        let prefix = format!("{sanitized}%");
+        let mut statement = conn
+            .prepare(
+                "SELECT item_id, name, item_class, quality FROM item_catalog
+                 WHERE name LIKE ?1 COLLATE NOCASE
+                 ORDER BY (name LIKE ?2 COLLATE NOCASE) DESC, name
+                 LIMIT ?3",
+            )
+            .map_err(|e| backend("prepare search", e))?;
+        let mut rows = statement
+            .query(rusqlite::params![pattern, prefix, limit as i64])
+            .map_err(|e| backend("query search", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| backend("search next", e))? {
+            out.push(SearchHit {
+                item_id: row.get(0).map_err(|e| backend("search id", e))?,
+                name: row.get(1).map_err(|e| backend("search name", e))?,
+                item_class: row.get(2).map_err(|e| backend("search class", e))?,
+                quality: row.get(3).map_err(|e| backend("search quality", e))?,
+            });
+        }
+        Ok(out)
+    }
+
+    fn by_id(&self, item_id: i64) -> Result<Option<NameRecord>, StoreError> {
+        let conn = self.open_transaction()?;
+        let row = conn
+            .query_row(
+                "SELECT item_id, name, item_class, quality FROM item_catalog WHERE item_id = ?1",
+                rusqlite::params![item_id],
+                |row| {
+                    Ok(NameRecord {
+                        item_id: row.get(0)?,
+                        name: row.get(1)?,
+                        item_class: row.get(2)?,
+                        quality: row.get(3)?,
+                    })
+                },
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(backend("catalog by_id", other)),
+            })?;
+        Ok(row)
+    }
+}
+
 impl PriceHistoryRepository for SqliteStore {
     fn load_fold(
         &self,
@@ -803,6 +885,84 @@ impl PriceHistoryRepository for SqliteStore {
             })
             .collect())
     }
+
+    fn item_day_rows(
+        &self,
+        target: &TargetId,
+        since_day: i64,
+    ) -> Result<Vec<ItemDayRow>, StoreError> {
+        let conn = self.open_transaction()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
+                 FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
+                 WHERE d.target_id = ?1 AND d.day >= ?2",
+            )
+            .map_err(|e| backend("prepare item_day_rows", e))?;
+        let rows = statement
+            .query(rusqlite::params![target.as_str(), since_day])
+            .map_err(|e| backend("query item_day_rows", e))?
+            .mapped(|row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("item_day_rows row", e))?;
+
+        let mut out = Vec::with_capacity(rows.len());
+        for (fold_json, day, kind, item_id, species, level, quality, breed) in rows {
+            let ser: SerDayFold =
+                serde_json::from_str(&fold_json).map_err(|e| backend("deserialize fold", e))?;
+            let fold = DayFold::from(ser);
+            let histogram = fold.histogram();
+            if histogram.listing_count == 0 {
+                continue;
+            }
+            let prices: Vec<i64> = histogram
+                .buckets
+                .iter()
+                .flat_map(|(price, bucket)| {
+                    std::iter::repeat(*price).take(bucket.listings as usize)
+                })
+                .collect();
+            let (min, median, mad) = price_stats_sorted(&prices);
+            out.push(ItemDayRow {
+                item: join_item_ref(&kind, item_id, species, level, quality, breed),
+                day,
+                listing_count: histogram.listing_count,
+                qty_sum: histogram.qty_sum,
+                min,
+                median,
+                mad,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// Nearest-rank p05/p25/p75/p95 helper for display tables.
+/// Prices must be sorted ascending.
+fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64) {
+    let n = prices.len();
+    if n == 0 {
+        return (0, 0, 0);
+    }
+    let mid = n.div_ceil(2);
+    let median = prices[mid - 1];
+    let mad = {
+        let mut deviations: Vec<i64> = prices.iter().map(|p| (p - median).abs()).collect();
+        deviations.sort_unstable();
+        deviations[mid - 1]
+    };
+    (prices[0], median, mad)
 }
 
 // ------------------------------------------------------------------ helpers

@@ -209,6 +209,20 @@ impl FeedPublisher for FileFeedPublisher {
             .get(&(target.0.clone(), format))
             .copied())
     }
+
+    fn read(&self, target: &TargetId, format: FeedFormat) -> Result<Option<Vec<u8>>, StoreError> {
+        let path = self
+            .dir
+            .join(target.as_str())
+            .join(format!("feed.{}", extension(format)));
+        std::fs::read(&path).map(Some).or_else(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                Ok(None)
+            } else {
+                Err(StoreError::Backend(format!("feed read: {e}")))
+            }
+        })
+    }
 }
 
 fn now_unix() -> i64 {

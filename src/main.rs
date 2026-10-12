@@ -9,11 +9,13 @@ use amtracker_core::ports::FeedRenderer;
 use amtracker_core::services::cycle::IngestCycleService;
 use amtracker_core::services::feed_export::FeedExportService;
 use amtracker_core::services::metrics::MetricsService;
+use amtracker_infra::blizzard_item_info::BlizzardItemInfo;
 use amtracker_infra::blizzard_source::BlizzardSource;
 use amtracker_infra::clock::SystemClock;
 use amtracker_infra::feed::{FeedCodec, FileFeedPublisher};
 use amtracker_infra::store::SqliteStore;
 use amtracker_server::config_file::load_config;
+use amtracker_server::web::AppState;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
@@ -108,11 +110,7 @@ fn main() {
                     std::process::exit(1);
                 }
             };
-            eprintln!(
-                "not implemented yet: web UI + poll loop land in R5 ({} target(s) validated, see PLAN.md)",
-                config.targets.len()
-            );
-            std::process::exit(2);
+            run_serve(config);
         }
         Commands::Metrics {
             config,
@@ -145,6 +143,91 @@ fn main() {
             run_export_feed(&config, target.as_deref(), &out, slim);
         }
     }
+}
+
+fn run_serve(config: amtracker_core::config::TrackerConfig) -> ! {
+    let store = match SqliteStore::open(
+        std::path::Path::new(&config.storage.database),
+        std::path::Path::new(&config.storage.archive_dir),
+    ) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let clock = Arc::new(SystemClock);
+    let item_info = Arc::new(BlizzardItemInfo::from_config(&config));
+    let metrics = Arc::new(MetricsService::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        clock.clone(),
+    ));
+
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        health: Arc::new(amtracker_core::services::health::HealthService::new(
+            store.clone(),
+            config.clone(),
+            clock.clone(),
+        )),
+        search: Arc::new(amtracker_core::services::search::SearchService::new(
+            store.clone(),
+        )),
+        catalog: Arc::new(amtracker_core::services::catalog::CatalogService::new(
+            store.clone(),
+            item_info.clone(),
+        )),
+        metrics: metrics.clone(),
+        opportunities: Arc::new(
+            amtracker_core::services::opportunity::OpportunityService::new(
+                store.clone(),
+                store.clone(),
+                clock.clone(),
+                &config,
+            ),
+        ),
+        watchlist: Arc::new(amtracker_core::services::watchlist::WatchlistService::new(
+            store.clone(),
+            clock.clone(),
+        )),
+        feed_export: Arc::new(FeedExportService::new(
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            metrics,
+            clock.clone(),
+        )),
+        publisher: Arc::new(FileFeedPublisher::new(PathBuf::from("feeds"))),
+        renderer: Arc::new(FeedCodec),
+        cycle: Arc::new(IngestCycleService::new(
+            Arc::new(BlizzardSource::new()),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            store.clone(),
+            clock.clone(),
+        )),
+        history: store.clone(),
+        item_info,
+    });
+
+    amtracker_server::scheduler::spawn(&config, state.cycle.clone());
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
+    eprintln!("listening on http://{}", config.server.bind);
+    if let Err(error) = runtime.block_on(amtracker_server::web::serve(
+        state,
+        config.server.bind.clone(),
+    )) {
+        eprintln!("server error: {error}");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 fn run_export_feed(

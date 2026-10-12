@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod blizzard_item_info;
 pub mod blizzard_source;
 pub mod clock;
 pub mod feed;

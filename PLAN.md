@@ -322,7 +322,7 @@ auctimogger-tracker/
 | R2 ✅ | Metric engine + golden vectors | `core::metrics::block_from_histograms` + `MetricsService` (cache-aside, 5-min staleness bound, invalidated on ingest); golden vectors V1–V4 asserted in Rust AND in the addon's `spec/metrics_parity_spec.lua` (addon commit `2107299`); parity verified on live data (item 237364: median 82 900, p05 55 000, p95 247 500, MAD 18 300, n 1 125 — identical to an independent computation over the stored fold) |
 | R3 ✅ | Sell-through | `TimeLeftBand::credits_sale` rule (vanish < band lower bound; SHORT never credits) unit-tested in core; `SqliteStore` implements `SalesRepository` (sight upserts, snapshot-diff closures joining item_ref, per-day sales aggregates); wired into the ingest cycle (`sale_credits` in the report) and into every metric block (14-day `saleRate`); real-sample integration test credits exactly the LONG/MEDIUM/VERY_LONG vanishings; live API confirmed the 304/no-churn path leaves tables untouched |
 | R4 ✅ | Feed export (lua+json, full+slim) + watchlist | `FeedExportService` (full = items with data in the window; slim = watchlist; `generatedAt` = newest source `Last-Modified`), `FeedCodec` (Lua/JSON renderers, empty-metric entries omitted), `FileFeedPublisher` (atomic write + last-published), watchlist repository, `export-feed` CLI; live export of 16 323 items passed `verify_feed.lua` AND the addon's real RestIngestor (0 dropped, 0 rejected) |
-| R5 | Web UI: dashboard, search/completions, item page, opportunities, overview | all tabs render live data |
+| R5 ✅ | Web UI: dashboard, search/completions, item page, opportunities, overview + API + scheduler | all pages/APIs render live data (smoke-tested); scheduler refreshed commodities live; token-gated fetch/watchlist verified (401 without token) |
 | R6 | CI release + systemd docs | one-command deploy |
 
 ---
@@ -365,9 +365,16 @@ auctimogger-tracker/
   a trailing 14-day `saleRate` to every block. 38 specs green.
 - 2026-10-12: R4 implemented — feed export: `FeedExportService` (full/slim,
   source-freshness `generatedAt`), Lua + JSON renderers and the atomic
-  `FileFeedPublisher` (`FileFeedPublisher` implements `FeedPublisher`),
-  watchlist repository + `export-feed` CLI, `scripts/verify_feed.lua` contract
+  `FileFeedPublisher`, watchlist repository + `export-feed` CLI, `scripts/verify_feed.lua` contract
   checker wired into tests. Live export: 16 323 items verified by
   `verify_feed.lua` AND accepted by the addon's real RestIngestor (0 dropped).
   55 specs green. HTTP endpoints (watchlist API surface) land with the R5 web
   crate; the watchlist repository/service already exist underneath.
+- 2026-10-12: R5 implemented — axum web server + thread scheduler: dashboard,
+  snapshots, search with completions, item detail (30-day sparkline + span
+  tables), opportunities with transparent component bars, market overview;
+  JSON API (`health/search/opportunities/overview/metrics/watchlist/fetch`,
+  `feed.lua`/`feed-slim.lua`/`feed.json` downloads); token-gated mutations;
+  Blizzard item-info adapter + name catalog; `OpportunityService` with
+  transparent weighted scoring (discount/reliability/churn/stability +
+  confidence). 55 specs green; all pages/APIs live-smoke-tested.

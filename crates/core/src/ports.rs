@@ -77,6 +77,13 @@ pub trait PriceHistoryRepository: Send + Sync {
         target: &TargetId,
         since_day: i64,
     ) -> Result<Vec<ItemRef>, StoreError>;
+    /// Per-item-day aggregate rows on/after the given UTC day (ranking fuel
+    /// for the opportunities/overview views).
+    fn item_day_rows(
+        &self,
+        target: &TargetId,
+        since_day: i64,
+    ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
 }
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).
@@ -158,4 +165,6 @@ pub trait FeedPublisher: Send + Sync {
         target: &TargetId,
         format: FeedFormat,
     ) -> Result<Option<PublishedFeed>, StoreError>;
+    /// Bytes of the last published feed (serving /feed.lua and friends).
+    fn read(&self, target: &TargetId, format: FeedFormat) -> Result<Option<Vec<u8>>, StoreError>;
 }

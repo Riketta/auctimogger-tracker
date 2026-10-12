@@ -112,7 +112,8 @@ pub struct NormalizedListing {
 
 // ---------------------------------------------------------------- snapshots
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Payload kind of one snapshot source endpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PayloadKind {
     Commodities,
     Auctions,
@@ -203,6 +204,19 @@ pub struct ItemDayHistogram {
 pub struct PriceBucket {
     pub listings: u64,
     pub qty: i64,
+}
+
+/// Per-item-day aggregate used by ranking/overview views (derived from the
+/// day fold; median/min are listing-level nearest-rank over that day).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemDayRow {
+    pub item: ItemRef,
+    pub day: i64,
+    pub listing_count: u64,
+    pub qty_sum: i64,
+    pub min: i64,
+    pub median: i64,
+    pub mad: i64,
 }
 
 /// A vanished sighting credited as a sale candidate (plan D7).
@@ -322,7 +336,7 @@ pub struct NameRecord {
     pub item_id: i64,
     pub name: String,
     pub item_class: Option<String>,
-    pub quality: Option<i32>,
+    pub quality: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -330,7 +344,7 @@ pub struct SearchHit {
     pub item_id: i64,
     pub name: String,
     pub item_class: Option<String>,
-    pub quality: Option<i32>,
+    pub quality: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

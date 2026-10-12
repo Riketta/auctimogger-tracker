@@ -196,6 +196,14 @@ impl PriceHistoryRepository for FakeHistory {
     ) -> Result<Vec<ItemRef>, StoreError> {
         Ok(Vec::new())
     }
+
+    fn item_day_rows(
+        &self,
+        _target: &TargetId,
+        _since_day: i64,
+    ) -> Result<Vec<amtracker_core::domain::ItemDayRow>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]
