@@ -35,7 +35,13 @@ normal for this item, and how do I know this deal is real?"*.
   (`region` + `connected_realm_id`) or raw `static-urls` (any endpoint that
   serves the same JSON shape, e.g. mainline-tracking emulators). Conditional
   GET via `If-Modified-Since` (a 304 costs nothing); malformed or truncated
-  rows are dropped **and counted**, never silently ingested.
+  rows are dropped **and counted** (per-reason breakdown at debug level),
+  never silently ingested; rate-limit answers carry their `Retry-After`.
+- **Self-healing scheduler** — a panicking ingest cycle is caught, logged
+  (panic hook feeds the file log and Sentry) and retried on the next
+  interval; the web UI can never outlive ingestion silently. Failed store
+  reads behind every page/API endpoint are logged server-side, not just
+  returned as 500s.
 - **SQLite storage (WAL)** — the raw listing working set is pruned after
   `storage.raw_listing_days` (default 7); day-folds, snapshot metadata,
   sell-through sightings and the item-name catalog are kept forever.
@@ -85,7 +91,7 @@ only — never put secrets in this file.
 |---|---|---|
 | `debug` | `false` | louder stdout defaults for the tracker's own crates; `RUST_LOG` overrides entirely |
 | `server.bind` | `127.0.0.1:8080` | web UI/API listen address |
-| `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset = open (localhost use) |
+| `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset = open (localhost use; `serve` logs one warning about it at startup) |
 | `storage.database` | `./data/tracker.sqlite3` | SQLite database (WAL) |
 | `storage.archive_dir` | `./data/raw` | raw payload archive |
 | `storage.raw_listing_days` | `7` | raw working-set retention; metadata/folds stay forever |
@@ -110,6 +116,10 @@ poll = { commodities_secs = 3600, auctions_secs = 1800 }
 
 `static-urls` targets set `commodities_url` / `auctions_url` instead and have
 optional `auth` — that is the seam a non-Blizzard server will plug into.
+
+Unknown keys anywhere in the file abort startup naming the offending path
+(`unknown config keys: sentry.environment2`): a typo like `enviroment` must
+fail loudly rather than silently disable the setting it was meant to set.
 
 ## CLI reference
 
