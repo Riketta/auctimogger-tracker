@@ -55,5 +55,5 @@ if [ -f /etc/systemd/system/auctimogger-tracker.service ]; then
     systemctl restart auctimogger-tracker
     systemctl --no-pager --lines=5 status auctimogger-tracker || true
 else
-    echo "==> service not installed yet; binary placed. See docs/DEPLOY.md for first-time setup."
+    echo "==> service not installed yet; binary placed. See README.md (Deployment) for first-time setup."
 fi

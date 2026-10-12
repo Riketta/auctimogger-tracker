@@ -1,6 +1,6 @@
 # systemd unit for the auctimogger-tracker service.
 #
-# Layout this unit expects (see docs/DEPLOY.md):
+# Layout this unit expects (see README.md, "Deployment"):
 #   /opt/auctimogger-tracker/auctimogger-tracker     binary (release build)
 #   /etc/auctimogger-tracker/config.toml             config (from config.example.toml)
 #   /etc/auctimogger-tracker/env                     secrets (Blizzard token), chmod 640 root:tracker
