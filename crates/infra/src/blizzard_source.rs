@@ -218,7 +218,8 @@ struct WireModifier {
 /// Strict whole-payload parse: a structurally invalid document fails the
 /// snapshot (fetcher refuses truncated/spliced payloads). Per-row soft rules
 /// (degenerate cage rows, non-positive prices) drop and count the row only.
-pub(crate) fn parse_payload(
+/// Public: integration tests and tooling replay real dumps through it.
+pub fn parse_payload(
     kind: PayloadKind,
     bytes: &[u8],
 ) -> Result<(Vec<NormalizedListing>, u64), SourceError> {

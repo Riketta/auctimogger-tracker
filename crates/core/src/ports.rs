@@ -75,12 +75,14 @@ pub trait PriceHistoryRepository: Send + Sync {
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).
 pub trait SalesRepository: Send + Sync {
-    /// Registers sightings for all listings of one snapshot.
+    /// Registers/refreshes sightings for all listings of one snapshot. `at` is
+    /// the cycle timestamp (unix seconds).
     fn observe(
         &self,
         target: &TargetId,
         listings: &[NormalizedListing],
         snapshot_id: i64,
+        at: i64,
     ) -> Result<(), StoreError>;
     /// Closes sightings absent from the newest snapshot; returns credits
     /// granted (vanishing earlier than the band's lower bound).

@@ -5,11 +5,13 @@
 use std::sync::Arc;
 
 use crate::config::TargetConfig;
-use crate::domain::{utc_day, FetchOutcome, NewSnapshot, PayloadKind, SnapshotStatus, TargetId};
+use crate::domain::{
+    utc_day, FetchOutcome, NewSnapshot, PayloadKind, SaleCredit, SnapshotStatus, TargetId,
+};
 use crate::error::CycleError;
 use crate::fold::{group_by_item, DayFold};
 use crate::ports::{
-    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository,
+    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository, SalesRepository,
     SnapshotRepository,
 };
 
@@ -18,6 +20,7 @@ pub struct IngestCycleService {
     snapshots: Arc<dyn SnapshotRepository>,
     history: Arc<dyn PriceHistoryRepository>,
     cache: Arc<dyn MetricsCacheRepository>,
+    sales: Arc<dyn SalesRepository>,
     clock: Arc<dyn ClockPort>,
 }
 
@@ -36,14 +39,17 @@ pub struct CycleReport {
     pub dropped: u64,
     pub snapshot_id: Option<i64>,
     pub items_folded: usize,
+    pub sale_credits: usize,
 }
 
 impl IngestCycleService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         source: Arc<dyn AuctionSourcePort>,
         snapshots: Arc<dyn SnapshotRepository>,
         history: Arc<dyn PriceHistoryRepository>,
         cache: Arc<dyn MetricsCacheRepository>,
+        sales: Arc<dyn SalesRepository>,
         clock: Arc<dyn ClockPort>,
     ) -> Self {
         Self {
@@ -51,6 +57,7 @@ impl IngestCycleService {
             snapshots,
             history,
             cache,
+            sales,
             clock,
         }
     }
@@ -75,6 +82,7 @@ impl IngestCycleService {
                 dropped: 0,
                 snapshot_id: None,
                 items_folded: 0,
+                sale_credits: 0,
             }),
             FetchOutcome::Payload(payload) => {
                 let now = self.clock.now();
@@ -92,7 +100,6 @@ impl IngestCycleService {
                     &payload.listings,
                     &payload.raw,
                 )?;
-
                 let grouped = group_by_item(&payload.listings);
                 for (item_ref, listings) in &grouped {
                     let mut fold = self
@@ -105,6 +112,13 @@ impl IngestCycleService {
                 // Fold state changed: memoized span metrics are stale.
                 self.cache.invalidate(&target.id)?;
 
+                // Sell-through bookkeeping: register sightings, then close
+                // the ones absent from the newest snapshot (plan §4.2).
+                self.sales
+                    .observe(&target.id, &payload.listings, snapshot_id, now)?;
+                let credits: Vec<SaleCredit> =
+                    self.sales.close_missing(&target.id, snapshot_id, now)?;
+
                 Ok(CycleReport {
                     target: target.id.clone(),
                     kind,
@@ -113,6 +127,7 @@ impl IngestCycleService {
                     dropped: payload.dropped_count,
                     snapshot_id: Some(snapshot_id),
                     items_folded: grouped.len(),
+                    sale_credits: credits.len(),
                 })
             }
         }

@@ -180,6 +180,115 @@ fn prune_removes_only_the_raw_working_set() {
 }
 
 #[test]
+fn sell_through_credits_band_violations_only() {
+    use amtracker_core::ports::SalesRepository;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let dir = temp_dir("sales");
+    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let target = TargetId("us-4".into());
+    // Anchored to wall-clock so the trailing-window sale_rate query sees the
+    // rows (its window is relative to real now inside the adapter).
+    let t0 = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+        - 1_200; // cycle 1 timestamp, 20 minutes ago
+
+    // Three MEDIUM-band listings opened at t0 (band lower bound: 30 min).
+    let batch = [
+        listing(1, &item(1), 100, 1),
+        listing(2, &item(1), 200, 2),
+        listing(3, &item(1), 300, 3),
+    ];
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: t0,
+                source_last_modified: None,
+                entry_count: 3,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &batch,
+            b"s1".as_slice(),
+        )
+        .expect("record s1");
+    store.observe(&target, &batch, 1, t0).expect("observe s1");
+
+    // Cycle 2 (snapshot 2) 10 minutes later: auctions 1 and 2 vanished,
+    // auction 3 is still present.
+    let t1 = t0 + 600;
+    let survivor = [listing(3, &item(1), 300, 3)];
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: t1,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &survivor,
+            b"s2".as_slice(),
+        )
+        .expect("record s2");
+    store
+        .observe(&target, &survivor, 2, t1)
+        .expect("observe s2");
+    let credits = store.close_missing(&target, 2, t1).expect("close");
+    assert_eq!(
+        credits.len(),
+        2,
+        "vanished after 10 min < 30 min band floor"
+    );
+    assert!(credits.iter().all(|c| c.item == item(1)));
+
+    // Later closure past the band floor is NOT credited: reopen auction 3's
+    // sight artificially? No - use a fresh MEDIUM sight closed after 30 min.
+    let t2 = t1 + 1_800 + 60; // just past the MEDIUM lower bound
+    let late = [listing(9, &item(2), 500, 1)];
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: t2,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &late,
+            b"s3".as_slice(),
+        )
+        .expect("record s3");
+    store.observe(&target, &late, 3, t2).expect("observe s3");
+    let t3 = t2 + 1_800 + 60;
+    store.close_missing(&target, 3, t3).expect("close late");
+
+    // sale_rate over the trailing window: item 1 = 2 credited / 2 listings.
+    let rate = store
+        .sale_rate(&target, &item(1), 14)
+        .expect("rate")
+        .expect("rate");
+    assert!((rate - 1.0).abs() < 1e-9, "all vanishings credited so far");
+
+    // item 2 closed past its band floor: credited stays 0, denominator 1.
+    let rate2 = store
+        .sale_rate(&target, &item(2), 14)
+        .expect("rate")
+        .expect("rate");
+    assert_eq!(rate2, 0.0);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn metrics_cache_round_trips_and_invalidates() {
     use amtracker_core::domain::MetricBlock;
 

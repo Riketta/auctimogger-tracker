@@ -5,16 +5,20 @@ use std::sync::Arc;
 use crate::domain::{utc_day, ItemRef, MetricBlock, Span, TargetId};
 use crate::error::StoreError;
 use crate::metrics::block_from_histograms;
-use crate::ports::{ClockPort, MetricsCacheRepository, PriceHistoryRepository};
+use crate::ports::{ClockPort, MetricsCacheRepository, PriceHistoryRepository, SalesRepository};
 
 /// How long a memoized block may serve queries before recomputation. Ingest
 /// invalidates the whole target cache immediately; this bound only covers
 /// intra-day fold growth.
 const MAX_CACHE_AGE_SECONDS: i64 = 300;
 
+/// Window for the sell-through rate attached to every block.
+const SALE_RATE_WINDOW_DAYS: i64 = 14;
+
 pub struct MetricsService {
     history: Arc<dyn PriceHistoryRepository>,
     cache: Arc<dyn MetricsCacheRepository>,
+    sales: Arc<dyn SalesRepository>,
     clock: Arc<dyn ClockPort>,
 }
 
@@ -22,11 +26,13 @@ impl MetricsService {
     pub fn new(
         history: Arc<dyn PriceHistoryRepository>,
         cache: Arc<dyn MetricsCacheRepository>,
+        sales: Arc<dyn SalesRepository>,
         clock: Arc<dyn ClockPort>,
     ) -> Self {
         Self {
             history,
             cache,
+            sales,
             clock,
         }
     }
@@ -57,7 +63,8 @@ impl MetricsService {
                 }
             }
         }
-        let block = block_from_histograms(&histograms, None); // sale_rate arrives with R3
+        let sale_rate = self.sales.sale_rate(target, item, SALE_RATE_WINDOW_DAYS)?;
+        let block = block_from_histograms(&histograms, sale_rate);
         if let Some(block) = &block {
             self.cache.put(target, item, span, block, now)?;
         }

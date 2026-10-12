@@ -12,7 +12,7 @@ use amtracker_core::domain::{
 use amtracker_core::error::{CycleError, SourceError, StoreError};
 use amtracker_core::fold::DayFold;
 use amtracker_core::ports::{
-    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository,
+    AuctionSourcePort, ClockPort, MetricsCacheRepository, PriceHistoryRepository, SalesRepository,
     SnapshotRepository, WatchlistRepository,
 };
 use amtracker_core::services::cycle::{CycleOutcome, IngestCycleService};
@@ -222,6 +222,55 @@ impl MetricsCacheRepository for FakeCache {
     }
 }
 
+#[derive(Default)]
+struct FakeSales {
+    observes: Mutex<usize>,
+    closes: Mutex<usize>,
+    credits: Mutex<Vec<amtracker_core::domain::SaleCredit>>,
+}
+
+impl FakeSales {
+    fn with_credits(credits: Vec<amtracker_core::domain::SaleCredit>) -> Self {
+        Self {
+            observes: Mutex::new(0),
+            closes: Mutex::new(0),
+            credits: Mutex::new(credits),
+        }
+    }
+}
+
+impl SalesRepository for FakeSales {
+    fn observe(
+        &self,
+        _target: &TargetId,
+        _listings: &[amtracker_core::domain::NormalizedListing],
+        _snapshot_id: i64,
+        _at: i64,
+    ) -> Result<(), StoreError> {
+        *self.observes.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    fn close_missing(
+        &self,
+        _target: &TargetId,
+        _snapshot_id: i64,
+        _at: i64,
+    ) -> Result<Vec<amtracker_core::domain::SaleCredit>, StoreError> {
+        *self.closes.lock().unwrap() += 1;
+        Ok(self.credits.lock().unwrap().clone())
+    }
+
+    fn sale_rate(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _days: i64,
+    ) -> Result<Option<f64>, StoreError> {
+        Ok(None)
+    }
+}
+
 struct FixedClock(i64);
 
 impl ClockPort for FixedClock {
@@ -253,6 +302,14 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
     let snapshots = Arc::new(FakeSnapshots::new());
     let history = Arc::new(FakeHistory::default());
     let cache = Arc::new(FakeCache::default());
+    let sales = Arc::new(FakeSales::with_credits(vec![
+        amtracker_core::domain::SaleCredit {
+            auction_id: 10,
+            item: item1.clone(),
+            quantity: 4,
+            at: 1_000_000,
+        },
+    ]));
     let clock = Arc::new(FixedClock(1_000_000)); // day 11
 
     let service = IngestCycleService::new(
@@ -260,6 +317,7 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
         snapshots.clone(),
         history.clone(),
         cache.clone(),
+        sales.clone(),
         clock,
     );
     let report = service
@@ -271,9 +329,15 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
     assert_eq!(report.dropped, 1);
     assert_eq!(report.snapshot_id, Some(1));
     assert_eq!(report.items_folded, 2);
+    assert_eq!(
+        report.sale_credits, 1,
+        "credits from close_missing surface in the report"
+    );
 
     // conditional GET saw no previous snapshot
     assert_eq!(source.conditional_gets(), vec![None]);
+    assert_eq!(*sales.observes.lock().unwrap(), 1);
+    assert_eq!(*sales.closes.lock().unwrap(), 1);
 
     let stored = snapshots.inner.lock().unwrap();
     assert_eq!(
@@ -336,8 +400,16 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
     let source = Arc::new(FakeSource::new(vec![Ok(FetchOutcome::NotModified)]));
     let history = Arc::new(FakeHistory::default());
     let cache = Arc::new(FakeCache::default());
+    let sales = Arc::new(FakeSales::default());
     let clock = Arc::new(FixedClock(1_000));
-    let service = IngestCycleService::new(source.clone(), snapshots, history, cache.clone(), clock);
+    let service = IngestCycleService::new(
+        source.clone(),
+        snapshots,
+        history,
+        cache.clone(),
+        sales.clone(),
+        clock,
+    );
 
     let report = service
         .run_cycle(&target(), PayloadKind::Commodities)
@@ -351,6 +423,12 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
         0,
         "304 must not invalidate"
     );
+    assert_eq!(
+        *sales.observes.lock().unwrap(),
+        0,
+        "304 must not touch sell-through"
+    );
+    assert_eq!(report.sale_credits, 0);
 }
 
 #[test]
@@ -364,6 +442,7 @@ fn ingest_cycle_maps_source_errors_without_touching_storage() {
         snapshots.clone(),
         history,
         Arc::new(FakeCache::default()),
+        Arc::new(FakeSales::default()),
         clock,
     );
 

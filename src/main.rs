@@ -146,14 +146,15 @@ fn run_metrics(
     };
     let metrics = amtracker_core::services::metrics::MetricsService::new(
         store.clone(),
-        store,
+        store.clone(),
+        store.clone(),
         Arc::new(SystemClock),
     );
     let item = amtracker_core::domain::ItemRef::Item { item_id };
     match metrics.block(&target.id, &item, span) {
         Ok(Some(block)) => {
             println!(
-                "{} {} span {} : n={} median={} min={} p05={} p25={} p75={} p95={} max={} mad={} vwap={} qty={}",
+                "{} {} span {} : n={} median={} min={} p05={} p25={} p75={} p95={} max={} mad={} vwap={} qty={} sale_rate={}",
                 target_id,
                 item_id,
                 span.name(),
@@ -168,6 +169,10 @@ fn run_metrics(
                 block.mad,
                 block.vwap,
                 block.qty_sum,
+                block
+                    .sale_rate
+                    .map(|rate| format!("{rate:.3}"))
+                    .unwrap_or_else(|| "n/a".into()),
             );
             std::process::exit(0);
         }
@@ -195,6 +200,7 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
     };
     let cycle = IngestCycleService::new(
         Arc::new(BlizzardSource::new()),
+        store.clone(),
         store.clone(),
         store.clone(),
         store,

@@ -320,7 +320,7 @@ auctimogger-tracker/
 | R0 ✅ | Workspace scaffold, ports/traits, config TOML, boundary test | `cargo test` green (17 specs: fold semantics, ingest cycle over fakes, watchlist, config parsing, boundary); example config parses; `config-check` CLI works |
 | R1 ✅ | Blizzard source adapter + ingest cycle + snapshots + item_day | live fetch verified against the real API (commodities 266 258 entries → 10 124 folds; auctions 12 948 → 6 199); 304 → NotModified; corrupted/truncated fixtures rejected (tests); SQLite store with atomic snapshot+listing records, fold round-trip, retention prune |
 | R2 ✅ | Metric engine + golden vectors | `core::metrics::block_from_histograms` + `MetricsService` (cache-aside, 5-min staleness bound, invalidated on ingest); golden vectors V1–V4 asserted in Rust AND in the addon's `spec/metrics_parity_spec.lua` (addon commit `2107299`); parity verified on live data (item 237364: median 82 900, p05 55 000, p95 247 500, MAD 18 300, n 1 125 — identical to an independent computation over the stored fold) |
-| R3 | Sell-through | synthetic sight sequences credit/deny per band rules |
+| R3 ✅ | Sell-through | `TimeLeftBand::credits_sale` rule (vanish < band lower bound; SHORT never credits) unit-tested in core; `SqliteStore` implements `SalesRepository` (sight upserts, snapshot-diff closures joining item_ref, per-day sales aggregates); wired into the ingest cycle (`sale_credits` in the report) and into every metric block (14-day `saleRate`); real-sample integration test credits exactly the LONG/MEDIUM/VERY_LONG vanishings; live API confirmed the 304/no-churn path leaves tables untouched |
 | R4 | Feed export (lua+json, full+slim) + watchlist API | generated `feed.lua` passes `luac -p`, shape asserts, and the addon's ingestor specs |
 | R5 | Web UI: dashboard, search/completions, item page, opportunities, overview | all tabs render live data |
 | R6 | CI release + systemd docs | one-command deploy |
@@ -358,3 +358,8 @@ auctimogger-tracker/
   (5-minute staleness bound, invalidated per target by the ingest cycle),
   SQLite cache implementation, `metrics` debug CLI. 35 specs green. Parity
   spot-checked on live data against an independent computation.
+- 2026-10-12: R3 implemented — sell-through: `TimeLeftBand::credits_sale`
+  rule, `sight`/`sales` tables, `SqliteStore` as `SalesRepository` (observe/
+  close-missing/sale-rate), ingest cycle records sightings and closes
+  vanished ones (`sale_credits` in the cycle report), `MetricsService` attaches
+  a trailing 14-day `saleRate` to every block. 38 specs green.

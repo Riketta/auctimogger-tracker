@@ -85,6 +85,14 @@ impl TimeLeftBand {
             _ => TimeLeftBand::Short,
         }
     }
+
+    /// Sell-through credit rule (plan D7): a listing that vanishes earlier
+    /// than the lower bound of its last observed remaining-time band cannot
+    /// have expired naturally — it is a sale candidate. SHORT (lower bound 0)
+    /// never credits.
+    pub fn credits_sale(&self, last_seen_at: i64, vanished_at: i64) -> bool {
+        vanished_at - last_seen_at < self.lower_bound_secs()
+    }
 }
 
 /// One clean listing row — the ACL output every downstream stage consumes.
@@ -342,4 +350,25 @@ pub struct WatchlistEntry {
 /// UTC day number for a unix timestamp (86400-second days).
 pub fn utc_day(unix_ts: i64) -> i64 {
     unix_ts.div_euclid(86_400)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sale_credit_rule_follows_band_lower_bounds() {
+        let t0 = 10_000;
+        // SHORT never credits (lower bound 0).
+        assert!(!TimeLeftBand::Short.credits_sale(t0, t0 + 60));
+        // MEDIUM (>= 30 min): vanishing earlier credits, later does not.
+        assert!(TimeLeftBand::Medium.credits_sale(t0, t0 + 600));
+        assert!(!TimeLeftBand::Medium.credits_sale(t0, t0 + 1_800));
+        // LONG (>= 2 h).
+        assert!(TimeLeftBand::Long.credits_sale(t0, t0 + 3_600));
+        assert!(!TimeLeftBand::Long.credits_sale(t0, t0 + 7_200));
+        // VERY_LONG (>= 12 h).
+        assert!(TimeLeftBand::VeryLong.credits_sale(t0, t0 + 11 * 3_600));
+        assert!(!TimeLeftBand::VeryLong.credits_sale(t0, t0 + 12 * 3_600));
+    }
 }

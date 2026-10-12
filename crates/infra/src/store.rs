@@ -9,12 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use amtracker_core::domain::{
-    utc_day, ItemRef, MetricBlock, NewSnapshot, NormalizedListing, PayloadKind, SnapshotMeta,
-    SnapshotStatus, Span, TargetId,
+    utc_day, ItemRef, MetricBlock, NewSnapshot, NormalizedListing, PayloadKind, SaleCredit,
+    SnapshotMeta, SnapshotStatus, Span, TargetId,
 };
 use amtracker_core::error::StoreError;
 use amtracker_core::fold::DayFold;
-use amtracker_core::ports::{MetricsCacheRepository, PriceHistoryRepository, SnapshotRepository};
+use amtracker_core::ports::{
+    MetricsCacheRepository, PriceHistoryRepository, SalesRepository, SnapshotRepository,
+};
 use rusqlite::Connection;
 
 const SCHEMA: &str = "
@@ -74,6 +76,33 @@ CREATE TABLE IF NOT EXISTS metrics_cache (
     computed_at INTEGER NOT NULL,
     block_json TEXT NOT NULL,
     PRIMARY KEY (target_id, item_ref_id, span)
+);
+
+CREATE TABLE IF NOT EXISTS sight (
+    target_id TEXT NOT NULL,
+    auction_id INTEGER NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    first_seen_snapshot INTEGER NOT NULL,
+    last_seen_snapshot INTEGER NOT NULL,
+    first_seen_at INTEGER NOT NULL,
+    last_seen_at INTEGER NOT NULL,
+    band TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    closed_at INTEGER,
+    credited INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (target_id, auction_id)
+);
+CREATE INDEX IF NOT EXISTS idx_sight_open ON sight(target_id, closed_at);
+
+CREATE TABLE IF NOT EXISTS sales (
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    day INTEGER NOT NULL,
+    listings INTEGER NOT NULL DEFAULT 0,
+    closed INTEGER NOT NULL DEFAULT 0,
+    credited INTEGER NOT NULL DEFAULT 0,
+    qty_sold INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (target_id, item_ref_id, day)
 );
 ";
 
@@ -248,6 +277,268 @@ impl SnapshotRepository for SqliteStore {
         }
         Ok(None)
     }
+}
+
+impl SalesRepository for SqliteStore {
+    fn observe(
+        &self,
+        target: &TargetId,
+        listings: &[NormalizedListing],
+        snapshot_id: i64,
+        at: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.open_transaction()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| backend("begin observe", e))?;
+        let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
+        let mut new_sights: HashMap<i64, u64> = HashMap::new(); // item_ref_id -> count
+        for listing in listings {
+            let item_ref_id = match item_ref_ids.get(&listing.item_ref) {
+                Some(id) => *id,
+                None => {
+                    let id = get_or_create_item_ref(&tx, &listing.item_ref)?;
+                    item_ref_ids.insert(listing.item_ref.clone(), id);
+                    id
+                }
+            };
+            let updated = tx
+                .execute(
+                    "UPDATE sight SET last_seen_snapshot = ?3, last_seen_at = ?4, band = ?5, quantity = ?6
+                     WHERE target_id = ?1 AND auction_id = ?2 AND closed_at IS NULL",
+                    rusqlite::params![
+                        target.as_str(),
+                        listing.auction_id,
+                        snapshot_id,
+                        at,
+                        listing.time_left.as_str(),
+                        listing.quantity,
+                    ],
+                )
+                .map_err(|e| backend("observe update", e))?;
+            if updated == 0 {
+                tx.execute(
+                    "INSERT INTO sight (target_id, auction_id, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity)
+                     VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        target.as_str(),
+                        listing.auction_id,
+                        item_ref_id,
+                        snapshot_id,
+                        at,
+                        listing.time_left.as_str(),
+                        listing.quantity,
+                    ],
+                )
+                .map_err(|e| backend("observe insert", e))?;
+                *new_sights.entry(item_ref_id).or_insert(0) += 1;
+            }
+        }
+        for (item_ref_id, count) in new_sights {
+            bump_sales_row(
+                &tx,
+                target,
+                item_ref_id,
+                utc_day(at),
+                SalesDelta {
+                    listings: count as i64,
+                    closed: 0,
+                    credited: 0,
+                    qty_sold: 0,
+                },
+            )?;
+        }
+        tx.commit().map_err(|e| backend("commit observe", e))?;
+        Ok(())
+    }
+
+    fn close_missing(
+        &self,
+        target: &TargetId,
+        snapshot_id: i64,
+        at: i64,
+    ) -> Result<Vec<SaleCredit>, StoreError> {
+        let conn = self.open_transaction()?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| backend("begin close", e))?;
+        let mut statement = tx
+            .prepare(
+                "SELECT s.auction_id, s.item_ref_id, s.first_seen_at, s.last_seen_at, s.band, s.quantity,
+                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
+                 FROM sight s JOIN item_ref r ON r.id = s.item_ref_id
+                 WHERE s.target_id = ?1 AND s.closed_at IS NULL AND s.last_seen_snapshot != ?2",
+            )
+            .map_err(|e| backend("prepare close", e))?;
+        let rows = statement
+            .query(rusqlite::params![target.as_str(), snapshot_id])
+            .map_err(|e| backend("query close", e))?
+            .mapped(|row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, i64>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("close row", e))?;
+        drop(statement);
+
+        let mut credits = Vec::new();
+        for (
+            auction_id,
+            item_ref_id,
+            _first_seen_at,
+            last_seen_at,
+            band,
+            quantity,
+            ref_kind,
+            ref_item_id,
+            pet_species,
+            pet_level,
+            pet_quality,
+            pet_breed,
+        ) in rows
+        {
+            let band = amtracker_core::domain::TimeLeftBand::parse(&band);
+            let credited = band.credits_sale(last_seen_at, at);
+            tx.execute(
+                "UPDATE sight SET closed_at = ?3, credited = ?4
+                 WHERE target_id = ?1 AND auction_id = ?2 AND closed_at IS NULL",
+                rusqlite::params![target.as_str(), auction_id, at, credited as i64],
+            )
+            .map_err(|e| backend("close update", e))?;
+            bump_sales_row(
+                &tx,
+                target,
+                item_ref_id,
+                utc_day(at),
+                SalesDelta {
+                    listings: 0,
+                    closed: 1,
+                    credited: credited as i64,
+                    qty_sold: if credited { quantity } else { 0 },
+                },
+            )?;
+            if credited {
+                credits.push(SaleCredit {
+                    auction_id,
+                    item: join_item_ref(
+                        &ref_kind,
+                        ref_item_id,
+                        pet_species,
+                        pet_level,
+                        pet_quality,
+                        pet_breed,
+                    ),
+                    quantity,
+                    at,
+                });
+            }
+        }
+        tx.commit().map_err(|e| backend("commit close", e))?;
+        Ok(credits)
+    }
+
+    fn sale_rate(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        days: i64,
+    ) -> Result<Option<f64>, StoreError> {
+        let conn = self.open_transaction()?;
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(None);
+        };
+        let now_day = utc_day(now_unix());
+        let cutoff_day = now_day - days + 1;
+        let (credited, listings): (i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
+                 WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3",
+                rusqlite::params![target.as_str(), item_ref_id, cutoff_day],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|e| backend("sale_rate", e))?;
+        if listings == 0 {
+            return Ok(None);
+        }
+        Ok(Some(credited as f64 / listings as f64))
+    }
+}
+
+/// Sales-aggregate deltas for one (target, item, day) row.
+struct SalesDelta {
+    listings: i64,
+    closed: i64,
+    credited: i64,
+    qty_sold: i64,
+}
+
+/// Sales-aggregate upsert: `listings` is the denominator (unique sights
+/// opened that day), `credited`/`qty_sold` the sell-through numerators.
+fn bump_sales_row(
+    tx: &rusqlite::Transaction<'_>,
+    target: &TargetId,
+    item_ref_id: i64,
+    day: i64,
+    delta: SalesDelta,
+) -> Result<(), StoreError> {
+    tx.execute(
+        "INSERT INTO sales (target_id, item_ref_id, day, listings, closed, credited, qty_sold)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         ON CONFLICT (target_id, item_ref_id, day) DO UPDATE SET
+           listings = listings + ?4,
+           closed = closed + ?5,
+           credited = credited + ?6,
+           qty_sold = qty_sold + ?7",
+        rusqlite::params![
+            target.as_str(),
+            item_ref_id,
+            day,
+            delta.listings,
+            delta.closed,
+            delta.credited,
+            delta.qty_sold
+        ],
+    )
+    .map_err(|e| backend("bump sales", e))?;
+    Ok(())
+}
+
+fn join_item_ref(
+    kind: &str,
+    item_id: i64,
+    species: i64,
+    level: i64,
+    quality: i64,
+    breed: i64,
+) -> ItemRef {
+    match kind {
+        "pet" => ItemRef::Pet {
+            species,
+            level: level as i32,
+            quality: quality as i32,
+            breed: breed as i32,
+        },
+        _ => ItemRef::Item { item_id },
+    }
+}
+
+fn now_unix() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
 }
 
 impl MetricsCacheRepository for SqliteStore {
