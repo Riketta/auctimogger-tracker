@@ -5,9 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use amtracker_core::domain::PayloadKind;
+use amtracker_core::ports::FeedRenderer;
 use amtracker_core::services::cycle::IngestCycleService;
+use amtracker_core::services::feed_export::FeedExportService;
+use amtracker_core::services::metrics::MetricsService;
 use amtracker_infra::blizzard_source::BlizzardSource;
 use amtracker_infra::clock::SystemClock;
+use amtracker_infra::feed::{FeedCodec, FileFeedPublisher};
 use amtracker_infra::store::SqliteStore;
 use amtracker_server::config_file::load_config;
 use clap::{Parser, Subcommand};
@@ -49,6 +53,18 @@ enum Commands {
         item: i64,
         #[arg(long, default_value = "d1")]
         span: String,
+    },
+    /// Export the tracker feed for a target (lua + json).
+    ExportFeed {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        target: Option<String>,
+        #[arg(long, default_value = "feeds")]
+        out: PathBuf,
+        /// Export only the target's watchlist items.
+        #[arg(long, default_value_t = false)]
+        slim: bool,
     },
 }
 
@@ -113,7 +129,102 @@ fn main() {
             };
             run_metrics(&config, &target, item, &span);
         }
+        Commands::ExportFeed {
+            config,
+            target,
+            out,
+            slim,
+        } => {
+            let config = match load_config(&config) {
+                Ok(config) => config,
+                Err(error) => {
+                    eprintln!("error: {error}");
+                    std::process::exit(1);
+                }
+            };
+            run_export_feed(&config, target.as_deref(), &out, slim);
+        }
     }
+}
+
+fn run_export_feed(
+    config: &amtracker_core::config::TrackerConfig,
+    only_target: Option<&str>,
+    out_dir: &std::path::Path,
+    slim: bool,
+) -> ! {
+    use amtracker_core::ports::FeedPublisher;
+
+    let store = match SqliteStore::open(
+        std::path::Path::new(&config.storage.database),
+        std::path::Path::new(&config.storage.archive_dir),
+    ) {
+        Ok(store) => Arc::new(store),
+        Err(error) => {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+    };
+    let clock = Arc::new(SystemClock);
+    let metrics = Arc::new(MetricsService::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        clock.clone(),
+    ));
+    let export = FeedExportService::new(store.clone(), store.clone(), store, metrics, clock);
+    let publisher = FileFeedPublisher::new(out_dir.to_path_buf());
+    let codec = FeedCodec;
+
+    let mut failures = 0u32;
+    for target in &config.targets {
+        if let Some(wanted) = only_target {
+            if target.id.as_str() != wanted {
+                continue;
+            }
+        }
+        let options = amtracker_core::services::feed_export::ExportOptions {
+            spans: config.metrics.spans.clone(),
+            watchlist_only: slim,
+        };
+        match export.build_feed(&target.id, &options) {
+            Ok(feed) => {
+                for format in [
+                    amtracker_core::domain::FeedFormat::Lua,
+                    amtracker_core::domain::FeedFormat::Json,
+                ] {
+                    match codec.render(&feed, format) {
+                        Ok(bytes) => {
+                            if let Err(error) = publisher.publish(&target.id, format, &bytes) {
+                                failures += 1;
+                                eprintln!("[{}] publish {format:?}: {error}", target.id);
+                            }
+                        }
+                        Err(error) => {
+                            failures += 1;
+                            eprintln!("[{}] render {format:?}: {error}", target.id);
+                        }
+                    }
+                }
+                println!(
+                    "[{}] feed exported: {} items, generatedAt {}",
+                    target.id,
+                    feed.entries.len(),
+                    feed.generated_at
+                );
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("[{}] export error: {error}", target.id);
+            }
+        }
+    }
+    println!("feeds written to {}", out_dir.display());
+    if failures > 0 {
+        eprintln!("{failures} export(s) failed");
+        std::process::exit(1);
+    }
+    std::process::exit(0);
 }
 
 fn run_metrics(

@@ -188,6 +188,14 @@ impl PriceHistoryRepository for FakeHistory {
     fn prune_raw_before(&self, _target: &TargetId, _day: i64) -> Result<u64, StoreError> {
         Ok(0)
     }
+
+    fn items_with_data(
+        &self,
+        _target: &TargetId,
+        _since_day: i64,
+    ) -> Result<Vec<ItemRef>, StoreError> {
+        Ok(Vec::new())
+    }
 }
 
 #[derive(Default)]

@@ -9,13 +9,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use amtracker_core::domain::{
-    utc_day, ItemRef, MetricBlock, NewSnapshot, NormalizedListing, PayloadKind, SaleCredit,
-    SnapshotMeta, SnapshotStatus, Span, TargetId,
+    utc_day, ItemRef, MetricBlock, NewSnapshot, NewWatchlistEntry, NormalizedListing, PayloadKind,
+    SaleCredit, SnapshotMeta, SnapshotStatus, Span, TargetId, WatchlistEntry,
 };
 use amtracker_core::error::StoreError;
 use amtracker_core::fold::DayFold;
 use amtracker_core::ports::{
     MetricsCacheRepository, PriceHistoryRepository, SalesRepository, SnapshotRepository,
+    WatchlistRepository,
 };
 use rusqlite::Connection;
 
@@ -76,6 +77,14 @@ CREATE TABLE IF NOT EXISTS metrics_cache (
     computed_at INTEGER NOT NULL,
     block_json TEXT NOT NULL,
     PRIMARY KEY (target_id, item_ref_id, span)
+);
+
+CREATE TABLE IF NOT EXISTS watchlist (
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    note TEXT,
+    added_at INTEGER NOT NULL,
+    PRIMARY KEY (target_id, item_ref_id)
 );
 
 CREATE TABLE IF NOT EXISTS sight (
@@ -607,6 +616,82 @@ impl MetricsCacheRepository for SqliteStore {
     }
 }
 
+impl WatchlistRepository for SqliteStore {
+    fn add(&self, entry: &NewWatchlistEntry) -> Result<WatchlistEntry, StoreError> {
+        let conn = self.open_transaction()?;
+        let item_ref_id = get_or_create_item_ref(&conn, &entry.item)?;
+        let added_at = now_unix();
+        let inserted = conn
+            .execute(
+                "INSERT OR IGNORE INTO watchlist (target_id, item_ref_id, note, added_at) VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![entry.target.as_str(), item_ref_id, entry.note, added_at],
+            )
+            .map_err(|e| backend("watchlist add", e))?;
+        if inserted == 0 {
+            return Err(StoreError::Conflict("item already watched".into()));
+        }
+        Ok(WatchlistEntry {
+            target: entry.target.clone(),
+            item: entry.item.clone(),
+            note: entry.note.clone(),
+            added_at,
+        })
+    }
+
+    fn remove(&self, target: &TargetId, item: &ItemRef) -> Result<bool, StoreError> {
+        let conn = self.open_transaction()?;
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(false);
+        };
+        let removed = conn
+            .execute(
+                "DELETE FROM watchlist WHERE target_id = ?1 AND item_ref_id = ?2",
+                rusqlite::params![target.as_str(), item_ref_id],
+            )
+            .map_err(|e| backend("watchlist remove", e))?;
+        Ok(removed > 0)
+    }
+
+    fn list(&self, target: &TargetId) -> Result<Vec<WatchlistEntry>, StoreError> {
+        let conn = self.open_transaction()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, w.note, w.added_at
+                 FROM watchlist w JOIN item_ref r ON r.id = w.item_ref_id
+                 WHERE w.target_id = ?1 ORDER BY w.added_at",
+            )
+            .map_err(|e| backend("prepare watchlist", e))?;
+        let rows = statement
+            .query(rusqlite::params![target.as_str()])
+            .map_err(|e| backend("query watchlist", e))?
+            .mapped(|row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Option<String>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("watchlist row", e))?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(kind, item_id, species, level, quality, breed, note, added_at)| WatchlistEntry {
+                    target: TargetId(target.as_str().to_string()),
+                    item: join_item_ref(&kind, item_id, species, level, quality, breed),
+                    note,
+                    added_at,
+                },
+            )
+            .collect())
+    }
+}
+
 impl PriceHistoryRepository for SqliteStore {
     fn load_fold(
         &self,
@@ -680,6 +765,43 @@ impl PriceHistoryRepository for SqliteStore {
             let _ = std::fs::remove_file(self.archive_dir.join(path));
         }
         Ok(removed)
+    }
+
+    fn items_with_data(
+        &self,
+        target: &TargetId,
+        since_day: i64,
+    ) -> Result<Vec<ItemRef>, StoreError> {
+        let conn = self.open_transaction()?;
+        let mut statement = conn
+            .prepare(
+                "SELECT DISTINCT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
+                 FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
+                 WHERE d.target_id = ?1 AND d.day >= ?2
+                 ORDER BY r.kind, r.item_id, r.pet_species",
+            )
+            .map_err(|e| backend("prepare items_with_data", e))?;
+        let rows = statement
+            .query(rusqlite::params![target.as_str(), since_day])
+            .map_err(|e| backend("query items_with_data", e))?
+            .mapped(|row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("items_with_data row", e))?;
+        Ok(rows
+            .into_iter()
+            .map(|(kind, item_id, species, level, quality, breed)| {
+                join_item_ref(&kind, item_id, species, level, quality, breed)
+            })
+            .collect())
     }
 }
 

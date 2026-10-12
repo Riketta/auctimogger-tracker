@@ -71,6 +71,12 @@ pub trait PriceHistoryRepository: Send + Sync {
     /// Returns the number of raw rows removed. Snapshot metadata, folds and
     /// sale credits are permanent.
     fn prune_raw_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError>;
+    /// Distinct items that have fold data on/after the given UTC day.
+    fn items_with_data(
+        &self,
+        target: &TargetId,
+        since_day: i64,
+    ) -> Result<Vec<ItemRef>, StoreError>;
 }
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).

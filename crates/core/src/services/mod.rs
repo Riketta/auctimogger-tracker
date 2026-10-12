@@ -2,6 +2,7 @@
 //! domain types; driving adapters call them, driven adapters serve them.
 
 pub mod cycle;
+pub mod feed_export;
 pub mod health;
 pub mod metrics;
 pub mod search;

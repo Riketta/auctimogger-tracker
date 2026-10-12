@@ -6,4 +6,5 @@
 
 pub mod blizzard_source;
 pub mod clock;
+pub mod feed;
 pub mod store;

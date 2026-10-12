@@ -286,7 +286,7 @@ pub struct MetricBlock {
 // ---------------------------------------------------------------- feed
 
 /// Which serialization a feed publisher should emit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FeedFormat {
     Lua,
     Json,
@@ -308,7 +308,8 @@ pub struct FeedSnapshot {
     pub entries: Vec<FeedEntry>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// Publication info for one rendered feed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PublishedFeed {
     pub at: i64,
     pub size: u64,
