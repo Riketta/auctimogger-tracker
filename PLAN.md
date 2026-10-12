@@ -286,7 +286,10 @@ POST /api/fetch?target=…         (token) out-of-band cycle trigger
 
 ```
 auctimogger-tracker/
-  Cargo.toml                     workspace
+  Cargo.toml                     workspace (+ shared [workspace.lints])
+  rust-toolchain.toml            stable pin (nightly only for rustfmt)
+  rustfmt.toml                   nightly formatting options
+  deny.toml                      cargo-deny (licenses/advisories/bans/sources)
   crates/core/                   domain, port traits, services (no infra deps)
   crates/infra/                  sqlite, blizzard source/item-info, feed, clock
   crates/server/                 axum HTTP + DTOs, scheduler driver, CLI
@@ -295,7 +298,10 @@ auctimogger-tracker/
   templates/ static/             askama templates, vendored chart js/css
   fixtures/                      real trimmed dumps incl. the corrupted prefix
   tests/                         integration + golden vectors + boundary grep
-  .github/workflows/ci.yml
+  .github/workflows/ci.yml       fmt/clippy/test/deny + windows lane + release
+  deploy/                        systemd unit
+  docs/DEPLOY.md                 server deployment, WAL + backup runbook
+  scripts/                       verify_feed.lua, install-release.sh
   config.example.toml
   PLAN.md                        this file
 ```
@@ -304,12 +310,28 @@ auctimogger-tracker/
 
 ## 7. CI / CD
 
-- `cargo fmt --check`, `clippy -D warnings`, `cargo test` (fixtures: corrupted
-  prefix must be rejected; golden metric vectors; boundary grep).
-- Release job: static Linux binary (`x86_64-unknown-linux-gnu`, rusqlite
-  bundled) + Windows build for local runs, attached as artifacts.
-- Deploy doc: systemd unit (`ExecStart=… serve`), WAL + `db.path` notes, backup
-  = sqlite backup API / file copy with checkpoint.
+Modeled on the SecOutfall pipeline:
+
+- **Linux lane**: `cargo +nightly fmt --check` (rustfmt.toml uses unstable
+  options), `clippy --workspace --all-targets -- -D warnings`, `cargo test`
+  (fixtures: corrupted prefix rejected; golden metric vectors; boundary grep;
+  lua5.4 installed for the feed contract verifier), `cargo-deny`
+  (licenses/advisories/bans/sources).
+- **Lint stack** (workspace lints, every crate opts in via `[lints]`):
+  `missing_docs`, clippy `pedantic` + `cargo`; **denied**: `unwrap_used`,
+  `expect_used`, `panic`, `indexing_slicing`, `string_slice`. Test modules
+  carry narrow `#![allow(...)]` blocks with justification comments; proven-safe
+  hot-path indexing keeps a scoped allow with an in-bounds proof.
+- **Windows lane**: clippy + tests + build (feed-verifier hooks self-skip
+  without a lua interpreter).
+- **Release** (tag `v*` or manual dispatch): `--release --locked` builds for
+  `x86_64-unknown-linux-gnu` (rusqlite bundled) and `x86_64-pc-windows-msvc`,
+  packaged (tar.gz/zip) with `config.example.toml`, uploaded as artifacts;
+  tags additionally publish a GitHub release (`gh release create`).
+- **Deploy**: `deploy/auctimogger-tracker.service` (hardened systemd unit,
+  env-file token, state under `/var/lib`), `docs/DEPLOY.md` (layout, WAL +
+  backup runbook), `scripts/install-release.sh` = one-command update from
+  GitHub releases.
 
 ---
 
@@ -323,7 +345,7 @@ auctimogger-tracker/
 | R3 ✅ | Sell-through | `TimeLeftBand::credits_sale` rule (vanish < band lower bound; SHORT never credits) unit-tested in core; `SqliteStore` implements `SalesRepository` (sight upserts, snapshot-diff closures joining item_ref, per-day sales aggregates); wired into the ingest cycle (`sale_credits` in the report) and into every metric block (14-day `saleRate`); real-sample integration test credits exactly the LONG/MEDIUM/VERY_LONG vanishings; live API confirmed the 304/no-churn path leaves tables untouched |
 | R4 ✅ | Feed export (lua+json, full+slim) + watchlist | `FeedExportService` (full = items with data in the window; slim = watchlist; `generatedAt` = newest source `Last-Modified`), `FeedCodec` (Lua/JSON renderers, empty-metric entries omitted), `FileFeedPublisher` (atomic write + last-published), watchlist repository, `export-feed` CLI; live export of 16 323 items passed `verify_feed.lua` AND the addon's real RestIngestor (0 dropped, 0 rejected) |
 | R5 ✅ | Web UI: dashboard, search/completions, item page, opportunities, overview + API + scheduler | all pages/APIs render live data (smoke-tested); scheduler refreshed commodities live; token-gated fetch/watchlist verified (401 without token) |
-| R6 | CI release + systemd docs | one-command deploy |
+| R6 ✅ | CI release + systemd docs | SecOutfall lint/format/deny stack adopted workspace-wide (fmt nightly options, pedantic + denied unwrap/expect/panic/indexing/slicing, cargo-deny green, all 55+ specs and golden vectors untouched); release job builds linux-gnu + windows-msvc archives with config and publishes GitHub releases on tags; hardened systemd unit + `docs/DEPLOY.md` + one-command `scripts/install-release.sh` |
 
 ---
 
@@ -378,3 +400,16 @@ auctimogger-tracker/
   Blizzard item-info adapter + name catalog; `OpportunityService` with
   transparent weighted scoring (discount/reliability/churn/stability +
   confidence). 55 specs green; all pages/APIs live-smoke-tested.
+- 2026-10-12: R6 implemented — quality stack ported from SecOutfall:
+  `rustfmt.toml` (nightly options; toolchain pinned stable via
+  `rust-toolchain.toml`), workspace lints (missing_docs, pedantic; denied
+  unwrap/expect/panic/indexing_slicing/string_slice) with every crate opting
+  in, `deny.toml` + cargo-deny (publish = false so private crates are
+  skipped from license checks). ~560 diagnostics fixed workspace-wide with
+  zero behavior change (golden vectors + 55 specs still green); justified
+  scoped allows only where indexing is proven in-bounds or casts are
+  domain-safe. CI rebuilt on the SecOutfall pattern: Linux lane
+  (fmt/clippy/test/deny + lua verifier), Windows lane, release job (linux-gnu
+  + windows-msvc archives, artifacts + tag-triggered GitHub release).
+  Deploy: hardened systemd unit, `docs/DEPLOY.md` (WAL/backup runbook),
+  one-command `scripts/install-release.sh`.

@@ -2,29 +2,150 @@ name: CI
 
 on:
   push:
+    branches: [main]
+    tags: ['v*']
   pull_request:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
 jobs:
-  quality:
+  linux:
+    name: Linux · fmt / clippy / test / deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
+      # rustfmt.toml uses unstable options, so formatting must run under
+      # nightly rustfmt; clippy/tests/build stay on the stable toolchain
+      # pinned by rust-toolchain.toml (installed explicitly because plain
+      # `cargo` must resolve stable regardless of install order).
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt
+
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy, rustfmt
 
       - uses: Swatinem/rust-cache@v2
 
       - name: Install Lua (feed contract verifier)
         run: sudo apt-get update && sudo apt-get install -y lua5.4
 
-      - name: Format check (rustfmt)
-        run: cargo fmt --all -- --check
+      - name: Format (nightly rustfmt options)
+        run: cargo +nightly fmt --all --check
 
-      - name: Lint (clippy)
+      - name: "Clippy (workspace lints: pedantic + denied unwrap/expect/panic/indexing/slicing)"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests (incl. hexagonal boundary checks)
+      - name: Tests (incl. hexagonal boundary checks + feed verifier)
         run: cargo test --workspace
+
+      - name: Deny (licenses / advisories / bans / sources)
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+  windows:
+    name: Windows · clippy / test / build
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # No lua interpreter on Windows runners: the feed-verifier test hooks
+      # detect that and skip themselves (see crates/infra/tests/feed.rs).
+      - name: Tests
+        run: cargo test --workspace
+
+      - name: Build
+        run: cargo build --workspace
+
+  release:
+    name: Release · ${{ matrix.target }}
+    # Runs on version tags and on manual dispatch (to keep the pipeline warm);
+    # artifacts are only PUBLISHED from tags (see the publish job).
+    if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
+    needs: [linux]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # rusqlite is bundled, so no system SQLite is needed; --locked keeps
+      # release builds reproducible against the committed Cargo.lock.
+      - name: Build release binary
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: Package (linux)
+        if: runner.os == 'Linux'
+        run: |
+          name="auctimogger-tracker-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          cp "target/${{ matrix.target }}/release/auctimogger-tracker" "dist/${name}/"
+          cp config.example.toml "dist/${name}/"
+          tar -czf "dist/${name}.tar.gz" -C dist "${name}"
+          rm -rf "dist/${name}"
+
+      - name: Package (windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $name = "auctimogger-tracker-$env:GITHUB_REF_NAME-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force "dist/$name" | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/auctimogger-tracker.exe" "dist/$name/"
+          Copy-Item config.example.toml "dist/$name/"
+          Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
+          Remove-Item -Recurse -Force "dist/$name"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: auctimogger-tracker-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    if: github.ref_type == 'tag'
+    needs: [release]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Attach archives to the tag release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

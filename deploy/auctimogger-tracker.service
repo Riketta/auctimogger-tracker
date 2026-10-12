@@ -1,0 +1,40 @@
+# systemd unit for the auctimogger-tracker service.
+#
+# Layout this unit expects (see docs/DEPLOY.md):
+#   /opt/auctimogger-tracker/auctimogger-tracker     binary (release build)
+#   /etc/auctimogger-tracker/config.toml             config (from config.example.toml)
+#   /etc/auctimogger-tracker/env                     secrets (Blizzard token), chmod 640 root:tracker
+#   /var/lib/auctimogger-tracker/                    WorkingDirectory: SQLite DB + raw archive + feeds/
+#
+# Install:
+#   sudo cp deploy/auctimogger-tracker.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now auctimogger-tracker
+
+[Unit]
+Description=AuctiMogger tracker (auction dumps -> SQLite -> analytics + feed + UI)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tracker
+Group=tracker
+WorkingDirectory=/var/lib/auctimogger-tracker
+ExecStart=/opt/auctimogger-tracker/auctimogger-tracker serve --config /etc/auctimogger-tracker/config.toml
+Restart=on-failure
+RestartSec=5
+
+# The feeds dir is CWD-relative; the DB path comes from config.storage.database.
+# Blizzard token(s) come from the env file only — never from the unit or config.
+EnvironmentFile=/etc/auctimogger-tracker/env
+
+# Hardening: write access limited to the state dir.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/auctimogger-tracker
+
+[Install]
+WantedBy=multi-user.target
