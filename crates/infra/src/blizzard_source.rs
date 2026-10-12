@@ -15,6 +15,7 @@
 //! - payloads can be truncated mid-transfer → strict parse or reject.
 
 use std::{
+    collections::BTreeMap,
     io::Read,
     path::Path,
     time::{
@@ -162,8 +163,19 @@ impl AuctionSourcePort for BlizzardSource {
             return Ok(FetchOutcome::NotModified);
         }
         if status != 200 {
-            tracing::warn!(status = status, url = %url, "unexpected source status");
-            return Err(SourceError::Http(format!("unexpected status {status} from {url}")));
+            let retry_after = response.header("retry-after").map(str::to_owned);
+            tracing::warn!(
+                status = status,
+                url = %url,
+                retry_after = ?retry_after,
+                "unexpected source status"
+            );
+            return Err(SourceError::Http(match retry_after {
+                Some(after) => {
+                    format!("unexpected status {status} from {url} (retry-after: {after})")
+                }
+                None => format!("unexpected status {status} from {url}"),
+            }));
         }
         let source_last_modified = response
             .header("last-modified")
@@ -265,13 +277,44 @@ pub fn parse_payload(
         .map_err(|e| SourceError::Parse(format!("{kind:?} payload rejected: {e}")))?;
     let mut listings = Vec::with_capacity(payload.auctions.len());
     let mut dropped = 0u64;
+    let mut by_reason = BTreeMap::<&'static str, u64>::new();
     for auction in payload.auctions {
         match map_auction(kind, auction) {
-            Some(listing) => listings.push(listing),
-            None => dropped += 1,
+            Ok(listing) => listings.push(listing),
+            Err(reason) => {
+                dropped += 1;
+                *by_reason.entry(reason.as_str()).or_default() += 1;
+            }
         }
     }
+    if dropped > 0 {
+        // The aggregate rides on the fetch info log; this breakdown answers
+        // "why" without recompiling.
+        tracing::debug!(kind = ?kind, dropped, reasons = ?by_reason, "degenerate rows dropped");
+    }
     Ok((listings, dropped))
+}
+
+/// Why a degenerate row was dropped. Diagnostics only: drops are expected
+/// (bid-only rows, species-less cage rows) and counted, never fatal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DropReason {
+    /// `quantity` missing or non-positive.
+    NonPositiveQuantity,
+    /// Pet-cage row with no species field or modifier.
+    CageWithoutSpecies,
+    /// No usable per-unit/stack price (including bid-only rows).
+    MissingPrice,
+}
+
+impl DropReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NonPositiveQuantity => "non-positive-quantity",
+            Self::CageWithoutSpecies => "cage-without-species",
+            Self::MissingPrice => "missing-price",
+        }
+    }
 }
 
 /// Narrow a wire pet field to its domain range. The value is clamped into
@@ -281,11 +324,11 @@ fn pet_field(value: Option<i64>) -> i32 {
     value.unwrap_or(0).clamp(0, i64::from(i32::MAX)) as i32
 }
 
-/// ACL rules for one row. `None` = degenerate row, drop and count it.
-fn map_auction(kind: PayloadKind, a: WireAuction) -> Option<NormalizedListing> {
+/// ACL rules for one row. `Err(reason)` = degenerate row, drop and count it.
+fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<NormalizedListing, DropReason> {
     let quantity = a.quantity.unwrap_or(0);
     if quantity <= 0 {
-        return None;
+        return Err(DropReason::NonPositiveQuantity);
     }
 
     let species = a
@@ -304,7 +347,7 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Option<NormalizedListing> {
             breed: pet_field(a.item.pet_breed_id),
         },
         None if a.item.id == PET_CAGE_ITEM_ID => {
-            return None; // cage row without species: degenerate, drop
+            return Err(DropReason::CageWithoutSpecies); // degenerate, drop
         }
         None => ItemRef::Item { item_id: a.item.id },
     };
@@ -312,7 +355,7 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Option<NormalizedListing> {
     let unit_price = match (kind, a.unit_price, a.buyout) {
         (PayloadKind::Commodities, Some(price), _) if price > 0 => price, // already per unit
         (PayloadKind::Auctions, _, Some(buyout)) if buyout > 0 => buyout / quantity,
-        _ => return None, // missing or non-positive price (incl. bid-only rows)
+        _ => return Err(DropReason::MissingPrice), // incl. bid-only rows
     };
 
     let bid = match kind {
@@ -320,7 +363,7 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Option<NormalizedListing> {
         PayloadKind::Commodities => None,
     };
 
-    Some(NormalizedListing {
+    Ok(NormalizedListing {
         auction_id: a.id,
         item_ref,
         kind: match kind {
