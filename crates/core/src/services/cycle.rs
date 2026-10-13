@@ -47,6 +47,11 @@ pub enum CycleOutcome {
     Fetched,
     /// The source answered 304 — nothing was written.
     NotModified,
+    /// A fresh payload parsed valid but carried zero listings. The snapshot is
+    /// archived, but sighting bookkeeping is skipped: mass-closing every open
+    /// sight against an empty dump (realm maintenance, emulator hiccup) would
+    /// credit phantom sales.
+    Empty,
 }
 
 /// Per-cycle counters and ids, for logs and HTTP responses.
@@ -113,6 +118,33 @@ impl IngestCycleService {
             }),
             FetchOutcome::Payload(payload) => {
                 let now = self.clock.now();
+                if payload.listings.is_empty() {
+                    let snapshot_id = self.snapshots.record(
+                        &NewSnapshot {
+                            target: target.id.clone(),
+                            kind,
+                            fetched_at: now,
+                            source_last_modified: payload.source_last_modified,
+                            entry_count: 0,
+                            dropped_count: payload.dropped_count,
+                            status: SnapshotStatus::Ok,
+                        },
+                        &payload.listings,
+                        &payload.raw,
+                    )?;
+                    // No logging here (the core never logs): the scheduler
+                    // upgrades `CycleOutcome::Empty` reports to a warning.
+                    return Ok(CycleReport {
+                        target: target.id.clone(),
+                        kind,
+                        outcome: CycleOutcome::Empty,
+                        entries: 0,
+                        dropped: payload.dropped_count,
+                        snapshot_id: Some(snapshot_id),
+                        items_folded: 0,
+                        sale_credits: 0,
+                    });
+                }
                 let day = utc_day(now);
                 let snapshot_id = self.snapshots.record(
                     &NewSnapshot {
@@ -140,10 +172,10 @@ impl IngestCycleService {
                 self.cache.invalidate(&target.id)?;
 
                 // Sell-through bookkeeping: register sightings, then close
-                // the ones absent from the newest snapshot (plan §4.2).
-                self.sales.observe(&target.id, &payload.listings, snapshot_id, now)?;
+                // the ones absent from the newest snapshot of this kind.
+                self.sales.observe(&target.id, kind, &payload.listings, snapshot_id, now)?;
                 let credits: Vec<SaleCredit> =
-                    self.sales.close_missing(&target.id, snapshot_id, now)?;
+                    self.sales.close_missing(&target.id, kind, snapshot_id, now)?;
 
                 Ok(CycleReport {
                     target: target.id.clone(),

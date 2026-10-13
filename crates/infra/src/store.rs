@@ -35,6 +35,7 @@ use amtracker_core::{
     error::StoreError,
     fold::DayFold,
     ports::{
+        ClockPort,
         ItemCatalogRepository,
         MetricsCacheRepository,
         PriceHistoryRepository,
@@ -44,6 +45,11 @@ use amtracker_core::{
     },
 };
 use rusqlite::Connection;
+
+/// Schema version of the store. Version 2 scoped sightings per payload kind
+/// (commodity and item auction ids are separate namespaces); version 1 files
+/// cannot be migrated faithfully (old rows carry no kind) and are refused.
+const SCHEMA_VERSION: i64 = 2;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -124,6 +130,7 @@ CREATE INDEX IF NOT EXISTS idx_item_catalog_name ON item_catalog(name);
 CREATE TABLE IF NOT EXISTS sight (
     target_id TEXT NOT NULL,
     auction_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
     first_seen_snapshot INTEGER NOT NULL,
     last_seen_snapshot INTEGER NOT NULL,
@@ -133,9 +140,9 @@ CREATE TABLE IF NOT EXISTS sight (
     quantity INTEGER NOT NULL,
     closed_at INTEGER,
     credited INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (target_id, auction_id)
+    PRIMARY KEY (target_id, auction_id, kind)
 );
-CREATE INDEX IF NOT EXISTS idx_sight_open ON sight(target_id, closed_at);
+CREATE INDEX IF NOT EXISTS idx_sight_open ON sight(target_id, kind, closed_at);
 
 CREATE TABLE IF NOT EXISTS sales (
     target_id TEXT NOT NULL,
@@ -156,6 +163,7 @@ CREATE TABLE IF NOT EXISTS sales (
 pub struct SqliteStore {
     conn: Mutex<Connection>,
     archive_dir: PathBuf,
+    clock: std::sync::Arc<dyn ClockPort>,
 }
 
 fn backend<E: std::fmt::Display>(context: &str, error: E) -> StoreError {
@@ -169,8 +177,14 @@ impl SqliteStore {
     ///
     /// Returns [`StoreError::Backend`] when the data or archive directories
     /// cannot be created, the database cannot be opened or configured (WAL,
-    /// synchronous pragma), or the schema batch cannot be applied.
-    pub fn open(database: &Path, archive_dir: &Path) -> Result<Self, StoreError> {
+    /// synchronous pragma), the schema batch cannot be applied, or a
+    /// pre-kind (schema v1) database is opened — those cannot be migrated
+    /// faithfully and must be rebuilt.
+    pub fn open(
+        database: &Path,
+        archive_dir: &Path,
+        clock: std::sync::Arc<dyn ClockPort>,
+    ) -> Result<Self, StoreError> {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent).map_err(|e| backend("create data dir", e))?;
         }
@@ -178,8 +192,42 @@ impl SqliteStore {
         let conn = Connection::open(database).map_err(|e| backend("open sqlite", e))?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| backend("journal_mode", e))?;
         conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| backend("synchronous", e))?;
+        Self::check_schema_version(&conn)?;
         conn.execute_batch(SCHEMA).map_err(|e| backend("schema", e))?;
-        Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf() })
+        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+            .map_err(|e| backend("user_version", e))?;
+        Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf(), clock })
+    }
+
+    /// Refuses schema-v1 databases (a `sight` table without the `kind`
+    /// column): old sighting rows cannot be assigned a payload kind, so a
+    /// silent migration would fabricate sell-through history. Fresh files and
+    /// current v2 files pass through.
+    fn check_schema_version(conn: &Connection) -> Result<(), StoreError> {
+        let version: i64 = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| backend("user_version", e))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        let legacy = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sight')
+                     AND NOT EXISTS (SELECT 1 FROM pragma_table_info('sight') WHERE name = 'kind')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|flag| flag == 1)
+            .map_err(|e| backend("inspect sight schema", e))?;
+        if legacy {
+            return Err(StoreError::Backend(
+                "database schema is outdated (pre-v2 sightings without a payload kind); \
+                 the file cannot be migrated faithfully - delete the database file and let \
+                 the tracker rebuild it (fold history regenerates within a day)"
+                    .into(),
+            ));
+        }
+        Ok(())
     }
 
     /// Lock the connection. A poisoned mutex (another thread panicked while
@@ -329,6 +377,7 @@ impl SalesRepository for SqliteStore {
     fn observe(
         &self,
         target: &TargetId,
+        kind: PayloadKind,
         listings: &[NormalizedListing],
         snapshot_id: i64,
         at: i64,
@@ -345,13 +394,16 @@ impl SalesRepository for SqliteStore {
                 item_ref_ids.insert(listing.item_ref.clone(), id);
                 id
             };
+            // A listing sighted in a previous kind cycle must never match
+            // here: commodity and item auction ids are separate namespaces.
             let updated = tx
                 .execute(
-                    "UPDATE sight SET last_seen_snapshot = ?3, last_seen_at = ?4, band = ?5, quantity = ?6
-                     WHERE target_id = ?1 AND auction_id = ?2 AND closed_at IS NULL",
+                    "UPDATE sight SET last_seen_snapshot = ?4, last_seen_at = ?5, band = ?6, quantity = ?7
+                     WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3 AND closed_at IS NULL",
                     rusqlite::params![
                         target.as_str(),
                         listing.auction_id,
+                        kind.as_str(),
                         snapshot_id,
                         at,
                         listing.time_left.as_str(),
@@ -360,21 +412,14 @@ impl SalesRepository for SqliteStore {
                 )
                 .map_err(|e| backend("observe update", e))?;
             if updated == 0 {
-                tx.execute(
-                    "INSERT INTO sight (target_id, auction_id, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity)
-                     VALUES (?1, ?2, ?3, ?4, ?4, ?5, ?5, ?6, ?7)",
-                    rusqlite::params![
-                        target.as_str(),
-                        listing.auction_id,
-                        item_ref_id,
-                        snapshot_id,
-                        at,
-                        listing.time_left.as_str(),
-                        listing.quantity,
-                    ],
-                )
-                .map_err(|e| backend("observe insert", e))?;
-                *new_sights.entry(item_ref_id).or_insert(0) += 1;
+                // No open sight: either brand new, or a closed one we must
+                // reopen (the listing vanished for a cycle - maintenance,
+                // truncated pull - and came back). Blind INSERTs would trip
+                // the primary key forever after.
+                if insert_or_reopen_sight(&tx, target, kind, listing, item_ref_id, snapshot_id, at)?
+                {
+                    *new_sights.entry(item_ref_id).or_insert(0) += 1;
+                }
             }
         }
         for (item_ref_id, count) in new_sights {
@@ -393,6 +438,7 @@ impl SalesRepository for SqliteStore {
     fn close_missing(
         &self,
         target: &TargetId,
+        kind: PayloadKind,
         snapshot_id: i64,
         at: i64,
     ) -> Result<Vec<SaleCredit>, StoreError> {
@@ -403,11 +449,11 @@ impl SalesRepository for SqliteStore {
                 "SELECT s.auction_id, s.item_ref_id, s.first_seen_at, s.last_seen_at, s.band, s.quantity,
                         r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
                  FROM sight s JOIN item_ref r ON r.id = s.item_ref_id
-                 WHERE s.target_id = ?1 AND s.closed_at IS NULL AND s.last_seen_snapshot != ?2",
+                 WHERE s.target_id = ?1 AND s.kind = ?2 AND s.closed_at IS NULL AND s.last_seen_snapshot != ?3",
             )
             .map_err(|e| backend("prepare close", e))?;
         let rows = statement
-            .query(rusqlite::params![target.as_str(), snapshot_id])
+            .query(rusqlite::params![target.as_str(), kind.as_str(), snapshot_id])
             .map_err(|e| backend("query close", e))?
             .mapped(|row| {
                 Ok((
@@ -495,7 +541,7 @@ impl SalesRepository for SqliteStore {
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
             return Ok(None);
         };
-        let now_day = utc_day(now_unix());
+        let now_day = utc_day(self.clock.now());
         let cutoff_day = now_day - days + 1;
         let (credited, listings): (i64, i64) = conn
             .query_row(
@@ -511,6 +557,54 @@ impl SalesRepository for SqliteStore {
         // Daily counts are far below f64's exact-integer range (2^53), and the
         // ratio is a display metric; precision loss on giant inputs is
         // acceptable by design.
+        #[allow(clippy::cast_precision_loss)]
+        Ok(Some(credited as f64 / listings as f64))
+    }
+
+    fn sale_rate_multi(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+    ) -> Result<Option<f64>, StoreError> {
+        if items.is_empty() {
+            return Ok(None);
+        }
+        let conn = self.open_transaction();
+        let mut ids = Vec::with_capacity(items.len());
+        for item in items {
+            if let Some(id) = lookup_item_ref(&conn, item)? {
+                ids.push(id);
+            }
+        }
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        // Placeholders are bound values, never interpolated input.
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
+             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ?"
+        );
+        let now_day = utc_day(self.clock.now());
+        let cutoff_day = now_day - days + 1;
+        let mut statement =
+            conn.prepare(&sql).map_err(|e| backend("prepare sale_rate_multi", e))?;
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in &ids {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Integer(cutoff_day));
+        let (credited, listings): (i64, i64) = statement
+            .query_row(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .map_err(|e| backend("sale_rate_multi", e))?;
+        if listings == 0 {
+            return Ok(None);
+        }
+        // Same display-metric precision trade as `sale_rate`.
         #[allow(clippy::cast_precision_loss)]
         Ok(Some(credited as f64 / listings as f64))
     }
@@ -555,6 +649,80 @@ fn bump_sales_row(
     Ok(())
 }
 
+/// Inserts a brand-new sight or reopens a closed one for the same
+/// (target, auction, kind). Reversing the previous close on ITS day keeps
+/// the sales ledger honest: a not-credited close must not keep inflating
+/// `closed`, and a credited close was a phantom sale the moment the
+/// listing returned. Returns `true` when a brand-new sight was opened.
+#[allow(clippy::too_many_lines)]
+fn insert_or_reopen_sight(
+    tx: &rusqlite::Transaction<'_>,
+    target: &TargetId,
+    kind: PayloadKind,
+    listing: &NormalizedListing,
+    item_ref_id: i64,
+    snapshot_id: i64,
+    at: i64,
+) -> Result<bool, StoreError> {
+    let prior: Option<(Option<i64>, i64, i64)> = tx
+        .query_row(
+            "SELECT closed_at, credited, quantity FROM sight
+             WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
+            rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(backend("observe prior", other)),
+        })?;
+    let Some((closed_at, credited, prior_qty)) = prior else {
+        tx.execute(
+            "INSERT INTO sight (target_id, auction_id, kind, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8)",
+            rusqlite::params![
+                target.as_str(),
+                listing.auction_id,
+                kind.as_str(),
+                item_ref_id,
+                snapshot_id,
+                at,
+                listing.time_left.as_str(),
+                listing.quantity,
+            ],
+        )
+        .map_err(|e| backend("observe insert", e))?;
+        return Ok(true);
+    };
+    if let Some(closed_at) = closed_at {
+        let (d_credited, d_qty) = if credited == 1 { (-credited, -prior_qty) } else { (0, 0) };
+        bump_sales_row(
+            tx,
+            target,
+            item_ref_id,
+            utc_day(closed_at),
+            &SalesDelta { listings: 0, closed: -1, credited: d_credited, qty_sold: d_qty },
+        )?;
+    }
+    tx.execute(
+        "UPDATE sight SET closed_at = NULL, credited = 0,
+                 first_seen_snapshot = ?4, last_seen_snapshot = ?4,
+                 first_seen_at = ?5, last_seen_at = ?5, band = ?6, quantity = ?7
+         WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
+        rusqlite::params![
+            target.as_str(),
+            listing.auction_id,
+            kind.as_str(),
+            snapshot_id,
+            at,
+            listing.time_left.as_str(),
+            listing.quantity,
+        ],
+    )
+    .map_err(|e| backend("observe reopen", e))?;
+    Ok(false)
+}
+
 /// Rebuild an [`ItemRef`] from its stored row. The pet fields were `i32`
 /// domain values before being widened for storage, so the narrowing casts
 /// below are exact.
@@ -576,14 +744,6 @@ fn join_item_ref(
         },
         _ => ItemRef::Item { item_id },
     }
-}
-
-fn now_unix() -> i64 {
-    // `u64` unix seconds only exceed `i64` far beyond any real date, so the
-    // conversion saturates; a clock before the epoch reads as 0.
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 impl MetricsCacheRepository for SqliteStore {
@@ -653,7 +813,7 @@ impl WatchlistRepository for SqliteStore {
     fn add(&self, entry: &NewWatchlistEntry) -> Result<WatchlistEntry, StoreError> {
         let conn = self.open_transaction();
         let item_ref_id = get_or_create_item_ref(&conn, &entry.item)?;
-        let added_at = now_unix();
+        let added_at = self.clock.now();
         let inserted = conn
             .execute(
                 "INSERT OR IGNORE INTO watchlist (target_id, item_ref_id, note, added_at) VALUES (?1, ?2, ?3, ?4)",
@@ -735,7 +895,7 @@ impl ItemCatalogRepository for SqliteStore {
                     record.name,
                     record.item_class,
                     record.quality,
-                    now_unix(),
+                    self.clock.now(),
                 ],
             )
             .map_err(|e| backend("catalog upsert", e))?;
@@ -1019,11 +1179,11 @@ fn parse_kind(value: &str) -> PayloadKind {
 }
 
 fn parse_status(value: &str) -> SnapshotStatus {
-    match value {
-        "parse_failed" => SnapshotStatus::ParseFailed,
-        "http_error" => SnapshotStatus::HttpFailed,
-        _ => SnapshotStatus::Ok,
-    }
+    // Failed fetches/parse attempts never persist a snapshot row, so stored
+    // values are "ok"; anything else (hand-edited rows, future states) reads
+    // as Ok rather than inventing states the domain no longer declares.
+    let _ = value;
+    SnapshotStatus::Ok
 }
 
 fn lookup_item_ref(conn: &Connection, item: &ItemRef) -> Result<Option<i64>, StoreError> {

@@ -121,10 +121,6 @@ fn main() {
 /// loaded pair. The observability guards live in this frame; the command
 /// diverges (`-> !`), so explicit flushes on the exit paths (see
 /// [`observability::exit_with_flush`]) are what carry queued events out.
-/// Loads the config, installs logging/Sentry, and runs `command` with the
-/// loaded pair. The observability guards live in this frame: when the
-/// command returns (it normally exits the process itself via
-/// [`observability::exit_with_flush`]), dropping them flushes queued events.
 fn with_observability(path: &Path, command: impl FnOnce(&LoadedConfig)) {
     let loaded = match load_config(path) {
         Ok(loaded) => loaded,
@@ -156,17 +152,18 @@ fn run_config_check(path: &Path) -> ! {
 }
 
 fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
-    let store = match open_store(config) {
+    let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
+    let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
-    let clock = Arc::new(SystemClock);
     let item_info = Arc::new(BlizzardItemInfo::from_config(config));
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
 
     let state = Arc::new(AppState {
         config: config.clone(),
+        clock: clock.clone(),
         health: Arc::new(amtracker_core::services::health::HealthService::new(
             store.clone(),
             config.clone(),
@@ -210,18 +207,23 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
     });
 
     // The open-without-token fallback is documented developer-mode behavior,
-    // but an operator who configured `token_env` and forgot the variable must
-    // still see one loud line at startup.
+    // but an operator who configured `token_env` and forgot the variable (or
+    // left it empty, as the compose default does) must still see one loud
+    // line at startup.
     if let Some(token_env) = &config.server.token_env {
-        if std::env::var(token_env).is_err() {
+        let unset_or_empty = match std::env::var(token_env) {
+            Ok(value) => value.trim().is_empty(),
+            Err(_) => true,
+        };
+        if unset_or_empty {
             tracing::warn!(
                 env = %token_env,
-                "bearer token env unset - mutating API endpoints are OPEN"
+                "bearer token env unset or empty - mutating API endpoints are OPEN"
             );
         }
     }
 
-    if let Err(error) = amtracker_server::scheduler::spawn(config, state.cycle.clone()) {
+    if let Err(error) = amtracker_server::scheduler::spawn(state.clone()) {
         tracing::error!(error = %error, "scheduler thread failed to start");
         observability::exit_with_flush(1, "");
     }
@@ -244,10 +246,14 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
 }
 
 /// Opens the SQLite store (shared by every command that touches state).
-fn open_store(config: &amtracker_core::config::TrackerConfig) -> Result<Arc<SqliteStore>, String> {
+fn open_store(
+    config: &amtracker_core::config::TrackerConfig,
+    clock: Arc<dyn amtracker_core::ports::ClockPort>,
+) -> Result<Arc<SqliteStore>, String> {
     SqliteStore::open(
         std::path::Path::new(&config.storage.database),
         std::path::Path::new(&config.storage.archive_dir),
+        clock,
     )
     .map(Arc::new)
     .map_err(|error| error.to_string())
@@ -261,11 +267,11 @@ fn run_export_feed(
 ) -> ! {
     use amtracker_core::ports::FeedPublisher;
 
-    let store = match open_store(config) {
+    let clock = Arc::new(SystemClock);
+    let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
-    let clock = Arc::new(SystemClock);
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
     let export = FeedExportService::new(store.clone(), store.clone(), store, metrics, clock);
@@ -353,7 +359,8 @@ fn run_metrics(
     let Some(target) = config.targets.iter().find(|t| t.id.as_str() == target_id) else {
         observability::exit_with_flush(1, &format!("error: unknown target '{target_id}'"));
     };
-    let store = match open_store(config) {
+    let clock = Arc::new(SystemClock);
+    let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
@@ -361,7 +368,7 @@ fn run_metrics(
         store.clone(),
         store.clone(),
         store.clone(),
-        Arc::new(SystemClock),
+        clock,
     );
     let item = amtracker_core::domain::ItemRef::Item { item_id };
     match metrics.block(&target.id, &item, span) {
@@ -402,7 +409,8 @@ fn run_metrics(
 }
 
 fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option<&str>) -> ! {
-    let store = match open_store(config) {
+    let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
+    let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
@@ -412,7 +420,7 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
         store.clone(),
         store.clone(),
         store,
-        Arc::new(SystemClock),
+        clock,
     );
 
     let mut failures = 0u32;

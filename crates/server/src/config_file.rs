@@ -174,10 +174,19 @@ pub struct LoadedConfig {
 pub struct FileServer {
     /// Socket address the web UI binds to, such as `127.0.0.1:8080`.
     pub bind: String,
-    /// Env var holding the bearer token; when absent, mutating endpoints
-    /// stay open (the documented developer-mode behavior).
+    /// Env var holding the bearer token; when absent (or empty), mutating
+    /// endpoints stay open (the documented developer-mode behavior).
     #[serde(default)]
     pub token_env: Option<String>,
+    /// Minimum seconds between feed re-publications per target; defaults
+    /// to 300. The scheduler publishes after successful cycles, throttled
+    /// by this.
+    #[serde(default = "default_feed_publish_secs")]
+    pub feed_publish_secs: u64,
+}
+
+fn default_feed_publish_secs() -> u64 {
+    300
 }
 
 /// File shape of the `[storage]` section.
@@ -361,7 +370,11 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
         spans.push(span);
     }
     Ok(TrackerConfig {
-        server: ServerConfig { bind: file.server.bind, token_env: file.server.token_env },
+        server: ServerConfig {
+            bind: file.server.bind,
+            token_env: file.server.token_env,
+            feed_publish_secs: file.server.feed_publish_secs,
+        },
         storage: StorageConfig {
             database: file.storage.database,
             raw_listing_days: file.storage.raw_listing_days,
@@ -398,7 +411,12 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
     collect_unknown(root, "", TOP_KEYS, &mut unknown);
 
     if let Some(server) = section(root, "server") {
-        collect_unknown(server, "server", &["bind", "token_env"], &mut unknown);
+        collect_unknown(
+            server,
+            "server",
+            &["bind", "token_env", "feed_publish_secs"],
+            &mut unknown,
+        );
     }
     if let Some(storage) = section(root, "storage") {
         collect_unknown(

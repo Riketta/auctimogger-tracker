@@ -48,7 +48,8 @@ normal for this item, and how do I know this deal is real?"*.
   sell-through sightings and the item-name catalog are kept forever.
 - **Span analytics** — per item and per span (`d1`/`d7`/`d14`/`d30`):
   `n, min, p05, p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`
-  plus a 14-day `saleRate`. The engine is **bit-identical** to the in-game
+  plus a 14-day `saleRate` (`d1` is the current UTC day-to-date, so it is
+  thin right after midnight). The engine is **bit-identical** to the in-game
   addon's (golden vectors asserted in both repos), and one auction is counted
   once per UTC day at its last observed price (hourly snapshots don't inflate
   samples).
@@ -75,9 +76,13 @@ export AMT_API_TOKEN=<random string>                # gates mutating API endpoin
 ./target/release/auctimogger-tracker serve  --config config.toml   # poll loop + UI on 127.0.0.1:8080
 ```
 
-`serve` writes feeds to `./feeds/<target-id>/` **relative to the working
-directory**; the DB path comes from the config. Then open
-`http://127.0.0.1:8080`.
+`serve` is self-contained: after each successful ingest cycle the scheduler
+re-renders and publishes `feed.lua` + `feed.json` to
+`./feeds/<target-id>/` (**relative to the working directory**; throttled by
+`server.feed_publish_secs`, default 300), applies raw-listing retention once
+per UTC day, and keeps the poll loop running. The DB path comes from the
+config. Then open `http://127.0.0.1:8080`. The `export-feed` subcommand
+remains for one-off/manual exports.
 
 Prebuilt binaries (linux-gnu / windows-msvc archives with
 `config.example.toml`) are attached to GitHub releases — see
@@ -92,7 +97,8 @@ only — never put secrets in this file.
 |---|---|---|
 | `debug` | `false` | louder stdout defaults for the tracker's own crates; `RUST_LOG` overrides entirely |
 | `server.bind` | `127.0.0.1:8080` | web UI/API listen address |
-| `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset = open (localhost use; `serve` logs one warning about it at startup) |
+| `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset **or empty** = open (localhost use; `serve` logs one warning about it at startup) |
+| `server.feed_publish_secs` | `300` | minimum seconds between feed re-publications per target |
 | `storage.database` | `./data/tracker.sqlite3` | SQLite database (WAL) |
 | `storage.archive_dir` | `./data/raw` | raw payload archive |
 | `storage.raw_listing_days` | `7` | raw working-set retention; metadata/folds stay forever |
@@ -252,8 +258,7 @@ docker compose up --build           # web UI on :8080
 
 | Piece | What it does |
 |---|---|
-| `tracker` service | `serve` (scheduler + web UI); port `8080:8080` |
-| `feed-exporter` service | re-renders `feed.lua` + `feed.json` every 5 min so `/feed.lua` stays fresh (`/feed-slim.lua` renders on demand and needs no exporter) |
+| `tracker` service | `serve` (scheduler + web UI); port `8080:8080`. The scheduler itself re-publishes `feed.lua`/`feed.json` after ingest cycles — no exporter sidecar needed |
 | `./config.docker.toml` → `/work/config.toml` | container config: binds `0.0.0.0`, absolute `/data` paths; edit targets here |
 | `amtracker-data` volume → `/data` | SQLite DB + raw archive, survives rebuilds |
 | `amtracker-feeds` volume → `/work/feeds` | published feeds |
@@ -326,8 +331,15 @@ the binary under `/opt`, and restarts the unit.
 - SQLite runs in **WAL mode**: expect `tracker.sqlite3`, `-wal`, `-shm`. The
   sidecar files are part of the database — never delete or move them alone.
 - Keep the DB on **local disk**; NFS/CIFS mounts can corrupt WAL databases.
-- Raw listings prune after `raw_listing_days`; folds/metadata/catalog grow
-  slowly (multi-month DBs stay in the low single-digit GB).
+- Raw listings prune after `raw_listing_days` (the scheduler applies it once
+  per UTC day); folds/metadata/catalog grow slowly (multi-month DBs stay in
+  the low single-digit GB).
+- **Upgrading from a pre-v2 database**: tracker schema v2 scopes sell-through
+  sightings per payload kind (commodity and item auction ids are separate
+  namespaces). Old files carry no kind on their sighting rows and cannot be
+  migrated faithfully — the tracker refuses to start with a clear message;
+  delete the database file and let it rebuild (folds regenerate within a
+  day).
 - **Never `cp` a live WAL database by itself** — use the backup API:
 
 ```sh

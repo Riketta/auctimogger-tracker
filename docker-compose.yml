@@ -1,10 +1,11 @@
-# Demo stack: `docker compose up --build` starts the tracker (scheduler +
-# web UI on :8080) with persistent storage, plus a small feed exporter loop
-# so /feed.lua and /feed.json stay fresh without a host cron.
+# Demo stack: `docker compose up --build` starts the tracker — the scheduler
+# ingests on cadence, applies raw-listing retention, and re-publishes
+# feed.lua / feed.json itself, so no exporter sidecar or host cron is needed.
 #
 # Edit ./config.docker.toml to choose targets; tokens come from the
 # environment (a .env file next to this file works: AMT_TOKEN=...,
-# AMT_API_TOKEN=...).
+# AMT_API_TOKEN=...). Leave AMT_API_TOKEN empty to keep the mutating API
+# open (one startup warning will tell you so).
 
 services:
   tracker:
@@ -22,27 +23,6 @@ services:
       AMT_TOKEN: ${AMT_TOKEN:-}
       # Set this to protect the mutating API (watchlist, /api/fetch).
       AMT_API_TOKEN: ${AMT_API_TOKEN:-}
-
-  feed-exporter:
-    # Same image as the tracker; renders feed.lua + feed.json every 5 minutes
-    # so the /feed.lua / /feed.json downloads serve fresh data. The in-game
-    # addon can live off /feed-slim.lua alone (rendered on demand) — disable
-    # this service if you only use the slim feed.
-    image: auctimogger-tracker:local
-    restart: unless-stopped
-    depends_on:
-      - tracker
-    volumes:
-      - ./config.docker.toml:/work/config.toml:ro
-      - amtracker-data:/data
-      - amtracker-feeds:/work/feeds
-    entrypoint: ["sh", "-c"]
-    command:
-      - |
-        while :; do
-          auctimogger-tracker export-feed --config /work/config.toml --out /work/feeds
-          sleep 300
-        done
 
 volumes:
   amtracker-data:

@@ -73,6 +73,8 @@ use serde::Deserialize;
 pub struct AppState {
     /// Fully parsed runtime configuration: targets, spans and thresholds.
     pub config: TrackerConfig,
+    /// Time injection shared with the scheduler (prune/publish day math).
+    pub clock: Arc<dyn amtracker_core::ports::ClockPort>,
     /// Snapshot freshness/age reporting for the dashboard and health API.
     pub health: Arc<HealthService>,
     /// Case-insensitive item-name search over the catalog table.
@@ -164,8 +166,10 @@ fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/api/overview", get(api_overview))
         .route("/api/items/{target_id}/{item_id}/metrics", get(api_item_metrics))
         .route("/api/feed.json", get(api_feed_json))
-        .route("/api/watchlist", get(api_watchlist_get).post(api_watchlist_post))
-        .route("/api/watchlist/{item_id}", axum::routing::delete(api_watchlist_delete))
+        .route(
+            "/api/watchlist",
+            get(api_watchlist_get).post(api_watchlist_post).delete(api_watchlist_delete),
+        )
         .route("/api/fetch", post(api_fetch))
         .with_state(state)
 }
@@ -248,19 +252,70 @@ fn sparkline(values: &[i64]) -> String {
     )
 }
 
-fn target_param(params: &HashMap<String, String>, config: &TrackerConfig) -> TargetId {
-    params.get("target").map_or_else(
-        || {
+/// Resolves the `?target=` query parameter against the configured targets.
+/// Unknown ids are rejected: they must never reach the store, the feed
+/// publisher's filesystem reads (path traversal), or the rendered HTML
+/// (reflected content).
+fn target_param(
+    params: &HashMap<String, String>,
+    config: &TrackerConfig,
+) -> Result<TargetId, Box<Response>> {
+    match params.get("target") {
+        None => {
             // `TrackerConfig::validate` requires at least one target, so the
             // index is provably in bounds; a fallback would silently query
             // the wrong market.
             #[allow(clippy::indexing_slicing)]
             {
-                config.targets[0].id.clone()
+                Ok(config.targets[0].id.clone())
             }
-        },
-        |t| TargetId(t.clone()),
-    )
+        }
+        Some(t) => known_target(config, t),
+    }
+}
+
+/// Like [`target_param`], but the parameter is mandatory (JSON API shape).
+fn required_target(
+    params: &HashMap<String, String>,
+    config: &TrackerConfig,
+) -> Result<TargetId, Box<Response>> {
+    match params.get("target") {
+        Some(t) => known_target(config, t),
+        None => Err(Box::new((StatusCode::BAD_REQUEST, "missing ?target=").into_response())),
+    }
+}
+
+fn known_target(config: &TrackerConfig, id: &str) -> Result<TargetId, Box<Response>> {
+    config.find_target(id).map(|target| target.id.clone()).ok_or_else(|| {
+        Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "unknown target '{}' (configured: {})",
+                    html_escape(id),
+                    config
+                        .targets
+                        .iter()
+                        .map(|t| t.id.as_str().to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ),
+            )
+                .into_response(),
+        )
+    })
+}
+
+/// Escapes a string for safe interpolation into HTML text/attribute
+/// positions. External data (item names, query echoes) never reaches markup
+/// raw.
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
 }
 
 async fn error_page(message: String) -> Response {
@@ -371,16 +426,24 @@ async fn items_search_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let target = target_param(&params, &state.config);
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
     let query = params.get("q").cloned().unwrap_or_default();
     let mut body = String::from(
-        "<input type=\"text\" id=\"q\" placeholder=\"search item name…\" autocomplete=\"off\">\
+        "<input type=\"text\" id=\"q\" placeholder=\"search item name\u{2026}\" autocomplete=\"off\">\
          <div id=\"completions\"></div>\
          <script>const q=document.getElementById('q'),c=document.getElementById('completions');\
          let t=null;q.addEventListener('input',()=>{clearTimeout(t);const v=q.value.trim();\
-         if(v.length<2){c.innerHTML='';return;}\
+         if(v.length<2){c.textContent='';return;}\
          t=setTimeout(async()=>{const r=await fetch('/api/search?q='+encodeURIComponent(v));\
-         const j=await r.json();c.innerHTML=j.hits.map(h=>'<div><a href=\"/items/'+h.itemID+'\">'+h.name+'</a> <span class=\"muted\">'+h.itemID+(h.itemClass?' — '+h.itemClass:'')+'</span></div>').join('');},250);});</script>",
+         const j=await r.json();c.textContent='';\
+         for(const h of j.hits){const d=document.createElement('div');\
+         const a=document.createElement('a');a.href='/items/'+h.itemID;a.textContent=h.name;\
+         const s=document.createElement('span');s.className='muted';\
+         s.textContent=h.itemID+(h.itemClass?' \u{2014} '+h.itemClass:'');\
+         d.appendChild(a);d.appendChild(s);c.appendChild(d);}},250);});</script>",
     );
     if !query.trim().is_empty() {
         match state.search.search(&query, 25) {
@@ -390,10 +453,10 @@ async fn items_search_page(
                     let _ = write!(
                         body,
                         "<li><a href=\"/items/{}/{ }\">{}</a> <span class=\"muted\">{}</span></li>",
-                        target.as_str(),
+                        html_escape(target.as_str()),
                         hit.item_id,
-                        hit.name,
-                        hit.item_class.as_deref().unwrap_or("")
+                        html_escape(&hit.name),
+                        html_escape(hit.item_class.as_deref().unwrap_or(""))
                     );
                 }
                 body.push_str("</ul>");
@@ -408,13 +471,20 @@ async fn item_page(
     State(state): State<Arc<AppState>>,
     Path((target_id, item_id)): Path<(String, i64)>,
 ) -> Response {
-    let target = TargetId(target_id.clone());
-    // name lookup: catalog first, then the item API (cached permanently)
-    let name = match state.catalog.ensure(item_id) {
-        Ok(record) => record.map(|r| r.name),
-        Err(error) => return store_error_page(error).await,
+    let target = match known_target(&state.config, &target_id) {
+        Ok(target) => target,
+        Err(response) => return *response,
     };
-    let title = name.unwrap_or_else(|| format!("item {item_id}"));
+    // name lookup: catalog first, then the item API (cached permanently);
+    // blocking sync core work stays off the async workers.
+    let state2 = Arc::clone(&state);
+    let lookup = tokio::task::spawn_blocking(move || state2.catalog.ensure(item_id));
+    let name = match lookup.await {
+        Ok(Ok(record)) => record.map(|r| r.name),
+        Ok(Err(error)) => return store_error_page(error).await,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
+    };
+    let title = html_escape(&name.unwrap_or_else(|| format!("item {item_id}")));
 
     let today = amtracker_core::domain::utc_day(
         std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| {
@@ -437,8 +507,10 @@ async fn item_page(
     let medians: Vec<i64> = days.iter().map(|row| row.median).collect();
     let chart = sparkline(&medians);
 
-    let mut body =
-        format!("<h2>{title}</h2><p class=\"muted\">target {target_id} · item id {item_id}</p>");
+    let mut body = format!(
+        "<h2>{title}</h2><p class=\"muted\">target {} \u{b7} item id {item_id}</p>",
+        html_escape(target.as_str())
+    );
     let _ = write!(body, "<h2>30-day median</h2><p>{chart}</p>");
     body.push_str("<h2>metric blocks</h2><table><tr><th>span</th><th>n</th><th>median</th><th>min</th><th>p05</th><th>p25</th><th>p75</th><th>p95</th><th>max</th><th>mad</th><th>vwap</th><th>qty</th><th>sale rate</th></tr>");
     for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
@@ -482,17 +554,21 @@ async fn opportunities_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let target = target_param(&params, &state.config);
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
     let min_churn: f64 = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let data = match state.opportunities.opportunities(&target, min_churn, 50) {
         Ok(data) => data,
         Err(error) => return store_error_page(error).await,
     };
     let mut body = format!(
-        "<p>ranked by score = w·(discount + reliability + churn + stability); \
-         confidence = evidence vs min samples. target <code>{target}</code></p>\
+        "<p>ranked by score = w\u{b7}(discount + reliability + churn + stability); \
+         confidence = evidence vs min samples. target <code>{}</code></p>\
          <table><tr><th>item</th><th>score</th><th>confidence</th><th>discount</th><th>reliability</th>\
-         <th>churn/day</th><th>stability</th><th>floor</th><th>median7</th></tr>"
+         <th>churn/day</th><th>stability</th><th>floor</th><th>median7</th></tr>",
+        html_escape(target.as_str())
     );
     for o in &data {
         let _ = write!(
@@ -537,7 +613,10 @@ async fn overview_page(
         out.push_str("</table>");
         out
     }
-    let target = target_param(&params, &state.config);
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
     let data = match state.opportunities.overview(&target, 15) {
         Ok(data) => data,
         Err(error) => return store_error_page(error).await,
@@ -558,21 +637,37 @@ async fn feed_file(
     Query(params): Query<HashMap<String, String>>,
     slim: bool,
 ) -> Response {
-    let target = target_param(&params, &state.config);
-    let bytes = if slim {
-        // slim is built on demand from the watchlist (no cached copy)
-        let options =
-            ExportOptions { spans: state.config.metrics.spans.clone(), watchlist_only: true };
-        match state.feed_export.build_feed(&target, &options) {
-            Ok(feed) => state
-                .renderer
-                .render(&feed, FeedFormat::Lua)
-                .map(Some)
-                .map_err(|e| StoreError::Backend(e.to_string())),
-            Err(error) => Err(error),
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    // Feed assembly/render touches SQLite and possibly lots of folds; keep it
+    // off the async workers.
+    let build = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || {
+            if slim {
+                // slim is built on demand from the watchlist (no cached copy)
+                let options = ExportOptions {
+                    spans: state.config.metrics.spans.clone(),
+                    watchlist_only: true,
+                };
+                state.feed_export.build_feed(&target, &options).and_then(|feed| {
+                    state
+                        .renderer
+                        .render(&feed, FeedFormat::Lua)
+                        .map(Some)
+                        .map_err(|e| StoreError::Backend(e.to_string()))
+                })
+            } else {
+                state.publisher.read(&target, FeedFormat::Lua)
+            }
         }
-    } else {
-        state.publisher.read(&target, FeedFormat::Lua)
+    });
+    let bytes = match build.await {
+        Ok(result) => result,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
     match bytes {
         Ok(Some(bytes)) => (
@@ -687,12 +782,13 @@ async fn api_opportunities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(target) = params.get("target") else {
-        return (StatusCode::BAD_REQUEST, "missing ?target=").into_response();
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
     };
     let min_churn = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
-    match state.opportunities.opportunities(&TargetId(target.clone()), min_churn, limit) {
+    match state.opportunities.opportunities(&target, min_churn, limit) {
         Ok(list) => Json(serde_json::json!({
             "opportunities": list.iter().map(|o| serde_json::json!({
                 "item": item_json(&o.item),
@@ -719,10 +815,11 @@ async fn api_overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(target) = params.get("target") else {
-        return (StatusCode::BAD_REQUEST, "missing ?target=").into_response();
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
     };
-    match state.opportunities.overview(&TargetId(target.clone()), 15) {
+    match state.opportunities.overview(&target, 15) {
         Ok(data) => {
             let mover = |m: &MoverRow| {
                 serde_json::json!({
@@ -752,10 +849,13 @@ async fn api_item_metrics(
     Path((target_id, item_id)): Path<(String, i64)>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
+    let target = match known_target(&state.config, &target_id) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
     let spans: Vec<Span> = params
         .get("span")
         .map_or_else(|| vec![Span::D1], |s| s.split(',').filter_map(Span::parse).collect());
-    let target = TargetId(target_id);
     let item = ItemRef::Item { item_id };
     let mut out = serde_json::Map::new();
     for span in spans {
@@ -785,7 +885,10 @@ async fn api_feed_json(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let target = target_param(&params, &state.config);
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
     let options =
         ExportOptions { spans: state.config.metrics.spans.clone(), watchlist_only: false };
     match state.feed_export.build_feed(&target, &options) {
@@ -868,9 +971,11 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>>
     let Some(env) = &state.config.server.token_env else {
         return Ok(());
     };
-    // An unset (or non-unicode) token env leaves the endpoints open; this is
-    // the documented developer-mode behavior.
-    let Ok(expected) = std::env::var(env) else {
+    // An unset, non-unicode, or EMPTY token env leaves the endpoints open;
+    // this is the documented developer-mode behavior (an empty compose
+    // default must not turn into a zero-length password).
+    let expected = std::env::var(env).ok().filter(|value| !value.trim().is_empty());
+    let Some(expected) = expected else {
         return Ok(());
     };
     let provided = headers
@@ -910,19 +1015,24 @@ async fn api_watchlist_post(
     }
 }
 
+/// DELETE /api/watchlist body: same identity shape as POST, so pets can be
+/// removed too (the old path-parameter form only ever matched plain items).
+#[derive(Deserialize)]
+struct WatchlistDelete {
+    target: String,
+    #[serde(flatten)]
+    item: ApiItemRef,
+}
+
 async fn api_watchlist_delete(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    Path(item_id): Path<i64>,
-    Query(params): Query<HashMap<String, String>>,
+    Json(body): Json<WatchlistDelete>,
 ) -> Response {
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    let Some(target) = params.get("target") else {
-        return (StatusCode::BAD_REQUEST, "missing ?target=").into_response();
-    };
-    match state.watchlist.remove(&TargetId(target.clone()), &ItemRef::Item { item_id }) {
+    match state.watchlist.remove(&TargetId(body.target.clone()), &body.item.to_ref()) {
         Ok(removed) => Json(serde_json::json!({ "ok": true, "removed": removed })).into_response(),
         Err(error) => {
             log_failure("watchlist-remove", &error);
@@ -945,30 +1055,45 @@ async fn api_fetch(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    let mut reports = Vec::new();
-    for target in &state.config.targets {
-        if let Some(wanted) = &params.target {
-            if target.id.as_str() != wanted {
-                continue;
+    // A cycle can block on the wire for minutes; keep it off the async workers.
+    let reports = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let wanted = params.target.clone();
+        move || {
+            let mut reports = Vec::new();
+            for target in &state.config.targets {
+                if let Some(wanted) = &wanted {
+                    if target.id.as_str() != wanted {
+                        continue;
+                    }
+                }
+                for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
+                    match state.cycle.run_cycle(target, kind) {
+                        Ok(report) => reports.push(serde_json::json!({
+                            "target": report.target.as_str(),
+                            "kind": report.kind.as_str(),
+                            "outcome": format!("{:?}", report.outcome),
+                            "entries": report.entries,
+                            "dropped": report.dropped,
+                            "saleCredits": report.sale_credits,
+                        })),
+                        Err(error) => reports.push(serde_json::json!({
+                            "target": target.id.as_str(),
+                            "kind": kind.as_str(),
+                            "error": error.to_string(),
+                        })),
+                    }
+                }
             }
+            reports
         }
-        for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
-            match state.cycle.run_cycle(target, kind) {
-                Ok(report) => reports.push(serde_json::json!({
-                    "target": report.target.as_str(),
-                    "kind": report.kind.as_str(),
-                    "outcome": format!("{:?}", report.outcome),
-                    "entries": report.entries,
-                    "dropped": report.dropped,
-                    "saleCredits": report.sale_credits,
-                })),
-                Err(error) => reports.push(serde_json::json!({
-                    "target": target.id.as_str(),
-                    "kind": kind.as_str(),
-                    "error": error.to_string(),
-                })),
-            }
+    });
+    let reports = match reports.await {
+        Ok(reports) => reports,
+        Err(error) => {
+            log_failure("fetch", &error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
         }
-    }
+    };
     Json(serde_json::json!({ "reports": reports })).into_response()
 }

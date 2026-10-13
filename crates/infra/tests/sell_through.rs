@@ -6,13 +6,12 @@
 
 use std::{
     path::PathBuf,
-    sync::atomic::{
-        AtomicU64,
-        Ordering,
-    },
-    time::{
-        SystemTime,
-        UNIX_EPOCH,
+    sync::{
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+        Arc,
     },
 };
 
@@ -26,6 +25,7 @@ use amtracker_core::{
         TimeLeftBand,
     },
     ports::{
+        ClockPort,
         SalesRepository,
         SnapshotRepository,
     },
@@ -36,6 +36,14 @@ use amtracker_infra::{
 };
 
 const SAMPLE: &str = include_str!("../../../fixtures/auctions_sample.json");
+
+struct FixedClock(i64);
+
+impl ClockPort for FixedClock {
+    fn now(&self) -> i64 {
+        self.0
+    }
+}
 
 fn temp_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -69,12 +77,17 @@ fn real_sample_sightings_close_and_credit() {
     assert!(listings.len() >= 50, "fixture should carry a meaningful batch");
 
     let dir = temp_dir("sample-sell");
-    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    // Deterministic clock: the band rule only compares sighting gaps, and the
+    // sale_rate window is relative to the injected clock.
+    let now: i64 = 1_000_000;
+    let store = SqliteStore::open(
+        &dir.join("db.sqlite3"),
+        &dir.join("raw"),
+        Arc::new(FixedClock(now + 600)),
+    )
+    .expect("open");
     let target = TargetId("us-4".into());
 
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
     let t0 = now - 600; // cycle 1: 10 minutes ago
 
     // The real sample's head rows are mostly SHORT (never credits). Give the
@@ -88,7 +101,7 @@ fn real_sample_sightings_close_and_credit() {
     store
         .record(&snapshot(&target, 1, t0, listings.len()), &listings, b"s1".as_slice())
         .expect("record s1");
-    store.observe(&target, &listings, 1, t0).expect("observe s1");
+    store.observe(&target, PayloadKind::Auctions, &listings, 1, t0).expect("observe s1");
 
     // Cycle 2: the LONG-band first half vanishes 10 minutes after its last
     // sighting; the rest survive.
@@ -98,8 +111,8 @@ fn real_sample_sightings_close_and_credit() {
     store
         .record(&snapshot(&target, 2, t1, survivors.len()), &survivors, b"s2".as_slice())
         .expect("record s2");
-    store.observe(&target, &survivors, 2, t1).expect("observe s2");
-    let credits = store.close_missing(&target, 2, t1).expect("close");
+    store.observe(&target, PayloadKind::Auctions, &survivors, 2, t1).expect("observe s2");
+    let credits = store.close_missing(&target, PayloadKind::Auctions, 2, t1).expect("close");
 
     let mut credited_ids: Vec<i64> = credits.iter().map(|c| c.auction_id).collect();
     credited_ids.sort_unstable();

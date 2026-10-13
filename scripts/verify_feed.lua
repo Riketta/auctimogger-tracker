@@ -1,5 +1,6 @@
 -- Verifies a generated tracker feed (feed.lua) against the frozen v2
--- contract the AuctiMogger addon ingests (AuctiMogger PLAN.md §2.1).
+-- contract the AuctiMogger addon ingests (see the tracker README's
+-- "Feed contract (v2)" section).
 -- Usage: lua verify_feed.lua <feed.lua>
 -- Exits non-zero with a message on the first violation.
 

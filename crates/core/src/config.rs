@@ -33,6 +33,9 @@ pub struct ServerConfig {
     pub bind: String,
     /// Environment variable holding the API token; `None` = open (localhost).
     pub token_env: Option<String>,
+    /// Minimum seconds between feed re-publications per target (the
+    /// scheduler publishes after successful cycles, throttled by this).
+    pub feed_publish_secs: u64,
 }
 
 /// Persistence settings.
@@ -139,6 +142,12 @@ impl TargetConfig {
 }
 
 impl TrackerConfig {
+    /// The configured target with the given id, if any.
+    #[must_use]
+    pub fn find_target(&self, id: &str) -> Option<&TargetConfig> {
+        self.targets.iter().find(|target| target.id.as_str() == id)
+    }
+
     /// Structural validation: ids unique, polls positive, spans known and
     /// non-empty, score weights sane, URL/auth references non-empty.
     ///

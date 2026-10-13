@@ -6,9 +6,12 @@
 
 use std::{
     path::PathBuf,
-    sync::atomic::{
-        AtomicU64,
-        Ordering,
+    sync::{
+        atomic::{
+            AtomicU64,
+            Ordering,
+        },
+        Arc,
     },
 };
 
@@ -26,12 +29,32 @@ use amtracker_core::{
     },
     fold::DayFold,
     ports::{
+        ClockPort,
         MetricsCacheRepository,
         PriceHistoryRepository,
         SnapshotRepository,
     },
 };
 use amtracker_infra::store::SqliteStore;
+
+/// Fixed clock: `sale_rate` windows and watchlist/catalog stamps now flow
+/// through the injected port, so tests are deterministic by construction.
+struct FixedClock(i64);
+
+impl ClockPort for FixedClock {
+    fn now(&self) -> i64 {
+        self.0
+    }
+}
+
+fn open_store(dir: &std::path::Path, now: i64) -> SqliteStore {
+    SqliteStore::open(
+        &dir.join("db.sqlite3"),
+        &dir.join("raw"),
+        Arc::new(FixedClock(now)) as Arc<dyn ClockPort>,
+    )
+    .expect("open")
+}
 
 fn temp_dir(tag: &str) -> PathBuf {
     static SEQ: AtomicU64 = AtomicU64::new(0);
@@ -66,7 +89,7 @@ fn item(id: i64) -> ItemRef {
 #[test]
 fn record_persists_snapshot_listings_and_latest() {
     let dir = temp_dir("record");
-    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let store = open_store(&dir, 1_000_000);
 
     let target = TargetId("us-4".into());
     let snapshot_id = store
@@ -101,7 +124,7 @@ fn record_persists_snapshot_listings_and_latest() {
 #[test]
 fn fold_round_trips_through_storage() {
     let dir = temp_dir("fold");
-    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let store = open_store(&dir, 1_000_000);
 
     let target = TargetId("us-4".into());
     let pet = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
@@ -122,7 +145,7 @@ fn fold_round_trips_through_storage() {
 #[test]
 fn prune_removes_only_the_raw_working_set() {
     let dir = temp_dir("prune");
-    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let store = open_store(&dir, 30 * 86_400);
     let target = TargetId("us-4".into());
 
     // old-day snapshot with listings
@@ -175,22 +198,13 @@ fn prune_removes_only_the_raw_working_set() {
 
 #[test]
 fn sell_through_credits_band_violations_only() {
-    use std::time::{
-        SystemTime,
-        UNIX_EPOCH,
-    };
-
     use amtracker_core::ports::SalesRepository;
 
     let dir = temp_dir("sales");
-    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let store = open_store(&dir, 1_000_000 + 1_800 + 60);
     let target = TargetId("us-4".into());
-    // Anchored to wall-clock so the trailing-window sale_rate query sees the
-    // rows (its window is relative to real now inside the adapter).
-    let t0 = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-        - 1_200; // cycle 1 timestamp, 20 minutes ago
+    // Fully deterministic now: the sale_rate window reads the injected clock.
+    let t0: i64 = 1_000_000 - 1_200; // cycle 1 timestamp, 20 minutes before cycle 3
 
     // Three MEDIUM-band listings opened at t0 (band lower bound: 30 min).
     let batch =
@@ -210,7 +224,7 @@ fn sell_through_credits_band_violations_only() {
             b"s1".as_slice(),
         )
         .expect("record s1");
-    store.observe(&target, &batch, 1, t0).expect("observe s1");
+    store.observe(&target, PayloadKind::Commodities, &batch, 1, t0).expect("observe s1");
 
     // Cycle 2 (snapshot 2) 10 minutes later: auctions 1 and 2 vanished,
     // auction 3 is still present.
@@ -231,8 +245,8 @@ fn sell_through_credits_band_violations_only() {
             b"s2".as_slice(),
         )
         .expect("record s2");
-    store.observe(&target, &survivor, 2, t1).expect("observe s2");
-    let credits = store.close_missing(&target, 2, t1).expect("close");
+    store.observe(&target, PayloadKind::Commodities, &survivor, 2, t1).expect("observe s2");
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 2, t1).expect("close");
     assert_eq!(credits.len(), 2, "vanished after 10 min < 30 min band floor");
     assert!(credits.iter().all(|c| c.item == item(1)));
 
@@ -255,9 +269,9 @@ fn sell_through_credits_band_violations_only() {
             b"s3".as_slice(),
         )
         .expect("record s3");
-    store.observe(&target, &late, 3, t2).expect("observe s3");
+    store.observe(&target, PayloadKind::Commodities, &late, 3, t2).expect("observe s3");
     let t3 = t2 + 1_800 + 60;
-    store.close_missing(&target, 3, t3).expect("close late");
+    store.close_missing(&target, PayloadKind::Commodities, 3, t3).expect("close late");
 
     // sale_rate over the trailing window: item 1 = 2 credited / 2 listings.
     let rate = store.sale_rate(&target, &item(1), 14).expect("rate").expect("rate");
@@ -270,12 +284,191 @@ fn sell_through_credits_band_violations_only() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// F1 regression: interleaving the two payload kinds must close only the
+/// vanished kind's sights (never the other kind's), never wedge on the sight
+/// primary key, and keep `sale_rate` sane.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
+    use amtracker_core::ports::SalesRepository;
+
+    let dir = temp_dir("interleave");
+    let store = open_store(&dir, 10_000);
+    let target = TargetId("us-4".into());
+    let shared_auction_id = 777; // deliberately the SAME numeric id in both kinds
+
+    let commodities = [listing(shared_auction_id, &item(1), 100, 1)];
+    let auctions = [{
+        let mut l = listing(shared_auction_id, &item(2), 200, 1);
+        l.kind = ListingKind::Item;
+        l
+    }];
+
+    // Cycle 1: both kinds observe their (id-clashing) listings.
+    for (kind, batch, tag) in [
+        (PayloadKind::Commodities, &commodities[..], b"c1".as_slice()),
+        (PayloadKind::Auctions, &auctions[..], b"a1".as_slice()),
+    ] {
+        let id = store
+            .record(
+                &NewSnapshot {
+                    target: target.clone(),
+                    kind,
+                    fetched_at: 10_000,
+                    source_last_modified: None,
+                    entry_count: 1,
+                    dropped_count: 0,
+                    status: SnapshotStatus::Ok,
+                },
+                batch,
+                tag,
+            )
+            .expect("record");
+        store.observe(&target, kind, batch, id, 10_000).expect("observe");
+    }
+
+    // Cycle 2: fresh snapshots for both kinds, same listings still present.
+    for (kind, batch, tag) in [
+        (PayloadKind::Commodities, &commodities[..], b"c2".as_slice()),
+        (PayloadKind::Auctions, &auctions[..], b"a2".as_slice()),
+    ] {
+        let id = store
+            .record(
+                &NewSnapshot {
+                    target: target.clone(),
+                    kind,
+                    fetched_at: 11_000,
+                    source_last_modified: None,
+                    entry_count: 1,
+                    dropped_count: 0,
+                    status: SnapshotStatus::Ok,
+                },
+                batch,
+                tag,
+            )
+            .expect("record");
+        store.observe(&target, kind, batch, id, 11_000).expect("re-observe");
+        // Before the fix this closed the OTHER kind's sights (their
+        // last_seen_snapshot differs) and then PK-viad the re-observe.
+        let credits = store.close_missing(&target, kind, id, 11_000).expect("close");
+        assert!(credits.is_empty(), "nothing vanished; cross-kind mass-close must not happen");
+    }
+
+    // Vanish the commodities listing for real: close, credit, then re-observe
+    // it later — the sight must reopen (not PK-wedge) and the phantom credit
+    // must be reversed.
+    let t_close = 12_000;
+    let id3 = store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: t_close,
+                source_last_modified: None,
+                entry_count: 0,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            b"c3".as_slice(),
+        )
+        .expect("record c3");
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, id3, t_close).expect("close c3");
+    assert_eq!(
+        credits.len(),
+        1,
+        "a 16-minute vanish with VERY_LONG remaining is a phantom sale candidate (gap < band floor)"
+    );
+    assert_eq!(
+        credits.first().map(|c| c.item.clone()),
+        Some(item(1)),
+        "only the commodities sight closed; auctions untouched"
+    );
+
+    let t_back = 13_000;
+    let id4 = store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: t_back,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &commodities,
+            b"c4".as_slice(),
+        )
+        .expect("record c4");
+    store
+        .observe(&target, PayloadKind::Commodities, &commodities, id4, t_back)
+        .expect("re-observe after close must reopen, not wedge");
+
+    // Sale ledger: 1 listing opened, 1 closed (not credited), reopen undid the
+    // close. Nothing credited.
+    let rate = store.sale_rate(&target, &item(1), 14).expect("rate");
+    assert!(rate.is_none() || rate == Some(0.0), "no phantom sales: got {rate:?}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A schema-v1 database (sight table without `kind`) must be refused with a
+/// rebuild hint instead of silently fabricating history.
+#[test]
+fn legacy_v1_database_is_refused() {
+    use rusqlite::Connection;
+
+    let dir = temp_dir("legacy");
+    let db_path = dir.join("db.sqlite3");
+    {
+        let conn = Connection::open(&db_path).expect("open legacy");
+        conn.execute_batch(
+            "CREATE TABLE sight (
+                 target_id TEXT NOT NULL,
+                 auction_id INTEGER NOT NULL,
+                 item_ref_id INTEGER NOT NULL,
+                 first_seen_snapshot INTEGER NOT NULL,
+                 last_seen_snapshot INTEGER NOT NULL,
+                 first_seen_at INTEGER NOT NULL,
+                 last_seen_at INTEGER NOT NULL,
+                 band TEXT NOT NULL,
+                 quantity INTEGER NOT NULL,
+                 closed_at INTEGER,
+                 credited INTEGER NOT NULL DEFAULT 0,
+                 PRIMARY KEY (target_id, auction_id)
+             );",
+        )
+        .expect("create legacy sight");
+    }
+    let error = expect_legacy_refusal(&dir, &db_path);
+    assert!(error.to_string().contains("delete the database"), "message: {error}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[allow(clippy::panic)]
+fn expect_legacy_refusal(
+    dir: &std::path::Path,
+    db_path: &std::path::Path,
+) -> amtracker_core::error::StoreError {
+    match SqliteStore::open(
+        db_path,
+        &dir.join("raw"),
+        Arc::new(FixedClock(0)) as Arc<dyn ClockPort>,
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("legacy v1 database must be refused"),
+    }
+}
+
 #[test]
 fn metrics_cache_round_trips_and_invalidates() {
     use amtracker_core::domain::MetricBlock;
 
     let dir = temp_dir("cache");
-    let store = SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw")).expect("open");
+    let store = open_store(&dir, 1_000_000);
     let target = TargetId("us-4".into());
     let item = item(194_784);
 

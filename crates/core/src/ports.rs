@@ -158,8 +158,10 @@ pub trait PriceHistoryRepository: Send + Sync {
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).
 pub trait SalesRepository: Send + Sync {
-    /// Registers/refreshes sightings for all listings of one snapshot. `at` is
-    /// the cycle timestamp (unix seconds).
+    /// Registers/refreshes sightings for all listings of one snapshot.
+    /// Sightings are scoped per payload kind: commodity and item auction ids
+    /// live in separate id namespaces, so the same numeric id may legitimately
+    /// appear in both. `at` is the cycle timestamp (unix seconds).
     ///
     /// # Errors
     ///
@@ -167,12 +169,14 @@ pub trait SalesRepository: Send + Sync {
     fn observe(
         &self,
         target: &TargetId,
+        kind: PayloadKind,
         listings: &[NormalizedListing],
         snapshot_id: i64,
         at: i64,
     ) -> Result<(), StoreError>;
-    /// Closes sightings absent from the newest snapshot; returns credits
-    /// granted (vanishing earlier than the band's lower bound).
+    /// Closes sightings of one payload kind that are absent from the newest
+    /// snapshot of that kind; returns credits granted (vanished earlier than
+    /// the band's lower bound).
     ///
     /// # Errors
     ///
@@ -181,6 +185,7 @@ pub trait SalesRepository: Send + Sync {
     fn close_missing(
         &self,
         target: &TargetId,
+        kind: PayloadKind,
         snapshot_id: i64,
         at: i64,
     ) -> Result<Vec<crate::domain::SaleCredit>, StoreError>;
@@ -196,6 +201,23 @@ pub trait SalesRepository: Send + Sync {
         item: &ItemRef,
         days: i64,
     ) -> Result<Option<f64>, StoreError>;
+    /// Sale rate summed over several item identities (pet variants of one
+    /// species share their market). `Ok(None)` when none of the items has
+    /// sales rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the credit statistics cannot be
+    /// read.
+    fn sale_rate_multi(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+    ) -> Result<Option<f64>, StoreError> {
+        let _ = (target, items, days);
+        Ok(None)
+    }
 }
 
 /// Outbound: memoized span metrics (invalidated per target on ingest).

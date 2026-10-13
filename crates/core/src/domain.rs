@@ -164,15 +164,14 @@ impl PayloadKind {
     }
 }
 
-/// Terminal state of one snapshot fetch+ingest attempt.
+/// Terminal state of one snapshot fetch+ingest attempt. Failed fetches/parse
+/// attempts never persist a snapshot row (the cycle errors out before
+/// `record`), so `Ok` is the only state that can occur today; the enum stays
+/// so the stored `status` column has a typed spelling for future states.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SnapshotStatus {
     /// Fetched, parsed and persisted.
     Ok,
-    /// Fetched but the payload could not be parsed.
-    ParseFailed,
-    /// The HTTP fetch itself failed.
-    HttpFailed,
 }
 
 impl SnapshotStatus {
@@ -181,8 +180,6 @@ impl SnapshotStatus {
     pub fn as_str(&self) -> &'static str {
         match self {
             SnapshotStatus::Ok => "ok",
-            SnapshotStatus::ParseFailed => "parse_failed",
-            SnapshotStatus::HttpFailed => "http_error",
         }
     }
 }

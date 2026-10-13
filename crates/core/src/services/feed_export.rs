@@ -1,7 +1,13 @@
 //! Feed export (tracker feed v2): gathers per-item span metrics and shapes
-//! them into the frozen cross-addon contract (`AuctiMogger` `PLAN.md §2.1`).
-//! Rendering and publication are outbound ports; this service owns the
-//! selection and freshness rules.
+//! them into the frozen cross-addon contract (see the README's
+//! "Feed contract (v2)" section). Rendering and publication are outbound
+//! ports; this service owns the selection, freshness and grain rules.
+//!
+//! Grain rule: the addon collapses every pet variant onto its species (the
+//! cage item key), so pet entries are exported per SPECIES — all variants'
+//! day-folds merge into one metric population and their sale rates pool.
+//! Exporting per-variant entries would make the in-game store silently
+//! keep only whichever variant ingested last.
 
 use std::{
     collections::BTreeMap,
@@ -82,18 +88,43 @@ impl FeedExportService {
             self.history.items_with_data(target, today - window_days + 1)?
         };
 
-        let mut entries = Vec::new();
+        // Group pet variants by species so the exported feed matches the
+        // addon's species-level grain; plain items stay per-id.
+        let mut groups: BTreeMap<PetGroupKey, Vec<ItemRef>> = BTreeMap::new();
         for item in items {
+            let key = match &item {
+                ItemRef::Item { item_id } => PetGroupKey::Item(*item_id),
+                ItemRef::Pet { species, .. } => PetGroupKey::PetSpecies(*species),
+            };
+            groups.entry(key).or_default().push(item);
+        }
+
+        let mut entries = Vec::new();
+        for (_, members) in groups {
+            // Groups are built by pushing at least one member, so indexing is
+            // in bounds by construction; a `.get()` fallback would produce an
+            // entry-less feed row instead of failing loudly.
+            #[allow(clippy::indexing_slicing)]
+            let (identity, single) = (canonical_item(&members[0]), members.len() == 1);
             let mut metrics = BTreeMap::new();
             for span in &options.spans {
-                if let Some(block) = self.metrics.block(target, &item, *span)? {
+                // Singles keep the per-item cached path (folds live under the
+                // original variant identity, not the canonical grain); merged
+                // populations go through block_merged.
+                #[allow(clippy::indexing_slicing)]
+                let block = if single {
+                    self.metrics.block(target, &members[0], *span)?
+                } else {
+                    self.metrics.block_merged(target, &members, *span)?
+                };
+                if let Some(block) = block {
                     metrics.insert(*span, block);
                 }
             }
             // Entries without any valid span would be rejected by the addon's
             // strict ingestor — omit them.
             if !metrics.is_empty() {
-                entries.push(FeedEntry { item, metrics });
+                entries.push(FeedEntry { item: identity, metrics });
             }
         }
         entries.sort_by(|a, b| a.item.cmp(&b.item));
@@ -118,5 +149,25 @@ impl FeedExportService {
 }
 
 fn utc_day_of(unix_ts: i64) -> i64 {
+    // `u64` unix seconds only exceed `i64` far beyond any real date, so the
+    // conversion saturates; a clock before the epoch reads as day 0.
     unix_ts.div_euclid(86_400)
+}
+
+/// Feed-grain grouping key: plain items per id, all pet variants of a species
+/// together (the addon resolves every pet entry onto the cage-species key).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum PetGroupKey {
+    Item(i64),
+    PetSpecies(i64),
+}
+
+/// The identity a feed entry carries for a group. Pet groups export the
+/// species-level tuple (level/quality/breed zeroed — the addon ignores them
+/// and JSON consumers should see the canonical grain).
+fn canonical_item(item: &ItemRef) -> ItemRef {
+    match *item {
+        ItemRef::Item { item_id } => ItemRef::Item { item_id },
+        ItemRef::Pet { species, .. } => ItemRef::Pet { species, level: 0, quality: 0, breed: 0 },
+    }
 }

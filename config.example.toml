@@ -9,7 +9,10 @@
 
 [server]
 bind = "127.0.0.1:8080"
-token_env = "AMT_API_TOKEN" # unset = mutating endpoints are open (localhost use)
+token_env = "AMT_API_TOKEN" # unset or empty = mutating endpoints are open (localhost use)
+# Minimum seconds between feed re-publications per target. The scheduler
+# publishes feed.lua + feed.json after successful cycles, throttled by this.
+# feed_publish_secs = 300
 
 [storage]
 database = "./data/tracker.sqlite3"

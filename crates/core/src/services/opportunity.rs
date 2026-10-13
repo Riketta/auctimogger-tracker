@@ -4,7 +4,10 @@
 //! never read it (they use exact metric blocks).
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     sync::{
         Arc,
         Mutex,
@@ -115,9 +118,9 @@ struct ItemScan {
     mad7: f64,
 }
 
-/// Cached scan: (computed at, target, snapshot) — `None` until the first
-/// scan for some target.
-type ScanCache = Option<(i64, TargetId, Arc<ScanSnapshot>)>;
+/// Cached scan per target: computed-at stamp plus the shared snapshot.
+/// Keyed by target so alternating requests don't evict each other.
+type ScanCache = HashMap<TargetId, (i64, Arc<ScanSnapshot>)>;
 
 /// Builds ranked opportunities and the market overview from day-fold history.
 pub struct OpportunityService {
@@ -144,7 +147,7 @@ impl OpportunityService {
             clock,
             weights: config.opportunities.weights.clone(),
             min_samples: config.opportunities.min_samples,
-            cache: Mutex::new(None),
+            cache: Mutex::new(HashMap::new()),
         }
     }
 
@@ -210,8 +213,8 @@ impl OpportunityService {
         let now = self.clock.now();
         {
             let cache = self.scan_cache()?;
-            if let Some((at, cached_target, snapshot)) = cache.as_ref() {
-                if now - at <= SCAN_TTL_SECONDS && cached_target == target {
+            if let Some((at, snapshot)) = cache.get(target) {
+                if now - at <= SCAN_TTL_SECONDS {
                     return Ok(Arc::clone(snapshot));
                 }
             }
@@ -230,7 +233,7 @@ impl OpportunityService {
         }
         let snapshot =
             Arc::new(ScanSnapshot { computed_at: now, items: scans.len(), rows: Arc::new(scans) });
-        *self.scan_cache()? = Some((now, target.clone(), Arc::clone(&snapshot)));
+        self.scan_cache()?.insert(target.clone(), (now, Arc::clone(&snapshot)));
         Ok(snapshot)
     }
 

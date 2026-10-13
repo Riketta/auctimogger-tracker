@@ -267,6 +267,7 @@ impl SalesRepository for FakeSales {
     fn observe(
         &self,
         _target: &TargetId,
+        _kind: amtracker_core::domain::PayloadKind,
         _listings: &[amtracker_core::domain::NormalizedListing],
         _snapshot_id: i64,
         _at: i64,
@@ -278,6 +279,7 @@ impl SalesRepository for FakeSales {
     fn close_missing(
         &self,
         _target: &TargetId,
+        _kind: amtracker_core::domain::PayloadKind,
         _snapshot_id: i64,
         _at: i64,
     ) -> Result<Vec<amtracker_core::domain::SaleCredit>, StoreError> {
