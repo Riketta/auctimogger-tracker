@@ -1,0 +1,12 @@
+# Build context hygiene: nothing here is needed inside the image.
+.git
+.github
+target
+dist
+data
+feeds
+logs
+*.log
+Dockerfile
+docker-compose.yml
+config.docker.toml

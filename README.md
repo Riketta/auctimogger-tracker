@@ -22,6 +22,7 @@ normal for this item, and how do I know this deal is real?"*.
   - [Project structure](#project-structure)
   - [Quality gates (local CI stack)](#quality-gates-local-ci-stack)
   - [GitHub CI & releases](#github-ci--releases)
+- [Docker (demo compose)](#docker-demo-compose)
 - [Deployment (Linux server)](#deployment-linux-server)
   - [Server layout](#server-layout)
   - [First-time install](#first-time-install)
@@ -229,7 +230,44 @@ only where an index is proven in bounds.
   `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, packaged with
   `config.example.toml`; tags additionally publish a GitHub release. The
   linux-gnu binary is built on `ubuntu-latest` (currently glibc 2.39) — older
-  glibc hosts should build from source.
+  glibc hosts should use the Docker image or build from source.
+- **Docker**: multi-stage image build on every run; pushes to GHCR on real
+  pushes (`:main` from main, semver + `:latest` from `v*` tags), pull
+  requests build without publishing.
+
+## Docker (demo compose)
+
+CI builds a multi-stage image and publishes it to GHCR on every push:
+`ghcr.io/riketta/auctimogger-tracker` (`:main` tracks main; `v*` tags
+publish `:x.y.z`, `:x.y` and `:latest`). The image bundles its own glibc, so
+it sidesteps the host-glibc caveat of the release tarball.
+
+The committed demo stack runs the whole thing with one command:
+
+```sh
+cp config.docker.toml config.toml   # edit targets; tokens go into .env
+docker compose up --build           # web UI on :8080
+```
+
+| Piece | What it does |
+|---|---|
+| `tracker` service | `serve` (scheduler + web UI); port `8080:8080` |
+| `feed-exporter` service | re-renders `feed.lua` + `feed.json` every 5 min so `/feed.lua` stays fresh (`/feed-slim.lua` renders on demand and needs no exporter) |
+| `./config.docker.toml` → `/work/config.toml` | container config: binds `0.0.0.0`, absolute `/data` paths; edit targets here |
+| `amtracker-data` volume → `/data` | SQLite DB + raw archive, survives rebuilds |
+| `amtracker-feeds` volume → `/work/feeds` | published feeds |
+| `AMT_TOKEN` / `AMT_API_TOKEN` env | Blizzard access and mutation-API protection (`.env` next to the compose file) |
+
+Run the CLI against the same volumes without stopping the server:
+
+```sh
+docker compose run --rm tracker config-check --config /work/config.toml
+docker compose run --rm tracker export-feed --config /work/config.toml --out /work/feeds
+```
+
+The compose file is a demo: for a real deployment either keep it (it is
+production-shaped — non-root user, named volumes, stdout logging for
+`docker logs`) or follow the systemd layout below.
 
 ## Deployment (Linux server)
 

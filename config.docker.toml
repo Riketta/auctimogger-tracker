@@ -1,0 +1,45 @@
+# auctimogger-tracker demo configuration for Docker (see docker-compose.yml).
+# Container-flavored defaults: bind all interfaces (the port mapping exposes
+# it), absolute storage paths on the /data volume, stdout logging only
+# (docker logs / compose logs capture it). Tokens come from the environment,
+# never from this file.
+
+[server]
+bind = "0.0.0.0:8080"
+token_env = "AMT_API_TOKEN" # unset = mutating endpoints are open; set it in compose
+
+[storage]
+database = "/data/tracker.sqlite3"
+raw_listing_days = 7
+archive_dir = "/data/raw"
+
+[metrics]
+spans = ["d1", "d7", "d14", "d30"]
+
+[opportunities]
+min_samples = 30
+weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
+
+# Optional: Sentry-protocol endpoint (Sentry SaaS or self-hosted GlitchTip).
+# Remove the comments and set the DSN to enable error reporting.
+# [sentry]
+# dsn = "http://your-key@your-glitchtip-host/1"
+# environment = "docker"
+
+# --- targets: edit these to the market you follow ---
+
+# Mainline-tracking emulator (static JSON dumps, no auth):
+[[targets]]
+id = "wowforever-main"
+kind = "static-urls"
+commodities_url = "https://example.org/api/commodities.json"
+auctions_url = "https://example.org/api/auctions.json"
+poll = { commodities_secs = 3600, auctions_secs = 3600 }
+
+# Live Blizzard connected realm (needs AMT_TOKEN in the environment):
+# [[targets]]
+# id = "us-4"
+# kind = "blizzard-connected-realm"
+# region = "us"
+# connected_realm_id = 4
+# poll = { commodities_secs = 3600, auctions_secs = 1800 }
