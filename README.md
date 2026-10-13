@@ -23,6 +23,13 @@ normal for this item, and how do I know this deal is real?"*.
   - [Quality gates (local CI stack)](#quality-gates-local-ci-stack)
   - [GitHub CI & releases](#github-ci--releases)
 - [Docker (demo compose)](#docker-demo-compose)
+  - [Set up](#set-up)
+  - [Configure](#configure)
+  - [Run](#run)
+  - [Use it](#use-it)
+  - [Feed the addon](#feed-the-addon)
+  - [Update, stop, reset](#update-stop-reset)
+  - [Without building](#without-building)
 - [Deployment (Linux server)](#deployment-linux-server)
   - [Server layout](#server-layout)
   - [First-time install](#first-time-install)
@@ -150,9 +157,9 @@ Pages: `/` dashboard · `/snapshots` · `/items?q=…` search ·
 | `GET /api/opportunities` · `/api/overview` | ranked deals, market dynamics |
 | `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
-| `GET+POST /api/watchlist`, `DELETE /api/watchlist/{id}` | watchlist (POST/DELETE token-gated) |
+| `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated) |
-| `GET /feed.lua` · `/feed-slim.lua` | feed downloads served from the feeds dir |
+| `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
 
 ## Feed contract (v2)
 
@@ -244,36 +251,147 @@ only where an index is proven in bounds.
 
 ## Docker (demo compose)
 
-CI builds a multi-stage image and publishes it to GHCR on every push:
-`ghcr.io/riketta/auctimogger-tracker` (`:main` tracks main; `v*` tags
-publish `:x.y.z`, `:x.y` and `:latest`). The image bundles its own glibc, so
-it sidesteps the host-glibc caveat of the release tarball.
+The fastest path to a running tracker. You need Docker Engine with the
+compose plugin; a Blizzard bearer token (develop.battle.net) is required
+only for live `blizzard-connected-realm` targets — `static-urls` targets
+(e.g. a mainline-tracking emulator) need no secret at all.
 
-The committed demo stack runs the whole thing with one command:
+### Set up
 
 ```sh
-cp config.docker.toml config.toml   # edit targets; tokens go into .env
-docker compose up --build           # web UI on :8080
+git clone https://github.com/Riketta/auctimogger-tracker.git
+cd auctimogger-tracker
+
+cat > .env <<'EOF'
+# Blizzard OAuth token, used by blizzard-connected-realm targets only.
+AMT_TOKEN=
+# Protects mutating endpoints (watchlist writes, /api/fetch). Any random
+# string; empty keeps them open (the server logs one warning about it).
+AMT_API_TOKEN=
+EOF
 ```
 
-| Piece | What it does |
-|---|---|
-| `tracker` service | `serve` (scheduler + web UI); port `8080:8080`. The scheduler itself re-publishes `feed.lua`/`feed.json` after ingest cycles — no exporter sidecar needed |
-| `./config.docker.toml` → `/work/config.toml` | container config: binds `0.0.0.0`, absolute `/data` paths; edit targets here |
-| `amtracker-data` volume → `/data` | SQLite DB + raw archive, survives rebuilds |
-| `amtracker-feeds` volume → `/work/feeds` | published feeds |
-| `AMT_TOKEN` / `AMT_API_TOKEN` env | Blizzard access and mutation-API protection (`.env` next to the compose file) |
+Fill in the values; `.env` is gitignored and never baked into the image.
 
-Run the CLI against the same volumes without stopping the server:
+### Configure
+
+`docker-compose.yml` mounts `./config.docker.toml` read-only as the
+container's `/work/config.toml` — edit that file, not a copy of it. Its
+defaults are container-shaped: bind `0.0.0.0:8080`, storage under `/data`,
+stdout logging only. Replace the demo target block with the market you
+follow:
+
+```toml
+# Mainline-tracking emulator (static JSON dumps, no auth):
+[[targets]]
+id = "wowforever-main"
+kind = "static-urls"
+commodities_url = "https://example.org/api/commodities.json"
+auctions_url = "https://example.org/api/auctions.json"
+poll = { commodities_secs = 3600, auctions_secs = 3600 }
+
+# Live Blizzard connected realm (reads AMT_TOKEN from the environment):
+# [[targets]]
+# id = "us-4"
+# kind = "blizzard-connected-realm"
+# region = "us"
+# connected_realm_id = 4
+# poll = { commodities_secs = 3600, auctions_secs = 1800 }
+```
+
+Every other key is documented in [Configuration](#configuration). Validate
+before starting:
 
 ```sh
-docker compose run --rm tracker config-check --config /work/config.toml
+docker compose run --rm tracker config-check /work/config.toml
+```
+
+### Run
+
+```sh
+docker compose up -d --build
+docker compose logs -f tracker                # cycles, publications, warnings
+curl -s http://localhost:8080/api/health
+```
+
+The first ingest cycle runs immediately at boot; pages stay empty until it
+succeeds. After every successful cycle the scheduler re-publishes
+`feed.lua`/`feed.json` (throttled by `server.feed_publish_secs`, default
+300) and applies raw-listing retention once per UTC day.
+
+### Use it
+
+Open `http://localhost:8080`: `/` dashboard · `/items?q=…` name search ·
+`/items/{target}/{itemID}` per-item detail · `/opportunities` ranked deals ·
+`/overview` market dynamics · `/snapshots` raw history. The same data over
+JSON:
+
+```sh
+curl -s 'http://localhost:8080/api/search?q=194784'
+curl -s 'http://localhost:8080/api/items/wowforever-main/194784/metrics'
+curl -s 'http://localhost:8080/api/opportunities'
+
+# Mutating endpoints require the AMT_API_TOKEN bearer:
+curl -s -X POST http://localhost:8080/api/watchlist \
+  -H "Authorization: Bearer $AMT_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"target":"wowforever-main","type":"item","itemID":194784,"note":"flip"}'
+curl -s -X DELETE http://localhost:8080/api/watchlist \
+  -H "Authorization: Bearer $AMT_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"target":"wowforever-main","type":"item","itemID":194784}'
+curl -s -X POST 'http://localhost:8080/api/fetch?target=wowforever-main' \
+  -H "Authorization: Bearer $AMT_API_TOKEN"
+```
+
+Pets use `"type":"pet"` with `speciesID`/`level`/`qualityID`/`breedID`.
+
+### Feed the addon
+
+```sh
+curl -sf -o feed.lua 'http://localhost:8080/feed.lua?target=wowforever-main'
+# `?target` is optional and defaults to the first configured target.
+# Watchlist-only variant:
+curl -sf -o feed-slim.lua 'http://localhost:8080/feed-slim.lua?target=wowforever-main'
+
+cp feed.lua <wow>/Interface/AddOns/AuctiMogger/AuctiMoggerTracker/feed.lua
+```
+
+`<wow>` is the client root (the folder containing `Interface/`).
+
+In-game, `/reload` makes the AuctiMoggerTracker sub-addon ingest the file
+at load; `/auctimogger ingest` re-reads it anytime without a reload. A 404
+means nothing has been published for that target yet — wait for a green
+cycle. The files also live in the `amtracker-feeds` volume:
+`docker compose cp tracker:/work/feeds/wowforever-main/feed.lua .`
+
+### Update, stop, reset
+
+```sh
+git pull && docker compose up -d --build   # new revision, same volumes
+docker compose down                        # stop; data + feeds volumes survive
+docker compose down -v                     # ...or wipe the database and feeds
+```
+
+### Without building
+
+CI publishes the image to GHCR on pushes to main (`:main`, `:sha-<8>`) and
+on `v*` tags (`:x.y.z`, `:x.y`, `:latest`). To skip the local build, replace
+the `tracker` service's `build: .` / `image:` lines with:
+
+```yaml
+    image: ghcr.io/riketta/auctimogger-tracker:main
+```
+
+The image bundles its own glibc, so it also sidesteps the host-glibc caveat
+of the release tarball. CLI one-offs against the same volumes keep working:
+
+```sh
+docker compose run --rm tracker config-check /work/config.toml
 docker compose run --rm tracker export-feed --config /work/config.toml --out /work/feeds
 ```
 
-The compose file is a demo: for a real deployment either keep it (it is
-production-shaped — non-root user, named volumes, stdout logging for
-`docker logs`) or follow the systemd layout below.
+The demo stack is production-shaped — non-root user, named volumes, stdout
+logging for `docker logs` — so keeping it long-term is fine; the systemd
+layout below is the bare-metal alternative.
 
 ## Deployment (Linux server)
 
