@@ -4,18 +4,29 @@
 # immune to host glibc versions.
 
 # syntax=docker/dockerfile:1
-FROM rust:1-slim AS build
+
+# ---- build stage ----
+# The -bookworm suffix pins the Debian suite, not just the compiler: the
+# binary links against this base's glibc, and the runtime stage below is
+# bookworm-slim. A moving default base could break the image at startup
+# ("GLIBC_x.y not found"), not at build time (versa-bot precedent). The
+# compiler itself follows the repo's rust-toolchain.toml pin (stable).
+FROM rust:1-bookworm AS build
 WORKDIR /build
 # Whole-context copy: the workspace spans crates/* + Cargo.lock + the
 # toolchain pin (see .dockerignore for what stays out).
 COPY . .
-# Cache mounts keep incremental rebuilds fast; the finished binary is copied
-# out of the cache-mounted target dir onto the layer.
+# Cache mounts keep the cargo registry/git checkouts and the build tree warm
+# between runs; the finished binary is copied out of the cache-mounted target
+# dir onto a real layer (files written inside a cache mount do not land in
+# the image layer).
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \
     cargo build --release --locked -p auctimogger-tracker \
     && cp target/release/auctimogger-tracker /build/auctimogger-tracker
 
+# ---- runtime stage ----
 FROM debian:bookworm-slim
 # rustls ships its own root store (webpki-roots), but system CA certs are
 # installed anyway so a future native-certs flip cannot silently break TLS.
@@ -35,6 +46,9 @@ USER amtracker
 # SQLite database + raw archive live on /data, published feeds on /work/feeds
 # (named volumes inherit these directories' ownership on first use).
 VOLUME ["/data", "/work/feeds"]
+# EnvFilter falls back to "info" when unset; set explicitly for
+# discoverability (RUST_LOG always wins over the config's debug flag).
+ENV RUST_LOG=info
 
 ENTRYPOINT ["/usr/local/bin/auctimogger-tracker"]
 CMD ["serve", "--config", "/work/config.toml"]

@@ -10,3 +10,7 @@ logs
 Dockerfile
 docker-compose.yml
 config.docker.toml
+# Secrets and docs never belong in a build context (versa-bot precedent).
+.env*
+README.md
+AGENTS.md

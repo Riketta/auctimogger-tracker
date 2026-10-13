@@ -231,9 +231,10 @@ only where an index is proven in bounds.
   `config.example.toml`; tags additionally publish a GitHub release. The
   linux-gnu binary is built on `ubuntu-latest` (currently glibc 2.39) — older
   glibc hosts should use the Docker image or build from source.
-- **Docker**: multi-stage image build on every run; pushes to GHCR on real
-  pushes (`:main` from main, semver + `:latest` from `v*` tags), pull
-  requests build without publishing.
+- **Docker**: multi-stage image build, published to GHCR from main (`:main`,
+  `:sha-<8>`) and from `v*` tags (`:x.y.z`, `:x.y`, `:latest`); the job does
+  not run on pull requests. The image bundles its own glibc, so it
+  sidesteps the host-glibc caveat of the release tarball.
 
 ## Docker (demo compose)
 
