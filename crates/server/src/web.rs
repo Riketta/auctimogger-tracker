@@ -481,7 +481,17 @@ async fn item_page(
     let lookup = tokio::task::spawn_blocking(move || state2.catalog.ensure(item_id));
     let name = match lookup.await {
         Ok(Ok(record)) => record.map(|r| r.name),
-        Ok(Err(error)) => return store_error_page(error).await,
+        Ok(Err(error)) => {
+            // The name is auxiliary: a failed item-API lookup (expired
+            // token, upstream outage) must not take the whole page down
+            // while the metrics below are still renderable.
+            tracing::warn!(
+                item_id,
+                error = %error,
+                "item name lookup failed; rendering with placeholder"
+            );
+            None
+        }
         Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
     let title = html_escape(&name.unwrap_or_else(|| format!("item {item_id}")));
