@@ -60,7 +60,10 @@ id = "us-4"
 kind = "blizzard-connected-realm"
 region = "us"
 connected_realm_id = 4
-auth = { type = "bearer", env = "AMT_TOKEN" }
+# Env var NAMES, not secrets. Tokens are fetched from the Battle.net OAuth
+# endpoint and refreshed automatically ahead of expiry. A static token also
+# works: auth = { type = "bearer", env = "AMT_TOKEN" }.
+auth = { type = "client-credentials", client_id_env = "BLIZZARD_CLIENT_ID", client_secret_env = "BLIZZARD_CLIENT_SECRET" }
 poll = { commodities_secs = 3600, auctions_secs = 1800 }
 
 [[targets]]

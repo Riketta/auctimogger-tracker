@@ -99,11 +99,39 @@ pub enum TargetKind {
     },
 }
 
-/// API authentication for one target.
+/// API authentication for one target. `Bearer` suits endpoints wanting a
+/// static token (self-hosted proxies); `ClientCredentials` runs the
+/// `Battle.net` `OAuth2` client-credentials flow, with the adapter fetching and
+/// refreshing bearer tokens itself.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthConfig {
-    /// Environment variable holding the bearer token.
-    pub env: String,
+pub enum AuthConfig {
+    /// A static bearer token read from an environment variable on every
+    /// request.
+    Bearer {
+        /// Environment variable holding the bearer token.
+        env: String,
+    },
+    /// `Battle.net` `OAuth2` client credentials: the client id/secret are read
+    /// from the named environment variables and exchanged for bearer tokens
+    /// that are cached until shortly before expiry.
+    ClientCredentials {
+        /// Environment variable holding the OAuth client id.
+        client_id_env: String,
+        /// Environment variable holding the OAuth client secret.
+        client_secret_env: String,
+    },
+}
+
+impl AuthConfig {
+    /// The default credentials for Blizzard endpoints: OAuth client
+    /// credentials read from `BLIZZARD_CLIENT_ID` / `BLIZZARD_CLIENT_SECRET`.
+    #[must_use]
+    pub fn default_blizzard() -> Self {
+        Self::ClientCredentials {
+            client_id_env: "BLIZZARD_CLIENT_ID".into(),
+            client_secret_env: "BLIZZARD_CLIENT_SECRET".into(),
+        }
+    }
 }
 
 /// Poll intervals (seconds) for the two payload kinds of one target.
@@ -122,7 +150,8 @@ pub struct TargetConfig {
     pub id: TargetId,
     /// How the source endpoints are reached.
     pub kind: TargetKind,
-    /// API authentication, when the source requires a token.
+    /// API authentication, when the source requires a token. Blizzard
+    /// targets default to [`AuthConfig::default_blizzard`] when absent.
     pub auth: Option<AuthConfig>,
     /// Poll intervals for the two payload kinds.
     pub poll: PollConfig,
@@ -154,8 +183,8 @@ impl TrackerConfig {
     /// # Errors
     ///
     /// Returns a `ConfigError` when no `[[targets]]` entries exist, a target
-    /// id is empty or duplicated, a poll interval is zero, an auth env or
-    /// source URL/region is blank, `connected_realm_id` is not positive,
+    /// id is empty or duplicated, a poll interval is zero, an auth env name
+    /// or source URL/region is blank, `connected_realm_id` is not positive,
     /// `[metrics].spans` is empty, a score weight is negative/non-finite or
     /// the weights sum to zero, or `[opportunities].min_samples` is zero.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -177,9 +206,21 @@ impl TrackerConfig {
                 )));
             }
             if let Some(auth) = &target.auth {
-                if auth.env.trim().is_empty() {
+                let empty = match auth {
+                    AuthConfig::Bearer { env } if env.trim().is_empty() => {
+                        Some("auth env".to_string())
+                    }
+                    AuthConfig::ClientCredentials { client_id_env, client_secret_env }
+                        if client_id_env.trim().is_empty()
+                            || client_secret_env.trim().is_empty() =>
+                    {
+                        Some("auth client_id_env/client_secret_env".to_string())
+                    }
+                    _ => None,
+                };
+                if let Some(names) = empty {
                     return Err(ConfigError(format!(
-                        "target '{}' auth env must not be empty",
+                        "target '{}' {names} must not be empty",
                         target.id
                     )));
                 }

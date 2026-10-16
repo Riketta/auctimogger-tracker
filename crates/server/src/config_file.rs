@@ -247,10 +247,18 @@ pub struct FilePoll {
 #[derive(Deserialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub enum FileAuth {
-    /// Read the bearer token from an environment variable.
+    /// Read a static bearer token from an environment variable.
     Bearer {
         /// Name of the env var holding the token.
         env: String,
+    },
+    /// `Battle.net` `OAuth2` client credentials; the adapter fetches and
+    /// refreshes bearer tokens itself.
+    ClientCredentials {
+        /// Name of the env var holding the OAuth client id.
+        client_id_env: String,
+        /// Name of the env var holding the OAuth client secret.
+        client_secret_env: String,
     },
 }
 
@@ -282,7 +290,8 @@ pub struct FileTarget {
     /// Flattened `kind` table selecting the source type.
     #[serde(flatten)]
     pub kind: FileTargetKind,
-    /// Auth override; Blizzard targets default to the `AMT_TOKEN` env var.
+    /// Auth override; Blizzard targets default to OAuth client credentials
+    /// (`BLIZZARD_CLIENT_ID` / `BLIZZARD_CLIENT_SECRET`).
     #[serde(default)]
     pub auth: Option<FileAuth>,
     /// Poll cadence per payload kind.
@@ -324,7 +333,8 @@ fn map_loaded(file: FileConfig) -> Result<LoadedConfig, ConfigError> {
 }
 
 /// Builds the core config from the file shapes, applying the Blizzard
-/// default auth env (`AMT_TOKEN`) and parsing the configured span names.
+/// default auth (OAuth client credentials) and parsing the configured span
+/// names.
 ///
 /// # Errors
 /// Returns [`ConfigError`] when a configured span name is not one of
@@ -343,13 +353,15 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
         let auth = target
             .auth
             .map(|auth| match auth {
-                FileAuth::Bearer { env } => AuthConfig { env },
+                FileAuth::Bearer { env } => AuthConfig::Bearer { env },
+                FileAuth::ClientCredentials { client_id_env, client_secret_env } => {
+                    AuthConfig::ClientCredentials { client_id_env, client_secret_env }
+                }
             })
             .or_else(|| match &kind {
-                // Blizzard targets default to the shared token variable.
-                TargetKind::BlizzardConnectedRealm { .. } => {
-                    Some(AuthConfig { env: "AMT_TOKEN".to_string() })
-                }
+                // Blizzard targets default to the OAuth client-credential
+                // env names; static endpoints stay unauthenticated.
+                TargetKind::BlizzardConnectedRealm { .. } => Some(AuthConfig::default_blizzard()),
                 TargetKind::StaticUrls { .. } => None,
             });
         targets.push(TargetConfig {
@@ -479,7 +491,12 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
                 );
             }
             if let Some(auth) = target.get("auth").and_then(toml::Value::as_table) {
-                collect_unknown(auth, &format!("{path}.auth"), &["type", "env"], &mut unknown);
+                collect_unknown(
+                    auth,
+                    &format!("{path}.auth"),
+                    &["type", "env", "client_id_env", "client_secret_env"],
+                    &mut unknown,
+                );
             }
         }
     }

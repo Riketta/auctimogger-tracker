@@ -45,9 +45,16 @@ fn parses_the_committed_example_config() {
             panic!("expected blizzard-connected-realm, got {other:?}")
         }
     }
-    // Blizzard targets default to the shared token env when auth is implicit.
+    // The example pins the auth explicitly: OAuth client credentials with
+    // env var NAMES (never the secrets themselves).
     let auth = first.auth.as_ref().expect("blizzard default auth");
-    assert_eq!(auth.env, "AMT_TOKEN");
+    let amtracker_core::config::AuthConfig::ClientCredentials { client_id_env, client_secret_env } =
+        auth
+    else {
+        panic!("expected client-credentials auth, got {auth:?}")
+    };
+    assert_eq!(client_id_env, "BLIZZARD_CLIENT_ID");
+    assert_eq!(client_secret_env, "BLIZZARD_CLIENT_SECRET");
     assert_eq!(first.poll.commodities_secs, 3600);
     assert_eq!(first.poll.auctions_secs, 1800);
 
@@ -177,4 +184,48 @@ fn both_kind_profiles_keys_are_accepted_in_targets() {
     );
     let loaded = parse_config_str(&text).expect("known kind keys must parse");
     assert_eq!(loaded.tracker.targets.len(), 3);
+}
+
+#[test]
+fn implicit_blizzard_auth_defaults_to_client_credentials() {
+    let text = format!(
+        "{EXAMPLE}\n[[targets]]\nid = \"us-5\"\nkind = \"blizzard-connected-realm\"\
+         \nregion = \"eu\"\nconnected_realm_id = 5\
+         \npoll = {{ commodities_secs = 60, auctions_secs = 60 }}\n"
+    );
+    let loaded = parse_config_str(&text).expect("parses");
+    let auth = loaded.tracker.targets[2].auth.as_ref().expect("default auth");
+    assert_eq!(auth, &amtracker_core::config::AuthConfig::default_blizzard());
+}
+
+#[test]
+fn explicit_bearer_auth_still_parses() {
+    let text = EXAMPLE.replace(
+        "auth = { type = \"client-credentials\", client_id_env = \"BLIZZARD_CLIENT_ID\", client_secret_env = \"BLIZZARD_CLIENT_SECRET\" }",
+        "auth = { type = \"bearer\", env = \"AMT_TOKEN\" }",
+    );
+    let loaded = parse_config_str(&text).expect("bearer auth must still parse");
+    let auth = loaded.tracker.targets[0].auth.as_ref().expect("bearer auth");
+    let amtracker_core::config::AuthConfig::Bearer { env } = auth else {
+        panic!("expected bearer auth, got {auth:?}")
+    };
+    assert_eq!(env, "AMT_TOKEN");
+}
+
+#[test]
+fn unknown_auth_key_is_rejected_by_path() {
+    let text = EXAMPLE.replace(
+        "client_secret_env = \"BLIZZARD_CLIENT_SECRET\" }",
+        "client_secret = \"BLIZZARD_CLIENT_SECRET\" }",
+    );
+    let error = parse_config_str(&text).expect_err("unknown auth key must fail");
+    assert!(error.to_string().contains("targets[0].auth.client_secret"), "{error}");
+}
+
+#[test]
+fn blank_credential_env_names_are_rejected() {
+    let text = EXAMPLE
+        .replace("client_secret_env = \"BLIZZARD_CLIENT_SECRET\"", "client_secret_env = \"  \"");
+    let error = parse_config_str(&text).expect_err("blank env name must fail");
+    assert!(error.to_string().contains("must not be empty"), "{error}");
 }

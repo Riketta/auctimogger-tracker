@@ -47,6 +47,7 @@ name = "amtracker-infra"
 version = "0.1.0"
 dependencies = [
  "amtracker-core",
+ "base64 0.22.1",
  "httpdate",
  "rusqlite",
  "serde",

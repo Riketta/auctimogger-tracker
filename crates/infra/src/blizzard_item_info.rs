@@ -10,6 +10,7 @@ use std::{
 
 use amtracker_core::{
     config::{
+        AuthConfig,
         TargetKind,
         TrackerConfig,
     },
@@ -28,42 +29,56 @@ use serde::{
     Deserializer,
 };
 
+use crate::blizzard_oauth::OAuthTokenSource;
+
+/// How the item API is authenticated.
+enum Credential {
+    /// Static bearer token read from this env var on every request.
+    BearerEnv(String),
+    /// Self-refreshing OAuth client-credentials token source.
+    OAuth(std::sync::Arc<OAuthTokenSource>),
+}
+
 /// Blizzard item API (`data/wow/item/{id}`, static namespace).
 pub struct BlizzardItemInfo {
     agent: ureq::Agent,
     region: String,
     locale: String,
-    token_env: String,
+    credential: Credential,
 }
 
 impl BlizzardItemInfo {
-    /// Derives region/locale/token from the config's first Blizzard target;
-    /// falls back to `us` + `AMT_TOKEN`.
+    /// Derives region and credentials from the config's first Blizzard
+    /// target; falls back to `us` with the default Blizzard client-credential
+    /// env names.
     #[must_use]
     pub fn from_config(config: &TrackerConfig) -> Self {
-        let (region, token_env) = config
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(15))
+            .timeout(Duration::from_secs(60))
+            .build();
+        let (region, auth) = config
             .targets
             .iter()
             .find_map(|target| match &target.kind {
-                TargetKind::BlizzardConnectedRealm { region, .. } => Some((
-                    region.clone(),
-                    target
-                        .auth
-                        .as_ref()
-                        .map_or_else(|| "AMT_TOKEN".into(), |auth| auth.env.clone()),
-                )),
+                TargetKind::BlizzardConnectedRealm { region, .. } => {
+                    Some((region.clone(), target.auth.clone()))
+                }
                 TargetKind::StaticUrls { .. } => None,
             })
-            .unwrap_or_else(|| ("us".into(), "AMT_TOKEN".into()));
-        Self {
-            agent: ureq::AgentBuilder::new()
-                .timeout_connect(Duration::from_secs(15))
-                .timeout(Duration::from_secs(60))
-                .build(),
-            region,
-            locale: "en_US".into(),
-            token_env,
-        }
+            .unwrap_or_else(|| ("us".into(), None));
+        let credential = match auth.unwrap_or_else(AuthConfig::default_blizzard) {
+            AuthConfig::Bearer { env } => Credential::BearerEnv(env),
+            AuthConfig::ClientCredentials { client_id_env, client_secret_env } => {
+                Credential::OAuth(std::sync::Arc::new(OAuthTokenSource::new(
+                    agent.clone(),
+                    Some(&region),
+                    &client_id_env,
+                    &client_secret_env,
+                )))
+            }
+        };
+        Self { agent, region, locale: "en_US".into(), credential }
     }
 
     fn item_url(&self, item_id: i64) -> String {
@@ -72,6 +87,40 @@ impl BlizzardItemInfo {
             self.region, item_id, self.region, self.locale
         )
     }
+
+    /// One authorized GET; on a 401 against the OAuth credential the cached
+    /// token is dropped and the request retried once with a fresh one.
+    fn authorized_get(&self, url: &str) -> Result<ureq::Response, SourceError> {
+        let token = match &self.credential {
+            Credential::BearerEnv(env) => bearer_token(env)?,
+            Credential::OAuth(source) => source.token()?,
+        };
+        let response = self
+            .agent
+            .get(url)
+            .set("Authorization", &format!("Bearer {token}"))
+            .call()
+            .map_err(|e| SourceError::Http(e.to_string()))?;
+        if response.status() == 401 {
+            if let Credential::OAuth(source) = &self.credential {
+                source.invalidate();
+                let fresh = source.token()?;
+                return self
+                    .agent
+                    .get(url)
+                    .set("Authorization", &format!("Bearer {fresh}"))
+                    .call()
+                    .map_err(|e| SourceError::Http(e.to_string()));
+            }
+        }
+        Ok(response)
+    }
+}
+
+fn bearer_token(env: &str) -> Result<String, SourceError> {
+    std::env::var(env).map_err(|_| {
+        SourceError::Config(format!("missing environment variable {env} (bearer token)"))
+    })
 }
 
 /// A localized string on the wire. The single-item endpoint returns plain
@@ -142,18 +191,7 @@ struct WireNamed {
 
 impl ItemInfoPort for BlizzardItemInfo {
     fn describe(&self, item_id: i64) -> Result<Option<NameRecord>, SourceError> {
-        let token = std::env::var(&self.token_env).map_err(|_| {
-            SourceError::Config(format!(
-                "missing environment variable {} (bearer token)",
-                self.token_env
-            ))
-        })?;
-        let response = self
-            .agent
-            .get(&self.item_url(item_id))
-            .set("Authorization", &format!("Bearer {token}"))
-            .call()
-            .map_err(|e| SourceError::Http(e.to_string()))?;
+        let response = self.authorized_get(&self.item_url(item_id))?;
         let status = response.status();
         if status == 404 {
             return Ok(None);

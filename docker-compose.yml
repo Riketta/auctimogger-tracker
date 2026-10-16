@@ -2,10 +2,10 @@
 # ingests on cadence, applies raw-listing retention, and re-publishes
 # feed.lua / feed.json itself, so no exporter sidecar or host cron is needed.
 #
-# Edit ./config.docker.toml to choose targets; tokens come from the
-# environment (a .env file next to this file works: AMT_TOKEN=...,
-# AMT_API_TOKEN=...). Leave AMT_API_TOKEN empty to keep the mutating API
-# open (one startup warning will tell you so).
+# Edit ./config.docker.toml to choose targets; secrets come from the
+# environment (a .env file next to this file works: BLIZZARD_CLIENT_ID=...,
+# BLIZZARD_CLIENT_SECRET=..., AMT_API_TOKEN=...). Leave AMT_API_TOKEN empty
+# to keep the mutating API open (one startup warning will tell you so).
 
 services:
   tracker:
@@ -19,8 +19,9 @@ services:
       - amtracker-data:/data
       - amtracker-feeds:/work/feeds
     environment:
-      # Blizzard targets only; static-urls targets need no token.
-      AMT_TOKEN: ${AMT_TOKEN:-}
+      # Blizzard targets only; static-urls targets need no credentials.
+      BLIZZARD_CLIENT_ID: ${BLIZZARD_CLIENT_ID:-}
+      BLIZZARD_CLIENT_SECRET: ${BLIZZARD_CLIENT_SECRET:-}
       # Set this to protect the mutating API (watchlist, /api/fetch).
       AMT_API_TOKEN: ${AMT_API_TOKEN:-}
 

@@ -75,7 +75,8 @@ normal for this item, and how do I know this deal is real?"*.
 cargo build --release
 cp config.example.toml config.toml      # adjust targets + paths
 
-export AMT_TOKEN=<blizzard bearer token>            # target auth (name = your choice)
+export BLIZZARD_CLIENT_ID=<from develop.battle.net>    # target auth (name = your choice)
+export BLIZZARD_CLIENT_SECRET=<from develop.battle.net>
 export AMT_API_TOKEN=<random string>                # gates mutating API endpoints
 
 ./target/release/auctimogger-tracker config-check config.toml
@@ -124,9 +125,16 @@ id = "us-4"
 kind = "blizzard-connected-realm"     # or "static-urls"
 region = "us"
 connected_realm_id = 4
-auth = { type = "bearer", env = "AMT_TOKEN" }   # env var NAME, not the secret
+# OAuth client credentials: env var NAMES, not secrets. Bearer tokens are
+# fetched from the Battle.net OAuth endpoint and refreshed automatically
+# ahead of expiry (a rejected token triggers one refresh + retry).
+auth = { type = "client-credentials", client_id_env = "BLIZZARD_CLIENT_ID", client_secret_env = "BLIZZARD_CLIENT_SECRET" }
 poll = { commodities_secs = 3600, auctions_secs = 1800 }
 ```
+
+Blizzard targets may omit `auth` entirely — the default is exactly the block
+above. A static token is still available for endpoints that want one:
+`auth = { type = "bearer", env = "AMT_TOKEN" }`.
 
 `static-urls` targets set `commodities_url` / `auctions_url` instead and have
 optional `auth` — that is the seam a non-Blizzard server will plug into.
@@ -252,9 +260,10 @@ only where an index is proven in bounds.
 ## Docker (demo compose)
 
 The fastest path to a running tracker. You need Docker Engine with the
-compose plugin; a Blizzard bearer token (develop.battle.net) is required
-only for live `blizzard-connected-realm` targets — `static-urls` targets
-(e.g. a mainline-tracking emulator) need no secret at all.
+compose plugin; Blizzard API credentials — a client id + secret from
+<https://develop.battle.net> — are required only for live
+`blizzard-connected-realm` targets — `static-urls` targets (e.g. a
+mainline-tracking emulator) need no secret at all.
 
 ### Set up
 
@@ -263,8 +272,10 @@ git clone https://github.com/Riketta/auctimogger-tracker.git
 cd auctimogger-tracker
 
 cat > .env <<'EOF'
-# Blizzard OAuth token, used by blizzard-connected-realm targets only.
-AMT_TOKEN=
+# Blizzard OAuth client credentials, used by blizzard-connected-realm
+# targets only. Create an application at https://develop.battle.net.
+BLIZZARD_CLIENT_ID=
+BLIZZARD_CLIENT_SECRET=
 # Protects mutating endpoints (watchlist writes, /api/fetch). Any random
 # string; empty keeps them open (the server logs one warning about it).
 AMT_API_TOKEN=
@@ -290,7 +301,9 @@ commodities_url = "https://example.org/api/commodities.json"
 auctions_url = "https://example.org/api/auctions.json"
 poll = { commodities_secs = 3600, auctions_secs = 3600 }
 
-# Live Blizzard connected realm (reads AMT_TOKEN from the environment):
+# Live Blizzard connected realm (reads BLIZZARD_CLIENT_ID and
+# BLIZZARD_CLIENT_SECRET from the environment; tokens are fetched and
+# refreshed automatically):
 # [[targets]]
 # id = "us-4"
 # kind = "blizzard-connected-realm"
@@ -415,7 +428,8 @@ archive_dir = "/var/lib/auctimogger-tracker/data/raw"
 `/etc/auctimogger-tracker/env` (sourced by systemd, `KEY=value` lines):
 
 ```sh
-AMT_TOKEN=<blizzard bearer token>
+BLIZZARD_CLIENT_ID=<from develop.battle.net>
+BLIZZARD_CLIENT_SECRET=<from develop.battle.net>
 AMT_API_TOKEN=<random string for the tracker's own mutation API>
 ```
 

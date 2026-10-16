@@ -1,9 +1,10 @@
 //! Blizzard-format auction source adapter (`AuctionSourcePort`).
 //!
 //! This is the anti-corruption layer over the wire format: URL profiles,
-//! bearer auth via environment, conditional GET (`If-Modified-Since`), strict
-//! payload parsing, and the degenerate-row rules all live HERE — the core
-//! never sees vendor shapes.
+//! auth (static bearer from env, or self-refreshing OAuth client
+//! credentials), conditional GET (`If-Modified-Since`), strict payload
+//! parsing, and the degenerate-row rules all live HERE — the core never sees
+//! vendor shapes.
 //!
 //! Wire facts verified against live dumps (2026-10-12):
 //! - both endpoints use the list key `"auctions"`;
@@ -15,9 +16,16 @@
 //! - payloads can be truncated mid-transfer → strict parse or reject.
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     io::Read,
     path::Path,
+    sync::{
+        Arc,
+        Mutex,
+    },
     time::{
         Duration,
         SystemTime,
@@ -26,6 +34,7 @@ use std::{
 
 use amtracker_core::{
     config::{
+        AuthConfig,
         TargetConfig,
         TargetKind,
     },
@@ -36,12 +45,15 @@ use amtracker_core::{
         ListingKind,
         NormalizedListing,
         PayloadKind,
+        TargetId,
         TimeLeftBand,
     },
     error::SourceError,
     ports::AuctionSourcePort,
 };
 use serde::Deserialize;
+
+use crate::blizzard_oauth::OAuthTokenSource;
 
 /// Pet cage item id: listings of this item are battle pets keyed by species.
 const PET_CAGE_ITEM_ID: i64 = 82_800;
@@ -55,6 +67,10 @@ const MODIFIER_PET_SPECIES: i64 = 6;
 /// [`SourceError::Parse`], degenerate rows are dropped and counted.
 pub struct BlizzardSource {
     agent: ureq::Agent,
+    /// OAuth token sources per target, built lazily on first use from the
+    /// target's auth config (client credentials name env vars, the region
+    /// names the token endpoint host).
+    tokens: Mutex<HashMap<TargetId, Arc<OAuthTokenSource>>>,
 }
 
 impl Default for BlizzardSource {
@@ -71,7 +87,7 @@ impl BlizzardSource {
             .timeout_connect(Duration::from_secs(15))
             .timeout(Duration::from_secs(600))
             .build();
-        Self { agent }
+        Self { agent, tokens: Mutex::new(HashMap::new()) }
     }
 
     /// Build a feed fixture from a JSON file on disk (local testing against
@@ -99,13 +115,12 @@ impl BlizzardSource {
     }
 }
 
-fn bearer_token(target: &TargetConfig) -> Result<Option<String>, SourceError> {
-    match &target.auth {
-        None => Ok(None),
-        Some(auth) => std::env::var(&auth.env).map(Some).map_err(|_| {
-            SourceError::Config(format!("missing environment variable {} (bearer token)", auth.env))
-        }),
-    }
+/// Reads the static-bearer token env var; resolved per request so rotated
+/// tokens are picked up without a restart.
+fn bearer_token(env: &str) -> Result<String, SourceError> {
+    std::env::var(env).map_err(|_| {
+        SourceError::Config(format!("missing environment variable {env} (bearer token)"))
+    })
 }
 
 fn build_url(target: &TargetConfig, kind: PayloadKind) -> String {
@@ -135,17 +150,56 @@ fn build_url(target: &TargetConfig, kind: PayloadKind) -> String {
     }
 }
 
-impl AuctionSourcePort for BlizzardSource {
-    fn fetch(
+impl BlizzardSource {
+    /// Per-target OAuth token source, built on first use: the region names
+    /// the regional token endpoint host (static-urls fall back to the
+    /// global one).
+    fn oauth_source(
+        &self,
+        target: &TargetConfig,
+        client_id_env: &str,
+        client_secret_env: &str,
+    ) -> Arc<OAuthTokenSource> {
+        let mut tokens = self.tokens.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        tokens
+            .entry(target.id.clone())
+            .or_insert_with(|| {
+                let region = match &target.kind {
+                    TargetKind::BlizzardConnectedRealm { region, .. } => Some(region.as_str()),
+                    TargetKind::StaticUrls { .. } => None,
+                };
+                Arc::new(OAuthTokenSource::new(
+                    self.agent.clone(),
+                    region,
+                    client_id_env,
+                    client_secret_env,
+                ))
+            })
+            .clone()
+    }
+
+    /// Builds and sends one authenticated conditional-GET request; returns
+    /// the response plus the OAuth source when the request rode on one (the
+    /// caller needs it for the 401 refresh-retry).
+    fn send_request(
         &self,
         target: &TargetConfig,
         kind: PayloadKind,
         if_modified_since: Option<i64>,
-    ) -> Result<FetchOutcome, SourceError> {
+    ) -> Result<(ureq::Response, String, Option<Arc<OAuthTokenSource>>), SourceError> {
         let url = build_url(target, kind);
         let mut request = self.agent.get(&url);
-        if let Some(token) = bearer_token(target)? {
-            request = request.set("Authorization", &format!("Bearer {token}"));
+        let mut oauth = None;
+        match &target.auth {
+            None => {}
+            Some(AuthConfig::Bearer { env }) => {
+                request = request.set("Authorization", &format!("Bearer {}", bearer_token(env)?));
+            }
+            Some(AuthConfig::ClientCredentials { client_id_env, client_secret_env }) => {
+                let source = self.oauth_source(target, client_id_env, client_secret_env);
+                request = request.set("Authorization", &format!("Bearer {}", source.token()?));
+                oauth = Some(source);
+            }
         }
         if let Some(ims) = if_modified_since {
             // `ims.max(0)` is non-negative, so the conversion is total.
@@ -155,57 +209,88 @@ impl AuctionSourcePort for BlizzardSource {
             );
             request = request.set("If-Modified-Since", &date);
         }
-
         let response = request.call().map_err(|e| SourceError::Http(e.to_string()))?;
-        let status = response.status();
-        if status == 304 {
-            tracing::debug!(url = %url, "source returned not-modified");
-            return Ok(FetchOutcome::NotModified);
-        }
-        if status != 200 {
-            let retry_after = response.header("retry-after").map(str::to_owned);
-            tracing::warn!(
-                status = status,
-                url = %url,
-                retry_after = ?retry_after,
-                "unexpected source status"
-            );
-            return Err(SourceError::Http(match retry_after {
-                Some(after) => {
-                    format!("unexpected status {status} from {url} (retry-after: {after})")
-                }
-                None => format!("unexpected status {status} from {url}"),
-            }));
-        }
-        let source_last_modified = response
-            .header("last-modified")
-            .and_then(|value| httpdate::parse_http_date(value).ok())
-            .map(|t| {
-                // `u64` unix seconds only exceed `i64` far beyond any real
-                // date, so the conversion saturates; pre-epoch dates read 0.
-                t.duration_since(SystemTime::UNIX_EPOCH)
-                    .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-            });
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| SourceError::Http(format!("read body: {e}")))?;
-        let (listings, dropped_count) = parse_payload(kind, &bytes)?;
-        tracing::info!(
-            kind = ?kind,
-            bytes = bytes.len(),
-            listings = listings.len(),
-            dropped = dropped_count,
-            "payload fetched"
+        Ok((response, url, oauth))
+    }
+}
+
+/// Terminal status handling + strict payload parse for one response.
+fn read_payload(
+    response: ureq::Response,
+    kind: PayloadKind,
+    url: &str,
+) -> Result<FetchOutcome, SourceError> {
+    let status = response.status();
+    if status == 304 {
+        tracing::debug!(url = %url, "source returned not-modified");
+        return Ok(FetchOutcome::NotModified);
+    }
+    if status != 200 {
+        let retry_after = response.header("retry-after").map(str::to_owned);
+        tracing::warn!(
+            status = status,
+            url = %url,
+            retry_after = ?retry_after,
+            "unexpected source status"
         );
-        Ok(FetchOutcome::Payload(FetchedPayload {
-            kind,
-            source_last_modified,
-            listings,
-            dropped_count,
-            raw: bytes,
-        }))
+        return Err(SourceError::Http(match retry_after {
+            Some(after) => {
+                format!("unexpected status {status} from {url} (retry-after: {after})")
+            }
+            None => format!("unexpected status {status} from {url}"),
+        }));
+    }
+    let source_last_modified = response
+        .header("last-modified")
+        .and_then(|value| httpdate::parse_http_date(value).ok())
+        .map(|t| {
+            // `u64` unix seconds only exceed `i64` far beyond any real
+            // date, so the conversion saturates; pre-epoch dates read 0.
+            t.duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
+        });
+    let mut bytes = Vec::new();
+    response
+        .into_reader()
+        .read_to_end(&mut bytes)
+        .map_err(|e| SourceError::Http(format!("read body: {e}")))?;
+    let (listings, dropped_count) = parse_payload(kind, &bytes)?;
+    tracing::info!(
+        kind = ?kind,
+        bytes = bytes.len(),
+        listings = listings.len(),
+        dropped = dropped_count,
+        "payload fetched"
+    );
+    Ok(FetchOutcome::Payload(FetchedPayload {
+        kind,
+        source_last_modified,
+        listings,
+        dropped_count,
+        raw: bytes,
+    }))
+}
+
+impl AuctionSourcePort for BlizzardSource {
+    fn fetch(
+        &self,
+        target: &TargetConfig,
+        kind: PayloadKind,
+        if_modified_since: Option<i64>,
+    ) -> Result<FetchOutcome, SourceError> {
+        let (response, url, oauth) = self.send_request(target, kind, if_modified_since)?;
+        // A cached OAuth token can be rejected before its expiry (revoked,
+        // clock skew): drop it and retry once with a freshly fetched one.
+        // Static bearer and unauthenticated requests take the plain path.
+        if response.status() == 401 {
+            if let Some(source) = &oauth {
+                tracing::debug!(url = %url, "oauth token rejected; refreshing and retrying once");
+                source.invalidate();
+                let (response, url, _) = self.send_request(target, kind, if_modified_since)?;
+                return read_payload(response, kind, &url);
+            }
+        }
+        read_payload(response, kind, &url)
     }
 }
 
@@ -495,6 +580,26 @@ mod tests {
             auctions_url: "https://wf.example/a.json".into(),
         });
         assert_eq!(build_url(&custom, PayloadKind::Auctions), "https://wf.example/a.json");
+    }
+
+    #[test]
+    fn missing_oauth_credentials_fail_fast_before_the_request() {
+        // Unique env names: if these were ever exported the fetch would
+        // continue to a real HTTP call, so the test preconditions on absence.
+        assert!(std::env::var("AMT_TEST_MISSING_CLIENT_ID").is_err());
+        assert!(std::env::var("AMT_TEST_MISSING_CLIENT_SECRET").is_err());
+        let mut target = target(TargetKind::BlizzardConnectedRealm {
+            region: "eu".into(),
+            connected_realm_id: 609,
+        });
+        target.auth = Some(AuthConfig::ClientCredentials {
+            client_id_env: "AMT_TEST_MISSING_CLIENT_ID".into(),
+            client_secret_env: "AMT_TEST_MISSING_CLIENT_SECRET".into(),
+        });
+        let error = BlizzardSource::new()
+            .fetch(&target, PayloadKind::Commodities, None)
+            .expect_err("missing credentials must fail fast");
+        assert!(error.to_string().contains("AMT_TEST_MISSING_CLIENT_ID"), "{error}");
     }
 
     fn target(kind: TargetKind) -> TargetConfig {

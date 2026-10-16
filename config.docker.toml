@@ -41,7 +41,9 @@ commodities_url = "https://example.org/api/commodities.json"
 auctions_url = "https://example.org/api/auctions.json"
 poll = { commodities_secs = 3600, auctions_secs = 3600 }
 
-# Live Blizzard connected realm (needs AMT_TOKEN in the environment):
+# Live Blizzard connected realm (reads BLIZZARD_CLIENT_ID and
+# BLIZZARD_CLIENT_SECRET from the environment; tokens are fetched and
+# refreshed automatically):
 # [[targets]]
 # id = "us-4"
 # kind = "blizzard-connected-realm"
