@@ -4,6 +4,11 @@
 # (docker logs / compose logs capture it). Tokens come from the environment,
 # never from this file.
 
+# Louder stdout defaults for the tracker's own crates (visible via docker
+# logs / compose logs). RUST_LOG overrides this entirely, e.g.
+# RUST_LOG="info,amtracker_infra=debug". Startup-only: restart to apply.
+# debug = true
+
 [server]
 bind = "0.0.0.0:8080"
 token_env = "AMT_API_TOKEN" # unset = mutating endpoints are open; set it in compose
