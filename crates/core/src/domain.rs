@@ -459,17 +459,56 @@ pub struct NameRecord {
     pub quality: Option<String>,
 }
 
-/// Catalog search result: the item id plus display fields.
+/// Human-readable catalog record for one battle-pet species (variant-free:
+/// species identity only — level/quality/breed are per-auction attributes).
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SearchHit {
-    /// The item id of the hit.
-    pub item_id: i64,
-    /// Localized item name.
+pub struct PetNameRecord {
+    /// The pet species id the record describes.
+    pub species_id: i64,
+    /// Localized species name as reported by the pet API.
     pub name: String,
-    /// Item class label, when known.
-    pub item_class: Option<String>,
-    /// Quality label, when known.
-    pub quality: Option<String>,
+}
+
+/// Catalog search result: one named item or one named pet species.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SearchHit {
+    /// A named item (the classic catalog record).
+    Item(NameRecord),
+    /// A named battle-pet species; detail pages pick the canonical variant.
+    Pet(PetNameRecord),
+}
+
+impl SearchHit {
+    /// The display name of the hit, whatever the kind.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        match self {
+            Self::Item(record) => &record.name,
+            Self::Pet(record) => &record.name,
+        }
+    }
+}
+
+/// Keyset pagination cursor for alphabetical catalog browsing: identity of
+/// the last row of the previous page, exclusive. `kind` sorts before `id`
+/// so (name, kind, id) is a total order across item/pet rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BrowseCursor {
+    /// Name of the last row on the previous page.
+    pub name: String,
+    /// Catalog kind of that row (`"item"` or `"pet"`).
+    pub kind: String,
+    /// Item or species id of that row (the within-name tiebreaker).
+    pub id: i64,
+}
+
+/// How many named records the catalog holds, per kind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatalogCounts {
+    /// Named item records.
+    pub items: u64,
+    /// Named battle-pet species records.
+    pub pets: u64,
 }
 
 /// Watchlist insertion request; storage stamps the insertion time.

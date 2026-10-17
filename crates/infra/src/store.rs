@@ -16,6 +16,8 @@ use std::{
 use amtracker_core::{
     domain::{
         utc_day,
+        BrowseCursor,
+        CatalogCounts,
         ItemDayRow,
         ItemRef,
         MetricBlock,
@@ -24,6 +26,7 @@ use amtracker_core::{
         NewWatchlistEntry,
         NormalizedListing,
         PayloadKind,
+        PetNameRecord,
         SaleCredit,
         SearchHit,
         SnapshotMeta,
@@ -49,7 +52,9 @@ use rusqlite::Connection;
 /// Schema version of the store. Version 2 scoped sightings per payload kind
 /// (commodity and item auction ids are separate namespaces); version 1 files
 /// cannot be migrated faithfully (old rows carry no kind) and are refused.
-const SCHEMA_VERSION: i64 = 2;
+/// Version 3 added the `pet_catalog` table (a fresh `CREATE TABLE IF NOT
+/// EXISTS`, so v2 files upgrade in place without a data migration).
+const SCHEMA_VERSION: i64 = 3;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -126,6 +131,13 @@ CREATE TABLE IF NOT EXISTS item_catalog (
     fetched_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_item_catalog_name ON item_catalog(name);
+
+CREATE TABLE IF NOT EXISTS pet_catalog (
+    species_id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_pet_catalog_name ON pet_catalog(name);
 
 CREATE TABLE IF NOT EXISTS sight (
     target_id TEXT NOT NULL,
@@ -383,6 +395,59 @@ impl SnapshotRepository for SqliteStore {
             }));
         }
         Ok(None)
+    }
+
+    fn list_recent(
+        &self,
+        target: &TargetId,
+        kind: PayloadKind,
+        limit: usize,
+    ) -> Result<Vec<SnapshotMeta>, StoreError> {
+        let conn = self.open_transaction();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status
+                 FROM snapshots WHERE target_id = ?1 AND kind = ?2
+                 ORDER BY id DESC LIMIT ?3",
+            )
+            .map_err(|e| backend("prepare list_recent", e))?;
+        let mut rows = statement
+            .query(rusqlite::params![
+                target.as_str(),
+                kind.as_str(),
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ])
+            .map_err(|e| backend("query list_recent", e))?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| backend("list_recent row", e))? {
+            // Same non-negative normalization as `latest`: counts are stored
+            // as non-negative i64; corrupt values degrade to 0.
+            let entry_count =
+                u64::try_from(row.get::<_, i64>(5).map_err(|e| backend("entry_count", e))?)
+                    .unwrap_or(0);
+            let dropped_count =
+                u64::try_from(row.get::<_, i64>(6).map_err(|e| backend("dropped_count", e))?)
+                    .unwrap_or(0);
+            out.push(SnapshotMeta {
+                id: row.get(0).map_err(|e| backend("list_recent id", e))?,
+                target: TargetId(
+                    row.get::<_, String>(1).map_err(|e| backend("list_recent target", e))?,
+                ),
+                kind: parse_kind(
+                    &row.get::<_, String>(2).map_err(|e| backend("list_recent kind", e))?,
+                ),
+                fetched_at: row.get(3).map_err(|e| backend("list_recent fetched_at", e))?,
+                source_last_modified: row
+                    .get(4)
+                    .map_err(|e| backend("list_recent last_modified", e))?,
+                entry_count,
+                dropped_count,
+                status: parse_status(
+                    &row.get::<_, String>(7).map_err(|e| backend("list_recent status", e))?,
+                ),
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -1077,6 +1142,19 @@ impl ItemCatalogRepository for SqliteStore {
         Ok(())
     }
 
+    fn upsert_pets(&self, records: &[PetNameRecord]) -> Result<(), StoreError> {
+        let conn = self.open_transaction();
+        for record in records {
+            conn.execute(
+                "INSERT INTO pet_catalog (species_id, name, fetched_at) VALUES (?1, ?2, ?3)
+                 ON CONFLICT (species_id) DO UPDATE SET name = excluded.name, fetched_at = excluded.fetched_at",
+                rusqlite::params![record.species_id, record.name, self.clock.now()],
+            )
+            .map_err(|e| backend("pet catalog upsert", e))?;
+        }
+        Ok(())
+    }
+
     fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
         let conn = self.open_transaction();
         let sanitized = query.replace(['%', '_'], "");
@@ -1084,8 +1162,13 @@ impl ItemCatalogRepository for SqliteStore {
         let prefix = format!("{sanitized}%");
         let mut statement = conn
             .prepare(
-                "SELECT item_id, name, item_class, quality FROM item_catalog
-                 WHERE name LIKE ?1 COLLATE NOCASE
+                "SELECT id, name, kind, item_class, quality FROM (
+                     SELECT item_id AS id, name, 'item' AS kind, item_class, quality FROM item_catalog
+                     WHERE name LIKE ?1 COLLATE NOCASE
+                     UNION ALL
+                     SELECT species_id AS id, name, 'pet' AS kind, NULL AS item_class, NULL AS quality FROM pet_catalog
+                     WHERE name LIKE ?1 COLLATE NOCASE
+                 )
                  ORDER BY (name LIKE ?2 COLLATE NOCASE) DESC, name
                  LIMIT ?3",
             )
@@ -1095,12 +1178,7 @@ impl ItemCatalogRepository for SqliteStore {
             .map_err(|e| backend("query search", e))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|e| backend("search next", e))? {
-            out.push(SearchHit {
-                item_id: row.get(0).map_err(|e| backend("search id", e))?,
-                name: row.get(1).map_err(|e| backend("search name", e))?,
-                item_class: row.get(2).map_err(|e| backend("search class", e))?,
-                quality: row.get(3).map_err(|e| backend("search quality", e))?,
-            });
+            out.push(catalog_hit_from_row(row)?);
         }
         Ok(out)
     }
@@ -1126,6 +1204,111 @@ impl ItemCatalogRepository for SqliteStore {
                 other => Err(backend("catalog by_id", other)),
             })?;
         Ok(row)
+    }
+
+    fn pet_by_species(&self, species_id: i64) -> Result<Option<PetNameRecord>, StoreError> {
+        let conn = self.open_transaction();
+        let row = conn
+            .query_row(
+                "SELECT species_id, name FROM pet_catalog WHERE species_id = ?1",
+                rusqlite::params![species_id],
+                |row| Ok(PetNameRecord { species_id: row.get(0)?, name: row.get(1)? }),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(backend("pet catalog by_species", other)),
+            })?;
+        Ok(row)
+    }
+
+    fn browse(
+        &self,
+        after: Option<&BrowseCursor>,
+        limit: usize,
+    ) -> Result<(Vec<SearchHit>, bool), StoreError> {
+        let conn = self.open_transaction();
+        // One row more than asked: its presence is the `has_more` answer, and
+        // it is dropped before returning.
+        let fetch = i64::try_from(limit).unwrap_or(i64::MAX).saturating_add(1);
+        let mut statement = match after {
+            Some(_cursor) => conn
+                .prepare(
+                    "SELECT id, name, kind, item_class, quality FROM (
+                         SELECT name, 'item' AS kind, item_id AS id, item_class, quality FROM item_catalog
+                         UNION ALL
+                         SELECT name, 'pet' AS kind, species_id AS id, NULL AS item_class, NULL AS quality FROM pet_catalog
+                     )
+                     WHERE (name, kind, id) > (?1, ?2, ?3)
+                     ORDER BY name, kind, id
+                     LIMIT ?4",
+                )
+                .map_err(|e| backend("prepare browse", e))?,
+            None => conn
+                .prepare(
+                    "SELECT id, name, kind, item_class, quality FROM (
+                         SELECT name, 'item' AS kind, item_id AS id, item_class, quality FROM item_catalog
+                         UNION ALL
+                         SELECT name, 'pet' AS kind, species_id AS id, NULL AS item_class, NULL AS quality FROM pet_catalog
+                     )
+                     ORDER BY name, kind, id
+                     LIMIT ?1",
+                )
+                .map_err(|e| backend("prepare browse", e))?,
+        };
+        let mut rows = match after {
+            Some(cursor) => statement
+                .query(rusqlite::params![cursor.name, cursor.kind, cursor.id, fetch])
+                .map_err(|e| backend("query browse", e))?,
+            None => {
+                statement.query(rusqlite::params![fetch]).map_err(|e| backend("query browse", e))?
+            }
+        };
+        let mut out = Vec::new();
+        let mut has_more = false;
+        while let Some(row) = rows.next().map_err(|e| backend("browse next", e))? {
+            if out.len() >= limit {
+                has_more = true;
+                break;
+            }
+            out.push(catalog_hit_from_row(row)?);
+        }
+        Ok((out, has_more))
+    }
+
+    fn counts(&self) -> Result<CatalogCounts, StoreError> {
+        let conn = self.open_transaction();
+        let items: i64 = conn
+            .query_row("SELECT COUNT(*) FROM item_catalog", [], |row| row.get(0))
+            .map_err(|e| backend("catalog count items", e))?;
+        let pets: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pet_catalog", [], |row| row.get(0))
+            .map_err(|e| backend("catalog count pets", e))?;
+        Ok(CatalogCounts {
+            items: u64::try_from(items).unwrap_or(0),
+            pets: u64::try_from(pets).unwrap_or(0),
+        })
+    }
+}
+
+/// Maps one row of the unified catalog queries (`id, name, kind,
+/// item_class, quality` — column order as in `search`/`browse`) into the
+/// kind-aware hit type. Unknown kind labels fail loudly: they mean the
+/// schema and this mapper have drifted apart.
+fn catalog_hit_from_row(row: &rusqlite::Row<'_>) -> Result<SearchHit, StoreError> {
+    let kind: String = row.get(2).map_err(|e| backend("catalog hit kind", e))?;
+    match kind.as_str() {
+        "item" => Ok(SearchHit::Item(NameRecord {
+            item_id: row.get(0).map_err(|e| backend("catalog hit id", e))?,
+            name: row.get(1).map_err(|e| backend("catalog hit name", e))?,
+            item_class: row.get(3).map_err(|e| backend("catalog hit class", e))?,
+            quality: row.get(4).map_err(|e| backend("catalog hit quality", e))?,
+        })),
+        "pet" => Ok(SearchHit::Pet(PetNameRecord {
+            species_id: row.get(0).map_err(|e| backend("catalog hit id", e))?,
+            name: row.get(1).map_err(|e| backend("catalog hit name", e))?,
+        })),
+        other => Err(StoreError::Backend(format!("unknown catalog row kind '{other}'"))),
     }
 }
 

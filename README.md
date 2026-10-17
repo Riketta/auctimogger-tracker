@@ -159,19 +159,36 @@ fail loudly rather than silently disable the setting it was meant to set.
 
 ## Web UI & JSON API
 
-Pages: `/` dashboard · `/snapshots` · `/items?q=…` search ·
-`/items/{target}/{item}` detail · `/opportunities` · `/overview`.
+Pages: `/` dashboard (health cards, recent ingest cycles, auto-reload) ·
+`/snapshots` (recent snapshot history per target) · `/items?q=…` search +
+alphabetical catalog browse · `/items/{target}/{item}` item detail ·
+`/items/{target}/pet/{species}?level=&quality=&breed=` pet detail ·
+`/opportunities` (filter/sort/CSV) · `/overview` (movers with real 30-day
+sparklines) · `/watchlist` · `/help` (terminology).
+
+Every page is complete server-rendered HTML; a small embedded script
+(`app.js`) adds table sorting, search completions, the interactive price-band
+chart, and — only when the mutating API is open — watchlist/"fetch now"
+buttons. Hover or focus any dotted term (or read `/help`) for explanations of
+median, p05/p95, MAD, VWAP, sale rate, score components, and so on. A target
+switcher in the top bar works on every target-scoped page.
 
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/health` | liveness probe (uptime monitoring) |
-| `GET /api/search?q=…` | id/name search with completions |
+| `GET /api/search?q=…` | id/name search over items and pet species (kind-aware hits) |
 | `GET /api/opportunities` · `/api/overview` | ranked deals, market dynamics |
 | `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
+
+Mutation buttons are rendered only in open mode (no usable API token): with a
+token configured, the browser never holds the secret, and watchlist/fetch
+actions stay API-only. Pet names resolve through the Blizzard pet API and are
+cached permanently in a `pet_catalog` table (schema v3, upgraded in place);
+static-URL deployments without Blizzard credentials simply have unnamed pets.
 
 Opportunities and overview are served from scans the scheduler prepares in
 the background: once right after startup, after each successful ingest cycle
@@ -215,9 +232,12 @@ Hexagonal (ports & adapters), compile-enforced:
   (D13); async exists only at the HTTP edge.
 - **`crates/infra`** — driven adapters: `ureq` Blizzard source (conditional
   GET, strict parse), `rusqlite` (bundled) repositories, feed codec +
-  atomic publisher, `BlizzardItemInfo`, `SystemClock`.
-- **`crates/server`** — driving adapters: axum web + DTOs, TOML config ACL,
-  poll-loop scheduler thread.
+  atomic publisher, `BlizzardItemInfo` (item + pet name lookups),
+  `SystemClock`.
+- **`crates/server`** — driving adapters: axum web (split into `pages`,
+  `api`, `render` and embedded `assets` modules) + DTOs, TOML config ACL,
+  poll-loop scheduler thread (which also feeds the dashboard's recent-cycles
+  ring).
 - **`src/main.rs`** — composition root; the only place that names concrete
   adapter types.
 
@@ -229,12 +249,14 @@ in both repos and fail either side on drift.
 
 ```
 crates/core/     domain, ports, services (+ tests: boundary, services)
-crates/infra/    sqlite, blizzard source/item-info, feed, clock (+ tests)
-crates/server/   axum web, scheduler, config ACL (+ tests)
+crates/infra/    sqlite, blizzard source/item/pet-info, feed, clock (+ tests)
+crates/server/   axum web (pages/api/render/assets modules), scheduler, config ACL (+ tests)
+crates/server/assets/  embedded UI stylesheet + enhancement script (include_str!)
 src/main.rs      CLI + wiring
 deploy/          systemd unit
 scripts/         verify_feed.lua, install-release.sh
 fixtures/        real trimmed dumps incl. the corrupted-prefix fixture
+docs/            frontend-swap plan (future WASM UI decision doc)
 ```
 
 ### Quality gates (local CI stack)
@@ -244,7 +266,7 @@ Run all four before pushing — CI runs exactly these:
 ```sh
 cargo +nightly fmt --all -- --check      # nightly-only rustfmt.toml options
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                   # 46 specs incl. golden vectors +
+cargo test --workspace                   # 118 specs incl. golden vectors +
                                          # boundary checks; lua5.4 enables the
                                          # feed-verifier hooks (skipped if absent)
 cargo deny check                         # licenses / advisories / bans / sources

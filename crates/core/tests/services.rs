@@ -172,6 +172,16 @@ impl SnapshotRepository for FakeSnapshots {
     ) -> Result<Option<SnapshotMeta>, StoreError> {
         Ok(self.inner.lock().unwrap().latest.clone())
     }
+
+    fn list_recent(
+        &self,
+        _target: &TargetId,
+        _kind: PayloadKind,
+        limit: usize,
+    ) -> Result<Vec<SnapshotMeta>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        Ok(inner.latest.iter().take(limit).cloned().collect())
+    }
 }
 
 #[derive(Default)]

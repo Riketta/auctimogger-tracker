@@ -5,6 +5,8 @@
 use crate::{
     config::TargetConfig,
     domain::{
+        BrowseCursor,
+        CatalogCounts,
         FeedFormat,
         FeedSnapshot,
         FetchOutcome,
@@ -15,6 +17,7 @@ use crate::{
         NewWatchlistEntry,
         NormalizedListing,
         PayloadKind,
+        PetNameRecord,
         PublishedFeed,
         SearchHit,
         SnapshotMeta,
@@ -57,7 +60,7 @@ pub trait AuctionSourcePort: Send + Sync {
     ) -> Result<FetchOutcome, SourceError>;
 }
 
-/// Outbound: item name/class/quality lookups (cache-aside handled by callers).
+/// Outbound: item/pet name lookups (cache-aside handled by callers).
 pub trait ItemInfoPort: Send + Sync {
     /// Looks up one item in the source item API; `None` when the item does
     /// not exist there.
@@ -67,6 +70,14 @@ pub trait ItemInfoPort: Send + Sync {
     /// Returns `SourceError::Http` on transport failures and
     /// `SourceError::Parse` when the response cannot be decoded.
     fn describe(&self, item_id: i64) -> Result<Option<NameRecord>, SourceError>;
+    /// Looks up one battle-pet species in the source pet API; `None` when
+    /// the species does not exist there.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SourceError::Http` on transport failures and
+    /// `SourceError::Parse` when the response cannot be decoded.
+    fn describe_pet(&self, species_id: i64) -> Result<Option<PetNameRecord>, SourceError>;
 }
 
 /// Outbound: snapshot metadata, raw payload archival, and the raw listing
@@ -95,6 +106,18 @@ pub trait SnapshotRepository: Send + Sync {
         target: &TargetId,
         kind: PayloadKind,
     ) -> Result<Option<SnapshotMeta>, StoreError>;
+    /// The `limit` newest snapshots for a target/kind, newest first (the
+    /// snapshot browser's history view).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the metadata cannot be read.
+    fn list_recent(
+        &self,
+        target: &TargetId,
+        kind: PayloadKind,
+        limit: usize,
+    ) -> Result<Vec<SnapshotMeta>, StoreError>;
 }
 
 /// Outbound: per-day unique-auction fold state (the long-term memory).
@@ -290,7 +313,7 @@ pub trait MetricsCacheRepository: Send + Sync {
     fn invalidate(&self, target: &TargetId) -> Result<(), StoreError>;
 }
 
-/// Outbound: item name/class/quality catalog backing search + completions.
+/// Outbound: item/pet name catalog backing search + completions + browsing.
 pub trait ItemCatalogRepository: Send + Sync {
     /// Inserts or updates the given catalog records.
     ///
@@ -298,7 +321,14 @@ pub trait ItemCatalogRepository: Send + Sync {
     ///
     /// Returns `StoreError::Backend` when records cannot be written.
     fn upsert(&self, records: &[NameRecord]) -> Result<(), StoreError>;
-    /// Substring search over known names, at most `limit` hits.
+    /// Inserts or updates the given pet-species records.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when records cannot be written.
+    fn upsert_pets(&self, records: &[PetNameRecord]) -> Result<(), StoreError>;
+    /// Kind-aware substring search over known names, at most `limit` hits
+    /// (prefix matches first, then alphabetical).
     ///
     /// # Errors
     ///
@@ -310,6 +340,30 @@ pub trait ItemCatalogRepository: Send + Sync {
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
     fn by_id(&self, item_id: i64) -> Result<Option<NameRecord>, StoreError>;
+    /// The catalog record for one pet species id, if known.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    fn pet_by_species(&self, species_id: i64) -> Result<Option<PetNameRecord>, StoreError>;
+    /// Alphabetical catalog browsing, keyset-paginated: rows strictly after
+    /// the `after` cursor (name, kind, id — `None` = from the top), at most
+    /// `limit` rows. `has_more` tells the UI whether a next page exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    fn browse(
+        &self,
+        after: Option<&BrowseCursor>,
+        limit: usize,
+    ) -> Result<(Vec<SearchHit>, bool), StoreError>;
+    /// How many named records the catalog holds, per kind (dashboard KPIs).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    fn counts(&self) -> Result<CatalogCounts, StoreError>;
 }
 
 /// Outbound: watchlist persistence (`Conflict` on duplicates).

@@ -13,7 +13,10 @@ use amtracker_core::{
         TargetKind,
         TrackerConfig,
     },
-    domain::NameRecord,
+    domain::{
+        NameRecord,
+        PetNameRecord,
+    },
     error::SourceError,
     ports::ItemInfoPort,
 };
@@ -120,6 +123,13 @@ impl BlizzardItemInfo {
         )
     }
 
+    fn pet_url(&self, species_id: i64) -> String {
+        format!(
+            "https://{}.api.blizzard.com/data/wow/pet/{}?namespace=static-{}&locale={}",
+            self.region, species_id, self.region, self.locale
+        )
+    }
+
     /// One authorized GET through the 401 refresh-retry helper: a 401 on the
     /// OAuth credential drops the cached token and retries once with a fresh
     /// one; anything else surfaces as a terminal [`SourceError`].
@@ -207,6 +217,12 @@ struct WireItem {
 }
 
 #[derive(Deserialize)]
+struct WirePet {
+    #[serde(default)]
+    name: Option<WireLocalized>,
+}
+
+#[derive(Deserialize)]
 struct WireNamed {
     #[serde(default)]
     name: Option<WireLocalized>,
@@ -229,6 +245,23 @@ impl ItemInfoPort for BlizzardItemInfo {
         )?;
         parse_item(item_id, &bytes)
     }
+
+    fn describe_pet(&self, species_id: i64) -> Result<Option<PetNameRecord>, SourceError> {
+        let response = self.authorized_get(&self.pet_url(species_id))?;
+        let status = response.status();
+        if status == 404 {
+            return Ok(None);
+        }
+        if status != 200 {
+            return Err(SourceError::Http(format!("pet api status {status}")));
+        }
+        let bytes = crate::blizzard_source::read_capped(
+            response.into_reader(),
+            MAX_ITEM_INFO_BYTES,
+            "pet body",
+        )?;
+        parse_pet(species_id, &bytes)
+    }
 }
 
 /// Decodes one item-API payload into a [`NameRecord`]. Kept separate from the
@@ -246,6 +279,18 @@ fn parse_item(item_id: i64, bytes: &[u8]) -> Result<Option<NameRecord>, SourceEr
         item_class: wire.item_class.and_then(|c| c.name.and_then(|n| n.en_us)),
         quality: wire.quality.and_then(|q| q.name.and_then(|n| n.en_us)),
     }))
+}
+
+/// Decodes one pet-API payload into a [`PetNameRecord`] (same wire name
+/// shapes as the item endpoint: plain string or locale-keyed map).
+fn parse_pet(species_id: i64, bytes: &[u8]) -> Result<Option<PetNameRecord>, SourceError> {
+    let wire: WirePet = serde_json::from_slice(bytes)
+        .map_err(|e| SourceError::Parse(format!("pet payload: {e}")))?;
+    let name = wire
+        .name
+        .and_then(|n| n.en_us)
+        .ok_or_else(|| SourceError::Parse(format!("pet {species_id} has no name")))?;
+    Ok(Some(PetNameRecord { species_id, name }))
 }
 
 #[cfg(test)]
@@ -303,5 +348,34 @@ mod tests {
         let payload = br#"{"id": 2589, "name": 42}"#;
         let error = parse_item(2589, payload).expect_err("name is a number");
         assert!(error.to_string().contains("item payload"));
+    }
+
+    #[test]
+    fn plain_string_pet_names_decode() {
+        // Real shape of `GET /data/wow/pet/{species}?locale=en_US`.
+        let payload = br#"{
+            "_links": {"self": {"href": "https://us.api.blizzard.com/data/wow/pet/264?namespace=static-us"}},
+            "id": 264,
+            "name": "Mechanical Squirrel Box",
+            "battle_pet_type": {"type": "MECHANICAL", "name": {"en_US": "Mechanical"}},
+            "creature": {"key": {"href": "https://us.api.blizzard.com/data/wow/creature/6227"}, "name": "Mechanical Squirrel", "id": 6227}
+        }"#;
+        let record = parse_pet(264, payload).expect("parses").expect("named");
+        assert_eq!(record.species_id, 264);
+        assert_eq!(record.name, "Mechanical Squirrel Box");
+    }
+
+    #[test]
+    fn locale_map_pet_names_still_decode() {
+        let payload = br#"{"id": 264, "name": {"en_US": "Mechanical Squirrel Box"}}"#;
+        let record = parse_pet(264, payload).expect("parses").expect("named");
+        assert_eq!(record.name, "Mechanical Squirrel Box");
+    }
+
+    #[test]
+    fn pet_missing_name_is_a_parse_error() {
+        let payload = br#"{"id": 264}"#;
+        let error = parse_pet(264, payload).expect_err("no name");
+        assert!(error.to_string().contains("has no name"));
     }
 }

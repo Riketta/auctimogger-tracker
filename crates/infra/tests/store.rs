@@ -1,8 +1,9 @@
 //! SQLite repository integration tests: atomic snapshot+listing records,
 //! fold round-trips through the serialization mirror, retention pruning.
 
-// Test assertions may unwrap: fixture-driven, deterministic inputs.
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+// Test assertions may unwrap/expect/panic and index: fixture-driven,
+// deterministic inputs (the SecOutfall precedent).
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::{
     path::PathBuf,
@@ -624,6 +625,151 @@ fn metrics_cache_round_trips_and_invalidates() {
 
     store.invalidate(&target).expect("invalidate");
     assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `list_recent` returns the newest-first snapshot history, bounded by the
+/// limit, and stays scoped to one target/kind.
+#[test]
+fn list_recent_returns_newest_first_bounded_and_scoped() {
+    let dir = temp_dir("snapshots-recent");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let other = TargetId("eu-1".into());
+
+    for i in 0..5_i64 {
+        store
+            .record(
+                &NewSnapshot {
+                    target: target.clone(),
+                    kind: PayloadKind::Commodities,
+                    fetched_at: 1_000_000 + i,
+                    source_last_modified: Some(900_000 + i),
+                    entry_count: 100 + u64::try_from(i).unwrap_or(0),
+                    dropped_count: 0,
+                    status: SnapshotStatus::Ok,
+                },
+                &[],
+                br"[]",
+            )
+            .expect("record");
+    }
+    // Noise in other namespaces must never leak into the history.
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Auctions,
+                fetched_at: 1_000_009,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            br"[]",
+        )
+        .expect("record");
+    store
+        .record(
+            &NewSnapshot {
+                target: other,
+                kind: PayloadKind::Commodities,
+                fetched_at: 1_000_009,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            br"[]",
+        )
+        .expect("record");
+
+    let recent = store.list_recent(&target, PayloadKind::Commodities, 3).expect("list_recent");
+    assert_eq!(recent.len(), 3, "limit is respected");
+    assert_eq!(recent.first().map(|meta| meta.fetched_at), Some(1_000_004), "newest first");
+    assert_eq!(recent.get(2).map(|meta| meta.fetched_at), Some(1_000_002), "bounded window");
+    assert!(recent.iter().all(|meta| meta.kind == PayloadKind::Commodities));
+
+    let all = store.list_recent(&target, PayloadKind::Commodities, 100).expect("list_recent");
+    assert_eq!(all.len(), 5, "all five commodity snapshots are retained");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Pet catalog records round-trip, and the unified search/browse surfaces
+/// mix items and pets with correct kinds and ordering.
+#[test]
+fn pet_catalog_round_trips_through_search_browse_and_counts() {
+    use amtracker_core::{
+        domain::{
+            BrowseCursor,
+            CatalogCounts,
+            NameRecord,
+            PetNameRecord,
+            SearchHit,
+        },
+        ports::ItemCatalogRepository,
+    };
+
+    let dir = temp_dir("pet-catalog");
+    let store = open_store(&dir, 1_000_000);
+
+    store
+        .upsert(&[NameRecord {
+            item_id: 2589,
+            name: "Linen Cloth".into(),
+            item_class: Some("Cloth".into()),
+            quality: Some("Common".into()),
+        }])
+        .expect("upsert item");
+    store
+        .upsert_pets(&[
+            PetNameRecord { species_id: 264, name: "Mechanical Squirrel Box".into() },
+            PetNameRecord { species_id: 42, name: "Linen-labeled Pet".into() },
+        ])
+        .expect("upsert pets");
+
+    // by-species reads.
+    let pet = store.pet_by_species(264).expect("by_species").expect("named");
+    assert_eq!(pet.name, "Mechanical Squirrel Box");
+    assert!(store.pet_by_species(999_999).expect("by_species").is_none());
+
+    // Kind-aware search: both pets share the substring with the item.
+    let hits = store.search("linen", 10).expect("search");
+    assert_eq!(hits.len(), 2, "item hit plus pet hit");
+    assert!(hits
+        .iter()
+        .any(|hit| matches!(hit, SearchHit::Item(record) if record.item_id == 2589)));
+    assert!(hits
+        .iter()
+        .any(|hit| matches!(hit, SearchHit::Pet(record) if record.species_id == 42)));
+    let pet_hits = store.search("squirrel", 10).expect("search");
+    assert_eq!(pet_hits.len(), 1, "pets are searchable by name");
+    assert!(matches!(pet_hits[0], SearchHit::Pet(ref record) if record.species_id == 264));
+
+    // Alphabetical browse across both kinds, keyset-paginated.
+    let (page1, has_more) = store.browse(None, 2).expect("browse");
+    assert_eq!(page1.len(), 2);
+    assert!(has_more, "a next page exists");
+    assert_eq!(page1[0].name(), "Linen Cloth", "ties break item before pet");
+    assert_eq!(page1[1].name(), "Linen-labeled Pet");
+
+    let last = match &page1[1] {
+        SearchHit::Pet(record) => {
+            BrowseCursor { name: record.name.clone(), kind: "pet".into(), id: record.species_id }
+        }
+        other @ SearchHit::Item(_) => panic!("expected pet hit, got {other:?}"),
+    };
+    let (page2, has_more) = store.browse(Some(&last), 2).expect("browse");
+    assert_eq!(page2.len(), 1);
+    assert!(!has_more, "end of catalog");
+    assert_eq!(page2[0].name(), "Mechanical Squirrel Box");
+
+    let counts = store.counts().expect("counts");
+    assert_eq!(counts, CatalogCounts { items: 1, pets: 2 }, "per-kind totals");
 
     std::fs::remove_dir_all(&dir).ok();
 }

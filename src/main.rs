@@ -210,9 +210,12 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
             clock.clone(),
         )),
         history: store.clone(),
+        snapshots: store.clone(),
         item_info,
         // One lock serializes scheduled and manual (`/api/fetch`) cycles.
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
+        // Dashboard-visible ingest history (bounded ring).
+        recent_cycles: Arc::new(amtracker_server::web::RecentCycles::new(24)),
     });
 
     if let Err(error) = amtracker_server::scheduler::spawn(state.clone()) {

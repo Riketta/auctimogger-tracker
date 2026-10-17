@@ -101,58 +101,7 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
                     if !due {
                         continue;
                     }
-                    match panic::catch_unwind(AssertUnwindSafe(|| {
-                        // Manual `/api/fetch` cycles take the same lock, so
-                        // two observe/close_missing sequences never interleave.
-                        let _guard =
-                            state.cycle_lock.lock().unwrap_or_else(PoisonError::into_inner);
-                        state.cycle.run_cycle(target, kind)
-                    })) {
-                        Ok(Ok(report)) => {
-                            if report.outcome
-                                == amtracker_core::services::cycle::CycleOutcome::Empty
-                            {
-                                tracing::warn!(
-                                    target = %report.target.0,
-                                    kind = kind.as_str(),
-                                    "ingest cycle returned an empty payload; \
-                                     fold/sighting stages were skipped"
-                                );
-                            }
-                            tracing::info!(
-                                target = %report.target.0,
-                                kind = kind.as_str(),
-                                outcome = ?report.outcome,
-                                entries = report.entries,
-                                dropped = report.dropped,
-                                folds = report.items_folded,
-                                sale_credits = report.sale_credits,
-                                "ingest cycle complete"
-                            );
-                            survive("after-cycle", &target.id.0, || {
-                                after_cycle(&state, &config, &timers, &target.id.0);
-                            });
-                        }
-                        Ok(Err(error)) => tracing::warn!(
-                            target = %target.id.0,
-                            kind = kind.as_str(),
-                            error = %error,
-                            "ingest cycle failed"
-                        ),
-                        Err(panic_payload) => {
-                            // The panic hook already logged the detail; this
-                            // record ties the panic to the target/kind. The
-                            // `last_run` insert below still runs, so the
-                            // panicking cycle retries on the next interval
-                            // instead of hot-looping.
-                            tracing::error!(
-                                target = %target.id.0,
-                                kind = kind.as_str(),
-                                panic = panic_message(&panic_payload),
-                                "ingest cycle panicked; continuing"
-                            );
-                        }
-                    }
+                    run_cycle_logged(&state, &config, &timers, target, kind);
                     timers
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
@@ -178,6 +127,110 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
             thread::sleep(TICK);
         }
     })
+}
+
+/// Runs one due ingest cycle under `catch_unwind`, logging the outcome and
+/// recording it in the dashboard's recent-cycles ring, then triggers the
+/// post-cycle side effects on success. Panics never kill the scheduler:
+/// the panic hook logs the detail, the ring shows it on the dashboard, and
+/// the next interval retries (the caller still stamps the run timer).
+fn run_cycle_logged(
+    state: &Arc<AppState>,
+    config: &amtracker_core::config::TrackerConfig,
+    timers: &Mutex<TargetTimers>,
+    target: &amtracker_core::config::TargetConfig,
+    kind: PayloadKind,
+) {
+    let run = panic::catch_unwind(AssertUnwindSafe(|| {
+        // Manual `/api/fetch` cycles take the same lock, so two
+        // observe/close_missing sequences never interleave.
+        let _guard = state.cycle_lock.lock().unwrap_or_else(PoisonError::into_inner);
+        state.cycle.run_cycle(target, kind)
+    }));
+    match run {
+        Ok(Ok(report)) => {
+            let outcome_label = match report.outcome {
+                amtracker_core::services::cycle::CycleOutcome::Empty => {
+                    tracing::warn!(
+                        target = %report.target.0,
+                        kind = kind.as_str(),
+                        "ingest cycle returned an empty payload; \
+                         fold/sighting stages were skipped"
+                    );
+                    "empty"
+                }
+                amtracker_core::services::cycle::CycleOutcome::Fetched => "fresh",
+                amtracker_core::services::cycle::CycleOutcome::NotModified => "not-modified",
+            };
+            tracing::info!(
+                target = %report.target.0,
+                kind = kind.as_str(),
+                outcome = ?report.outcome,
+                entries = report.entries,
+                dropped = report.dropped,
+                folds = report.items_folded,
+                sale_credits = report.sale_credits,
+                "ingest cycle complete"
+            );
+            state.recent_cycles.push(crate::web::CycleRecord {
+                at: state.clock.now(),
+                target: report.target.0.clone(),
+                kind: kind.as_str().to_string(),
+                outcome: outcome_label.to_string(),
+                entries: report.entries,
+                dropped: report.dropped,
+                folds: report.items_folded,
+                credits: report.sale_credits,
+                error: None,
+            });
+            survive("after-cycle", &target.id.0, || {
+                after_cycle(state, config, timers, &target.id.0);
+            });
+        }
+        Ok(Err(error)) => {
+            tracing::warn!(
+                target = %target.id.0,
+                kind = kind.as_str(),
+                error = %error,
+                "ingest cycle failed"
+            );
+            state.recent_cycles.push(crate::web::CycleRecord {
+                at: state.clock.now(),
+                target: target.id.0.clone(),
+                kind: kind.as_str().to_string(),
+                outcome: "failed".to_string(),
+                entries: 0,
+                dropped: 0,
+                folds: 0,
+                credits: 0,
+                error: Some(error.to_string()),
+            });
+        }
+        Err(panic_payload) => {
+            // The panic hook already logged the detail; this record ties the
+            // panic to the target/kind. The caller's `last_run` insert still
+            // runs, so the panicking cycle retries on the next interval
+            // instead of hot-looping.
+            let message = panic_message(&panic_payload);
+            tracing::error!(
+                target = %target.id.0,
+                kind = kind.as_str(),
+                panic = %message,
+                "ingest cycle panicked; continuing"
+            );
+            state.recent_cycles.push(crate::web::CycleRecord {
+                at: state.clock.now(),
+                target: target.id.0.clone(),
+                kind: kind.as_str().to_string(),
+                outcome: "panicked".to_string(),
+                entries: 0,
+                dropped: 0,
+                folds: 0,
+                credits: 0,
+                error: Some(message),
+            });
+        }
+    }
 }
 
 /// Operational side effects after a successful cycle for one target:
