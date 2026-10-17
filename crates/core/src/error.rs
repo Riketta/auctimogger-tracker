@@ -20,6 +20,13 @@ impl std::error::Error for ConfigError {}
 pub enum SourceError {
     /// The HTTP transport failed (non-success status, connection or timeout).
     Http(String),
+    /// The source rate-limited the request (HTTP 429). `retry_after` carries
+    /// the endpoint's `Retry-After` hint in seconds when it sent one; the
+    /// scheduler backs off until then instead of hot-retrying.
+    RateLimited {
+        /// `Retry-After` seconds, when the source sent a parseable one.
+        retry_after: Option<u64>,
+    },
     /// The payload could not be parsed into the normalized listing shape.
     Parse(String),
     /// The source cannot be reached with the given configuration (e.g. a
@@ -31,6 +38,12 @@ impl fmt::Display for SourceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SourceError::Http(m) => write!(f, "source http error: {m}"),
+            SourceError::RateLimited { retry_after: Some(secs) } => {
+                write!(f, "source rate-limited (retry after {secs}s)")
+            }
+            SourceError::RateLimited { retry_after: None } => {
+                write!(f, "source rate-limited (no retry-after hint)")
+            }
             SourceError::Parse(m) => write!(f, "source payload parse error: {m}"),
             SourceError::Config(m) => write!(f, "source configuration error: {m}"),
         }

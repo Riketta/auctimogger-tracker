@@ -310,6 +310,13 @@ fn read_payload(
             retry_after = ?retry_after,
             "unexpected source status"
         );
+        // 429 is not terminal the way other 4xx are: the scheduler backs off
+        // for the hinted window instead of retrying on the next interval.
+        if status == 429 {
+            return Err(SourceError::RateLimited {
+                retry_after: retry_after.as_deref().and_then(|v| v.trim().parse().ok()),
+            });
+        }
         return Err(SourceError::Http(match retry_after {
             Some(after) => {
                 format!("unexpected status {status} from {url} (retry-after: {after})")
@@ -642,6 +649,19 @@ mod tests {
         let error = read_payload(response, PayloadKind::Commodities, "https://source.example/c")
             .expect_err("503 must fail");
         assert!(error.to_string().contains("unexpected status 503"), "{error}");
+    }
+
+    #[test]
+    fn a_429_answer_is_a_rate_limit_not_a_terminal_error() {
+        let response =
+            ureq::Response::new(429, "Too Many Requests", "slow down").expect("synthetic");
+        let error = read_payload(response, PayloadKind::Commodities, "https://source.example/c")
+            .expect_err("429 must fail");
+        assert!(
+            matches!(error, SourceError::RateLimited { retry_after: None }),
+            "429 maps to the rate-limit variant: {error:?}"
+        );
+        assert!(error.to_string().contains("rate-limited"), "{error}");
     }
 
     #[test]

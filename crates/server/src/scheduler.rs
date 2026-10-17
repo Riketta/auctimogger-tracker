@@ -49,6 +49,10 @@ use crate::web::AppState;
 /// How often the loop wakes up to check whether a cycle is due.
 const TICK: Duration = Duration::from_secs(30);
 
+/// Backoff applied to a rate-limited (target, kind) when the source sent no
+/// parseable `Retry-After` hint.
+const DEFAULT_BACKOFF_SECS: u64 = 60;
+
 /// Store-wide online-backup hook: writes a consistent copy of the database to
 /// the given path. Injected by the composition root (which owns the concrete
 /// store) so the scheduler — and this crate — never needs the adapter type.
@@ -60,6 +64,20 @@ struct TargetTimers {
     cycle_run: HashMap<(String, PayloadKind), Instant>,
     prune_day: HashMap<String, i64>,
     feed_publish: HashMap<String, Instant>,
+    /// Until when a (target, kind) is rate-limit-backed off (skipped entirely).
+    backoff_until: HashMap<(String, PayloadKind), Instant>,
+}
+
+/// Deterministic boot jitter for one (target, kind): a stable FNV-1a hash of
+/// the key scaled into `[0, interval)` so many targets never stampede the
+/// source at startup — the same spread persists across restarts.
+fn boot_jitter(key: &(String, PayloadKind), interval: u64) -> Duration {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in key.0.as_bytes().iter().chain(key.1.as_str().as_bytes()) {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Duration::from_secs(hash % interval.max(1))
 }
 
 /// Spawns the background poll loop: ingestion cycles for every configured
@@ -97,6 +115,29 @@ pub fn spawn(
         // lock can only come from a panic inside this very loop; recover
         // the guard instead of panicking on poison.
         let timers = Mutex::new(TargetTimers::default());
+        // Stagger the first fire of every (target, kind) across its own
+        // interval: without this, startup fires all targets back-to-back.
+        {
+            let mut timers = timers.lock().unwrap_or_else(PoisonError::into_inner);
+            for target in &config.targets {
+                for (kind, interval) in [
+                    (PayloadKind::Commodities, target.poll.commodities_secs),
+                    (PayloadKind::Auctions, target.poll.auctions_secs),
+                ] {
+                    let key = (target.id.0.clone(), kind);
+                    let offset = boot_jitter(&key, interval);
+                    // Stamp "last run" so the first due lands after `offset`:
+                    // elapsed is (interval - offset) now and grows. The checked
+                    // subtraction cannot underflow (offset < interval), but a
+                    // fallback of "due now" stays correct anyway.
+                    let seeded = (Instant::now() + offset)
+                        .checked_sub(Duration::from_secs(interval))
+                        .unwrap_or_else(Instant::now);
+                    timers.cycle_run.insert(key.clone(), seeded);
+                    timers.backoff_until.remove(&key);
+                }
+            }
+        }
         let mut last_backup: Option<Instant> = None;
         loop {
             for target in &config.targets {
@@ -105,17 +146,22 @@ pub fn spawn(
                     (PayloadKind::Auctions, target.poll.auctions_secs),
                 ] {
                     let key = (target.id.0.clone(), kind);
-                    let due = match timers
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .cycle_run
-                        .get(&key)
                     {
-                        Some(last) => last.elapsed().as_secs() >= interval,
-                        None => true,
-                    };
-                    if !due {
-                        continue;
+                        let locked = timers.lock().unwrap_or_else(PoisonError::into_inner);
+                        if locked
+                            .backoff_until
+                            .get(&key)
+                            .is_some_and(|until| Instant::now() < *until)
+                        {
+                            continue;
+                        }
+                        let due = match locked.cycle_run.get(&key) {
+                            Some(last) => last.elapsed().as_secs() >= interval,
+                            None => true,
+                        };
+                        if !due {
+                            continue;
+                        }
                     }
                     run_cycle_logged(&state, &config, &timers, target, kind);
                     timers
@@ -295,6 +341,19 @@ fn run_cycle_logged(
             });
         }
         Ok(Err(error)) => {
+            // Rate limiting is transient and self-describing: park the
+            // (target, kind) until the hinted moment (or a conservative
+            // default) instead of retrying on the regular interval.
+            if let amtracker_core::error::CycleError::Source(
+                amtracker_core::error::SourceError::RateLimited { retry_after },
+            ) = &error
+            {
+                let secs = retry_after.unwrap_or(DEFAULT_BACKOFF_SECS);
+                timers.lock().unwrap_or_else(PoisonError::into_inner).backoff_until.insert(
+                    (target.id.0.clone(), kind),
+                    Instant::now() + Duration::from_secs(secs),
+                );
+            }
             tracing::warn!(
                 target = %target.id.0,
                 kind = kind.as_str(),
