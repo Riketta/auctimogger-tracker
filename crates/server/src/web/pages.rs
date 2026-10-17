@@ -73,6 +73,8 @@ type ItemPageData = (
     Vec<(Span, Option<MetricBlock>)>,
     Vec<serde_json::Value>,
     std::collections::BTreeMap<i64, amtracker_core::domain::PriceBucket>,
+    // Same identity on the other configured targets: (target, d7 block).
+    Vec<(TargetId, Option<MetricBlock>)>,
 );
 
 /// Watchlist membership key: kind-prefixed identity string, so items and
@@ -753,10 +755,17 @@ async fn item_detail_page(
             for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
                 blocks.push((span, state.metrics.block(&target, &item, span)?));
             }
-            Ok((rows, blocks, chart_rows, distribution))
+            // Cross-target comparison: the same identity on every other
+            // configured target (cached d7 blocks — cheap by construction).
+            let mut peers = Vec::new();
+            for other in state.config.targets.iter().filter(|t| t.id != target) {
+                let block = state.metrics.block(&other.id, &item, Span::D7)?;
+                peers.push((other.id.clone(), block));
+            }
+            Ok((rows, blocks, chart_rows, distribution, peers))
         }
     });
-    let (rows, blocks, mut chart_rows, distribution) = match page_data.await {
+    let (rows, blocks, mut chart_rows, distribution, peers) = match page_data.await {
         Ok(Ok(data)) => data,
         Ok(Err(error)) => return render::store_error_page(error).await,
         Err(error) => {
@@ -817,6 +826,74 @@ async fn item_detail_page(
             "<h2>{} today</h2><div class=\"chart-card\">{}</div>",
             tip("price distribution", "Unique auctions folded so far today, bucketed by unit price. Bar height = number of listings at that price; hover a bar for details."),
             distribution_svg(&distribution)
+        );
+    }
+
+    // Cross-target comparison: the same identity on every other configured
+    // target, from cached d7 blocks. Commodities rows are region-global, so
+    // same-region spreads there are expected to be ~zero — the note says so.
+    if !peers.is_empty() {
+        body.push_str(
+            "<h2>across targets</h2><div class=\"scroll-x\"><table id=\"peers\"><thead><tr>",
+        );
+        for (label, tip_text) in [
+            ("target", "Another configured market serving this identity."),
+            ("median d7", "7-day median unit price on that target."),
+            ("floor d7", "7-day p05 (deal floor) on that target."),
+            (
+                "Δ vs this",
+                "How that target's median compares to this one: negative = cheaper there.",
+            ),
+            ("sale rate 14d", "Sell-through on that target."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        // Display-only percentage math in f64 (rendering, not decisions).
+        #[allow(clippy::cast_precision_loss)]
+        let delta_pct =
+            |other: i64, mine: i64| -> f64 { (other - mine) as f64 / mine as f64 * 100.0 };
+        let here = blocks.iter().find(|(span, _)| *span == Span::D7).and_then(|(_, b)| b.as_ref());
+        for (peer_target, block) in &peers {
+            let Some(block) = block else {
+                let _ = write!(
+                    body,
+                    "<tr><td>{}</td><td class=\"muted\" colspan=\"4\">no data in the last 7 days</td></tr>",
+                    html_escape(peer_target.as_str())
+                );
+                continue;
+            };
+            let delta = match here {
+                Some(here) if here.median > 0 => format!(
+                    "<span class=\"num\" data-v=\"{:.1}\">{:+.1}%</span>",
+                    delta_pct(block.median, here.median),
+                    delta_pct(block.median, here.median)
+                ),
+                _ => "—".to_string(),
+            };
+            let _ = write!(
+                body,
+                "<tr><td><a href=\"/items/{}/{}\">{}</a></td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td>{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td></tr>",
+                html_escape(peer_target.as_str()),
+                peer_item_path(&item),
+                html_escape(peer_target.as_str()),
+                block.median,
+                money(block.median),
+                block.p05,
+                money(block.p05),
+                delta,
+                block.sale_rate.map_or(String::new(), |r| format!("{r:.4}")),
+                block.sale_rate.map_or("—".to_string(), |r| format!("{:.0}%", r * 100.0)),
+            );
+        }
+        body.push_str(
+            "</tbody></table></div><p class=\"muted\">commodity rows are region-global — \
+             same-region spreads there are expected to be ~zero; the signal lives in \
+             pets and gear (the auctions payload).</p>",
         );
     }
 
@@ -1488,6 +1565,17 @@ fn alert_remove_button(open: bool, rule_id: i64) -> String {
         "<button class=\"btn btn-sm btn-danger\" data-alert-remove='{rule_id}' \
          title=\"remove this rule (its history stays)\">remove</button>"
     )
+}
+
+/// Path segment under `/items/{target}` for an identity, mirroring
+/// `render::item_link`'s scheme (items by id, pets by query-carried tuple).
+fn peer_item_path(item: &ItemRef) -> String {
+    match item {
+        ItemRef::Item { item_id } => format!("/{item_id}"),
+        ItemRef::Pet { species, level, quality, breed } => {
+            format!("/pet/{species}?level={level}&quality={quality}&breed={breed}")
+        }
+    }
 }
 
 // -------------------------------------------------------------------- help
