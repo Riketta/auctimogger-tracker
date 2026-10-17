@@ -86,6 +86,10 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
                         continue;
                     }
                     match panic::catch_unwind(AssertUnwindSafe(|| {
+                        // Manual `/api/fetch` cycles take the same lock, so
+                        // two observe/close_missing sequences never interleave.
+                        let _guard =
+                            state.cycle_lock.lock().unwrap_or_else(PoisonError::into_inner);
                         state.cycle.run_cycle(target, kind)
                     })) {
                         Ok(Ok(report)) => {
@@ -181,6 +185,15 @@ fn after_cycle(
         drop(timers);
         publish_feed(state, config, target);
     }
+}
+
+/// Runs the after-cycle side effects for one target right now, without the
+/// scheduler's once-per-day/throttle bookkeeping: retention pruning + feed
+/// publication, exactly as a successful scheduled cycle would trigger them.
+/// Used by the manual `/api/fetch` path, whose successful cycles must show
+/// up in `/feed.lua` immediately instead of waiting for the scheduler.
+pub fn after_cycle_now(state: &Arc<AppState>, target: &str) {
+    after_cycle(state, &state.config, &Mutex::new(TargetTimers::default()), target);
 }
 
 /// Builds and publishes the full feed (lua + json) for one target.

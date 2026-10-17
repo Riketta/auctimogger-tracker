@@ -35,14 +35,18 @@ pub fn block_from_histograms(
 ) -> Option<MetricBlock> {
     let mut samples: Vec<i64> = Vec::new();
     let mut qty_sum = 0i64;
-    let mut value_qty = 0i64;
+    // `price * qty` overflows i64 on extreme-but-legal inputs (huge quantities
+    // at huge prices); the accumulator stays i128 so the floored quotient is
+    // exact and the parity rule (vwap = floor(Σ p·q / Σ q)) holds for any
+    // input the store can carry.
+    let mut value_qty = 0i128;
     for histogram in histograms {
         for (price, bucket) in &histogram.buckets {
             for _ in 0..bucket.listings {
                 samples.push(*price);
             }
             qty_sum += bucket.qty;
-            value_qty += price * bucket.qty;
+            value_qty += i128::from(*price) * i128::from(bucket.qty);
         }
     }
     if samples.is_empty() {
@@ -69,7 +73,15 @@ pub fn block_from_histograms(
     } else {
         i64::midpoint(deviations[mid - 1], deviations[mid])
     };
-    let vwap = if qty_sum > 0 { value_qty / qty_sum } else { median };
+    let vwap = if qty_sum > 0 {
+        // Prices/quantities are non-negative, so the quotient is
+        // non-negative; `i64::MAX` saturation is unreachable for any real
+        // market (the average of in-range prices is in range) and only
+        // guards corrupt rows.
+        i64::try_from(value_qty / i128::from(qty_sum)).unwrap_or(i64::MAX)
+    } else {
+        median
+    };
 
     Some(MetricBlock {
         n,
@@ -207,5 +219,36 @@ mod tests {
     fn empty_input_yields_none() {
         assert!(block_from_histograms(&[], None).is_none());
         assert!(block_from_histograms(&[ItemDayHistogram::default()], None).is_none());
+    }
+
+    /// Extreme values: `price * qty` products that overflow any i64
+    /// accumulator must neither panic (debug builds) nor wrap (release) —
+    /// the i128 accumulator keeps the floored quotient exact.
+    #[test]
+    fn vwap_survives_extreme_price_quantity_products() {
+        let mut hist = ItemDayHistogram::default();
+        hist.buckets.insert(i64::MAX - 1, PriceBucket { listings: 2, qty: i64::MAX });
+        hist.listing_count = 2;
+        hist.qty_sum = i64::MAX;
+        let b = block_from_histograms(std::slice::from_ref(&hist), None).expect("data present");
+        assert_eq!(b.qty_sum, i64::MAX);
+        assert_eq!(b.vwap, i64::MAX - 1, "floor((MAX-1) · MAX / MAX)");
+    }
+
+    /// Several extreme days accumulate across histograms without overflow:
+    /// `qty_sum` stays inside i64 while `Σ p·q` only fits i128.
+    #[test]
+    fn vwap_mixes_extreme_and_moderate_days() {
+        let mut extreme = ItemDayHistogram::default();
+        extreme.buckets.insert(i64::MAX - 1, PriceBucket { listings: 1, qty: i64::MAX - 1 });
+        extreme.listing_count = 1;
+        extreme.qty_sum = i64::MAX - 1;
+        let mut moderate = ItemDayHistogram::default();
+        moderate.buckets.insert(100, PriceBucket { listings: 1, qty: 1 });
+        moderate.listing_count = 1;
+        moderate.qty_sum = 1;
+        let b = block_from_histograms(&[extreme, moderate], None).expect("data present");
+        assert_eq!(b.qty_sum, i64::MAX, "in-range total quantity");
+        assert_eq!(b.vwap, i64::MAX - 2, "floor(((MAX-1)² + 100) / MAX)");
     }
 }

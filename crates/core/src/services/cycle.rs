@@ -1,6 +1,7 @@
 //! Ingestion cycle: fetch → record snapshot → fold day histograms.
-//! One cycle is transactional per snapshot — a failed stage leaves the store
-//! untouched (integrity first, plan §6).
+//! Stages run sequentially and stop at the first failure — earlier writes of
+//! a cycle stay in place (cycles are NOT transactional end-to-end; see the
+//! `run_cycle` doc for the exact per-stage failure semantics).
 
 use std::sync::Arc;
 

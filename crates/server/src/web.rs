@@ -99,6 +99,9 @@ pub struct AppState {
     pub history: Arc<dyn PriceHistoryRepository>,
     /// Late item-name resolution for IDs missing from the catalog.
     pub item_info: Arc<dyn ItemInfoPort>,
+    /// Serializes ingestion cycles (scheduled + manual `/api/fetch`) so the
+    /// `observe`/`close_missing` sequences of two cycles never interleave.
+    pub cycle_lock: Arc<std::sync::Mutex<()>>,
 }
 
 /// Builds the full HTTP router (pages, JSON API, feed downloads, token-gated
@@ -108,12 +111,9 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// Serves the router until the process is interrupted (call from a runtime).
-///
-/// # Errors
-/// Serves the router on `bind` until a shutdown signal arrives: `Ctrl+C`
-/// anywhere, or `SIGTERM` on Unix (systemd stop). Graceful shutdown lets
-/// in-flight requests finish; the binary then flushes queued logs/Sentry
-/// events before exiting.
+/// Graceful shutdown lets in-flight requests finish: `Ctrl+C` anywhere, or
+/// `SIGTERM` on Unix (systemd stop); the binary then flushes queued
+/// logs/Sentry events before exiting.
 ///
 /// # Errors
 /// Returns the underlying [`std::io::Error`] when binding `bind` fails or
@@ -341,9 +341,15 @@ async fn store_error_page(error: StoreError) -> Response {
 // ------------------------------------------------------------------ pages
 
 async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
-    let health = match state.health.health() {
-        Ok(health) => health,
-        Err(error) => return store_error_page(error).await,
+    // SQLite reads stay off the async workers (see item_page/feed_file).
+    let health = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || state.health.health()
+    });
+    let health = match health.await {
+        Ok(Ok(health)) => health,
+        Ok(Err(error)) => return store_error_page(error).await,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
     let mut body = String::from(
         "<h2>targets</h2><table><tr><th>target</th><th>payload</th><th>latest fetch</th><th>age</th><th>entries</th><th>dropped</th></tr>",
@@ -384,9 +390,14 @@ async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn snapshots_page(State(state): State<Arc<AppState>>) -> Response {
-    let health = match state.health.health() {
-        Ok(health) => health,
-        Err(error) => return store_error_page(error).await,
+    let health = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || state.health.health()
+    });
+    let health = match health.await {
+        Ok(Ok(health)) => health,
+        Ok(Err(error)) => return store_error_page(error).await,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
     let mut body = String::from(
         "<h2>latest snapshots</h2><table><tr><th>target</th><th>payload</th><th>fetched at</th><th>source modified</th><th>entries</th><th>dropped</th><th>status</th></tr>",
@@ -431,28 +442,39 @@ async fn items_search_page(
         Err(response) => return *response,
     };
     let query = params.get("q").cloned().unwrap_or_default();
-    let mut body = String::from(
+    // The completions script builds detail-page URLs; the target id is a
+    // configured slug, but it is escaped like every other interpolation so a
+    // pathological id cannot break out of the JS string or the script tag.
+    let completions = format!(
         "<input type=\"text\" id=\"q\" placeholder=\"search item name\u{2026}\" autocomplete=\"off\">\
          <div id=\"completions\"></div>\
          <script>const q=document.getElementById('q'),c=document.getElementById('completions');\
-         let t=null;q.addEventListener('input',()=>{clearTimeout(t);const v=q.value.trim();\
-         if(v.length<2){c.textContent='';return;}\
-         t=setTimeout(async()=>{const r=await fetch('/api/search?q='+encodeURIComponent(v));\
+         let t=null;q.addEventListener('input',()=>{{clearTimeout(t);const v=q.value.trim();\
+         if(v.length<2){{c.textContent='';return;}}\
+         t=setTimeout(async()=>{{const r=await fetch('/api/search?q='+encodeURIComponent(v));\
          const j=await r.json();c.textContent='';\
-         for(const h of j.hits){const d=document.createElement('div');\
-         const a=document.createElement('a');a.href='/items/'+h.itemID;a.textContent=h.name;\
+         for(const h of j.hits){{const d=document.createElement('div');\
+         const a=document.createElement('a');a.href='/items/{target_js}/'+h.itemID;a.textContent=h.name;\
          const s=document.createElement('span');s.className='muted';\
          s.textContent=h.itemID+(h.itemClass?' \u{2014} '+h.itemClass:'');\
-         d.appendChild(a);d.appendChild(s);c.appendChild(d);}},250);});</script>",
+         d.appendChild(a);d.appendChild(s);c.appendChild(d);}},250);}});</script>",
+        target_js = html_escape(target.as_str())
     );
+    let mut body = completions;
     if !query.trim().is_empty() {
-        match state.search.search(&query, 25) {
-            Ok(hits) => {
+        // SQLite reads stay off the async workers.
+        let hits = tokio::task::spawn_blocking({
+            let state = Arc::clone(&state);
+            let query = query.clone();
+            move || state.search.search(&query, 25)
+        });
+        match hits.await {
+            Ok(Ok(hits)) => {
                 body.push_str("<h2>results</h2><ul>");
                 for hit in hits {
                     let _ = write!(
                         body,
-                        "<li><a href=\"/items/{}/{ }\">{}</a> <span class=\"muted\">{}</span></li>",
+                        "<li><a href=\"/items/{}/{}\">{}</a> <span class=\"muted\">{}</span></li>",
                         html_escape(target.as_str()),
                         hit.item_id,
                         html_escape(&hit.name),
@@ -461,11 +483,19 @@ async fn items_search_page(
                 }
                 body.push_str("</ul>");
             }
-            Err(error) => return store_error_page(error).await,
+            Ok(Err(error)) => return store_error_page(error).await,
+            Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
         }
     }
     layout("items", &body)
 }
+
+/// What the item page renders from the store: the item-scoped day rows plus
+/// one optional metric block per span.
+type ItemPageData = (
+    Vec<amtracker_core::domain::ItemDayRow>,
+    Vec<(Span, Option<amtracker_core::domain::MetricBlock>)>,
+);
 
 async fn item_page(
     State(state): State<Arc<AppState>>,
@@ -496,23 +526,33 @@ async fn item_page(
     };
     let title = html_escape(&name.unwrap_or_else(|| format!("item {item_id}")));
 
-    let today = amtracker_core::domain::utc_day(
-        std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| {
-            // Unix seconds from `now` fit `i64` for the plausible lifetime of
-            // this process; the wrap is unreachable.
-            #[allow(clippy::cast_possible_wrap)]
-            {
-                d.as_secs() as i64
-            }
-        }),
-    );
+    // Window + analytics all read SQLite through the injected clock; keep the
+    // blocking body off the async workers.
+    let today = amtracker_core::domain::utc_day(state.clock.now());
     let item = ItemRef::Item { item_id };
-    let rows = match state.history.item_day_rows(&target, today - 29) {
-        Ok(rows) => rows,
-        Err(error) => return store_error_page(error).await,
+    let since = today - 29;
+    let page_data = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        let item = item.clone();
+        move || -> Result<ItemPageData, StoreError> {
+            // Item-scoped query: the SQL filters on the exact identity tuple
+            // instead of loading the whole market's rows (the opportunity
+            // scan keeps the unfiltered variant).
+            let rows = state.history.item_day_rows_for_item(&target, &item, since)?;
+            let mut blocks = Vec::with_capacity(4);
+            for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
+                blocks.push((span, state.metrics.block(&target, &item, span)?));
+            }
+            Ok((rows, blocks))
+        }
+    });
+    let (rows, blocks) = match page_data.await {
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => return store_error_page(error).await,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
-    let mut days: Vec<&amtracker_core::domain::ItemDayRow> =
-        rows.iter().filter(|row| row.item == item).collect();
+    let mut days: Vec<&amtracker_core::domain::ItemDayRow> = rows.iter().collect();
     days.sort_by_key(|row| row.day);
     let medians: Vec<i64> = days.iter().map(|row| row.median).collect();
     let chart = sparkline(&medians);
@@ -523,29 +563,25 @@ async fn item_page(
     );
     let _ = write!(body, "<h2>30-day median</h2><p>{chart}</p>");
     body.push_str("<h2>metric blocks</h2><table><tr><th>span</th><th>n</th><th>median</th><th>min</th><th>p05</th><th>p25</th><th>p75</th><th>p95</th><th>max</th><th>mad</th><th>vwap</th><th>qty</th><th>sale rate</th></tr>");
-    for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
-        match state.metrics.block(&target, &item, span) {
-            Ok(Some(block)) => {
-                let _ = write!(
-                    body,
-                    "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
-                    span.name(),
-                    block.n,
-                    money(block.median),
-                    money(block.min),
-                    money(block.p05),
-                    money(block.p25),
-                    money(block.p75),
-                    money(block.p95),
-                    money(block.max),
-                    block.mad,
-                    money(block.vwap),
-                    block.qty_sum,
-                    block.sale_rate.map_or_else(|| "—".into(), |r| format!("{r:.2}"))
-                );
-            }
-            Ok(None) => {}
-            Err(error) => return store_error_page(error).await,
+    for (span, block) in &blocks {
+        if let Some(block) = block {
+            let _ = write!(
+                body,
+                "<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>",
+                span.name(),
+                block.n,
+                money(block.median),
+                money(block.min),
+                money(block.p05),
+                money(block.p25),
+                money(block.p75),
+                money(block.p95),
+                money(block.max),
+                block.mad,
+                money(block.vwap),
+                block.qty_sum,
+                block.sale_rate.map_or_else(|| "—".into(), |r| format!("{r:.2}"))
+            );
         }
     }
     body.push_str("</table>");
@@ -569,9 +605,15 @@ async fn opportunities_page(
         Err(response) => return *response,
     };
     let min_churn: f64 = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
-    let data = match state.opportunities.opportunities(&target, min_churn, 50) {
-        Ok(data) => data,
-        Err(error) => return store_error_page(error).await,
+    let data = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.opportunities.opportunities(&target, min_churn, 50)
+    });
+    let data = match data.await {
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => return store_error_page(error).await,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
     let mut body = format!(
         "<p>ranked by score = w\u{b7}(discount + reliability + churn + stability); \
@@ -627,9 +669,15 @@ async fn overview_page(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    let data = match state.opportunities.overview(&target, 15) {
-        Ok(data) => data,
-        Err(error) => return store_error_page(error).await,
+    let data = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.opportunities.overview(&target, 15)
+    });
+    let data = match data.await {
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => return store_error_page(error).await,
+        Err(error) => return store_error_page(StoreError::Backend(error.to_string())).await,
     };
     let body = format!(
         "<h2>rising</h2>{}<h2>falling</h2>{}<h2>most active</h2>{}",
@@ -718,8 +766,12 @@ async fn feed_slim_lua(
 // ------------------------------------------------------------------ api
 
 async fn api_health(State(state): State<Arc<AppState>>) -> Response {
-    match state.health.health() {
-        Ok(health) => Json(serde_json::json!({
+    let health = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || state.health.health()
+    });
+    match health.await {
+        Ok(Ok(health)) => Json(serde_json::json!({
             "targets": health.iter().map(|t| serde_json::json!({
                 "target": t.target.as_str(),
                 "kinds": t.kinds.iter().map(|k| serde_json::json!({
@@ -736,8 +788,12 @@ async fn api_health(State(state): State<Arc<AppState>>) -> Response {
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => {
+        Ok(Err(error)) => {
             log_failure("health", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("health-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -771,8 +827,14 @@ async fn api_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> Response {
-    match state.search.search(&params.q, params.limit) {
-        Ok(hits) => Json(serde_json::json!({
+    let hits = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let q = params.q.clone();
+        let limit = params.limit;
+        move || state.search.search(&q, limit)
+    });
+    match hits.await {
+        Ok(Ok(hits)) => Json(serde_json::json!({
             "hits": hits.iter().map(|hit| serde_json::json!({
                 "itemID": hit.item_id,
                 "name": hit.name,
@@ -781,8 +843,12 @@ async fn api_search(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => {
+        Ok(Err(error)) => {
             log_failure("search", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("search-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -798,8 +864,13 @@ async fn api_opportunities(
     };
     let min_churn = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
-    match state.opportunities.opportunities(&target, min_churn, limit) {
-        Ok(list) => Json(serde_json::json!({
+    let list = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.opportunities.opportunities(&target, min_churn, limit)
+    });
+    match list.await {
+        Ok(Ok(list)) => Json(serde_json::json!({
             "opportunities": list.iter().map(|o| serde_json::json!({
                 "item": item_json(&o.item),
                 "median7": o.median7,
@@ -814,8 +885,12 @@ async fn api_opportunities(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => {
+        Ok(Err(error)) => {
             log_failure("opportunities", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("opportunities-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -829,8 +904,13 @@ async fn api_overview(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    match state.opportunities.overview(&target, 15) {
-        Ok(data) => {
+    let data = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.opportunities.overview(&target, 15)
+    });
+    match data.await {
+        Ok(Ok(data)) => {
             let mover = |m: &MoverRow| {
                 serde_json::json!({
                     "item": item_json(&m.item),
@@ -847,8 +927,12 @@ async fn api_overview(
             }))
             .into_response()
         }
-        Err(error) => {
+        Ok(Err(error)) => {
             log_failure("overview", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("overview-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -867,25 +951,40 @@ async fn api_item_metrics(
         .get("span")
         .map_or_else(|| vec![Span::D1], |s| s.split(',').filter_map(Span::parse).collect());
     let item = ItemRef::Item { item_id };
+    let computed = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || -> Result<Vec<(Span, Option<amtracker_core::domain::MetricBlock>)>, StoreError> {
+            let mut out = Vec::with_capacity(spans.len());
+            for span in spans {
+                out.push((span, state.metrics.block(&target, &item, span)?));
+            }
+            Ok(out)
+        }
+    });
+    let computed = match computed.await {
+        Ok(Ok(computed)) => computed,
+        Ok(Err(error)) => {
+            log_failure("item-metrics", &error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+        Err(error) => {
+            log_failure("item-metrics-join", &error);
+            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+        }
+    };
     let mut out = serde_json::Map::new();
-    for span in spans {
-        match state.metrics.block(&target, &item, span) {
-            Ok(Some(block)) => {
-                out.insert(
-                    span.name().to_string(),
-                    serde_json::json!({
-                        "n": block.n, "min": block.min, "p05": block.p05, "p25": block.p25,
-                        "median": block.median, "p75": block.p75, "p95": block.p95, "max": block.max,
-                        "mad": block.mad, "vwap": block.vwap, "qtySum": block.qty_sum,
-                        "listingCount": block.listing_count, "saleRate": block.sale_rate,
-                    }),
-                );
-            }
-            Ok(None) => {}
-            Err(error) => {
-                log_failure("item-metrics", &error);
-                return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
-            }
+    for (span, block) in computed {
+        if let Some(block) = block {
+            out.insert(
+                span.name().to_string(),
+                serde_json::json!({
+                    "n": block.n, "min": block.min, "p05": block.p05, "p25": block.p25,
+                    "median": block.median, "p75": block.p75, "p95": block.p95, "max": block.max,
+                    "mad": block.mad, "vwap": block.vwap, "qtySum": block.qty_sum,
+                    "listingCount": block.listing_count, "saleRate": block.sale_rate,
+                }),
+            );
         }
     }
     Json(serde_json::Value::Object(out)).into_response()
@@ -901,16 +1000,28 @@ async fn api_feed_json(
     };
     let options =
         ExportOptions { spans: state.config.metrics.spans.clone(), watchlist_only: false };
-    match state.feed_export.build_feed(&target, &options) {
-        Ok(feed) => match state.renderer.render(&feed, FeedFormat::Json) {
-            Ok(bytes) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
-            Err(error) => {
-                log_failure("feed-render", &error);
-                (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-            }
-        },
+    // Feed assembly touches SQLite and lots of folds; keep it off the async
+    // workers (render errors map into the same store-error shape as build).
+    let payload = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || {
+            state.feed_export.build_feed(&target, &options).and_then(|feed| {
+                state
+                    .renderer
+                    .render(&feed, FeedFormat::Json)
+                    .map_err(|e| StoreError::Backend(e.to_string()))
+            })
+        }
+    });
+    match payload.await {
+        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+        Ok(Err(error)) => {
+            log_failure("feed-json", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
         Err(error) => {
-            log_failure("feed-build", &error);
+            log_failure("feed-json-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -958,11 +1069,22 @@ async fn api_watchlist_get(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
-    let Some(target) = params.get("target") else {
+    let Some(name) = params.get("target") else {
         return (StatusCode::BAD_REQUEST, "missing ?target=").into_response();
     };
-    match state.watchlist.list(&TargetId(target.clone())) {
-        Ok(entries) => Json(serde_json::json!({
+    // Unknown ids are rejected before they reach the store, like every read
+    // path (they would silently query an empty watchlist).
+    let target = match known_target(&state.config, name) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let entries = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.watchlist.list(&target)
+    });
+    match entries.await {
+        Ok(Ok(entries)) => Json(serde_json::json!({
             "items": entries.iter().map(|e| serde_json::json!({
                 "item": item_json(&e.item),
                 "note": e.note,
@@ -970,39 +1092,69 @@ async fn api_watchlist_get(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Err(error) => {
+        Ok(Err(error)) => {
             log_failure("watchlist-get", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("watchlist-get-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
 }
 
-fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
-    let Some(env) = &state.config.server.token_env else {
-        return Ok(());
-    };
-    // An unset, non-unicode, or EMPTY token env leaves the endpoints open;
-    // this is the documented developer-mode behavior (an empty compose
-    // default must not turn into a zero-length password).
-    let expected = std::env::var(env).ok().filter(|value| !value.trim().is_empty());
+/// The configured API token value; `None` = the mutating API is open (no
+/// `token_env` configured, or the named env var is unset, non-unicode, or
+/// EMPTY — the documented developer-mode behavior: an empty compose default
+/// must not turn into a zero-length password).
+fn expected_api_token(config: &TrackerConfig) -> Option<String> {
+    let env = config.server.token_env.as_ref()?;
+    std::env::var(env).ok().filter(|value| !value.trim().is_empty())
+}
+
+/// The bearer value presented by the request, if well-formed.
+fn provided_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+}
+
+/// Length-checked, constant-time-ish comparison: the XOR fold visits every
+/// byte pair regardless of where a difference sits, so token bytes do not
+/// leak through early-exit timing (length still does; tokens are not secret
+/// from the operator).
+fn tokens_match(provided: &str, expected: &str) -> bool {
+    if provided.len() != expected.len() {
+        return false;
+    }
+    let diff = provided.bytes().zip(expected.bytes()).fold(0u8, |acc, (a, b)| acc | (a ^ b));
+    diff == 0
+}
+
+/// The authorization verdict for one request given the expected token
+/// (`None` = open mode) and the presented bearer value.
+fn authorize_result(expected: Option<&str>, provided: Option<&str>) -> Result<(), Box<Response>> {
     let Some(expected) = expected else {
         return Ok(());
     };
-    let provided = headers
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
     match provided {
-        Some(token) if token == expected => Ok(()),
-        _ => {
-            let mut response =
-                (StatusCode::UNAUTHORIZED, "invalid or missing bearer token\n").into_response();
-            response
-                .headers_mut()
-                .insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
-            Err(Box::new(response))
-        }
+        Some(token) if tokens_match(token, expected) => Ok(()),
+        _ => Err(Box::new(unauthorized_response())),
     }
+}
+
+fn unauthorized_response() -> Response {
+    let mut response =
+        (StatusCode::UNAUTHORIZED, "invalid or missing bearer token\n").into_response();
+    response
+        .headers_mut()
+        .insert(header::WWW_AUTHENTICATE, header::HeaderValue::from_static("Bearer"));
+    response
+}
+
+fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>> {
+    authorize_result(expected_api_token(&state.config).as_deref(), provided_token(headers))
 }
 
 async fn api_watchlist_post(
@@ -1013,7 +1165,11 @@ async fn api_watchlist_post(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    match state.watchlist.add(&TargetId(body.target.clone()), body.item.to_ref(), body.note) {
+    let target = match known_target(&state.config, &body.target) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    match state.watchlist.add(&target, body.item.to_ref(), body.note) {
         Ok(entry) => {
             Json(serde_json::json!({ "ok": true, "addedAt": entry.added_at })).into_response()
         }
@@ -1042,7 +1198,11 @@ async fn api_watchlist_delete(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    match state.watchlist.remove(&TargetId(body.target.clone()), &body.item.to_ref()) {
+    let target = match known_target(&state.config, &body.target) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    match state.watchlist.remove(&target, &body.item.to_ref()) {
         Ok(removed) => Json(serde_json::json!({ "ok": true, "removed": removed })).into_response(),
         Err(error) => {
             log_failure("watchlist-remove", &error);
@@ -1065,34 +1225,57 @@ async fn api_fetch(
     if let Err(response) = authorize(&state, &headers) {
         return *response;
     }
-    // A cycle can block on the wire for minutes; keep it off the async workers.
+    // An unknown target would silently no-op through the filter below;
+    // validate it like every other target-bearing endpoint.
+    let wanted = match params.target.as_deref() {
+        Some(name) => match known_target(&state.config, name) {
+            Ok(target) => Some(target),
+            Err(response) => return *response,
+        },
+        None => None,
+    };
+    // A cycle can block on the wire for minutes; keep it off the async
+    // workers. The cycle lock serializes against the scheduler's cycles so
+    // observe/close_missing sequences never interleave, and a successful
+    // fetch republishes the target's feed right here (the scheduler only
+    // does that on its own cadence — without this, `/api/fetch` never
+    // refreshed what `/feed.lua` serves).
     let reports = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
-        let wanted = params.target.clone();
         move || {
+            let _guard = state.cycle_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut reports = Vec::new();
             for target in &state.config.targets {
                 if let Some(wanted) = &wanted {
-                    if target.id.as_str() != wanted {
+                    if target.id != *wanted {
                         continue;
                     }
                 }
+                let mut fetched = false;
                 for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
                     match state.cycle.run_cycle(target, kind) {
-                        Ok(report) => reports.push(serde_json::json!({
-                            "target": report.target.as_str(),
-                            "kind": report.kind.as_str(),
-                            "outcome": format!("{:?}", report.outcome),
-                            "entries": report.entries,
-                            "dropped": report.dropped,
-                            "saleCredits": report.sale_credits,
-                        })),
+                        Ok(report) => {
+                            fetched = true;
+                            reports.push(serde_json::json!({
+                                "target": report.target.as_str(),
+                                "kind": report.kind.as_str(),
+                                "outcome": format!("{:?}", report.outcome),
+                                "entries": report.entries,
+                                "dropped": report.dropped,
+                                "saleCredits": report.sale_credits,
+                            }));
+                        }
                         Err(error) => reports.push(serde_json::json!({
                             "target": target.id.as_str(),
                             "kind": kind.as_str(),
                             "error": error.to_string(),
                         })),
                     }
+                }
+                if fetched {
+                    // Same operational side effects the scheduler runs after
+                    // its own successful cycles (retention + feed publish).
+                    crate::scheduler::after_cycle_now(&state, target.id.as_str());
                 }
             }
             reports
@@ -1106,4 +1289,89 @@ async fn api_fetch(
         }
     };
     Json(serde_json::json!({ "reports": reports })).into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
+    // inputs (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    /// Minimal-but-valid tracker config for authorization/target tests.
+    fn test_config(allow_open: bool) -> TrackerConfig {
+        use amtracker_core::config::PollConfig;
+        TrackerConfig {
+            server: amtracker_core::config::ServerConfig {
+                bind: "127.0.0.1:0".into(),
+                token_env: Some("AMT_API_TOKEN_TEST".into()),
+                allow_open,
+                feed_publish_secs: 300,
+            },
+            storage: amtracker_core::config::StorageConfig {
+                database: "mem.sqlite3".into(),
+                raw_listing_days: 7,
+                archive_dir: "raw".into(),
+            },
+            metrics: amtracker_core::config::MetricsConfig { spans: vec![Span::D1] },
+            opportunities: amtracker_core::config::OpportunitiesConfig {
+                min_samples: 1,
+                weights: amtracker_core::config::ScoreWeights {
+                    discount: 0.4,
+                    sale: 0.3,
+                    churn: 0.2,
+                    stability: 0.1,
+                },
+            },
+            targets: vec![amtracker_core::config::TargetConfig {
+                id: TargetId("us-4".into()),
+                kind: amtracker_core::config::TargetKind::BlizzardConnectedRealm {
+                    region: "us".into(),
+                    connected_realm_id: 4,
+                },
+                auth: None,
+                poll: PollConfig { commodities_secs: 60, auctions_secs: 60 },
+            }],
+        }
+    }
+
+    /// authorize matrix: unset/empty token (open mode), valid, and wrong
+    /// token, crossed with the open-mode expectation.
+    #[test]
+    fn authorize_matrix_open_mode_allows_anything() {
+        // No configured token: open, with or without a presented bearer.
+        assert!(authorize_result(None, None).is_ok());
+        assert!(authorize_result(None, Some("anything")).is_ok());
+        // Empty/blank configured values normalize to open (the env filter
+        // mirrors `expected_api_token`).
+        assert!(authorize_result(None, Some("")).is_ok());
+    }
+
+    #[test]
+    fn authorize_matrix_protected_mode_rejects_wrong_or_missing_tokens() {
+        let expected = Some("s3cret");
+        assert!(authorize_result(expected, Some("s3cret")).is_ok());
+        for provided in [None, Some(""), Some("wrong"), Some("s3cret "), Some("s3cretx")] {
+            let response = authorize_result(expected, provided).expect_err("must reject");
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "provided {provided:?}");
+        }
+    }
+
+    #[test]
+    fn unknown_targets_are_rejected_with_a_bad_request() {
+        let config = test_config(false);
+        let response = known_target(&config, "nope").expect_err("unknown target");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert!(known_target(&config, "us-4").is_ok(), "configured target resolves");
+    }
+
+    #[test]
+    fn constant_time_compare_matches_exact_tokens_only() {
+        assert!(tokens_match("abc", "abc"));
+        assert!(!tokens_match("abd", "abc"));
+        assert!(!tokens_match("abcd", "abc"));
+        assert!(!tokens_match("", "abc"));
+        assert!(tokens_match("", ""));
+    }
 }

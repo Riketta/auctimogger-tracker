@@ -16,6 +16,7 @@ use std::{
 
 use crate::{
     domain::{
+        utc_day,
         FeedEntry,
         FeedSnapshot,
         ItemRef,
@@ -79,7 +80,7 @@ impl FeedExportService {
         options: &ExportOptions,
     ) -> Result<FeedSnapshot, StoreError> {
         let generated_at = self.freshness(target)?;
-        let today = utc_day_of(self.clock.now());
+        let today = utc_day(self.clock.now());
         let window_days = options.spans.iter().map(Span::days).max().unwrap_or(1);
 
         let items: Vec<ItemRef> = if options.watchlist_only {
@@ -146,12 +147,6 @@ impl FeedExportService {
             Ok(newest)
         }
     }
-}
-
-fn utc_day_of(unix_ts: i64) -> i64 {
-    // `u64` unix seconds only exceed `i64` far beyond any real date, so the
-    // conversion saturates; a clock before the epoch reads as day 0.
-    unix_ts.div_euclid(86_400)
 }
 
 /// Feed-grain grouping key: plain items per id, all pet variants of a species

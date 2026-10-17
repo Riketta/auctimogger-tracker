@@ -5,4 +5,5 @@
 
 pub mod config_file;
 pub mod scheduler;
+pub mod startup;
 pub mod web;

@@ -4,8 +4,12 @@
 #
 # Edit ./config.docker.toml to choose targets; secrets come from the
 # environment (a .env file next to this file works: BLIZZARD_CLIENT_ID=...,
-# BLIZZARD_CLIENT_SECRET=..., AMT_API_TOKEN=...). Leave AMT_API_TOKEN empty
-# to keep the mutating API open (one startup warning will tell you so).
+# BLIZZARD_CLIENT_SECRET=..., AMT_API_TOKEN=...). The compose default token
+# is the well-known dev token below: the server runs with it but WARNS at
+# startup — replace it (or set a real AMT_API_TOKEN in .env) before exposing
+# the instance beyond localhost. An EMPTY token makes `serve` refuse to start
+# on this non-loopback bind (that is the safety guard; see
+# config.docker.toml's [server] comments).
 
 services:
   tracker:
@@ -22,8 +26,11 @@ services:
       # Blizzard targets only; static-urls targets need no credentials.
       BLIZZARD_CLIENT_ID: ${BLIZZARD_CLIENT_ID:-}
       BLIZZARD_CLIENT_SECRET: ${BLIZZARD_CLIENT_SECRET:-}
-      # Set this to protect the mutating API (watchlist, /api/fetch).
-      AMT_API_TOKEN: ${AMT_API_TOKEN:-}
+      # Protects the mutating API (watchlist, /api/fetch). Default below is a
+      # well-known DEV token so the demo stack starts out of the box — the
+      # server logs a loud warning while it is in effect. REPLACE ME (set
+      # AMT_API_TOKEN in .env); do not expose the default beyond localhost.
+      AMT_API_TOKEN: ${AMT_API_TOKEN:-dev-insecure-token-change-me}
 
 volumes:
   amtracker-data:

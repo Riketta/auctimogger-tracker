@@ -105,7 +105,8 @@ only — never put secrets in this file.
 |---|---|---|
 | `debug` | `false` | louder stdout defaults for the tracker's own crates; `RUST_LOG` overrides entirely |
 | `server.bind` | `127.0.0.1:8080` | web UI/API listen address |
-| `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset **or empty** = open (localhost use; `serve` logs one warning about it at startup) |
+| `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset **or empty** = open on a loopback bind (localhost dev; one loud startup warning). On any other bind this **refuses to start `serve`** |
+| `server.allow_open` | `false` | explicit opt-out: set `true` to let `serve` start with an open mutating API on a non-loopback bind (strongly discouraged) |
 | `server.feed_publish_secs` | `300` | minimum seconds between feed re-publications per target |
 | `storage.database` | `./data/tracker.sqlite3` | SQLite database (WAL) |
 | `storage.archive_dir` | `./data/raw` | raw payload archive |
@@ -128,6 +129,9 @@ connected_realm_id = 4
 # OAuth client credentials: env var NAMES, not secrets. Bearer tokens are
 # fetched from the Battle.net OAuth endpoint and refreshed automatically
 # ahead of expiry (a rejected token triggers one refresh + retry).
+# `serve` refuses to start while a configured target's credential env vars
+# are unset or empty, so a forgotten secret cannot masquerade as a working
+# deployment that never ingests.
 auth = { type = "client-credentials", client_id_env = "BLIZZARD_CLIENT_ID", client_secret_env = "BLIZZARD_CLIENT_SECRET" }
 poll = { commodities_secs = 3600, auctions_secs = 1800 }
 ```
@@ -166,7 +170,7 @@ Pages: `/` dashboard · `/snapshots` · `/items?q=…` search ·
 | `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
-| `POST /api/fetch` | trigger a cycle (token-gated) |
+| `POST /api/fetch` | trigger a cycle (token-gated); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
 
 ## Feed contract (v2)
@@ -277,7 +281,11 @@ cat > .env <<'EOF'
 BLIZZARD_CLIENT_ID=
 BLIZZARD_CLIENT_SECRET=
 # Protects mutating endpoints (watchlist writes, /api/fetch). Any random
-# string; empty keeps them open (the server logs one warning about it).
+# string. The compose default is the well-known dev token
+# 'dev-insecure-token-change-me' (one loud startup warning tells you it is
+# in effect — replace me). An EMPTY value makes `serve` refuse to start on
+# the container's non-loopback bind (set [server].allow_open = true in
+# config.docker.toml to override deliberately).
 AMT_API_TOKEN=
 EOF
 ```
@@ -502,7 +510,9 @@ example (nightly, keep 14):
 - `Ctrl+C` / `SIGTERM` shut down gracefully: in-flight requests finish and
   queued log/Sentry events are flushed before exit.
 - Reads are open on the loopback bind; mutations (`POST /api/fetch`,
-  watchlist changes) require the `AMT_API_TOKEN` value. For LAN access, bind
-  `0.0.0.0` only behind a reverse proxy with TLS + auth.
+  watchlist changes) require the `AMT_API_TOKEN` value. `serve` refuses to
+  start with an unset/empty token on a non-loopback bind unless
+  `[server].allow_open = true`. For LAN access, bind `0.0.0.0` only behind a
+  reverse proxy with TLS + auth.
 - The addon consumes `feed.lua` / `feed-slim.lua`; `feed.json` is the seam
   for the future companion client.

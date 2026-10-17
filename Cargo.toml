@@ -33,6 +33,16 @@ amtracker-core = { path = "crates/core" }
 amtracker-infra = { path = "crates/infra" }
 amtracker-server = { path = "crates/server" }
 clap = { version = "4", features = ["derive"] }
+# Sentry is the only reason a second HTTP stack (ureq 3.x) is built: its
+# transport feature `ureq` uses sentry-ureq → ureq 3, while the app itself
+# uses ureq 2 (see crates/infra). Verified with `cargo tree` (2026-10):
+# - `reqwest` 0.13 and `aws-lc-rs` appear in Cargo.lock but are LOCKFILE-INERT:
+#   `cargo tree -i reqwest` / `-i aws-lc-rs` print nothing — neither is
+#   compiled for any workspace target.
+# - One TLS stack is shared: both ureq versions sit on rustls 0.23 + ring.
+# Dropping ureq 3 would mean either no Sentry transport at all (feature off)
+# or a heavier reqwest/hyper/tokio stack; keeping the small ureq 3 transport
+# is the cheapest option.
 sentry = { version = "0.49", default-features = false, features = [
     "ureq",
     "rustls",

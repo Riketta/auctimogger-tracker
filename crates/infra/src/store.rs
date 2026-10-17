@@ -59,7 +59,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     fetched_at INTEGER NOT NULL,
     source_last_modified INTEGER,
     sha256 TEXT NOT NULL,
-    archive_path TEXT NOT NULL,
+    archive_path TEXT,
     entry_count INTEGER NOT NULL,
     dropped_count INTEGER NOT NULL,
     status TEXT NOT NULL
@@ -192,21 +192,34 @@ impl SqliteStore {
         let conn = Connection::open(database).map_err(|e| backend("open sqlite", e))?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| backend("journal_mode", e))?;
         conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| backend("synchronous", e))?;
-        Self::check_schema_version(&conn)?;
+        // Operators run CLI one-offs against a live `serve` (documented in
+        // the README); a 5 s busy wait turns those races into waits instead
+        // of `SQLITE_BUSY` errors.
+        conn.pragma_update(None, "busy_timeout", 5_000).map_err(|e| backend("busy_timeout", e))?;
+        let version = Self::read_schema_version(&conn)?;
+        Self::check_schema_version(&conn, version)?;
         conn.execute_batch(SCHEMA).map_err(|e| backend("schema", e))?;
-        conn.pragma_update(None, "user_version", SCHEMA_VERSION)
-            .map_err(|e| backend("user_version", e))?;
+        // Only mark UPgrades: a database from a future version must keep its
+        // higher marker so the version check keeps reporting it as newer.
+        if version < SCHEMA_VERSION {
+            conn.pragma_update(None, "user_version", SCHEMA_VERSION)
+                .map_err(|e| backend("user_version", e))?;
+        }
         Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf(), clock })
+    }
+
+    /// Reads the stored schema version (`PRAGMA user_version`).
+    fn read_schema_version(conn: &Connection) -> Result<i64, StoreError> {
+        conn.query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(|e| backend("user_version", e))
     }
 
     /// Refuses schema-v1 databases (a `sight` table without the `kind`
     /// column): old sighting rows cannot be assigned a payload kind, so a
     /// silent migration would fabricate sell-through history. Fresh files and
-    /// current v2 files pass through.
-    fn check_schema_version(conn: &Connection) -> Result<(), StoreError> {
-        let version: i64 = conn
-            .query_row("PRAGMA user_version", [], |row| row.get(0))
-            .map_err(|e| backend("user_version", e))?;
+    /// current v2 files pass through; files from a FUTURE version also pass
+    /// (the downgrade-guard in `open` keeps their marker intact).
+    fn check_schema_version(conn: &Connection, version: i64) -> Result<(), StoreError> {
         if version >= SCHEMA_VERSION {
             return Ok(());
         }
@@ -384,6 +397,34 @@ impl SalesRepository for SqliteStore {
     ) -> Result<(), StoreError> {
         let conn = self.open_transaction();
         let tx = conn.unchecked_transaction().map_err(|e| backend("begin observe", e))?;
+        // Prepared once per call, reused per listing: observe runs over whole
+        // dumps (thousands of rows), so per-row `prepare` calls dominated.
+        let mut update_open = tx
+            .prepare(
+                "UPDATE sight SET last_seen_snapshot = ?4, last_seen_at = ?5, band = ?6, quantity = ?7
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3 AND closed_at IS NULL",
+            )
+            .map_err(|e| backend("prepare observe update", e))?;
+        let mut select_prior = tx
+            .prepare(
+                "SELECT closed_at, credited, quantity FROM sight
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
+            )
+            .map_err(|e| backend("prepare observe prior", e))?;
+        let mut insert_sight = tx
+            .prepare(
+                "INSERT INTO sight (target_id, auction_id, kind, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8)",
+            )
+            .map_err(|e| backend("prepare observe insert", e))?;
+        let mut reopen_sight = tx
+            .prepare(
+                "UPDATE sight SET closed_at = NULL, credited = 0,
+                         first_seen_snapshot = ?4, last_seen_snapshot = ?4,
+                         first_seen_at = ?5, last_seen_at = ?5, band = ?6, quantity = ?7
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
+            )
+            .map_err(|e| backend("prepare observe reopen", e))?;
         let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
         let mut new_sights: HashMap<i64, i64> = HashMap::new(); // item_ref_id -> count
         for listing in listings {
@@ -396,28 +437,34 @@ impl SalesRepository for SqliteStore {
             };
             // A listing sighted in a previous kind cycle must never match
             // here: commodity and item auction ids are separate namespaces.
-            let updated = tx
-                .execute(
-                    "UPDATE sight SET last_seen_snapshot = ?4, last_seen_at = ?5, band = ?6, quantity = ?7
-                     WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3 AND closed_at IS NULL",
-                    rusqlite::params![
-                        target.as_str(),
-                        listing.auction_id,
-                        kind.as_str(),
-                        snapshot_id,
-                        at,
-                        listing.time_left.as_str(),
-                        listing.quantity,
-                    ],
-                )
+            let updated = update_open
+                .execute(rusqlite::params![
+                    target.as_str(),
+                    listing.auction_id,
+                    kind.as_str(),
+                    snapshot_id,
+                    at,
+                    listing.time_left.as_str(),
+                    listing.quantity,
+                ])
                 .map_err(|e| backend("observe update", e))?;
             if updated == 0 {
                 // No open sight: either brand new, or a closed one we must
                 // reopen (the listing vanished for a cycle - maintenance,
                 // truncated pull - and came back). Blind INSERTs would trip
                 // the primary key forever after.
-                if insert_or_reopen_sight(&tx, target, kind, listing, item_ref_id, snapshot_id, at)?
-                {
+                if observe_new_or_reopen(
+                    &mut select_prior,
+                    &mut insert_sight,
+                    &mut reopen_sight,
+                    &tx,
+                    target,
+                    kind,
+                    listing,
+                    item_ref_id,
+                    snapshot_id,
+                    at,
+                )? {
                     *new_sights.entry(item_ref_id).or_insert(0) += 1;
                 }
             }
@@ -431,6 +478,11 @@ impl SalesRepository for SqliteStore {
                 &SalesDelta { listings: count, closed: 0, credited: 0, qty_sold: 0 },
             )?;
         }
+        // Statements borrow `tx`; release them before the commit move.
+        drop(update_open);
+        drop(select_prior);
+        drop(insert_sight);
+        drop(reopen_sight);
         tx.commit().map_err(|e| backend("commit observe", e))?;
         Ok(())
     }
@@ -493,10 +545,19 @@ impl SalesRepository for SqliteStore {
         {
             let band = amtracker_core::domain::TimeLeftBand::parse(&band);
             let credited = band.credits_sale(last_seen_at, at);
+            // The kind predicate is load-bearing: commodity and item auction
+            // ids are separate namespaces, so a close for one kind must never
+            // touch the other kind's sight with the same numeric id.
             tx.execute(
-                "UPDATE sight SET closed_at = ?3, credited = ?4
-                 WHERE target_id = ?1 AND auction_id = ?2 AND closed_at IS NULL",
-                rusqlite::params![target.as_str(), auction_id, at, i64::from(credited)],
+                "UPDATE sight SET closed_at = ?4, credited = ?5
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3 AND closed_at IS NULL",
+                rusqlite::params![
+                    target.as_str(),
+                    auction_id,
+                    kind.as_str(),
+                    at,
+                    i64::from(credited)
+                ],
             )
             .map_err(|e| backend("close update", e))?;
             bump_sales_row(
@@ -567,40 +628,19 @@ impl SalesRepository for SqliteStore {
         items: &[ItemRef],
         days: i64,
     ) -> Result<Option<f64>, StoreError> {
-        if items.is_empty() {
-            return Ok(None);
-        }
         let conn = self.open_transaction();
-        let mut ids = Vec::with_capacity(items.len());
-        for item in items {
-            if let Some(id) = lookup_item_ref(&conn, item)? {
-                ids.push(id);
-            }
-        }
+        let ids = resolve_item_ids(&conn, items)?;
         if ids.is_empty() {
             return Ok(None);
         }
-        // Placeholders are bound values, never interpolated input.
-        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
-        let sql = format!(
-            "SELECT COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
-             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ?"
-        );
         let now_day = utc_day(self.clock.now());
-        let cutoff_day = now_day - days + 1;
-        let mut statement =
-            conn.prepare(&sql).map_err(|e| backend("prepare sale_rate_multi", e))?;
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
-        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
-        for id in &ids {
-            params.push(rusqlite::types::Value::Integer(*id));
+        let rates = sale_rates_by_id(&conn, target, &ids, now_day - days + 1)?;
+        let mut credited = 0i64;
+        let mut listings = 0i64;
+        for (c, l) in rates.values() {
+            credited += *c;
+            listings += *l;
         }
-        params.push(rusqlite::types::Value::Integer(cutoff_day));
-        let (credited, listings): (i64, i64) = statement
-            .query_row(rusqlite::params_from_iter(params.iter()), |row| {
-                Ok((row.get(0)?, row.get(1)?))
-            })
-            .map_err(|e| backend("sale_rate_multi", e))?;
         if listings == 0 {
             return Ok(None);
         }
@@ -608,6 +648,147 @@ impl SalesRepository for SqliteStore {
         #[allow(clippy::cast_precision_loss)]
         Ok(Some(credited as f64 / listings as f64))
     }
+
+    fn sale_rate_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+    ) -> Result<Vec<Option<f64>>, StoreError> {
+        let conn = self.open_transaction();
+        // One pass resolves identities in order (None = unknown item), so the
+        // result stays positionally aligned with `items`.
+        let mut ids: Vec<Option<i64>> = Vec::with_capacity(items.len());
+        for item in items {
+            ids.push(lookup_item_ref(&conn, item)?);
+        }
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        if known.is_empty() {
+            return Ok(vec![None; items.len()]);
+        }
+        let now_day = utc_day(self.clock.now());
+        let rates = sale_rates_by_id(&conn, target, &known, now_day - days + 1)?;
+        Ok(ids
+            .iter()
+            .map(|id| {
+                id.and_then(|id| rates.get(&id)).and_then(|(credited, listings)| {
+                    if *listings == 0 {
+                        None
+                    } else {
+                        // Same display-metric precision trade as `sale_rate`.
+                        #[allow(clippy::cast_precision_loss)]
+                        Some(*credited as f64 / *listings as f64)
+                    }
+                })
+            })
+            .collect())
+    }
+}
+
+/// Stored day-row shape shared by `item_day_rows` and its item-scoped
+/// variant.
+type StoredDayRow = (String, i64, String, i64, i64, i64, i64, i64);
+
+/// Runs a day-row SELECT whose columns match [`StoredDayRow`].
+fn query_day_rows(
+    statement: &mut rusqlite::Statement<'_>,
+    params: impl rusqlite::Params,
+) -> Result<Vec<StoredDayRow>, StoreError> {
+    statement
+        .query(params)
+        .map_err(|e| backend("query day rows", e))?
+        .mapped(|row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, i64>(4)?,
+                row.get::<_, i64>(5)?,
+                row.get::<_, i64>(6)?,
+                row.get::<_, i64>(7)?,
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| backend("day rows row", e))
+}
+
+/// Expands stored day rows (fold JSON + identity) into [`ItemDayRow`]s.
+fn day_rows_from_stored(rows: Vec<StoredDayRow>) -> Result<Vec<ItemDayRow>, StoreError> {
+    let mut out = Vec::with_capacity(rows.len());
+    for (fold_json, day, kind, item_id, species, level, quality, breed) in rows {
+        let ser: SerDayFold =
+            serde_json::from_str(&fold_json).map_err(|e| backend("deserialize fold", e))?;
+        let fold = DayFold::from(ser);
+        let histogram = fold.histogram();
+        if histogram.listing_count == 0 {
+            continue;
+        }
+        let prices: Vec<i64> = histogram
+            .buckets
+            .iter()
+            .flat_map(|(price, bucket)| {
+                // Listing counts are small non-negative values; a corrupt
+                // negative count contributes no repeated prices.
+                std::iter::repeat_n(*price, usize::try_from(bucket.listings).unwrap_or(0))
+            })
+            .collect();
+        let (min, median, mad) = price_stats_sorted(&prices);
+        out.push(ItemDayRow {
+            item: join_item_ref(&kind, item_id, species, level, quality, breed),
+            day,
+            listing_count: histogram.listing_count,
+            qty_sum: histogram.qty_sum,
+            min,
+            median,
+            mad,
+        });
+    }
+    Ok(out)
+}
+
+/// Resolves item identities to `item_ref` ids, keeping only known ones.
+fn resolve_item_ids(conn: &Connection, items: &[ItemRef]) -> Result<Vec<i64>, StoreError> {
+    let mut ids = Vec::with_capacity(items.len());
+    for item in items {
+        if let Some(id) = lookup_item_ref(conn, item)? {
+            ids.push(id);
+        }
+    }
+    Ok(ids)
+}
+
+/// Credited/listings sums per `item_ref` id over the trailing day window, in
+/// one grouped query (the batched fuel for `sale_rate_multi`/
+/// `sale_rate_each`). Placeholders are bound values, never interpolated
+/// input.
+fn sale_rates_by_id(
+    conn: &Connection,
+    target: &TargetId,
+    ids: &[i64],
+    cutoff_day: i64,
+) -> Result<HashMap<i64, (i64, i64)>, StoreError> {
+    // Placeholders are bound values, never interpolated input.
+    let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "SELECT item_ref_id, COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
+         WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ?
+         GROUP BY item_ref_id"
+    );
+    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
+    params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+    for id in ids {
+        params.push(rusqlite::types::Value::Integer(*id));
+    }
+    params.push(rusqlite::types::Value::Integer(cutoff_day));
+    let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare sale_rates", e))?;
+    let rows = statement
+        .query(rusqlite::params_from_iter(params.iter()))
+        .map_err(|e| backend("query sale_rates", e))?
+        .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| backend("sale_rates row", e))?;
+    Ok(rows.into_iter().map(|(id, credited, listings)| (id, (credited, listings))).collect())
 }
 
 /// Sales-aggregate deltas for one (target, item, day) row.
@@ -654,8 +835,12 @@ fn bump_sales_row(
 /// the sales ledger honest: a not-credited close must not keep inflating
 /// `closed`, and a credited close was a phantom sale the moment the
 /// listing returned. Returns `true` when a brand-new sight was opened.
-#[allow(clippy::too_many_lines)]
-fn insert_or_reopen_sight(
+/// Statements arrive pre-prepared (see `observe`).
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
+fn observe_new_or_reopen(
+    select_prior: &mut rusqlite::Statement<'_>,
+    insert_sight: &mut rusqlite::Statement<'_>,
+    reopen_sight: &mut rusqlite::Statement<'_>,
     tx: &rusqlite::Transaction<'_>,
     target: &TargetId,
     kind: PayloadKind,
@@ -664,23 +849,18 @@ fn insert_or_reopen_sight(
     snapshot_id: i64,
     at: i64,
 ) -> Result<bool, StoreError> {
-    let prior: Option<(Option<i64>, i64, i64)> = tx
-        .query_row(
-            "SELECT closed_at, credited, quantity FROM sight
-             WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
-            rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )
+    let prior: Option<(Option<i64>, i64, i64)> = select_prior
+        .query_row(rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .map(Some)
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
             other => Err(backend("observe prior", other)),
         })?;
     let Some((closed_at, credited, prior_qty)) = prior else {
-        tx.execute(
-            "INSERT INTO sight (target_id, auction_id, kind, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8)",
-            rusqlite::params![
+        insert_sight
+            .execute(rusqlite::params![
                 target.as_str(),
                 listing.auction_id,
                 kind.as_str(),
@@ -689,9 +869,8 @@ fn insert_or_reopen_sight(
                 at,
                 listing.time_left.as_str(),
                 listing.quantity,
-            ],
-        )
-        .map_err(|e| backend("observe insert", e))?;
+            ])
+            .map_err(|e| backend("observe insert", e))?;
         return Ok(true);
     };
     if let Some(closed_at) = closed_at {
@@ -704,12 +883,8 @@ fn insert_or_reopen_sight(
             &SalesDelta { listings: 0, closed: -1, credited: d_credited, qty_sold: d_qty },
         )?;
     }
-    tx.execute(
-        "UPDATE sight SET closed_at = NULL, credited = 0,
-                 first_seen_snapshot = ?4, last_seen_snapshot = ?4,
-                 first_seen_at = ?5, last_seen_at = ?5, band = ?6, quantity = ?7
-         WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
-        rusqlite::params![
+    reopen_sight
+        .execute(rusqlite::params![
             target.as_str(),
             listing.auction_id,
             kind.as_str(),
@@ -717,9 +892,8 @@ fn insert_or_reopen_sight(
             at,
             listing.time_left.as_str(),
             listing.quantity,
-        ],
-    )
-    .map_err(|e| backend("observe reopen", e))?;
+        ])
+        .map_err(|e| backend("observe reopen", e))?;
     Ok(false)
 }
 
@@ -1011,19 +1185,31 @@ impl PriceHistoryRepository for SqliteStore {
                 rusqlite::params![target.as_str(), day],
             )
             .map_err(|e| backend("prune listings", e))? as u64;
-        // Best-effort archive cleanup: payload files of old snapshots.
+        // Best-effort archive cleanup: payload files of old snapshots. The
+        // row's path is cleared alongside the file so a re-run neither
+        // re-reads a dangling reference nor re-deletes (files may also be
+        // absent because a previous run removed them before failing here).
         let mut statement = conn
             .prepare(
-                "SELECT DISTINCT archive_path FROM snapshots WHERE target_id = ?1 AND fetched_at < ?2",
+                "SELECT DISTINCT archive_path FROM snapshots
+                 WHERE target_id = ?1 AND fetched_at < ?2 AND archive_path IS NOT NULL",
             )
             .map_err(|e| backend("prune query", e))?;
         let paths: Vec<String> = statement
-            .query_map(rusqlite::params![target.as_str(), day * 86_400], |row| row.get(0))
+            .query_map(rusqlite::params![target.as_str(), day * 86_400], |row| {
+                row.get::<_, Option<String>>(0).map(Option::unwrap_or_default)
+            })
             .map_err(|e| backend("prune rows", e))?
             .filter_map(Result::ok)
+            .filter(|path| !path.is_empty())
             .collect();
         for path in paths {
-            let _ = std::fs::remove_file(self.archive_dir.join(path));
+            let _ = std::fs::remove_file(self.archive_dir.join(&path));
+            let _ = conn.execute(
+                "UPDATE snapshots SET archive_path = NULL
+                 WHERE target_id = ?1 AND archive_path = ?2",
+                rusqlite::params![target.as_str(), path],
+            );
         }
         Ok(removed)
     }
@@ -1078,54 +1264,44 @@ impl PriceHistoryRepository for SqliteStore {
                  WHERE d.target_id = ?1 AND d.day >= ?2",
             )
             .map_err(|e| backend("prepare item_day_rows", e))?;
-        let rows = statement
-            .query(rusqlite::params![target.as_str(), since_day])
-            .map_err(|e| backend("query item_day_rows", e))?
-            .mapped(|row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                    row.get::<_, i64>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                    row.get::<_, i64>(7)?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|e| backend("item_day_rows row", e))?;
+        let rows = query_day_rows(&mut statement, rusqlite::params![target.as_str(), since_day])?;
+        day_rows_from_stored(rows)
+    }
 
-        let mut out = Vec::with_capacity(rows.len());
-        for (fold_json, day, kind, item_id, species, level, quality, breed) in rows {
-            let ser: SerDayFold =
-                serde_json::from_str(&fold_json).map_err(|e| backend("deserialize fold", e))?;
-            let fold = DayFold::from(ser);
-            let histogram = fold.histogram();
-            if histogram.listing_count == 0 {
-                continue;
-            }
-            let prices: Vec<i64> = histogram
-                .buckets
-                .iter()
-                .flat_map(|(price, bucket)| {
-                    // Listing counts are small non-negative values; a corrupt
-                    // negative count contributes no repeated prices.
-                    std::iter::repeat_n(*price, usize::try_from(bucket.listings).unwrap_or(0))
-                })
-                .collect();
-            let (min, median, mad) = price_stats_sorted(&prices);
-            out.push(ItemDayRow {
-                item: join_item_ref(&kind, item_id, species, level, quality, breed),
-                day,
-                listing_count: histogram.listing_count,
-                qty_sum: histogram.qty_sum,
-                min,
-                median,
-                mad,
-            });
-        }
-        Ok(out)
+    fn item_day_rows_for_item(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        since_day: i64,
+    ) -> Result<Vec<ItemDayRow>, StoreError> {
+        let conn = self.open_transaction();
+        let mut statement = conn
+            .prepare(
+                "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
+                 FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
+                 WHERE d.target_id = ?1 AND d.day >= ?2
+                   AND r.kind = ?3 AND r.item_id = ?4 AND r.pet_species = ?5
+                   AND r.pet_level = ?6 AND r.pet_quality = ?7 AND r.pet_breed = ?8",
+            )
+            .map_err(|e| backend("prepare item_day_rows_for_item", e))?;
+        // The identity tuple is the canonical `item_ref` shape (see
+        // `split_item_ref`): the item page passes a plain item id, exactly
+        // how item rows were written.
+        let (kind, item_id, species, level, quality, breed) = split_item_ref(item);
+        let rows = query_day_rows(
+            &mut statement,
+            rusqlite::params![
+                target.as_str(),
+                since_day,
+                kind,
+                item_id,
+                species,
+                level,
+                quality,
+                breed
+            ],
+        )?;
+        day_rows_from_stored(rows)
     }
 }
 

@@ -25,6 +25,7 @@ fn parses_the_committed_example_config() {
 
     assert_eq!(config.server.bind, "127.0.0.1:8080");
     assert_eq!(config.server.token_env.as_deref(), Some("AMT_API_TOKEN"));
+    assert!(!config.server.allow_open, "the open-API opt-out defaults to off");
 
     assert_eq!(config.storage.raw_listing_days, 7);
     assert_eq!(config.metrics.spans, vec![Span::D1, Span::D7, Span::D14, Span::D30]);
@@ -210,6 +211,29 @@ fn explicit_bearer_auth_still_parses() {
         panic!("expected bearer auth, got {auth:?}")
     };
     assert_eq!(env, "AMT_TOKEN");
+}
+
+#[test]
+fn allow_open_opt_out_parses_and_defaults_off() {
+    // Absent key → false (the guard is on by default).
+    let loaded = parse_config_str(EXAMPLE).expect("example parses");
+    assert!(!loaded.tracker.server.allow_open);
+
+    // Explicit true → true (and the key is a known [server] key).
+    let text = EXAMPLE.replace(
+        "token_env = \"AMT_API_TOKEN\"",
+        "token_env = \"AMT_API_TOKEN\"\nallow_open = true",
+    );
+    let loaded = parse_config_str(&text).expect("allow_open = true must parse");
+    assert!(loaded.tracker.server.allow_open);
+
+    // A typo'd variant is rejected by path, like every unknown key.
+    let text = EXAMPLE.replace(
+        "token_env = \"AMT_API_TOKEN\"",
+        "token_env = \"AMT_API_TOKEN\"\nallow_openn = true",
+    );
+    let error = parse_config_str(&text).expect_err("typo'd allow_open must fail");
+    assert!(error.to_string().contains("server.allow_openn"), "{error}");
 }
 
 #[test]

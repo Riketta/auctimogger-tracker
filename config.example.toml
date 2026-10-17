@@ -10,6 +10,10 @@
 [server]
 bind = "127.0.0.1:8080"
 token_env = "AMT_API_TOKEN" # unset or empty = mutating endpoints are open (localhost use)
+# Safety guard: with an unset/empty token, `serve` refuses to start on any
+# non-loopback bind (an open mutating API must not reach the network by
+# accident). Set true to accept exactly that:
+# allow_open = false
 # Minimum seconds between feed re-publications per target. The scheduler
 # publishes feed.lua + feed.json after successful cycles, throttled by this.
 # feed_publish_secs = 300

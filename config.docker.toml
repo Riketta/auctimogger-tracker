@@ -11,7 +11,13 @@
 
 [server]
 bind = "0.0.0.0:8080"
-token_env = "AMT_API_TOKEN" # unset = mutating endpoints are open; set it in compose
+# Set AMT_API_TOKEN in compose to a real random string. The compose default
+# is the well-known dev token 'dev-insecure-token-change-me' (the server
+# warns loudly when it detects it): REPLACE ME. With an unset/empty token,
+# serve REFUSES to start on this non-loopback bind unless you explicitly set
+# allow_open = true (not recommended).
+token_env = "AMT_API_TOKEN"
+# allow_open = false
 
 [storage]
 database = "/data/tracker.sqlite3"

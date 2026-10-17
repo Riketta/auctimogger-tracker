@@ -178,6 +178,11 @@ pub struct FileServer {
     /// endpoints stay open (the documented developer-mode behavior).
     #[serde(default)]
     pub token_env: Option<String>,
+    /// Explicit opt-out for the open-mutating-API guard: with `true`, `serve`
+    /// starts even with an unset/empty token on a non-loopback bind (the
+    /// default refuses). Defaults to `false`.
+    #[serde(default)]
+    pub allow_open: bool,
     /// Minimum seconds between feed re-publications per target; defaults
     /// to 300. The scheduler publishes after successful cycles, throttled
     /// by this.
@@ -385,6 +390,7 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
         server: ServerConfig {
             bind: file.server.bind,
             token_env: file.server.token_env,
+            allow_open: file.server.allow_open,
             feed_publish_secs: file.server.feed_publish_secs,
         },
         storage: StorageConfig {
@@ -426,7 +432,7 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
         collect_unknown(
             server,
             "server",
-            &["bind", "token_env", "feed_publish_secs"],
+            &["bind", "token_env", "allow_open", "feed_publish_secs"],
             &mut unknown,
         );
     }

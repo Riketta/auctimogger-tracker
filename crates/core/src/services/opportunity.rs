@@ -165,9 +165,13 @@ impl OpportunityService {
         limit: usize,
     ) -> Result<Vec<Opportunity>, StoreError> {
         let scan = self.scan(target)?;
+        // One batched lookup instead of a per-candidate query (scan recompute
+        // serves whole markets; the N+1 variant dominated its latency).
+        let items: Vec<ItemRef> = scan.rows.iter().map(|row| row.item.clone()).collect();
+        let rates = self.sales.sale_rate_each(target, &items, 14)?;
         let mut out: Vec<Opportunity> = Vec::new();
-        for row in scan.rows.iter() {
-            let Some(opportunity) = self.opportunity_for(row, target)? else {
+        for (row, rate) in scan.rows.iter().zip(rates) {
+            let Some(opportunity) = self.opportunity_for(row, rate.unwrap_or(0.0)) else {
                 continue;
             };
             if opportunity.samples7 >= i64::from(self.min_samples)
@@ -288,26 +292,18 @@ impl OpportunityService {
     }
 
     /// Builds one opportunity from a scan row. `Ok(None)` = the row is not
-    /// rankable (no price evidence). Sale-rate lookup errors propagate: a
-    /// failing sales store must zero the reliability visibly, not silently.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Backend` when the 14-day sale-rate lookup fails.
-    fn opportunity_for(
-        &self,
-        scan: &ItemScan,
-        target: &TargetId,
-    ) -> Result<Option<Opportunity>, StoreError> {
+    /// rankable (no price evidence). `reliability` comes from the batched
+    /// `sale_rate_each` lookup; a failing sales store zeroes it visibly (the
+    /// error propagates from the batch call, not silently per row).
+    fn opportunity_for(&self, scan: &ItemScan, reliability: f64) -> Option<Opportunity> {
         if scan.median7 <= 0.0 || scan.floor_now <= 0 {
-            return Ok(None);
+            return None;
         }
         // Discount is rounded to 3 decimals for feed/UI stability.
         #[allow(clippy::cast_precision_loss)]
         let discount = ((1.0 - scan.floor_now as f64 / scan.median7).clamp(0.0, 1.0) * 1000.0)
             .round()
             / 1000.0;
-        let reliability = self.sales.sale_rate(target, &scan.item, 14)?.unwrap_or(0.0);
         let churn_score = (scan.churn_per_day / CHURN_ANCHOR).min(1.0);
         let stability = 1.0 - (scan.mad7 / scan.median7).min(1.0);
         // Confidence compares evidence against the u32 floor; f64 is exact at
@@ -322,7 +318,7 @@ impl OpportunityService {
         // the floored integer median, matching the addon's display rule.
         #[allow(clippy::cast_possible_truncation)]
         let median7 = scan.median7 as i64;
-        Ok(Some(Opportunity {
+        Some(Opportunity {
             item: scan.item.clone(),
             median7,
             floor_now: scan.floor_now,
@@ -334,7 +330,7 @@ impl OpportunityService {
             samples7: scan.samples7,
             confidence,
             score,
-        }))
+        })
     }
 
     fn mover_for(scan: &ItemScan, _target: &TargetId) -> Option<MoverRow> {

@@ -53,7 +53,14 @@ use amtracker_core::{
 };
 use serde::Deserialize;
 
-use crate::blizzard_oauth::OAuthTokenSource;
+use crate::blizzard_oauth::{
+    bearer_token,
+    call_refreshing_on_401,
+    CallFailure,
+    OAuthTokenSource,
+    RefreshableCredential,
+    RequestAuth,
+};
 
 /// Pet cage item id: listings of this item are battle pets keyed by species.
 const PET_CAGE_ITEM_ID: i64 = 82_800;
@@ -115,14 +122,6 @@ impl BlizzardSource {
     }
 }
 
-/// Reads the static-bearer token env var; resolved per request so rotated
-/// tokens are picked up without a restart.
-fn bearer_token(env: &str) -> Result<String, SourceError> {
-    std::env::var(env).map_err(|_| {
-        SourceError::Config(format!("missing environment variable {env} (bearer token)"))
-    })
-}
-
 fn build_url(target: &TargetConfig, kind: PayloadKind) -> String {
     match (&target.kind, kind) {
         (
@@ -178,40 +177,118 @@ impl BlizzardSource {
             .clone()
     }
 
-    /// Builds and sends one authenticated conditional-GET request; returns
-    /// the response plus the OAuth source when the request rode on one (the
-    /// caller needs it for the 401 refresh-retry).
+    /// Builds and sends one authenticated conditional-GET request through the
+    /// 401 refresh-retry helper: on a 401 with an OAuth credential the cached
+    /// token is dropped and the request retried once with a fresh one; a
+    /// second 401 (or a static-bearer/anonymous request) surfaces as a
+    /// terminal [`SourceError`] carrying the status.
     fn send_request(
         &self,
         target: &TargetConfig,
         kind: PayloadKind,
         if_modified_since: Option<i64>,
-    ) -> Result<(ureq::Response, String, Option<Arc<OAuthTokenSource>>), SourceError> {
+    ) -> Result<ureq::Response, SourceError> {
         let url = build_url(target, kind);
-        let mut request = self.agent.get(&url);
-        let mut oauth = None;
-        match &target.auth {
-            None => {}
-            Some(AuthConfig::Bearer { env }) => {
-                request = request.set("Authorization", &format!("Bearer {}", bearer_token(env)?));
-            }
+        // The Arc keeps the token source alive for the borrow inside
+        // [`FetchAuth::OAuth`] for the whole call.
+        let oauth = match &target.auth {
             Some(AuthConfig::ClientCredentials { client_id_env, client_secret_env }) => {
-                let source = self.oauth_source(target, client_id_env, client_secret_env);
-                request = request.set("Authorization", &format!("Bearer {}", source.token()?));
-                oauth = Some(source);
+                Some(self.oauth_source(target, client_id_env, client_secret_env))
             }
-        }
-        if let Some(ims) = if_modified_since {
-            // `ims.max(0)` is non-negative, so the conversion is total.
-            let date = httpdate::fmt_http_date(
-                SystemTime::UNIX_EPOCH
-                    + Duration::from_secs(u64::try_from(ims.max(0)).unwrap_or(0)),
-            );
-            request = request.set("If-Modified-Since", &date);
-        }
-        let response = request.call().map_err(|e| SourceError::Http(e.to_string()))?;
-        Ok((response, url, oauth))
+            _ => None,
+        };
+        let auth = if let Some(source) = oauth.as_deref() {
+            FetchAuth::OAuth(source)
+        } else if let Some(AuthConfig::Bearer { env }) = &target.auth {
+            FetchAuth::BearerEnv(env)
+        } else {
+            FetchAuth::Anonymous
+        };
+        call_refreshing_on_401(&auth, |token| {
+            let request = build_request(&self.agent, &url, token, if_modified_since);
+            match request.call() {
+                // 401 is the refreshable case; every other answer — success
+                // or >=400 — flows to `read_payload` so the terminal status
+                // handling (retry-after, logging) applies uniformly.
+                Err(ureq::Error::Status(401, _)) => Err(CallFailure::Unauthorized),
+                Ok(response) | Err(ureq::Error::Status(_, response)) => Ok(response),
+                Err(error) => Err(CallFailure::Terminal(SourceError::Http(error.to_string()))),
+            }
+        })
     }
+}
+
+/// Request auth flavors for the fetch path (see [`RequestAuth`]). The env
+/// bearer is re-read per attempt so rotated tokens apply without a restart.
+enum FetchAuth<'a> {
+    Anonymous,
+    BearerEnv(&'a str),
+    OAuth(&'a OAuthTokenSource),
+}
+
+impl RequestAuth for FetchAuth<'_> {
+    fn initial_token(&self) -> Result<Option<String>, SourceError> {
+        Ok(match self {
+            Self::Anonymous => None,
+            Self::BearerEnv(env) => Some(bearer_token(env)?),
+            Self::OAuth(source) => Some(source.token()?),
+        })
+    }
+
+    fn refresh_source(&self) -> Option<&dyn RefreshableCredential> {
+        match self {
+            Self::OAuth(source) => Some(*source),
+            Self::Anonymous | Self::BearerEnv(_) => None,
+        }
+    }
+}
+
+/// Builds one conditional-GET request, optionally with a bearer header.
+fn build_request(
+    agent: &ureq::Agent,
+    url: &str,
+    token: Option<&str>,
+    if_modified_since: Option<i64>,
+) -> ureq::Request {
+    let mut request = agent.get(url);
+    if let Some(token) = token {
+        request = request.set("Authorization", &format!("Bearer {token}"));
+    }
+    if let Some(ims) = if_modified_since {
+        // `ims.max(0)` is non-negative, so the conversion is total.
+        let date = httpdate::fmt_http_date(
+            SystemTime::UNIX_EPOCH + Duration::from_secs(u64::try_from(ims.max(0)).unwrap_or(0)),
+        );
+        request = request.set("If-Modified-Since", &date);
+    }
+    request
+}
+
+/// Read-cap for one auction payload. Real dumps sit in the tens of MB; the
+/// cap bounds a hostile or unbounded body an order of magnitude above that.
+const MAX_PAYLOAD_BYTES: u64 = 256 * 1024 * 1024;
+
+/// Reads a body under a hard byte cap; exceeding it is a clear transport
+/// error instead of unbounded memory growth. Shared with the OAuth token and
+/// item-info adapters.
+pub(crate) fn read_capped(
+    reader: impl std::io::Read,
+    cap: u64,
+    what: &str,
+) -> Result<Vec<u8>, SourceError> {
+    let mut bytes = Vec::new();
+    reader
+        .take(cap)
+        .read_to_end(&mut bytes)
+        .map_err(|e| SourceError::Http(format!("read {what}: {e}")))?;
+    // `take` stops at the cap: a full-cap read means there was more (or
+    // exactly the cap, which no legitimate payload is).
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) >= cap {
+        return Err(SourceError::Http(format!(
+            "{what} exceeds the {cap}-byte read cap - refusing the payload"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Terminal status handling + strict payload parse for one response.
@@ -249,11 +326,7 @@ fn read_payload(
             t.duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         });
-    let mut bytes = Vec::new();
-    response
-        .into_reader()
-        .read_to_end(&mut bytes)
-        .map_err(|e| SourceError::Http(format!("read body: {e}")))?;
+    let bytes = read_capped(response.into_reader(), MAX_PAYLOAD_BYTES, "payload")?;
     let (listings, dropped_count) = parse_payload(kind, &bytes)?;
     tracing::info!(
         kind = ?kind,
@@ -278,19 +351,8 @@ impl AuctionSourcePort for BlizzardSource {
         kind: PayloadKind,
         if_modified_since: Option<i64>,
     ) -> Result<FetchOutcome, SourceError> {
-        let (response, url, oauth) = self.send_request(target, kind, if_modified_since)?;
-        // A cached OAuth token can be rejected before its expiry (revoked,
-        // clock skew): drop it and retry once with a freshly fetched one.
-        // Static bearer and unauthenticated requests take the plain path.
-        if response.status() == 401 {
-            if let Some(source) = &oauth {
-                tracing::debug!(url = %url, "oauth token rejected; refreshing and retrying once");
-                source.invalidate();
-                let (response, url, _) = self.send_request(target, kind, if_modified_since)?;
-                return read_payload(response, kind, &url);
-            }
-        }
-        read_payload(response, kind, &url)
+        let response = self.send_request(target, kind, if_modified_since)?;
+        read_payload(response, kind, &build_url(target, kind))
     }
 }
 
@@ -558,6 +620,56 @@ mod tests {
             parse_payload(PayloadKind::Commodities, payload.as_bytes()).expect("parses");
         assert!(listings.is_empty());
         assert_eq!(dropped, 3);
+    }
+
+    // -------------------------------------------------- fetch status paths
+
+    #[test]
+    fn a_304_answer_passes_through_as_not_modified() {
+        let response = ureq::Response::new(304, "Not Modified", "").expect("synthetic response");
+        let outcome =
+            read_payload(response, PayloadKind::Commodities, "https://source.example/c.json")
+                .expect("304 is a valid outcome");
+        assert!(matches!(outcome, FetchOutcome::NotModified));
+    }
+
+    #[test]
+    fn a_non_200_answer_is_a_terminal_error_carrying_the_status() {
+        let response = ureq::Response::new(503, "Service Unavailable", "busy").expect("synthetic");
+        let error = read_payload(response, PayloadKind::Commodities, "https://source.example/c")
+            .expect_err("503 must fail");
+        assert!(error.to_string().contains("unexpected status 503"), "{error}");
+    }
+
+    #[test]
+    fn a_200_answer_parses_into_a_payload() {
+        let response = ureq::Response::new(200, "OK", AUCTIONS_SAMPLE).expect("synthetic response");
+        let outcome =
+            read_payload(response, PayloadKind::Auctions, "https://source.example/a.json")
+                .expect("sample parses");
+        match outcome {
+            FetchOutcome::Payload(payload) => {
+                assert_eq!(payload.listings.len(), 60);
+                assert_eq!(payload.dropped_count, 0);
+                assert_eq!(payload.raw.len(), AUCTIONS_SAMPLE.len());
+            }
+            FetchOutcome::NotModified => panic!("200 must not read as not-modified"),
+        }
+    }
+
+    #[test]
+    fn oversized_bodies_hit_the_read_cap() {
+        let body = vec![b'x'; 4096];
+        let error = read_capped(std::io::Cursor::new(&body), 1024, "payload")
+            .expect_err("body over the cap must fail");
+        assert!(error.to_string().contains("read cap"), "{error}");
+        let capped = read_capped(
+            std::io::Cursor::new(&body),
+            u64::try_from(body.len()).unwrap_or(u64::MAX) + 1,
+            "payload",
+        )
+        .expect("body under the cap reads fully");
+        assert_eq!(capped.len(), body.len());
     }
 
     #[test]

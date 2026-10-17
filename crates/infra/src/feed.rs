@@ -196,6 +196,9 @@ impl FeedPublisher for FileFeedPublisher {
         Ok(())
     }
 
+    /// NOTE: write-only in production — no handler or service reads the
+    /// stamp today; the reader exists for diagnostics and is asserted by the
+    /// `publisher_writes_files_and_tracks_last_publication` integration test.
     fn last_published(
         &self,
         target: &TargetId,

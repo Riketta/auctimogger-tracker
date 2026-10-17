@@ -4,7 +4,6 @@
 
 use std::{
     fmt,
-    io::Read,
     time::Duration,
 };
 
@@ -29,7 +28,17 @@ use serde::{
     Deserializer,
 };
 
-use crate::blizzard_oauth::OAuthTokenSource;
+use crate::blizzard_oauth::{
+    bearer_token,
+    call_refreshing_on_401,
+    CallFailure,
+    OAuthTokenSource,
+    RefreshableCredential,
+    RequestAuth,
+};
+
+/// Read-cap for one item-information payload (real answers are a few KB).
+const MAX_ITEM_INFO_BYTES: u64 = 1024 * 1024;
 
 /// How the item API is authenticated.
 enum Credential {
@@ -37,6 +46,29 @@ enum Credential {
     BearerEnv(String),
     /// Self-refreshing OAuth client-credentials token source.
     OAuth(std::sync::Arc<OAuthTokenSource>),
+}
+
+/// Request-auth view over [`BlizzardItemInfo`]'s credential (see
+/// [`RequestAuth`]): the OAuth flavor is refreshable, the env bearer is not.
+enum ItemAuth<'a> {
+    BearerEnv(&'a str),
+    OAuth(&'a OAuthTokenSource),
+}
+
+impl RequestAuth for ItemAuth<'_> {
+    fn initial_token(&self) -> Result<Option<String>, SourceError> {
+        Ok(Some(match self {
+            Self::BearerEnv(env) => bearer_token(env)?,
+            Self::OAuth(source) => source.token()?,
+        }))
+    }
+
+    fn refresh_source(&self) -> Option<&dyn RefreshableCredential> {
+        match self {
+            Self::OAuth(source) => Some(*source),
+            Self::BearerEnv(_) => None,
+        }
+    }
 }
 
 /// Blizzard item API (`data/wow/item/{id}`, static namespace).
@@ -88,39 +120,30 @@ impl BlizzardItemInfo {
         )
     }
 
-    /// One authorized GET; on a 401 against the OAuth credential the cached
-    /// token is dropped and the request retried once with a fresh one.
+    /// One authorized GET through the 401 refresh-retry helper: a 401 on the
+    /// OAuth credential drops the cached token and retries once with a fresh
+    /// one; anything else surfaces as a terminal [`SourceError`].
     fn authorized_get(&self, url: &str) -> Result<ureq::Response, SourceError> {
-        let token = match &self.credential {
-            Credential::BearerEnv(env) => bearer_token(env)?,
-            Credential::OAuth(source) => source.token()?,
+        let auth = match &self.credential {
+            Credential::BearerEnv(env) => ItemAuth::BearerEnv(env),
+            Credential::OAuth(source) => ItemAuth::OAuth(source),
         };
-        let response = self
-            .agent
-            .get(url)
-            .set("Authorization", &format!("Bearer {token}"))
-            .call()
-            .map_err(|e| SourceError::Http(e.to_string()))?;
-        if response.status() == 401 {
-            if let Credential::OAuth(source) = &self.credential {
-                source.invalidate();
-                let fresh = source.token()?;
-                return self
-                    .agent
-                    .get(url)
-                    .set("Authorization", &format!("Bearer {fresh}"))
-                    .call()
-                    .map_err(|e| SourceError::Http(e.to_string()));
+        call_refreshing_on_401(&auth, |token| {
+            let mut request = self.agent.get(url);
+            if let Some(token) = token {
+                request = request.set("Authorization", &format!("Bearer {token}"));
             }
-        }
-        Ok(response)
+            match request.call() {
+                // 401 is the refreshable case; every other answer — success
+                // or >=400 — flows to the caller so its terminal status
+                // handling (404 = unknown item, anything else = error)
+                // applies uniformly.
+                Err(ureq::Error::Status(401, _)) => Err(CallFailure::Unauthorized),
+                Ok(response) | Err(ureq::Error::Status(_, response)) => Ok(response),
+                Err(error) => Err(CallFailure::Terminal(SourceError::Http(error.to_string()))),
+            }
+        })
     }
-}
-
-fn bearer_token(env: &str) -> Result<String, SourceError> {
-    std::env::var(env).map_err(|_| {
-        SourceError::Config(format!("missing environment variable {env} (bearer token)"))
-    })
 }
 
 /// A localized string on the wire. The single-item endpoint returns plain
@@ -199,11 +222,11 @@ impl ItemInfoPort for BlizzardItemInfo {
         if status != 200 {
             return Err(SourceError::Http(format!("item api status {status}")));
         }
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| SourceError::Http(format!("read body: {e}")))?;
+        let bytes = crate::blizzard_source::read_capped(
+            response.into_reader(),
+            MAX_ITEM_INFO_BYTES,
+            "item body",
+        )?;
         parse_item(item_id, &bytes)
     }
 }

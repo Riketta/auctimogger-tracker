@@ -4,11 +4,7 @@
 //! never sees tokens.
 
 use std::{
-    io::Read,
-    sync::{
-        Arc,
-        Mutex,
-    },
+    sync::Mutex,
     time::{
         Duration,
         Instant,
@@ -27,6 +23,9 @@ const REFRESH_MARGIN: Duration = Duration::from_secs(60);
 /// answers are ~24h; the cap also keeps `Instant + Duration` math
 /// overflow-free no matter what a hostile endpoint reports.
 const MAX_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3_600;
+
+/// Read-cap for one token-endpoint answer (real answers are ~1 KB).
+const MAX_TOKEN_BODY_BYTES: u64 = 1024 * 1024;
 
 /// The lifetime accepted into the cache: a hostile `expires_in` is clamped
 /// so the `Instant` arithmetic below can never overflow.
@@ -117,11 +116,11 @@ impl OAuthTokenSource {
         if status != 200 {
             return Err(SourceError::Http(format!("token endpoint status {status}")));
         }
-        let mut bytes = Vec::new();
-        response
-            .into_reader()
-            .read_to_end(&mut bytes)
-            .map_err(|e| SourceError::Http(format!("read token body: {e}")))?;
+        let bytes = crate::blizzard_source::read_capped(
+            response.into_reader(),
+            MAX_TOKEN_BODY_BYTES,
+            "token body",
+        )?;
         let (access_token, expires_in) = parse_token_response(&bytes)?;
         Ok(CachedToken {
             access_token,
@@ -152,6 +151,14 @@ fn credential(env: &str, what: &str) -> Result<String, SourceError> {
             Err(SourceError::Config(format!("missing environment variable {env} (OAuth {what})")))
         }
     }
+}
+
+/// Reads the static-bearer token env var; resolved per request so rotated
+/// tokens are picked up without a restart.
+pub(crate) fn bearer_token(env: &str) -> Result<String, SourceError> {
+    std::env::var(env).map_err(|_| {
+        SourceError::Config(format!("missing environment variable {env} (bearer token)"))
+    })
 }
 
 /// Wire shape of the token endpoint answer.
@@ -191,8 +198,102 @@ fn needs_refresh(now: Instant, expires_at: Instant) -> bool {
     now.checked_add(REFRESH_MARGIN).is_none_or(|threshold| threshold >= expires_at)
 }
 
-/// Shared handle used by the Blizzard adapters.
-pub type SharedTokenSource = Arc<OAuthTokenSource>;
+// ------------------------------------------------- 401 refresh-retry helper
+
+/// Token-provisioning surface the 401-retry helper needs. Implemented by the
+/// live [`OAuthTokenSource`] and by test stubs, so the retry logic is
+/// unit-testable without HTTP.
+pub trait RefreshableCredential {
+    /// A bearer token, fetched fresh when the cache is empty or stale.
+    ///
+    /// # Errors
+    ///
+    /// Propagates credential/endpoint failures as [`SourceError`].
+    fn token(&self) -> Result<String, SourceError>;
+    /// Drops any cached token so the next [`token`](Self::token) refetches.
+    fn invalidate(&self);
+}
+
+impl RefreshableCredential for OAuthTokenSource {
+    fn token(&self) -> Result<String, SourceError> {
+        // The inherent method takes precedence in normal call position; the
+        // explicit path disambiguates inside this trait impl.
+        OAuthTokenSource::token(self)
+    }
+
+    fn invalidate(&self) {
+        OAuthTokenSource::invalidate(self);
+    }
+}
+
+/// What a request authenticates with. `ureq` 2.x reports HTTP error statuses
+/// as `Err(Error::Status(..))`, so "call and check the response status" never
+/// sees real 401s — this trait is how the fetch path learns which rejected
+/// tokens can be refreshed.
+pub trait RequestAuth {
+    /// The bearer token for the first attempt; `None` = no auth header.
+    ///
+    /// # Errors
+    ///
+    /// Propagates credential resolution failures as [`SourceError`].
+    fn initial_token(&self) -> Result<Option<String>, SourceError>;
+    /// The refresh seam when a 401 may trigger one invalidate+retry cycle.
+    fn refresh_source(&self) -> Option<&dyn RefreshableCredential>;
+}
+
+/// Failure modes of one send attempt, split so the retry helper recognizes a
+/// refreshable 401 without knowing HTTP details.
+pub enum CallFailure {
+    /// The endpoint answered 401: the presented credential was rejected.
+    Unauthorized,
+    /// Anything else is terminal (transport failure or non-401 status).
+    Terminal(SourceError),
+}
+
+/// Performs an authorized call with the documented 401 semantics: `send`
+/// receives the bearer token (`None` = no Authorization header). When the
+/// first attempt fails with a 401 and the credential has a refresh source,
+/// the cached token is dropped, a fresh one is fetched, and the request is
+/// retried exactly once. A second 401 — or a 401 on a credential without a
+/// refresh source (static bearer, anonymous) — surfaces as a terminal
+/// [`SourceError::Http`] carrying the status.
+///
+/// # Errors
+///
+/// Returns the first [`CallFailure::Terminal`] as-is, credential resolution
+/// failures from [`RequestAuth::initial_token`]/refresh, and
+/// [`SourceError::Http`] for unrecoverable 401s.
+pub fn call_refreshing_on_401<T, F>(auth: &dyn RequestAuth, mut send: F) -> Result<T, SourceError>
+where
+    F: FnMut(Option<&str>) -> Result<T, CallFailure>,
+{
+    let token = auth.initial_token()?;
+    match send(token.as_deref()) {
+        Ok(value) => Ok(value),
+        Err(CallFailure::Terminal(error)) => Err(error),
+        Err(CallFailure::Unauthorized) => {
+            let Some(source) = auth.refresh_source() else {
+                return Err(SourceError::Http(
+                    "source answered 401 unauthorized (static bearer or unauthenticated \
+                     request - nothing to refresh)"
+                        .into(),
+                ));
+            };
+            // A cached token can be rejected before its expiry (revoked,
+            // clock skew): drop it and retry once with a freshly fetched one.
+            tracing::debug!("oauth token rejected; refreshing and retrying once");
+            source.invalidate();
+            let fresh = source.token()?;
+            match send(Some(fresh.as_str())) {
+                Ok(value) => Ok(value),
+                Err(CallFailure::Terminal(error)) => Err(error),
+                Err(CallFailure::Unauthorized) => Err(SourceError::Http(
+                    "source still answers 401 unauthorized after one OAuth token refresh".into(),
+                )),
+            }
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -267,5 +368,130 @@ mod tests {
         assert_eq!(clamped_lifetime(29_999), 29_999);
         let now = Instant::now();
         assert!(!needs_refresh(now, now + Duration::from_secs(clamped_lifetime(u64::MAX))));
+    }
+
+    // ---------------------------------------------- 401 refresh-retry helper
+
+    /// Credential stub: hands out scripted tokens and counts invalidations.
+    struct StubCredential {
+        tokens: Mutex<Vec<&'static str>>,
+        invalidations: Mutex<usize>,
+    }
+
+    impl StubCredential {
+        fn new(tokens: &[&'static str]) -> Self {
+            Self { tokens: Mutex::new(tokens.to_vec()), invalidations: Mutex::new(0) }
+        }
+
+        fn invalidations(&self) -> usize {
+            *self.invalidations.lock().unwrap()
+        }
+    }
+
+    impl RefreshableCredential for StubCredential {
+        fn token(&self) -> Result<String, SourceError> {
+            self.tokens
+                .lock()
+                .unwrap()
+                .pop()
+                .map(str::to_owned)
+                .ok_or_else(|| SourceError::Config("stub token list exhausted".into()))
+        }
+
+        fn invalidate(&self) {
+            *self.invalidations.lock().unwrap() += 1;
+        }
+    }
+
+    /// Auth stub over a [`StubCredential`].
+    struct StubAuth {
+        credential: StubCredential,
+        with_refresh: bool,
+    }
+
+    impl RequestAuth for StubAuth {
+        fn initial_token(&self) -> Result<Option<String>, SourceError> {
+            if self.with_refresh {
+                self.credential.token().map(Some)
+            } else {
+                // Static-bearer shape: token present, no refresh source.
+                Ok(Some("static-bearer".into()))
+            }
+        }
+
+        fn refresh_source(&self) -> Option<&dyn RefreshableCredential> {
+            if self.with_refresh {
+                Some(&self.credential)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// A send stub that answers 401 for the given tokens, succeeds otherwise,
+    /// and records the tokens it was called with.
+    fn rejecting_send<'a>(
+        reject: &'a [&'static str],
+    ) -> impl FnMut(Option<&str>) -> Result<&'static str, CallFailure> + 'a {
+        let seen = std::cell::RefCell::new(Vec::new());
+        move |token: Option<&str>| {
+            seen.borrow_mut().push(token.map(str::to_owned));
+            let rejected = token.is_some_and(|t| reject.contains(&t));
+            if rejected {
+                Err(CallFailure::Unauthorized)
+            } else {
+                Ok("payload")
+            }
+        }
+    }
+
+    #[test]
+    fn a_401_invalidates_and_retries_once_with_a_fresh_token() {
+        let auth =
+            StubAuth { credential: StubCredential::new(&["fresh", "stale"]), with_refresh: true };
+        let send = rejecting_send(&["stale"]);
+        let result = call_refreshing_on_401(&auth, send).expect("retry succeeds");
+        assert_eq!(result, "payload");
+        assert_eq!(auth.credential.invalidations(), 1, "exactly one invalidation");
+    }
+
+    #[test]
+    fn a_second_401_surfaces_as_a_terminal_error() {
+        let auth =
+            StubAuth { credential: StubCredential::new(&["fresh-2", "stale"]), with_refresh: true };
+        let error = call_refreshing_on_401(&auth, rejecting_send(&["stale", "fresh-2"]))
+            .expect_err("both attempts rejected");
+        assert!(error.to_string().contains("401"), "{error}");
+        assert_eq!(auth.credential.invalidations(), 1, "only one refresh cycle");
+    }
+
+    #[test]
+    fn a_401_without_a_refresh_source_is_terminal() {
+        let auth = StubAuth { credential: StubCredential::new(&[]), with_refresh: false };
+        let error = call_refreshing_on_401(&auth, rejecting_send(&["static-bearer"]))
+            .expect_err("static bearer cannot refresh");
+        assert!(error.to_string().contains("nothing to refresh"), "{error}");
+    }
+
+    #[test]
+    fn terminal_failures_pass_through_without_a_retry() {
+        let auth = StubAuth { credential: StubCredential::new(&["unused"]), with_refresh: true };
+        let result: Result<&'static str, SourceError> = call_refreshing_on_401(&auth, |_| {
+            Err(CallFailure::Terminal(SourceError::Http("status 503 from source".into())))
+        });
+        let error = result.expect_err("terminal failure");
+        assert!(error.to_string().contains("503"), "{error}");
+        assert_eq!(auth.credential.invalidations(), 0, "no refresh on non-401");
+    }
+
+    #[test]
+    fn a_first_attempt_success_never_touches_the_refresh_path() {
+        let auth = StubAuth { credential: StubCredential::new(&["good"]), with_refresh: true };
+        let result = call_refreshing_on_401(&auth, |token| match token {
+            Some("good") => Ok("payload"),
+            other => panic!("unexpected token {other:?}"),
+        });
+        assert_eq!(result.expect("succeeds"), "payload");
+        assert_eq!(auth.credential.invalidations(), 0);
     }
 }

@@ -152,6 +152,13 @@ fn run_config_check(path: &Path) -> ! {
 }
 
 fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
+    // Fail fast BEFORE any state is created: an open mutating API on a
+    // non-loopback bind, or missing ingestion credentials, must abort in
+    // milliseconds with a message instead of serving a broken instance.
+    if let Err(message) = amtracker_server::startup::validate_serve_startup(config) {
+        tracing::error!("{message}");
+        observability::exit_with_flush(1, &format!("error: {message}"));
+    }
     let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
@@ -204,24 +211,9 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
         )),
         history: store.clone(),
         item_info,
+        // One lock serializes scheduled and manual (`/api/fetch`) cycles.
+        cycle_lock: Arc::new(std::sync::Mutex::new(())),
     });
-
-    // The open-without-token fallback is documented developer-mode behavior,
-    // but an operator who configured `token_env` and forgot the variable (or
-    // left it empty, as the compose default does) must still see one loud
-    // line at startup.
-    if let Some(token_env) = &config.server.token_env {
-        let unset_or_empty = match std::env::var(token_env) {
-            Ok(value) => value.trim().is_empty(),
-            Err(_) => true,
-        };
-        if unset_or_empty {
-            tracing::warn!(
-                env = %token_env,
-                "bearer token env unset or empty - mutating API endpoints are OPEN"
-            );
-        }
-    }
 
     if let Err(error) = amtracker_server::scheduler::spawn(state.clone()) {
         tracing::error!(error = %error, "scheduler thread failed to start");

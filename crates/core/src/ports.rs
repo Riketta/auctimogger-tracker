@@ -154,6 +154,20 @@ pub trait PriceHistoryRepository: Send + Sync {
         target: &TargetId,
         since_day: i64,
     ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
+    /// Per-item-day aggregate rows on/after `since_day` for exactly one item
+    /// identity (the item detail page): SQL-scoped instead of loading the
+    /// whole market's rows. The identity must match the canonical `item_ref`
+    /// tuple (`kind` + `item_id` + pet fields, see `split_item_ref`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the aggregates cannot be computed.
+    fn item_day_rows_for_item(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        since_day: i64,
+    ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
 }
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).
@@ -217,6 +231,28 @@ pub trait SalesRepository: Send + Sync {
     ) -> Result<Option<f64>, StoreError> {
         let _ = (target, items, days);
         Ok(None)
+    }
+    /// Sale rate for EACH of the given identities, positionally aligned
+    /// (`rates[i]` belongs to `items[i]`); `None` entries have no sales rows.
+    /// Batched replacement for per-item `sale_rate` loops over candidate
+    /// lists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the credit statistics cannot be
+    /// read.
+    fn sale_rate_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+    ) -> Result<Vec<Option<f64>>, StoreError> {
+        // Correct-by-default fallback: one query per identity.
+        let mut rates = Vec::with_capacity(items.len());
+        for item in items {
+            rates.push(self.sale_rate(target, item, days)?);
+        }
+        Ok(rates)
     }
 }
 

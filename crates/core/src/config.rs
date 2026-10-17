@@ -33,6 +33,11 @@ pub struct ServerConfig {
     pub bind: String,
     /// Environment variable holding the API token; `None` = open (localhost).
     pub token_env: Option<String>,
+    /// Explicit opt-out for the open-mutating-API guard: when set, `serve`
+    /// starts even with an unset/empty token on a non-loopback bind (the
+    /// default refuses, because that combination exposes watchlist writes
+    /// and `/api/fetch` to the network).
+    pub allow_open: bool,
     /// Minimum seconds between feed re-publications per target (the
     /// scheduler publishes after successful cycles, throttled by this).
     pub feed_publish_secs: u64,

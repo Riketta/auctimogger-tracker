@@ -353,6 +353,22 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
         let credits = store.close_missing(&target, kind, id, 11_000).expect("close");
         assert!(credits.is_empty(), "nothing vanished; cross-kind mass-close must not happen");
     }
+    // BOTH sights must still be open after each kind's close pass: the
+    // close UPDATE carries the same kind predicate as the SELECT.
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        for kind in ["commodities", "auctions"] {
+            let closed_at: Option<i64> = conn
+                .query_row(
+                    "SELECT closed_at FROM sight
+                     WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
+                    rusqlite::params![target.as_str(), shared_auction_id, kind],
+                    |row| row.get(0),
+                )
+                .expect("sight row present");
+            assert!(closed_at.is_none(), "{kind} sight must stay open after its own close pass");
+        }
+    }
 
     // Vanish the commodities listing for real: close, credit, then re-observe
     // it later — the sight must reopen (not PK-wedge) and the phantom credit
@@ -385,6 +401,30 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
         Some(item(1)),
         "only the commodities sight closed; auctions untouched"
     );
+    // The close must be scoped to its own kind: the OTHER kind's sight stays
+    // open (with the old UPDATE this is where the auctions sight was closed
+    // and its phantom credit polluted item 2's ledger).
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let auctions_closed: Option<i64> = conn
+            .query_row(
+                "SELECT closed_at FROM sight
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = 'auctions'",
+                rusqlite::params![target.as_str(), shared_auction_id],
+                |row| row.get(0),
+            )
+            .expect("auctions sight present");
+        assert!(auctions_closed.is_none(), "the OTHER kind's sight must stay open");
+        let commodities_closed: Option<i64> = conn
+            .query_row(
+                "SELECT closed_at FROM sight
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = 'commodities'",
+                rusqlite::params![target.as_str(), shared_auction_id],
+                |row| row.get(0),
+            )
+            .expect("commodities sight present");
+        assert!(commodities_closed.is_some(), "the vanished kind's sight IS closed");
+    }
 
     let t_back = 13_000;
     let id4 = store
@@ -410,6 +450,93 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
     // close. Nothing credited.
     let rate = store.sale_rate(&target, &item(1), 14).expect("rate");
     assert!(rate.is_none() || rate == Some(0.0), "no phantom sales: got {rate:?}");
+
+    // Sales aggregates must never go negative after the close/reopen cycle
+    // (a phantom credit reversal that underflowed the counters would corrupt
+    // every rate computed afterwards).
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let rows: Vec<(i64, i64, i64, i64)> = conn
+            .prepare("SELECT listings, closed, credited, qty_sold FROM sales")
+            .expect("prepare sales scan")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)))
+            .expect("query sales")
+            .filter_map(Result::ok)
+            .collect();
+        assert!(!rows.is_empty(), "sales rows exist after the cycle");
+        for (listings, closed, credited, qty_sold) in rows {
+            assert!(listings >= 0 && closed >= 0 && credited >= 0 && qty_sold >= 0);
+        }
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// T11 companion: a larger synthetic batch through record/observe/close must
+/// produce identical bookkeeping to the small-path tests (the batched
+/// prepared statements cover the per-listing work).
+#[test]
+fn larger_batches_record_observe_and_close_without_drift() {
+    use amtracker_core::ports::SalesRepository;
+
+    let dir = temp_dir("batch");
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+
+    // 400 listings across 4 items, distinct auction ids in one namespace.
+    let batch: Vec<NormalizedListing> =
+        (0..400).map(|i| listing(i, &item((i % 4) + 1), 100 + i, 1)).collect();
+    let snapshot_id = store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: 20_000,
+                source_last_modified: None,
+                entry_count: batch.len() as u64,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &batch,
+            b"batch-1".as_slice(),
+        )
+        .expect("record batch");
+    store
+        .observe(&target, PayloadKind::Commodities, &batch, snapshot_id, 20_000)
+        .expect("observe batch");
+
+    // Every sight opens exactly once per item: 100 new sights each.
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let total: i64 = conn
+            .query_row(
+                "SELECT COALESCE(SUM(listings), 0) FROM sales WHERE target_id = ?1",
+                rusqlite::params![target.as_str()],
+                |row| row.get(0),
+            )
+            .expect("sales sum");
+        assert_eq!(total, 400, "one new-sight listing counted per observed row");
+    }
+
+    // A snapshot without any of them closes and credits the whole batch.
+    let next = store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: 21_000,
+                source_last_modified: None,
+                entry_count: 0,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            b"batch-2".as_slice(),
+        )
+        .expect("record empty");
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, next, 21_000).expect("close all");
+    assert_eq!(credits.len(), 400, "every vanished VERY_LONG listing credits");
 
     std::fs::remove_dir_all(&dir).ok();
 }
