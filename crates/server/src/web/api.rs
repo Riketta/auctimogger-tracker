@@ -580,6 +580,7 @@ pub(crate) async fn api_snapshots(
                 "sourceLastModified": meta.source_last_modified,
                 "entryCount": meta.entry_count,
                 "droppedCount": meta.dropped_count,
+                "droppedReasons": meta.dropped_reasons,
                 "status": format!("{:?}", meta.status),
             }))
             .collect::<Vec<_>>(),

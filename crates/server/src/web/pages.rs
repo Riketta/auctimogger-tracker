@@ -401,18 +401,28 @@ pub(crate) async fn snapshots_page(State(state): State<Arc<AppState>>) -> Respon
             ("fetched at", "When the tracker stored this snapshot (UTC)."),
             ("source modified", "The source's Last-Modified header — the addon's freshness anchor. “—” when the source does not send it."),
             ("entries", "Listings that survived the strict parse."),
-            ("dropped", "Listings rejected by the strict parse (counted, never ingested)."),
+            ("dropped", "Listings rejected by the strict parse (counted, never ingested). Hover for the per-reason breakdown when the source classifies them."),
             ("status", "Storage status of the snapshot."),
         ] {
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
         for meta in rows {
+            // Per-reason breakdown as the hover title: "reason ×count",
+            // most frequent first; empty when the source drops nothing or
+            // does not classify (pre-v5 rows read empty too).
+            let mut reasons: Vec<(&String, &u64)> = meta.dropped_reasons.iter().collect();
+            reasons.sort_by(|a, b| b.1.cmp(a.1).then(a.0.cmp(b.0)));
+            let breakdown = reasons
+                .iter()
+                .map(|(reason, count)| format!("{reason} ×{count}"))
+                .collect::<Vec<_>>()
+                .join(", ");
             let _ = write!(
                 body,
                 "<tr><td class=\"num\" data-v=\"{}\">{}</td><td>{}</td><td>{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
-                 <td class=\"num\" data-v=\"{}\">{}</td><td>{}</td></tr>",
+                 <td class=\"num\" data-v=\"{}\" title=\"{}\">{}</td><td>{}</td></tr>",
                 meta.id,
                 meta.id,
                 human_time(meta.fetched_at),
@@ -420,6 +430,7 @@ pub(crate) async fn snapshots_page(State(state): State<Arc<AppState>>) -> Respon
                 meta.entry_count,
                 meta.entry_count,
                 meta.dropped_count,
+                html_escape(&breakdown),
                 meta.dropped_count,
                 html_escape(meta.status.as_str())
             );

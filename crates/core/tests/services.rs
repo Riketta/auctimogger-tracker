@@ -6,7 +6,10 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     sync::{
         Arc,
         Mutex,
@@ -100,6 +103,7 @@ fn payload(listings: Vec<amtracker_core::domain::NormalizedListing>) -> FetchOut
         source_last_modified: None,
         listings,
         dropped_count: 0,
+        dropped_reasons: BTreeMap::new(),
         raw: b"raw".to_vec(),
     })
 }
@@ -172,6 +176,7 @@ impl SnapshotRepository for FakeSnapshots {
             source_last_modified: snapshot.source_last_modified,
             entry_count: snapshot.entry_count,
             dropped_count: snapshot.dropped_count,
+            dropped_reasons: snapshot.dropped_reasons.clone(),
             status: snapshot.status,
         });
         inner.raws.push(raw.to_vec());
@@ -381,6 +386,7 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
                 listing(10, &item1, 100, 4), // re-sight: last wins, not a new auction
             ],
             dropped_count: 1,
+            dropped_reasons: BTreeMap::new(),
             raw: b"raw-bytes".to_vec(),
         },
     ))]));
@@ -448,6 +454,7 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
                 source_last_modified: Some(500),
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[],

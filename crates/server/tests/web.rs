@@ -512,6 +512,7 @@ async fn snapshots_api_serves_filterable_metadata() {
                 source_last_modified: Some(999),
                 entry_count: 3,
                 dropped_count: 1,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[],

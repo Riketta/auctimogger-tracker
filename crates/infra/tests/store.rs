@@ -104,6 +104,7 @@ fn record_persists_snapshot_listings_and_latest() {
                 source_last_modified: Some(999_000),
                 entry_count: 2,
                 dropped_count: 1,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[listing(10, &item(1), 100, 20), listing(11, &item(1), 200, 1)],
@@ -161,6 +162,7 @@ fn prune_removes_only_the_raw_working_set() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[listing(1, &item(1), 100, 1)],
@@ -178,6 +180,7 @@ fn prune_removes_only_the_raw_working_set() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[listing(2, &item(2), 300, 1)],
@@ -221,6 +224,7 @@ fn sell_through_credits_band_violations_only() {
                 source_last_modified: None,
                 entry_count: 3,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &batch,
@@ -242,6 +246,7 @@ fn sell_through_credits_band_violations_only() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &survivor,
@@ -266,6 +271,7 @@ fn sell_through_credits_band_violations_only() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &late,
@@ -321,6 +327,7 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
                     source_last_modified: None,
                     entry_count: 1,
                     dropped_count: 0,
+                    dropped_reasons: std::collections::BTreeMap::new(),
                     status: SnapshotStatus::Ok,
                 },
                 batch,
@@ -344,6 +351,7 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
                     source_last_modified: None,
                     entry_count: 1,
                     dropped_count: 0,
+                    dropped_reasons: std::collections::BTreeMap::new(),
                     status: SnapshotStatus::Ok,
                 },
                 batch,
@@ -386,6 +394,7 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
                 source_last_modified: None,
                 entry_count: 0,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[],
@@ -439,6 +448,7 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &commodities,
@@ -498,6 +508,7 @@ fn larger_batches_record_observe_and_close_without_drift() {
                 source_last_modified: None,
                 entry_count: batch.len() as u64,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &batch,
@@ -531,6 +542,7 @@ fn larger_batches_record_observe_and_close_without_drift() {
                 source_last_modified: None,
                 entry_count: 0,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[],
@@ -740,6 +752,7 @@ fn prune_keeps_archives_shared_with_recent_snapshots() {
         source_last_modified: None,
         entry_count: 0,
         dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
         status: SnapshotStatus::Ok,
     };
     store.record(&snapshot(50_000), &[], b"shared-payload").expect("old shared");
@@ -784,6 +797,7 @@ fn list_recent_returns_newest_first_bounded_and_scoped() {
                     source_last_modified: Some(900_000 + i),
                     entry_count: 100 + u64::try_from(i).unwrap_or(0),
                     dropped_count: 0,
+                    dropped_reasons: std::collections::BTreeMap::new(),
                     status: SnapshotStatus::Ok,
                 },
                 &[],
@@ -801,6 +815,7 @@ fn list_recent_returns_newest_first_bounded_and_scoped() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[],
@@ -816,6 +831,7 @@ fn list_recent_returns_newest_first_bounded_and_scoped() {
                 source_last_modified: None,
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[],
@@ -1018,6 +1034,7 @@ fn backup_to_writes_consistent_copy_and_refuses_existing_target() {
                 source_last_modified: Some(999_000),
                 entry_count: 1,
                 dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
                 status: SnapshotStatus::Ok,
             },
             &[listing(10, &item(1), 100, 20)],
@@ -1138,6 +1155,98 @@ fn alert_rules_and_events_round_trip() {
         .expect("add other rule");
     assert_eq!(store.list(&target).expect("list").len(), 0);
     assert_eq!(store.list(&TargetId("eu-9".into())).expect("list").len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Drop-reason breakdowns persist with the snapshot metadata and read back
+/// through `latest`/`list_recent`; snapshots recorded without a breakdown
+/// (or pre-v5 rows) read as empty maps, not errors.
+#[test]
+fn snapshot_drop_reasons_round_trip_and_default_empty() {
+    let dir = temp_dir("drop-reasons");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let mut reasons = std::collections::BTreeMap::new();
+    reasons.insert("missing-price".to_string(), 2);
+    reasons.insert("cage-without-species".to_string(), 1);
+
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: 1_000_001,
+                source_last_modified: None,
+                entry_count: 3,
+                dropped_count: 3,
+                dropped_reasons: reasons,
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            br"[]",
+        )
+        .expect("record with breakdown");
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Auctions,
+                fetched_at: 1_000_002,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            br"[]",
+        )
+        .expect("record without breakdown");
+
+    let latest = store.latest(&target, PayloadKind::Commodities).expect("latest").expect("row");
+    assert_eq!(latest.dropped_count, 3);
+    assert_eq!(latest.dropped_reasons.get("missing-price"), Some(&2));
+    assert_eq!(latest.dropped_reasons.get("cage-without-species"), Some(&1));
+
+    let auctions =
+        store.latest(&target, PayloadKind::Auctions).expect("latest auctions").expect("row");
+    assert!(auctions.dropped_reasons.is_empty(), "no breakdown stored → empty map");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Reopening an already-migrated store keeps stored breakdowns readable (the
+/// migration branch runs again and must not disturb the data).
+#[test]
+fn reopening_a_migrated_store_keeps_drop_reasons_readable() {
+    let dir = temp_dir("drop-reasons-reopen");
+    let target = TargetId("us-4".into());
+    {
+        let store = open_store(&dir, 1_000_000);
+        store
+            .record(
+                &NewSnapshot {
+                    target: target.clone(),
+                    kind: PayloadKind::Commodities,
+                    fetched_at: 1_000_001,
+                    source_last_modified: None,
+                    entry_count: 1,
+                    dropped_count: 1,
+                    dropped_reasons: std::collections::BTreeMap::from([(
+                        "missing-price".to_string(),
+                        1,
+                    )]),
+                    status: SnapshotStatus::Ok,
+                },
+                &[],
+                br"[]",
+            )
+            .expect("record");
+    }
+    let store = open_store(&dir, 1_000_000);
+    let latest = store.latest(&target, PayloadKind::Commodities).expect("latest").expect("row");
+    assert_eq!(latest.dropped_reasons.get("missing-price"), Some(&1));
 
     std::fs::remove_dir_all(&dir).ok();
 }

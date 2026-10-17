@@ -43,8 +43,10 @@ normal for this item, and how do I know this deal is real?"*.
   (`region` + `connected_realm_id`) or raw `static-urls` (any endpoint that
   serves the same JSON shape, e.g. mainline-tracking emulators). Conditional
   GET via `If-Modified-Since` (a 304 costs nothing); malformed or truncated
-  rows are dropped **and counted** (per-reason breakdown at debug level),
-  never silently ingested; rate-limit answers carry their `Retry-After`.
+  rows are dropped **and counted** (per-reason breakdown persisted with the
+  snapshot and shown on the snapshots page/API),
+  never silently ingested; rate-limit answers back the poller off with their
+  `Retry-After` hint.
 - **Self-healing scheduler** — a panicking ingest cycle is caught, logged
   (panic hook feeds the file log and Sentry) and retried on the next
   interval; the web UI can never outlive ingestion silently. Failed store

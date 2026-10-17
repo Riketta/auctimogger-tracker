@@ -217,6 +217,9 @@ pub struct SnapshotMeta {
     pub entry_count: u64,
     /// Number of entries dropped by the ACL pass.
     pub dropped_count: u64,
+    /// Drop breakdown by reason (why the ACL pass discarded rows). Empty
+    /// when nothing was dropped or the source does not classify reasons.
+    pub dropped_reasons: std::collections::BTreeMap<String, u64>,
     /// Terminal ingest state of the snapshot.
     pub status: SnapshotStatus,
 }
@@ -233,6 +236,8 @@ pub struct FetchedPayload {
     pub listings: Vec<NormalizedListing>,
     /// How many source entries the ACL pass discarded.
     pub dropped_count: u64,
+    /// Drop breakdown by reason (see `SnapshotMeta::dropped_reasons`).
+    pub dropped_reasons: std::collections::BTreeMap<String, u64>,
     /// Verbatim raw payload bytes, for archival and re-parse.
     pub raw: Vec<u8>,
 }
@@ -261,6 +266,8 @@ pub struct NewSnapshot {
     pub entry_count: u64,
     /// Number of entries dropped by the ACL pass.
     pub dropped_count: u64,
+    /// Drop breakdown by reason (see `SnapshotMeta::dropped_reasons`).
+    pub dropped_reasons: std::collections::BTreeMap<String, u64>,
     /// Terminal ingest state of the snapshot.
     pub status: SnapshotStatus,
 }

@@ -65,14 +65,16 @@ fn snapshot(target: &TargetId, _id: i64, fetched_at: i64, count: usize) -> NewSn
         source_last_modified: None,
         entry_count: count as u64,
         dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
         status: SnapshotStatus::Ok,
     }
 }
 
 #[test]
 fn real_sample_sightings_close_and_credit() {
-    let (listings, dropped) =
+    let (listings, dropped, dropped_reasons) =
         parse_payload(PayloadKind::Auctions, SAMPLE.as_bytes()).expect("sample parses");
+    let _ = dropped_reasons;
     assert_eq!(dropped, 0);
     assert!(listings.len() >= 50, "fixture should carry a meaningful batch");
 

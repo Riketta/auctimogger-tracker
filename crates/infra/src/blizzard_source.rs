@@ -111,12 +111,13 @@ impl BlizzardSource {
     ) -> Result<FetchOutcome, SourceError> {
         let bytes = std::fs::read(path)
             .map_err(|e| SourceError::Http(format!("{}: {e}", path.display())))?;
-        let (listings, dropped_count) = parse_payload(kind, &bytes)?;
+        let (listings, dropped_count, dropped_reasons) = parse_payload(kind, &bytes)?;
         Ok(FetchOutcome::Payload(FetchedPayload {
             kind,
             source_last_modified,
             listings,
             dropped_count,
+            dropped_reasons,
             raw: bytes,
         }))
     }
@@ -334,7 +335,7 @@ fn read_payload(
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         });
     let bytes = read_capped(response.into_reader(), MAX_PAYLOAD_BYTES, "payload")?;
-    let (listings, dropped_count) = parse_payload(kind, &bytes)?;
+    let (listings, dropped_count, dropped_reasons) = parse_payload(kind, &bytes)?;
     tracing::info!(
         kind = ?kind,
         bytes = bytes.len(),
@@ -347,6 +348,7 @@ fn read_payload(
         source_last_modified,
         listings,
         dropped_count,
+        dropped_reasons,
         raw: bytes,
     }))
 }
@@ -426,10 +428,24 @@ struct WireModifier {
 /// Returns [`SourceError::Parse`] when `bytes` is not a complete, structurally
 /// valid JSON document of the expected wire shape (truncated or spliced
 /// payloads are rejected wholesale rather than partially mapped).
-pub fn parse_payload(
-    kind: PayloadKind,
-    bytes: &[u8],
-) -> Result<(Vec<NormalizedListing>, u64), SourceError> {
+/// Parse result: cleaned listings, the drop total and the per-reason
+/// breakdown behind it.
+pub type ParsedPayload = (Vec<NormalizedListing>, u64, BTreeMap<String, u64>);
+
+/// Strict ACL pass over one auction dump (see the crate docs): rows whose
+/// identity cannot be represented are dropped here — cage rows without any
+/// species signal (the addon keys pets on `speciesID`; an unidentifiable row
+/// would poison every later snapshot (fetcher refuses truncated/spliced
+/// payloads). Per-row soft rules (degenerate cage rows, non-positive prices)
+/// drop and count the row only. Public: integration tests and tooling replay
+/// real dumps through it.
+///
+/// # Errors
+///
+/// Returns [`SourceError::Parse`] when `bytes` is not a complete, structurally
+/// valid JSON document of the expected wire shape (truncated or spliced
+/// payloads are rejected wholesale rather than partially mapped).
+pub fn parse_payload(kind: PayloadKind, bytes: &[u8]) -> Result<ParsedPayload, SourceError> {
     let payload: WirePayload = serde_json::from_slice(bytes)
         .map_err(|e| SourceError::Parse(format!("{kind:?} payload rejected: {e}")))?;
     let mut listings = Vec::with_capacity(payload.auctions.len());
@@ -449,7 +465,8 @@ pub fn parse_payload(
         // "why" without recompiling.
         tracing::debug!(kind = ?kind, dropped, reasons = ?by_reason, "degenerate rows dropped");
     }
-    Ok((listings, dropped))
+    let reasons = by_reason.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
+    Ok((listings, dropped, reasons))
 }
 
 /// Why a degenerate row was dropped. Diagnostics only: drops are expected
@@ -554,8 +571,9 @@ mod tests {
 
     #[test]
     fn sample_fixture_parses_with_real_rows() {
-        let (listings, dropped) = parse_payload(PayloadKind::Auctions, AUCTIONS_SAMPLE.as_bytes())
-            .expect("sample must parse");
+        let (listings, dropped, _reasons) =
+            parse_payload(PayloadKind::Auctions, AUCTIONS_SAMPLE.as_bytes())
+                .expect("sample must parse");
         assert_eq!(dropped, 0, "real sample rows are all well-formed");
         assert_eq!(listings.len(), 60);
         // auction ids must survive as identity
@@ -589,7 +607,7 @@ mod tests {
             {"id":3,"item":{"id":82800},"quantity":1,"buyout":100,"time_left":"LONG"},
             {"id":4,"item":{"id":82800,"modifiers":[]},"quantity":1,"buyout":100,"time_left":"LONG"}
         ]}"#;
-        let (listings, dropped) =
+        let (listings, dropped, _reasons) =
             parse_payload(PayloadKind::Auctions, payload.as_bytes()).expect("parses");
         assert_eq!(dropped, 2, "species-less cage rows drop");
         assert_eq!(listings.len(), 2);
@@ -608,12 +626,12 @@ mod tests {
         let commodities = r#"{"auctions":[{"id":1,"item":{"id":89112},"quantity":16,"unit_price":170000,"time_left":"SHORT"}]}"#;
         let auctions = r#"{"auctions":[{"id":1,"item":{"id":863},"quantity":4,"buyout":800000,"time_left":"SHORT","bid":700000}]}"#;
 
-        let (commodity_rows, _) =
+        let (commodity_rows, _, _) =
             parse_payload(PayloadKind::Commodities, commodities.as_bytes()).expect("ok");
         assert_eq!(commodity_rows[0].unit_price, 170_000, "commodities are already per unit");
         assert_eq!(commodity_rows[0].bid, None);
 
-        let (auction_rows, _) =
+        let (auction_rows, _, _) =
             parse_payload(PayloadKind::Auctions, auctions.as_bytes()).expect("ok");
         assert_eq!(auction_rows[0].unit_price, 200_000, "buyout divides by quantity");
         assert_eq!(auction_rows[0].bid, Some(700_000));
@@ -626,10 +644,11 @@ mod tests {
             {"id":2,"item":{"id":1},"quantity":1,"unit_price":0,"time_left":"SHORT"},
             {"id":3,"item":{"id":1},"quantity":1,"time_left":"SHORT"}
         ]}"#;
-        let (listings, dropped) =
+        let (listings, dropped, reasons) =
             parse_payload(PayloadKind::Commodities, payload.as_bytes()).expect("parses");
         assert!(listings.is_empty());
         assert_eq!(dropped, 3);
+        assert_eq!(reasons.len(), 2, "three drops across two reasons");
     }
 
     // -------------------------------------------------- fetch status paths

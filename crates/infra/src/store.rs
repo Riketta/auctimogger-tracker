@@ -56,7 +56,7 @@ use rusqlite::Connection;
 /// cannot be migrated faithfully (old rows carry no kind) and are refused.
 /// Version 3 added the `pet_catalog` table (a fresh `CREATE TABLE IF NOT
 /// EXISTS`, so v2 files upgrade in place without a data migration).
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -69,6 +69,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     archive_path TEXT,
     entry_count INTEGER NOT NULL,
     dropped_count INTEGER NOT NULL,
+    drop_reasons TEXT,
     status TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_snapshots_target ON snapshots(target_id, kind, id DESC);
@@ -252,9 +253,24 @@ impl SqliteStore {
         let version = Self::read_schema_version(&conn)?;
         Self::check_schema_version(&conn, version)?;
         conn.execute_batch(SCHEMA).map_err(|e| backend("schema", e))?;
-        // Only mark UPgrades: a database from a future version must keep its
-        // higher marker so the version check keeps reporting it as newer.
+        // v5 added the per-reason drop breakdown column. Older files get an
+        // in-place ALTER guarded by the version gate and a column check, so
+        // both fresh v5 files (column already present) and v4 files (column
+        // missing) converge; the column is nullable — pre-v5 rows read as
+        // "no breakdown recorded".
         if version < SCHEMA_VERSION {
+            let has_column = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('snapshots') WHERE name = 'drop_reasons')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|flag| flag == 1)
+                .map_err(|e| backend("inspect snapshots schema", e))?;
+            if !has_column {
+                conn.execute_batch("ALTER TABLE snapshots ADD COLUMN drop_reasons TEXT")
+                    .map_err(|e| backend("migrate drop_reasons", e))?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
         }
@@ -366,9 +382,17 @@ impl SnapshotRepository for SqliteStore {
 
         let conn = self.open_transaction();
         let tx = conn.unchecked_transaction().map_err(|e| backend("begin", e))?;
+        let drop_reasons_json = if snapshot.dropped_reasons.is_empty() {
+            None
+        } else {
+            Some(
+                serde_json::to_string(&snapshot.dropped_reasons)
+                    .map_err(|e| backend("serialize drop reasons", e))?,
+            )
+        };
         tx.execute(
-            "INSERT INTO snapshots (target_id, kind, fetched_at, source_last_modified, sha256, archive_path, entry_count, dropped_count, status)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            "INSERT INTO snapshots (target_id, kind, fetched_at, source_last_modified, sha256, archive_path, entry_count, dropped_count, drop_reasons, status)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             rusqlite::params![
                 snapshot.target.as_str(),
                 snapshot.kind.as_str(),
@@ -380,6 +404,7 @@ impl SnapshotRepository for SqliteStore {
                 // unreachable and preferred over wrapping.
                 i64::try_from(snapshot.entry_count).unwrap_or(i64::MAX),
                 i64::try_from(snapshot.dropped_count).unwrap_or(i64::MAX),
+                drop_reasons_json,
                 snapshot.status.as_str(),
             ],
         )
@@ -431,7 +456,7 @@ impl SnapshotRepository for SqliteStore {
         let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
-                "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status
+                "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status, drop_reasons
                  FROM snapshots WHERE target_id = ?1 AND kind = ?2
                  ORDER BY id DESC LIMIT 1",
             )
@@ -456,6 +481,9 @@ impl SnapshotRepository for SqliteStore {
                 source_last_modified: row.get(4).map_err(|e| backend("last_modified", e))?,
                 entry_count,
                 dropped_count,
+                dropped_reasons: parse_drop_reasons(
+                    row.get(8).map_err(|e| backend("latest drop_reasons", e))?,
+                )?,
                 status: parse_status(&row.get::<_, String>(7).map_err(|e| backend("status", e))?),
             }));
         }
@@ -471,7 +499,7 @@ impl SnapshotRepository for SqliteStore {
         let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
-                "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status
+                "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status, drop_reasons
                  FROM snapshots WHERE target_id = ?1 AND kind = ?2
                  ORDER BY id DESC LIMIT ?3",
             )
@@ -507,6 +535,9 @@ impl SnapshotRepository for SqliteStore {
                     .map_err(|e| backend("list_recent last_modified", e))?,
                 entry_count,
                 dropped_count,
+                dropped_reasons: parse_drop_reasons(
+                    row.get(8).map_err(|e| backend("list_recent drop_reasons", e))?,
+                )?,
                 status: parse_status(
                     &row.get::<_, String>(7).map_err(|e| backend("list_recent status", e))?,
                 ),
@@ -1951,6 +1982,18 @@ fn parse_kind(value: &str) -> PayloadKind {
         "auctions" => PayloadKind::Auctions,
         _ => PayloadKind::Commodities,
     }
+}
+
+/// Deserializes the stored drop-reason breakdown. `NULL` (pre-v5 rows, or
+/// snapshots with nothing dropped) reads as an empty map; corrupt JSON
+/// degrades to empty rather than failing every snapshot read.
+fn parse_drop_reasons(
+    json: Option<String>,
+) -> Result<std::collections::BTreeMap<String, u64>, StoreError> {
+    let Some(json) = json else {
+        return Ok(std::collections::BTreeMap::new());
+    };
+    serde_json::from_str(&json).map_err(|e| backend("deserialize drop reasons", e))
 }
 
 fn parse_status(value: &str) -> SnapshotStatus {
