@@ -83,7 +83,8 @@ pub struct AppState {
     pub catalog: Arc<amtracker_core::services::catalog::CatalogService>,
     /// Precomputed per-span metric blocks (medians, VWAP, sale rate).
     pub metrics: Arc<MetricsService>,
-    /// Discount/opportunity ranking behind the opportunities pages.
+    /// Discount/opportunity ranking behind the opportunities pages, served
+    /// from scans the scheduler prepares in the background.
     pub opportunities: Arc<OpportunityService>,
     /// User-curated watch list that drives the slim feed export.
     pub watchlist: Arc<WatchlistService>,

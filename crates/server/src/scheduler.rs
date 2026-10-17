@@ -1,8 +1,11 @@
 //! Poll-loop scheduler: a plain thread that runs ingestion cycles per target
 //! on the configured cadence, then keeps the operational side effects that
-//! belong to ingestion flowing: raw-listing retention (`prune_raw_before`)
-//! and feed publication (the files `/feed.lua` serves). Doing both here means
-//! a plain `serve` is self-contained — no cron, no exporter sidecar.
+//! belong to ingestion flowing: raw-listing retention (`prune_raw_before`),
+//! feed publication (the files `/feed.lua` serves), and the prepared
+//! opportunity/overview scans (`OpportunityService::refresh` — at startup,
+//! after every successful cycle, and when a scan outlives its TTL, so
+//! requests serve prepared data with no store reads). Doing all of this here
+//! means a plain `serve` is self-contained — no cron, no exporter sidecar.
 //!
 //! D13: no async in or around the core; everything below is blocking and
 //! runs on this dedicated thread.
@@ -31,8 +34,12 @@ use amtracker_core::{
         utc_day,
         FeedFormat,
         PayloadKind,
+        TargetId,
     },
-    services::feed_export::ExportOptions,
+    services::{
+        feed_export::ExportOptions,
+        opportunity::SCAN_TTL_SECONDS,
+    },
 };
 
 use crate::web::AppState;
@@ -62,6 +69,15 @@ struct TargetTimers {
 pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
+        // Prepare every configured target's opportunity scan before the first
+        // request arrives; best effort — a failing scan logs a warning and the
+        // target's scan simply stays cold (the request path falls back to an
+        // inline compute), so `serve` never fails startup over it.
+        for target in &config.targets {
+            survive("startup-refresh", &target.id.0, || {
+                refresh_opportunities(&state, &target.id);
+            });
+        }
         // The critical sections below only touch the maps, so a poisoned
         // lock can only come from a panic inside this very loop; recover
         // the guard instead of panicking on poison.
@@ -113,7 +129,9 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
                                 sale_credits = report.sale_credits,
                                 "ingest cycle complete"
                             );
-                            after_cycle(&state, &config, &timers, &target.id.0);
+                            survive("after-cycle", &target.id.0, || {
+                                after_cycle(&state, &config, &timers, &target.id.0);
+                            });
                         }
                         Ok(Err(error)) => tracing::warn!(
                             target = %target.id.0,
@@ -142,6 +160,20 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
                         .insert(key, Instant::now());
                 }
             }
+            // Refresh any prepared opportunity scan that outlived its TTL;
+            // the debounce window in `refresh` makes overlap with the
+            // post-cycle refresh above harmless.
+            for target in &config.targets {
+                let refresh_due = state
+                    .opportunities
+                    .snapshot_age_secs(&target.id)
+                    .is_none_or(|age| age >= SCAN_TTL_SECONDS);
+                if refresh_due {
+                    survive("scan-refresh", &target.id.0, || {
+                        refresh_opportunities(&state, &target.id);
+                    });
+                }
+            }
             tracing::trace!(tick_secs = TICK.as_secs(), "scheduler tick");
             thread::sleep(TICK);
         }
@@ -149,8 +181,10 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
 }
 
 /// Operational side effects after a successful cycle for one target:
-/// once-per-UTC-day retention pruning and throttled feed publication. Both
-/// are best effort — a failure is logged and retried on a later cycle.
+/// once-per-UTC-day retention pruning, throttled feed publication, and a
+/// refresh of the target's prepared opportunity scan (new folds/credits just
+/// landed). All are best effort — a failure is logged and retried on a later
+/// cycle.
 fn after_cycle(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
@@ -185,15 +219,42 @@ fn after_cycle(
         drop(timers);
         publish_feed(state, config, target);
     }
+
+    refresh_opportunities(state, &TargetId(target.to_string()));
 }
 
 /// Runs the after-cycle side effects for one target right now, without the
-/// scheduler's once-per-day/throttle bookkeeping: retention pruning + feed
-/// publication, exactly as a successful scheduled cycle would trigger them.
+/// scheduler's once-per-day/throttle bookkeeping: retention pruning, feed
+/// publication, and an opportunity scan refresh, exactly as a successful
+/// scheduled cycle would trigger them.
 /// Used by the manual `/api/fetch` path, whose successful cycles must show
-/// up in `/feed.lua` immediately instead of waiting for the scheduler.
+/// up in `/feed.lua` and the ranking pages immediately instead of waiting
+/// for the scheduler.
 pub fn after_cycle_now(state: &Arc<AppState>, target: &str) {
     after_cycle(state, &state.config, &Mutex::new(TargetTimers::default()), target);
+}
+
+/// Runs a best-effort scheduler step under `catch_unwind`, giving the
+/// operational side effects (prune, publish, scan refresh) the same
+/// panic-survival guarantee ingest cycles already have: the panic hook logs
+/// the detail, this keeps the thread alive and names the step.
+fn survive(step: &'static str, target: &str, f: impl FnOnce()) {
+    if panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
+        tracing::error!(step, target, "scheduler step panicked; continuing");
+    }
+}
+
+/// Recomputes one target's prepared opportunity scan, best effort: success is
+/// logged at debug with the items covered, failures warn and are swallowed —
+/// ranking data is background hygiene, never worth failing a cycle or the
+/// startup over.
+fn refresh_opportunities(state: &Arc<AppState>, target: &TargetId) {
+    match state.opportunities.refresh(target) {
+        Ok(items) => tracing::debug!(target = %target.0, items, "opportunity scan refreshed"),
+        Err(error) => {
+            tracing::warn!(target = %target.0, error = %error, "opportunity scan refresh failed");
+        }
+    }
 }
 
 /// Builds and publishes the full feed (lua + json) for one target.

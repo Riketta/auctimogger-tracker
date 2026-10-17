@@ -17,9 +17,11 @@ use amtracker_core::{
     config::{
         TargetConfig,
         TargetKind,
+        TrackerConfig,
     },
     domain::{
         FetchOutcome,
+        ItemDayRow,
         ItemRef,
         ListingKind,
         NewWatchlistEntry,
@@ -49,6 +51,7 @@ use amtracker_core::{
             CycleOutcome,
             IngestCycleService,
         },
+        opportunity::OpportunityService,
         watchlist::WatchlistService,
     },
 };
@@ -506,4 +509,368 @@ fn watchlist_service_adds_lists_and_rejects_duplicates() {
     assert!(service.remove(&target, &pet).expect("remove"));
     assert!(!service.remove(&target, &pet).expect("remove again"));
     assert_eq!(service.list(&target).expect("list").len(), 0);
+}
+
+// --------------------------------------------------------- opportunity scans
+
+/// Clock the tests can move forward to simulate TTL expiry and debounce
+/// windows.
+struct MutableClock(Mutex<i64>);
+
+impl MutableClock {
+    fn new(now: i64) -> Arc<Self> {
+        Arc::new(Self(Mutex::new(now)))
+    }
+
+    fn advance(&self, secs: i64) {
+        *self.0.lock().unwrap() += secs;
+    }
+}
+
+impl ClockPort for MutableClock {
+    fn now(&self) -> i64 {
+        *self.0.lock().unwrap()
+    }
+}
+
+/// Full-market history fake: scripted day rows plus a read counter, so tests
+/// can prove that steady-state requests touch no store.
+struct CountingHistory {
+    rows: Vec<ItemDayRow>,
+    item_day_rows_calls: Mutex<usize>,
+}
+
+impl CountingHistory {
+    fn new(rows: Vec<ItemDayRow>) -> Self {
+        Self { rows, item_day_rows_calls: Mutex::new(0) }
+    }
+
+    fn item_day_rows_calls(&self) -> usize {
+        *self.item_day_rows_calls.lock().unwrap()
+    }
+}
+
+impl PriceHistoryRepository for CountingHistory {
+    fn load_fold(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _day: i64,
+    ) -> Result<Option<DayFold>, StoreError> {
+        Ok(None)
+    }
+
+    fn save_fold(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _day: i64,
+        _fold: &DayFold,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn prune_raw_before(&self, _target: &TargetId, _day: i64) -> Result<u64, StoreError> {
+        Ok(0)
+    }
+
+    fn items_with_data(
+        &self,
+        _target: &TargetId,
+        _since_day: i64,
+    ) -> Result<Vec<ItemRef>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn item_day_rows(
+        &self,
+        _target: &TargetId,
+        _since_day: i64,
+    ) -> Result<Vec<ItemDayRow>, StoreError> {
+        *self.item_day_rows_calls.lock().unwrap() += 1;
+        Ok(self.rows.clone())
+    }
+
+    fn item_day_rows_for_item(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _since_day: i64,
+    ) -> Result<Vec<ItemDayRow>, StoreError> {
+        Ok(Vec::new())
+    }
+}
+
+/// Sales fake: a deterministic per-item rate, a batch-call counter, and an
+/// injectable failure mode for the failed-refresh resilience test.
+#[derive(Default)]
+struct CountingSales {
+    sale_rate_each_calls: Mutex<usize>,
+    fail_sale_rate_each: Mutex<bool>,
+}
+
+impl CountingSales {
+    fn sale_rate_each_calls(&self) -> usize {
+        *self.sale_rate_each_calls.lock().unwrap()
+    }
+
+    fn set_sale_rate_each_failure(&self, fail: bool) {
+        *self.fail_sale_rate_each.lock().unwrap() = fail;
+    }
+}
+
+impl SalesRepository for CountingSales {
+    fn observe(
+        &self,
+        _target: &TargetId,
+        _kind: PayloadKind,
+        _listings: &[amtracker_core::domain::NormalizedListing],
+        _snapshot_id: i64,
+        _at: i64,
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn close_missing(
+        &self,
+        _target: &TargetId,
+        _kind: PayloadKind,
+        _snapshot_id: i64,
+        _at: i64,
+    ) -> Result<Vec<amtracker_core::domain::SaleCredit>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn sale_rate(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _days: i64,
+    ) -> Result<Option<f64>, StoreError> {
+        Ok(None)
+    }
+
+    fn sale_rate_each(
+        &self,
+        _target: &TargetId,
+        items: &[ItemRef],
+        _days: i64,
+    ) -> Result<Vec<Option<f64>>, StoreError> {
+        *self.sale_rate_each_calls.lock().unwrap() += 1;
+        if *self.fail_sale_rate_each.lock().unwrap() {
+            return Err(StoreError::Backend("sales store unavailable".into()));
+        }
+        Ok(items.iter().map(|i| if *i == item(1) { Some(0.25) } else { None }).collect())
+    }
+}
+
+/// Minimal-but-valid tracker config for the opportunity service specs.
+fn opportunity_config() -> TrackerConfig {
+    TrackerConfig {
+        server: amtracker_core::config::ServerConfig {
+            bind: "127.0.0.1:0".into(),
+            token_env: None,
+            allow_open: true,
+            feed_publish_secs: 300,
+        },
+        storage: amtracker_core::config::StorageConfig {
+            database: "mem.sqlite3".into(),
+            raw_listing_days: 7,
+            archive_dir: "raw".into(),
+        },
+        metrics: amtracker_core::config::MetricsConfig {
+            spans: vec![amtracker_core::domain::Span::D1],
+        },
+        opportunities: amtracker_core::config::OpportunitiesConfig {
+            min_samples: 1,
+            weights: amtracker_core::config::ScoreWeights {
+                discount: 0.4,
+                sale: 0.3,
+                churn: 0.2,
+                stability: 0.1,
+            },
+        },
+        targets: vec![target()],
+    }
+}
+
+fn day_row(item_id: i64, day: i64, listing_count: u64, min: i64, median: i64) -> ItemDayRow {
+    ItemDayRow { item: item(item_id), day, listing_count, qty_sum: 0, min, median, mad: 500 }
+}
+
+/// Two ranked items: item 1 with a steep discount and sales evidence, item 2
+/// with a modest discount and none.
+fn scan_day_rows() -> Vec<ItemDayRow> {
+    let today = amtracker_core::domain::utc_day(1_000_000);
+    vec![
+        day_row(1, today - 1, 900, 45_000, 90_000),
+        day_row(1, today, 1_100, 55_000, 110_000),
+        day_row(2, today, 300, 80_000, 95_000),
+    ]
+}
+
+/// A fresh opportunity service over the shared fixture: scripted rows,
+/// counting sales fake, movable clock.
+fn opportunity_fixture(
+    now: i64,
+) -> (Arc<OpportunityService>, Arc<CountingHistory>, Arc<CountingSales>, Arc<MutableClock>) {
+    let history = Arc::new(CountingHistory::new(scan_day_rows()));
+    let sales = Arc::new(CountingSales::default());
+    let clock = MutableClock::new(now);
+    let service = Arc::new(OpportunityService::new(
+        history.clone(),
+        sales.clone(),
+        clock.clone(),
+        &opportunity_config(),
+    ));
+    (service, history, sales, clock)
+}
+
+#[test]
+fn refresh_prepares_the_scan_so_requests_read_nothing() {
+    let target = TargetId("us-4".into());
+    let (service, history, sales, _clock) = opportunity_fixture(1_000_000);
+
+    let covered = service.refresh(&target).expect("refresh");
+    assert_eq!(covered, 2, "both scanned items are covered");
+
+    for _ in 0..3 {
+        let ranked = service.opportunities(&target, 1.0, 50).expect("ranked");
+        assert_eq!(ranked.len(), 2);
+        let overview = service.overview(&target, 15).expect("overview");
+        assert_eq!(overview.most_active.len(), 2);
+    }
+    assert_eq!(history.item_day_rows_calls(), 1, "only the refresh reads history");
+    assert_eq!(sales.sale_rate_each_calls(), 1, "only the refresh reads sale rates");
+}
+
+#[test]
+fn prepared_ranking_matches_the_inline_semantics() {
+    let target = TargetId("us-4".into());
+    // The same data through the cold inline fallback and through a prepared
+    // snapshot must produce identical ranking.
+    let (cold, _, _, _) = opportunity_fixture(1_000_000);
+    let inline = cold.opportunities(&target, 1.0, 50).expect("inline ranked");
+
+    let (prepared, history, sales, _clock) = opportunity_fixture(1_000_000);
+    prepared.refresh(&target).expect("refresh");
+    let warmed = prepared.opportunities(&target, 1.0, 50).expect("prepared ranked");
+
+    assert_eq!(inline, warmed, "prepared rates must reproduce the inline math");
+    assert_eq!(
+        warmed.first().map(|o| o.item.clone()),
+        Some(item(1)),
+        "biggest discount ranks first"
+    );
+    assert_eq!(
+        warmed.first().map(|o| o.reliability),
+        Some(0.25),
+        "prepared rate feeds reliability"
+    );
+    assert_eq!(history.item_day_rows_calls(), 1);
+    assert_eq!(sales.sale_rate_each_calls(), 1);
+}
+
+#[test]
+fn stale_snapshot_is_still_served_without_recompute() {
+    let target = TargetId("us-4".into());
+    let ttl = amtracker_core::services::opportunity::SCAN_TTL_SECONDS;
+    let (service, history, sales, clock) = opportunity_fixture(1_000_000);
+    service.refresh(&target).expect("refresh");
+    assert_eq!(service.snapshot_age_secs(&target), Some(0));
+
+    // Past the scheduler TTL but far inside the staleness backstop: the
+    // stale snapshot keeps serving.
+    clock.advance(ttl + 60);
+    assert_eq!(service.snapshot_age_secs(&target), Some(ttl + 60));
+
+    service.opportunities(&target, 1.0, 50).expect("ranked from the stale snapshot");
+    service.overview(&target, 15).expect("overview from the stale snapshot");
+    assert_eq!(history.item_day_rows_calls(), 1, "a stale snapshot must not recompute inline");
+    assert_eq!(sales.sale_rate_each_calls(), 1);
+}
+
+#[test]
+fn cold_cache_falls_back_to_inline_compute() {
+    let target = TargetId("us-4".into());
+    let (service, history, sales, _clock) = opportunity_fixture(1_000_000);
+
+    let ranked = service.opportunities(&target, 1.0, 50).expect("ranked");
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(history.item_day_rows_calls(), 1, "cold cache computes inline");
+    assert_eq!(sales.sale_rate_each_calls(), 1);
+
+    // The inline compute also seeds the cache: the next request reads nothing.
+    service.overview(&target, 15).expect("overview");
+    assert_eq!(history.item_day_rows_calls(), 1);
+    assert_eq!(sales.sale_rate_each_calls(), 1);
+}
+
+#[test]
+fn refresh_debounces_inside_the_window_and_recomputes_outside() {
+    let target = TargetId("us-4".into());
+    let (service, history, sales, clock) = opportunity_fixture(1_000_000);
+    let covered = service.refresh(&target).expect("first refresh");
+    assert_eq!(covered, 2);
+
+    clock.advance(10);
+    let covered = service.refresh(&target).expect("debounced refresh");
+    assert_eq!(covered, 2, "debounced refresh reports the cached coverage");
+    assert_eq!(history.item_day_rows_calls(), 1, "inside the debounce window no work happens");
+    assert_eq!(sales.sale_rate_each_calls(), 1);
+
+    clock.advance(21); // 31s after the first refresh
+    let covered = service.refresh(&target).expect("post-debounce refresh");
+    assert_eq!(covered, 2);
+    assert_eq!(history.item_day_rows_calls(), 2, "outside the window the scan recomputes");
+    assert_eq!(sales.sale_rate_each_calls(), 2);
+}
+
+#[test]
+fn a_failed_refresh_keeps_the_previous_snapshot_serving() {
+    let target = TargetId("us-4".into());
+    let (service, history, sales, clock) = opportunity_fixture(1_000_000);
+    service.refresh(&target).expect("first refresh");
+
+    clock.advance(31); // past the debounce, so the next refresh really runs
+    sales.set_sale_rate_each_failure(true);
+    assert!(service.refresh(&target).is_err(), "the failed sales lookup surfaces as an Err");
+
+    // The failed pass must not evict or poison the cached artifact: ranking
+    // and overview keep serving the previous snapshot without store reads.
+    let ranked = service.opportunities(&target, 1.0, 50).expect("stale ranked");
+    assert_eq!(ranked.len(), 2);
+    service.overview(&target, 15).expect("stale overview");
+    assert_eq!(
+        history.item_day_rows_calls(),
+        2,
+        "the failed attempt re-read history before the sales step failed"
+    );
+    assert_eq!(sales.sale_rate_each_calls(), 2, "the failed attempt counted");
+}
+
+#[test]
+fn snapshot_age_is_none_until_a_scan_exists() {
+    let target = TargetId("us-4".into());
+    let (service, _history, _sales, _clock) = opportunity_fixture(1_000_000);
+    assert_eq!(service.snapshot_age_secs(&target), None, "cold cache has no age");
+    service.refresh(&target).expect("refresh");
+    assert_eq!(service.snapshot_age_secs(&target), Some(0));
+}
+
+#[test]
+fn requests_self_heal_once_a_snapshot_passes_the_backstop() {
+    let target = TargetId("us-4".into());
+    let ttl = amtracker_core::services::opportunity::SCAN_TTL_SECONDS;
+    let (service, history, sales, clock) = opportunity_fixture(1_000_000);
+    service.refresh(&target).expect("refresh");
+
+    // A dead scheduler would leave the snapshot aging forever; past six TTLs
+    // the request path recomputes inline instead of serving it.
+    clock.advance(ttl * 6 + 1);
+    let ranked = service.opportunities(&target, 1.0, 50).expect("ranked");
+    assert_eq!(ranked.len(), 2);
+    assert_eq!(history.item_day_rows_calls(), 2, "the backstop recomputed inline");
+    assert_eq!(sales.sale_rate_each_calls(), 2);
+    assert_eq!(service.snapshot_age_secs(&target), Some(0), "the backstop seeds a fresh scan");
 }

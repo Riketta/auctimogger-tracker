@@ -33,8 +33,21 @@ use crate::{
 
 /// Scan window for ranking and overview (days).
 const SCAN_WINDOW_DAYS: i64 = 7;
-/// How long a computed scan may serve requests before recomputation.
-const SCAN_TTL_SECONDS: i64 = 300;
+/// Sale-rate window backing the reliability component (days).
+const SALE_RATE_WINDOW_DAYS: i64 = 14;
+/// How long a prepared scan stays fresh before the scheduler refreshes it;
+/// stale snapshots keep serving until the refreshed one lands.
+pub const SCAN_TTL_SECONDS: i64 = 300;
+/// Hard staleness backstop: past this age a request recomputes inline even
+/// though a snapshot exists, so ranking self-heals (as it did before the
+/// background scheduler existed) if that thread ever dies or persistently
+/// fails. Six TTLs keeps this far above normal refresh jitter.
+const SCAN_MAX_STALENESS_SECONDS: i64 = SCAN_TTL_SECONDS * 6;
+/// Minimum age a cached scan must reach before [`OpportunityService::refresh`]
+/// recomputes it, deduplicating back-to-back post-cycle refreshes (commodity
+/// and auction cycles can land in the same scheduler pass) and races with a
+/// manual `/api/fetch` refresh.
+const SCAN_REFRESH_DEBOUNCE_SECONDS: i64 = 30;
 /// Normalization anchor for the churn component: this many unique listings
 /// per day scores as a full 1.0 (config could override later).
 const CHURN_ANCHOR: f64 = 50.0;
@@ -95,8 +108,9 @@ pub struct OverviewData {
     pub most_active: Vec<MoverRow>,
 }
 
-/// Immutable result of one full-market scan, shared across requests until the
-/// TTL expires.
+/// Immutable result of one full-market scan, prepared by
+/// [`OpportunityService::refresh`] (scheduler) or the cold-start inline
+/// fallback and shared across requests until the next refresh replaces it.
 #[derive(Clone, Debug)]
 pub struct ScanSnapshot {
     /// When the scan was computed (unix seconds).
@@ -104,6 +118,9 @@ pub struct ScanSnapshot {
     /// How many distinct items the scan covered.
     pub items: usize,
     rows: Arc<Vec<ItemScan>>,
+    /// 14-day sale rates positionally aligned with `rows` (`None` = the item
+    /// has no sales evidence in the window).
+    rates: Arc<Vec<Option<f64>>>,
 }
 
 /// Per-item intermediate scan row (pre-filter, pre-ranking).
@@ -122,7 +139,10 @@ struct ItemScan {
 /// Keyed by target so alternating requests don't evict each other.
 type ScanCache = HashMap<TargetId, (i64, Arc<ScanSnapshot>)>;
 
-/// Builds ranked opportunities and the market overview from day-fold history.
+/// Builds ranked opportunities and the market overview from prepared
+/// full-market scans: the scheduler refreshes them in the background and
+/// requests only read the snapshot; a completely cold cache falls back to an
+/// inline compute.
 pub struct OpportunityService {
     history: Arc<dyn PriceHistoryRepository>,
     sales: Arc<dyn SalesRepository>,
@@ -152,12 +172,14 @@ impl OpportunityService {
     }
 
     /// Ranked snipe candidates: `min_samples` evidence floor, optional churn
-    /// floor, sorted by score descending.
+    /// floor, sorted by score descending. Served entirely from the prepared
+    /// scan — reliability ships with the snapshot, so steady-state requests
+    /// touch no store.
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when history rows cannot be read, a
-    /// sale-rate lookup fails, or the scan cache is poisoned.
+    /// Returns `StoreError::Backend` when the cold-start inline scan cannot
+    /// read history rows or sale rates, or the scan cache is poisoned.
     pub fn opportunities(
         &self,
         target: &TargetId,
@@ -165,12 +187,10 @@ impl OpportunityService {
         limit: usize,
     ) -> Result<Vec<Opportunity>, StoreError> {
         let scan = self.scan(target)?;
-        // One batched lookup instead of a per-candidate query (scan recompute
-        // serves whole markets; the N+1 variant dominated its latency).
-        let items: Vec<ItemRef> = scan.rows.iter().map(|row| row.item.clone()).collect();
-        let rates = self.sales.sale_rate_each(target, &items, 14)?;
         let mut out: Vec<Opportunity> = Vec::new();
-        for (row, rate) in scan.rows.iter().zip(rates) {
+        // Sale rates come with the prepared snapshot, positionally aligned
+        // with the rows; requests never re-query the sales store.
+        for (row, rate) in scan.rows.iter().zip(scan.rates.iter()) {
             let Some(opportunity) = self.opportunity_for(row, rate.unwrap_or(0.0)) else {
                 continue;
             };
@@ -186,11 +206,13 @@ impl OpportunityService {
     }
 
     /// Market overview: movers vs their window median, plus most-active.
+    /// Served from the prepared scan; nothing is read from the store unless
+    /// the cache is completely cold.
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when history rows cannot be read or the
-    /// scan cache is poisoned.
+    /// Returns `StoreError::Backend` when the cold-start inline scan cannot
+    /// read history rows or sale rates, or the scan cache is poisoned.
     pub fn overview(&self, target: &TargetId, limit: usize) -> Result<OverviewData, StoreError> {
         let scan = self.scan(target)?;
         let mut movers: Vec<MoverRow> = scan
@@ -212,17 +234,75 @@ impl OpportunityService {
         Ok(OverviewData { movers_up, movers_down, most_active })
     }
 
-    /// Computes (or serves from cache) the full per-item scan.
+    /// Recomputes the full scan artifact for one target — history read,
+    /// per-item aggregation, and one batched sale-rate lookup — and stores it
+    /// as the snapshot requests are served from. Meant for the background
+    /// scheduler: after startup, after each successful ingest cycle, and when
+    /// a prepared scan outlives [`SCAN_TTL_SECONDS`]. Skips all work while the
+    /// cached snapshot is younger than [`SCAN_REFRESH_DEBOUNCE_SECONDS`], so a
+    /// post-cycle refresh and the TTL tick never double-compute.
+    ///
+    /// Returns the number of items the scan covered (the cached count when
+    /// skipped).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when history rows or sale rates cannot be
+    /// read, or the scan cache is poisoned.
+    pub fn refresh(&self, target: &TargetId) -> Result<usize, StoreError> {
+        let now = self.clock.now();
+        {
+            let cache = self.scan_cache()?;
+            if let Some((at, snapshot)) = cache.get(target) {
+                if now - at <= SCAN_REFRESH_DEBOUNCE_SECONDS {
+                    return Ok(snapshot.items);
+                }
+            }
+        }
+        let snapshot = Arc::new(self.compute_scan(target)?);
+        let covered = snapshot.items;
+        self.scan_cache()?.insert(target.clone(), (snapshot.computed_at, Arc::clone(&snapshot)));
+        Ok(covered)
+    }
+
+    /// Age of the prepared snapshot in seconds (via the injected clock);
+    /// `None` when nothing has been prepared for the target yet.
+    #[must_use]
+    pub fn snapshot_age_secs(&self, target: &TargetId) -> Option<i64> {
+        let cache = self.scan_cache().ok()?;
+        let (computed_at, _) = cache.get(target)?;
+        Some(self.clock.now() - computed_at)
+    }
+
+    /// Serves the prepared scan for a target: any snapshot younger than
+    /// [`SCAN_MAX_STALENESS_SECONDS`] is returned as-is (stale-while-
+    /// revalidate — the scheduler keeps refreshing it in the background, so
+    /// staleness is bounded by the refresh cadence, not by request traffic).
+    /// Only a completely cold cache (e.g. the first request right after
+    /// startup, before the scheduler's initial refresh) or a snapshot past
+    /// the hard backstop (the scheduler is dead or persistently failing)
+    /// computes inline as a fallback.
     fn scan(&self, target: &TargetId) -> Result<Arc<ScanSnapshot>, StoreError> {
         let now = self.clock.now();
         {
             let cache = self.scan_cache()?;
             if let Some((at, snapshot)) = cache.get(target) {
-                if now - at <= SCAN_TTL_SECONDS {
+                if now - at <= SCAN_MAX_STALENESS_SECONDS {
                     return Ok(Arc::clone(snapshot));
                 }
             }
         }
+        let snapshot = Arc::new(self.compute_scan(target)?);
+        self.scan_cache()?.insert(target.clone(), (snapshot.computed_at, Arc::clone(&snapshot)));
+        Ok(snapshot)
+    }
+
+    /// Builds one full-market scan artifact in a single store pass: day rows,
+    /// per-item aggregation, then one batched sale-rate lookup aligned with
+    /// the aggregated rows. This is the whole per-target cost, paid by the
+    /// scheduler (or the cold-start fallback) instead of request threads.
+    fn compute_scan(&self, target: &TargetId) -> Result<ScanSnapshot, StoreError> {
+        let now = self.clock.now();
         let today = utc_day(now);
         let rows = self.history.item_day_rows(target, today - SCAN_WINDOW_DAYS + 1)?;
 
@@ -235,10 +315,21 @@ impl OpportunityService {
         for (item, day_rows) in &by_item {
             scans.push(Self::scan_item(item, day_rows));
         }
-        let snapshot =
-            Arc::new(ScanSnapshot { computed_at: now, items: scans.len(), rows: Arc::new(scans) });
-        self.scan_cache()?.insert(target.clone(), (now, Arc::clone(&snapshot)));
-        Ok(snapshot)
+        // BTreeMap iteration is sorted, so the batched rates line up
+        // positionally with the stored rows by construction.
+        let items: Vec<ItemRef> = scans.iter().map(|scan| scan.item.clone()).collect();
+        let rates = self.sales.sale_rate_each(target, &items, SALE_RATE_WINDOW_DAYS)?;
+        debug_assert_eq!(
+            scans.len(),
+            rates.len(),
+            "sale_rate_each must stay positionally aligned with the scan rows"
+        );
+        Ok(ScanSnapshot {
+            computed_at: now,
+            items: scans.len(),
+            rows: Arc::new(scans),
+            rates: Arc::new(rates),
+        })
     }
 
     /// Locks the scan cache. A poisoned mutex (another thread panicked while
@@ -292,9 +383,10 @@ impl OpportunityService {
     }
 
     /// Builds one opportunity from a scan row. `Ok(None)` = the row is not
-    /// rankable (no price evidence). `reliability` comes from the batched
-    /// `sale_rate_each` lookup; a failing sales store zeroes it visibly (the
-    /// error propagates from the batch call, not silently per row).
+    /// rankable (no price evidence). `reliability` comes from the sale rates
+    /// prepared with the snapshot; a failing sales store surfaces while the
+    /// snapshot is computed (in `refresh` or the cold-start fallback), never
+    /// per request.
     fn opportunity_for(&self, scan: &ItemScan, reliability: f64) -> Option<Opportunity> {
         if scan.median7 <= 0.0 || scan.floor_now <= 0 {
             return None;

@@ -173,6 +173,16 @@ Pages: `/` dashboard · `/snapshots` · `/items?q=…` search ·
 | `POST /api/fetch` | trigger a cycle (token-gated); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
 
+Opportunities and overview are served from scans the scheduler prepares in
+the background: once right after startup, after each successful ingest cycle
+for the cycled target, and whenever a prepared scan outlives the scan TTL
+(300 s). Requests therefore read no store in steady state; freshness is
+bounded by the refresh cadence — typically well under one scan TTL plus a
+scheduler tick — not by the TTL alone. Two inline fallbacks remain: a
+completely cold cache (e.g. the very first request before the scheduler's
+initial refresh lands) and, as a self-heal backstop, any scan that ages past
+six scan TTLs (which would take a dead or persistently failing scheduler).
+
 ## Feed contract (v2)
 
 ```lua
