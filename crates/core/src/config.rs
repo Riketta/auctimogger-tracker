@@ -24,6 +24,8 @@ pub struct TrackerConfig {
     pub metrics: MetricsConfig,
     /// Opportunity scoring settings.
     pub opportunities: OpportunitiesConfig,
+    /// Alert evaluation and delivery settings.
+    pub alerts: AlertsConfig,
     /// One entry per configured market source.
     pub targets: Vec<TargetConfig>,
 }
@@ -82,6 +84,54 @@ pub struct OpportunitiesConfig {
     pub min_samples: u32,
     /// Relative weights of the four score components.
     pub weights: ScoreWeights,
+}
+
+/// Alert evaluation and delivery settings. Rules are per-target and live in
+/// the store; this section decides whether (and how often) they are evaluated
+/// and where fired alerts go.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AlertsConfig {
+    /// Master switch: `false` skips evaluation entirely (rules and history
+    /// stay browsable in the UI/API).
+    pub enabled: bool,
+    /// A fired rule re-fires at most once per this many seconds.
+    pub cooldown_secs: u64,
+    /// Delivery adapter: `"log"` (record only — events surface in the UI/API
+    /// and the scheduler logs them), `"discord"` (webhook message) or
+    /// `"telegram"` (bot API message).
+    pub delivery: String,
+    /// Environment variable holding the Discord webhook URL
+    /// (`delivery = "discord"`; required for that delivery).
+    pub webhook_env: Option<String>,
+    /// Environment variable holding the Telegram bot token
+    /// (`delivery = "telegram"`; required for that delivery).
+    pub token_env: Option<String>,
+    /// Environment variable holding the Telegram chat id
+    /// (`delivery = "telegram"`; required for that delivery).
+    pub chat_id_env: Option<String>,
+}
+
+impl AlertsConfig {
+    /// The delivery enum the configured string maps to.
+    #[must_use]
+    pub fn delivery_kind(&self) -> AlertDelivery {
+        match self.delivery.as_str() {
+            "discord" => AlertDelivery::Discord,
+            "telegram" => AlertDelivery::Telegram,
+            _ => AlertDelivery::Log,
+        }
+    }
+}
+
+/// Delivery adapters the config string can select.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AlertDelivery {
+    /// Record events only; no outbound messages.
+    Log,
+    /// Post each fired alert to a Discord webhook.
+    Discord,
+    /// Send each fired alert through the Telegram bot API.
+    Telegram,
 }
 
 /// Weights of the opportunity score components. Only the ratio matters for
@@ -297,6 +347,33 @@ impl TrackerConfig {
         }
         if self.opportunities.min_samples == 0 {
             return Err(ConfigError("[opportunities].min_samples must be positive".into()));
+        }
+        if !matches!(self.alerts.delivery.as_str(), "log" | "discord" | "telegram") {
+            return Err(ConfigError(format!(
+                "[alerts].delivery must be one of \"log\", \"discord\", \"telegram\" (got '{}')",
+                self.alerts.delivery
+            )));
+        }
+        self.validate_alerts_delivery()
+    }
+
+    /// Delivery-specific `[alerts]` checks: the selected adapter's credential
+    /// env var names must be present and non-empty.
+    fn validate_alerts_delivery(&self) -> Result<(), ConfigError> {
+        let missing = |env: &Option<String>| env.as_deref().is_none_or(|v| v.trim().is_empty());
+        if self.alerts.delivery == "discord" && missing(&self.alerts.webhook_env) {
+            return Err(ConfigError(
+                "[alerts].webhook_env must name an environment variable when delivery = \"discord\""
+                    .into(),
+            ));
+        }
+        if self.alerts.delivery == "telegram"
+            && (missing(&self.alerts.token_env) || missing(&self.alerts.chat_id_env))
+        {
+            return Err(ConfigError(
+                "[alerts].token_env and chat_id_env must name environment variables when delivery = \"telegram\""
+                    .into(),
+            ));
         }
         Ok(())
     }

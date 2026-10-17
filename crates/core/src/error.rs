@@ -107,3 +107,24 @@ impl From<StoreError> for CycleError {
         CycleError::Store(e)
     }
 }
+
+/// Alert delivery failures raised by `AlertDispatchPort` implementations
+/// (Discord/Telegram webhooks). Transports stay opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AlertDispatchError {
+    /// The delivery endpoint answered with a non-success status.
+    Status(u16),
+    /// The endpoint could not be reached or the payload could not be built.
+    Transport(String),
+}
+
+impl fmt::Display for AlertDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AlertDispatchError::Status(s) => write!(f, "alert endpoint answered {s}"),
+            AlertDispatchError::Transport(m) => write!(f, "alert transport error: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for AlertDispatchError {}

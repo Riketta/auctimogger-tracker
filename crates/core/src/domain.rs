@@ -550,6 +550,142 @@ pub struct WatchlistEntry {
     pub added_at: i64,
 }
 
+/// A user-defined alert rule: "tell me when this condition holds for this
+/// identity". Evaluation runs after ingest cycles; a rule fires at most once
+/// per cooldown window (the cooldown anchor is `last_fired_at`).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlertRule {
+    /// Storage-assigned rule id.
+    pub id: i64,
+    /// Target the rule watches.
+    pub target: TargetId,
+    /// The tracked item or pet.
+    pub item: ItemRef,
+    /// What the rule watches for.
+    pub condition: AlertCondition,
+    /// Free-form label carried into notifications and the events page.
+    pub note: Option<String>,
+    /// When the rule was created (unix seconds).
+    pub created_at: i64,
+    /// When the rule last fired (unix seconds) — the cooldown anchor.
+    pub last_fired_at: Option<i64>,
+}
+
+/// A rule as handed to the store; `id`, `created_at` and `last_fired_at` are
+/// assigned by the storage layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewAlertRule {
+    /// Target the rule watches.
+    pub target: TargetId,
+    /// The tracked item or pet.
+    pub item: ItemRef,
+    /// What the rule watches for.
+    pub condition: AlertCondition,
+    /// Free-form label carried into notifications.
+    pub note: Option<String>,
+}
+
+/// What an alert rule watches for. All conditions observe the same cached
+/// metric blocks the UI shows, so an alert can never contradict its page.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum AlertCondition {
+    /// The current day's median unit price drops to `copper` or below —
+    /// a literal price target.
+    PriceBelow {
+        /// Threshold in copper per unit.
+        copper: i64,
+    },
+    /// The span's median drops to its own floor percentile or below — the
+    /// whole window is trading at floor prices (a market-level signal,
+    /// independent of absolute price levels).
+    BelowFloor {
+        /// Window whose median/floor are compared.
+        span: Span,
+        /// Which floor percentile to compare against.
+        percentile: FloorPercentile,
+    },
+    /// The trailing 14-day sale rate reaches `rate` or above — demand is
+    /// accelerating.
+    SaleRateAbove {
+        /// Threshold fraction (0.0..=1.0).
+        rate: f64,
+    },
+}
+
+/// Floor percentile behind [`AlertCondition::BelowFloor`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FloorPercentile {
+    /// The 5th percentile — deep-floor deals.
+    P05,
+    /// The 25th percentile — the broad lower quartile.
+    P25,
+}
+
+impl FloorPercentile {
+    /// Lowercase wire/UI spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FloorPercentile::P05 => "p05",
+            FloorPercentile::P25 => "p25",
+        }
+    }
+
+    /// Parses the lowercase spelling (see [`FloorPercentile::as_str`]).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "p05" => Some(FloorPercentile::P05),
+            "p25" => Some(FloorPercentile::P25),
+            _ => None,
+        }
+    }
+}
+
+/// One fired alert: the persisted history row (events page, JSON API) and the
+/// payload dispatch adapters receive.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AlertEvent {
+    /// Storage-assigned event id.
+    pub id: i64,
+    /// The rule that fired.
+    pub rule_id: i64,
+    /// Target the rule watches.
+    pub target: TargetId,
+    /// The tracked item or pet.
+    pub item: ItemRef,
+    /// The condition that held.
+    pub condition: AlertCondition,
+    /// The observed value that fired the rule (median copper for price
+    /// conditions, the sale-rate fraction for `SaleRateAbove`); `None` when
+    /// the condition fired without a single comparable number.
+    pub observed: Option<f64>,
+    /// Human-readable one-liner describing what was observed.
+    pub message: String,
+    /// When the rule fired (unix seconds).
+    pub fired_at: i64,
+}
+
+/// A fired alert as handed to the store; `id` is assigned by the storage
+/// layer.
+#[derive(Clone, Debug, PartialEq)]
+pub struct NewAlertEvent {
+    /// The rule that fired.
+    pub rule_id: i64,
+    /// Target the rule watches.
+    pub target: TargetId,
+    /// The tracked item or pet.
+    pub item: ItemRef,
+    /// The condition that held.
+    pub condition: AlertCondition,
+    /// The observed value that fired the rule (see [`AlertEvent::observed`]).
+    pub observed: Option<f64>,
+    /// Human-readable one-liner describing what was observed.
+    pub message: String,
+    /// When the rule fired (unix seconds).
+    pub fired_at: i64,
+}
+
 /// UTC day number for a unix timestamp (86400-second days).
 #[must_use]
 pub fn utc_day(unix_ts: i64) -> i64 {

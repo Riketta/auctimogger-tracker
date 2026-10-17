@@ -38,6 +38,8 @@ use amtracker_core::{
     error::StoreError,
     fold::DayFold,
     ports::{
+        AlertEventRepository,
+        AlertRuleRepository,
         ClockPort,
         ItemCatalogRepository,
         MetricsCacheRepository,
@@ -54,7 +56,7 @@ use rusqlite::Connection;
 /// cannot be migrated faithfully (old rows carry no kind) and are refused.
 /// Version 3 added the `pet_catalog` table (a fresh `CREATE TABLE IF NOT
 /// EXISTS`, so v2 files upgrade in place without a data migration).
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -166,6 +168,31 @@ CREATE TABLE IF NOT EXISTS sales (
     qty_sold INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (target_id, item_ref_id, day)
 );
+
+CREATE TABLE IF NOT EXISTS alert_rule (
+    id INTEGER PRIMARY KEY,
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    condition_json TEXT NOT NULL,
+    note TEXT,
+    created_at INTEGER NOT NULL,
+    last_fired_at INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_alert_rule_target ON alert_rule(target_id, id);
+
+CREATE TABLE IF NOT EXISTS alert_event (
+    id INTEGER PRIMARY KEY,
+    -- No FK to alert_rule: events are the audit log and outlive their rule's
+    -- removal (rule_id stays as the historical reference).
+    rule_id INTEGER NOT NULL,
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    condition_json TEXT NOT NULL,
+    observed REAL,
+    message TEXT NOT NULL,
+    fired_at INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_alert_event_target ON alert_event(target_id, id DESC);
 ";
 
 /// Single-connection SQLite store (WAL journal) implementing the snapshot,
@@ -1272,6 +1299,218 @@ impl WatchlistRepository for SqliteStore {
     }
 }
 
+impl AlertRuleRepository for SqliteStore {
+    fn add(
+        &self,
+        rule: &amtracker_core::domain::NewAlertRule,
+    ) -> Result<amtracker_core::domain::AlertRule, StoreError> {
+        let conn = self.open_transaction();
+        let item_ref_id = get_or_create_item_ref(&conn, &rule.item)?;
+        let created_at = self.clock.now();
+        let condition_json = serde_json::to_string(&SerAlertCondition::from(&rule.condition))
+            .map_err(|e| backend("serialize alert condition", e))?;
+        conn.execute(
+            "INSERT INTO alert_rule (target_id, item_ref_id, condition_json, note, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                rule.target.as_str(),
+                item_ref_id,
+                condition_json,
+                rule.note,
+                created_at
+            ],
+        )
+        .map_err(|e| backend("alert rule add", e))?;
+        Ok(amtracker_core::domain::AlertRule {
+            id: conn.last_insert_rowid(),
+            target: rule.target.clone(),
+            item: rule.item.clone(),
+            condition: rule.condition,
+            note: rule.note.clone(),
+            created_at,
+            last_fired_at: None,
+        })
+    }
+
+    fn remove(&self, rule_id: i64) -> Result<bool, StoreError> {
+        let conn = self.open_transaction();
+        // Events are history: they outlive their rule (the join column keeps
+        // its identity), so only the rule row goes.
+        let removed = conn
+            .execute("DELETE FROM alert_rule WHERE id = ?1", rusqlite::params![rule_id])
+            .map_err(|e| backend("alert rule remove", e))?;
+        Ok(removed > 0)
+    }
+
+    fn list(
+        &self,
+        target: &TargetId,
+    ) -> Result<Vec<amtracker_core::domain::AlertRule>, StoreError> {
+        let conn = self.open_transaction();
+        let mut statement = conn
+            .prepare(
+                "SELECT r.id, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality,
+                        r.pet_breed, a.condition_json, a.note, a.created_at, a.last_fired_at
+                 FROM alert_rule a JOIN item_ref r ON r.id = a.item_ref_id
+                 WHERE a.target_id = ?1 ORDER BY a.id",
+            )
+            .map_err(|e| backend("prepare alert rules", e))?;
+        let rows = statement
+            .query(rusqlite::params![target.as_str()])
+            .map_err(|e| backend("query alert rules", e))?
+            .mapped(|row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, i64>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("alert rule row", e))?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    kind,
+                    item_id,
+                    species,
+                    level,
+                    quality,
+                    breed,
+                    json,
+                    note,
+                    created_at,
+                    last_fired_at,
+                )| {
+                    let ser: SerAlertCondition = serde_json::from_str(&json)
+                        .map_err(|e| backend("deserialize alert condition", e))?;
+                    Ok(amtracker_core::domain::AlertRule {
+                        id,
+                        target: TargetId(target.as_str().to_string()),
+                        item: join_item_ref(&kind, item_id, species, level, quality, breed),
+                        condition: ser.try_into().map_err(StoreError::Backend)?,
+                        note,
+                        created_at,
+                        last_fired_at,
+                    })
+                },
+            )
+            .collect()
+    }
+
+    fn mark_fired(&self, rule_id: i64, at: i64) -> Result<(), StoreError> {
+        let conn = self.open_transaction();
+        conn.execute(
+            "UPDATE alert_rule SET last_fired_at = ?1 WHERE id = ?2",
+            rusqlite::params![at, rule_id],
+        )
+        .map_err(|e| backend("alert rule mark fired", e))?;
+        Ok(())
+    }
+}
+
+impl AlertEventRepository for SqliteStore {
+    fn record(&self, event: &amtracker_core::domain::NewAlertEvent) -> Result<i64, StoreError> {
+        let conn = self.open_transaction();
+        let item_ref_id = get_or_create_item_ref(&conn, &event.item)?;
+        let condition_json = serde_json::to_string(&SerAlertCondition::from(&event.condition))
+            .map_err(|e| backend("serialize alert condition", e))?;
+        conn.execute(
+            "INSERT INTO alert_event
+                 (rule_id, target_id, item_ref_id, condition_json, observed, message, fired_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            rusqlite::params![
+                event.rule_id,
+                event.target.as_str(),
+                item_ref_id,
+                condition_json,
+                event.observed,
+                event.message,
+                event.fired_at,
+            ],
+        )
+        .map_err(|e| backend("alert event record", e))?;
+        Ok(conn.last_insert_rowid())
+    }
+
+    fn recent(
+        &self,
+        target: &TargetId,
+        limit: usize,
+    ) -> Result<Vec<amtracker_core::domain::AlertEvent>, StoreError> {
+        let conn = self.open_transaction();
+        let mut statement = conn
+            .prepare(
+                "SELECT e.id, e.rule_id, r.kind, r.item_id, r.pet_species, r.pet_level,
+                        r.pet_quality, r.pet_breed, e.condition_json, e.observed, e.message,
+                        e.fired_at
+                 FROM alert_event e JOIN item_ref r ON r.id = e.item_ref_id
+                 WHERE e.target_id = ?1 ORDER BY e.id DESC LIMIT ?2",
+            )
+            .map_err(|e| backend("prepare alert events", e))?;
+        let rows = statement
+            .query(rusqlite::params![target.as_str(), i64::try_from(limit).unwrap_or(i64::MAX),])
+            .map_err(|e| backend("query alert events", e))?
+            .mapped(|row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<f64>>(9)?,
+                    row.get::<_, String>(10)?,
+                    row.get::<_, i64>(11)?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("alert event row", e))?;
+        rows.into_iter()
+            .map(
+                |(
+                    id,
+                    rule_id,
+                    kind,
+                    item_id,
+                    species,
+                    level,
+                    quality,
+                    breed,
+                    json,
+                    observed,
+                    message,
+                    fired_at,
+                )| {
+                    let ser: SerAlertCondition = serde_json::from_str(&json)
+                        .map_err(|e| backend("deserialize alert condition", e))?;
+                    Ok(amtracker_core::domain::AlertEvent {
+                        id,
+                        rule_id,
+                        target: TargetId(target.as_str().to_string()),
+                        item: join_item_ref(&kind, item_id, species, level, quality, breed),
+                        condition: ser.try_into().map_err(StoreError::Backend)?,
+                        observed,
+                        message,
+                        fired_at,
+                    })
+                },
+            )
+            .collect()
+    }
+}
+
 impl ItemCatalogRepository for SqliteStore {
     fn upsert(&self, records: &[NameRecord]) -> Result<(), StoreError> {
         let conn = self.open_transaction();
@@ -1872,6 +2111,67 @@ impl From<SerMetricBlock> for MetricBlock {
             qty_sum: ser.qty_sum,
             listing_count: ser.listing_count,
             sale_rate: ser.sale_rate,
+        }
+    }
+}
+
+/// Serialization mirror for [`amtracker_core::domain::AlertCondition`] — the
+/// core stays serde-free; the wire spellings live here.
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum SerAlertCondition {
+    /// Mirror of `AlertCondition::PriceBelow`.
+    PriceBelow {
+        /// Threshold in copper per unit.
+        copper: i64,
+    },
+    /// Mirror of `AlertCondition::BelowFloor`.
+    BelowFloor {
+        /// Window whose median/floor are compared.
+        span: String,
+        /// Lowercase [`amtracker_core::domain::FloorPercentile`] spelling.
+        percentile: String,
+    },
+    /// Mirror of `AlertCondition::SaleRateAbove`.
+    SaleRateAbove {
+        /// Threshold fraction (0.0..=1.0).
+        rate: f64,
+    },
+}
+
+impl From<&amtracker_core::domain::AlertCondition> for SerAlertCondition {
+    fn from(condition: &amtracker_core::domain::AlertCondition) -> Self {
+        use amtracker_core::domain::AlertCondition;
+        match *condition {
+            AlertCondition::PriceBelow { copper } => Self::PriceBelow { copper },
+            AlertCondition::BelowFloor { span, percentile } => Self::BelowFloor {
+                span: span.name().to_string(),
+                percentile: percentile.as_str().to_string(),
+            },
+            AlertCondition::SaleRateAbove { rate } => Self::SaleRateAbove { rate },
+        }
+    }
+}
+
+impl TryFrom<SerAlertCondition> for amtracker_core::domain::AlertCondition {
+    type Error = String;
+
+    fn try_from(ser: SerAlertCondition) -> Result<Self, Self::Error> {
+        use amtracker_core::domain::{
+            AlertCondition,
+            FloorPercentile,
+        };
+        match ser {
+            SerAlertCondition::PriceBelow { copper } => Ok(AlertCondition::PriceBelow { copper }),
+            SerAlertCondition::BelowFloor { span, percentile } => {
+                let span = Span::parse(&span)
+                    .ok_or_else(|| format!("unknown span '{span}' in alert condition"))?;
+                let percentile = FloorPercentile::parse(&percentile).ok_or_else(|| {
+                    format!("unknown percentile '{percentile}' in alert condition")
+                })?;
+                Ok(AlertCondition::BelowFloor { span, percentile })
+            }
+            SerAlertCondition::SaleRateAbove { rate } => Ok(AlertCondition::SaleRateAbove { rate }),
         }
     }
 }

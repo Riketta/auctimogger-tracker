@@ -65,9 +65,11 @@ normal for this item, and how do I know this deal is real?"*.
 - **Tracker feed v2** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
+- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot.
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
-  completions, item detail with 30-day sparkline, opportunities, market
-  overview. Mutating endpoints are token-gated.
+  completions, item detail with interactive 30-day price-band chart (p05–p95,
+  median, VWAP), opportunities, market overview, live watchlist, cross-target
+  alerts. Mutating endpoints are token-gated.
 
 ## Quick start
 
@@ -189,6 +191,9 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` | every watchlist entry joined to its metric blocks, sale rate and 30-day trend — one batched read (the live watchlist page's contract) |
+| `GET /api/alerts?target=&events=` | a target's alert rules + newest fired events |
+| `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"sale-rate-above","rate":0.3}` |
+| `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
 

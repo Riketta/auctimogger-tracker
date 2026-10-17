@@ -8,6 +8,7 @@ use std::path::{
 
 use amtracker_core::{
     config::{
+        AlertsConfig,
         AuthConfig,
         MetricsConfig,
         OpportunitiesConfig,
@@ -59,6 +60,10 @@ pub struct FileConfig {
     pub metrics: FileMetrics,
     /// `[opportunities]` section: ranking knobs for the opportunities page.
     pub opportunities: FileOpportunities,
+    /// `[alerts]` section: evaluation switch, cooldown and delivery. Absent =
+    /// enabled with `log` delivery (events surface in the UI/API only).
+    #[serde(default)]
+    pub alerts: FileAlerts,
     /// `[[targets]]` array: one entry per polled market source.
     pub targets: Vec<FileTarget>,
     /// Optional `[logging]` section: persistent file logging. Absent = stdout
@@ -248,6 +253,54 @@ pub struct FileOpportunities {
     pub weights: FileWeights,
 }
 
+/// File model of the `[alerts]` section.
+#[derive(Deserialize, Clone, Debug)]
+pub struct FileAlerts {
+    /// Master switch; defaults to `true`.
+    #[serde(default = "default_alerts_enabled")]
+    pub enabled: bool,
+    /// Re-fire cooldown per rule, seconds; defaults to 6 hours.
+    #[serde(default = "default_alert_cooldown")]
+    pub cooldown_secs: u64,
+    /// `"log"` (default), `"discord"` or `"telegram"`.
+    #[serde(default = "default_alert_delivery")]
+    pub delivery: String,
+    /// Discord webhook URL env var name (`discord` delivery).
+    #[serde(default)]
+    pub webhook_env: Option<String>,
+    /// Telegram bot token env var name (`telegram` delivery).
+    #[serde(default)]
+    pub token_env: Option<String>,
+    /// Telegram chat id env var name (`telegram` delivery).
+    #[serde(default)]
+    pub chat_id_env: Option<String>,
+}
+
+impl Default for FileAlerts {
+    fn default() -> Self {
+        Self {
+            enabled: default_alerts_enabled(),
+            cooldown_secs: default_alert_cooldown(),
+            delivery: default_alert_delivery(),
+            webhook_env: None,
+            token_env: None,
+            chat_id_env: None,
+        }
+    }
+}
+
+fn default_alerts_enabled() -> bool {
+    true
+}
+
+fn default_alert_cooldown() -> u64 {
+    21_600
+}
+
+fn default_alert_delivery() -> String {
+    "log".into()
+}
+
 /// File shape of the score-weight table under `[opportunities]`.
 #[derive(Deserialize)]
 pub struct FileWeights {
@@ -433,13 +486,30 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
                 stability: file.opportunities.weights.stability,
             },
         },
+        alerts: AlertsConfig {
+            enabled: file.alerts.enabled,
+            cooldown_secs: file.alerts.cooldown_secs,
+            delivery: file.alerts.delivery,
+            webhook_env: file.alerts.webhook_env,
+            token_env: file.alerts.token_env,
+            chat_id_env: file.alerts.chat_id_env,
+        },
         targets,
     })
 }
 
 /// Keys the file model accepts at the top level.
-const TOP_KEYS: &[&str] =
-    &["debug", "server", "storage", "metrics", "opportunities", "targets", "logging", "sentry"];
+const TOP_KEYS: &[&str] = &[
+    "debug",
+    "server",
+    "storage",
+    "metrics",
+    "opportunities",
+    "alerts",
+    "targets",
+    "logging",
+    "sentry",
+];
 
 /// Rejects keys the file model does not know: a typo like `enviroment` must
 /// fail startup naming the path instead of silently disabling the setting
@@ -489,6 +559,14 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
                 &mut unknown,
             );
         }
+    }
+    if let Some(alerts) = section(root, "alerts") {
+        collect_unknown(
+            alerts,
+            "alerts",
+            &["enabled", "cooldown_secs", "delivery", "webhook_env", "token_env", "chat_id_env"],
+            &mut unknown,
+        );
     }
     if let Some(logging) = section(root, "logging") {
         collect_unknown(logging, "logging", &["dir", "rotation", "level"], &mut unknown);

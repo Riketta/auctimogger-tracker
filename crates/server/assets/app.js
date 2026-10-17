@@ -287,6 +287,37 @@
       act(button, "/api/fetch?target=" + encodeURIComponent(button.getAttribute("data-fetch-now")), "POST", "{}");
     });
   });
+  $all("[data-alert-remove]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      act(button, "/api/alerts", "DELETE", JSON.stringify({ ruleID: Number(button.getAttribute("data-alert-remove")) }));
+    });
+  });
+
+  // The alerts page rule form: serializes the condition union — pets win
+  // when a species id is filled, otherwise the item id is required.
+  $all("form[data-alert-form]").forEach(function (form) {
+    form.addEventListener("submit", function (event) {
+      event.preventDefault();
+      var get = function (name) { return form.elements[name].value.trim(); };
+      var payload = { target: form.getAttribute("data-target") };
+      var species = get("speciesID");
+      if (species) {
+        payload.item = { type: "pet", speciesID: Number(species), level: Number(get("level") || "1"), qualityID: Number(get("qualityID") || "0"), breedID: Number(get("breedID") || "0") };
+      } else {
+        payload.item = { type: "item", itemID: Number(get("itemID")) };
+      }
+      var type = get("type");
+      payload.condition = { type: type };
+      if (type === "price-below") payload.condition.copper = Number(get("copper"));
+      if (type === "below-floor") { payload.condition.span = get("span") || "d7"; payload.condition.percentile = get("percentile") || "p05"; }
+      if (type === "sale-rate-above") payload.condition.rate = Number(get("rate"));
+      if (get("note")) payload.note = get("note");
+      var button = form.querySelector("button[type=submit]");
+      if (button) {
+        act(button, "/api/alerts", "POST", JSON.stringify(payload));
+      }
+    });
+  });
 
   function act(button, url, method, body) {
     if (button.disabled) return;

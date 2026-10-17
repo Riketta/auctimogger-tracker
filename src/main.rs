@@ -307,6 +307,32 @@ fn build_app_state(
                 clock.clone(),
             ),
         ),
+        alerts: {
+            use amtracker_core::config::AlertDelivery;
+            let dispatcher: Option<Arc<dyn amtracker_core::ports::AlertDispatchPort>> =
+                match config.alerts.delivery_kind() {
+                    AlertDelivery::Log => None,
+                    AlertDelivery::Discord => {
+                        Some(Arc::new(amtracker_infra::alert_discord::DiscordAlertDispatcher::new(
+                            config.alerts.webhook_env.clone().unwrap_or_default(),
+                        )))
+                    }
+                    AlertDelivery::Telegram => Some(Arc::new(
+                        amtracker_infra::alert_telegram::TelegramAlertDispatcher::new(
+                            config.alerts.token_env.clone().unwrap_or_default(),
+                            config.alerts.chat_id_env.clone().unwrap_or_default(),
+                        ),
+                    )),
+                };
+            Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
+                store.clone(),
+                store.clone(),
+                metrics.clone(),
+                store.clone(),
+                dispatcher,
+                clock.clone(),
+            ))
+        },
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),
             store.clone(),

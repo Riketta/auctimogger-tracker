@@ -381,6 +381,32 @@ fn after_cycle(
     }
 
     refresh_opportunities(state, &TargetId(target.to_string()));
+    evaluate_alerts(state, target);
+}
+
+/// Runs one alert-evaluation pass for a target (post-cycle and post-manual-
+/// fetch): disabled configs are a no-op; fired alerts are counted and logged
+/// here since the core never logs. Best effort — an evaluation failure warns
+/// and waits for the next cycle.
+fn evaluate_alerts(state: &Arc<AppState>, target: &str) {
+    if !state.config.alerts.enabled {
+        return;
+    }
+    let cooldown = i64::try_from(state.config.alerts.cooldown_secs).unwrap_or(i64::MAX);
+    match state.alerts.evaluate(&TargetId(target.to_string()), cooldown) {
+        Ok(run) if run.fired > 0 => tracing::info!(
+            target,
+            evaluated = run.evaluated,
+            fired = run.fired,
+            dispatched = run.dispatched,
+            failures = run.dispatch_failures,
+            "alerts evaluated"
+        ),
+        Ok(_) => {}
+        Err(error) => {
+            tracing::warn!(target, error = %error, "alert evaluation failed");
+        }
+    }
 }
 
 /// Runs the after-cycle side effects for one target right now, without the

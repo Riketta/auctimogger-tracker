@@ -1053,3 +1053,91 @@ fn backup_to_writes_consistent_copy_and_refuses_existing_target() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Alert rules and fired events round-trip: conditions survive the JSON
+/// mirror, identities rebuild from the `item_ref` join, and events outlive
+/// their rule's removal.
+#[test]
+fn alert_rules_and_events_round_trip() {
+    use amtracker_core::{
+        domain::{
+            AlertCondition,
+            FloorPercentile,
+            NewAlertEvent,
+            NewAlertRule,
+        },
+        ports::{
+            AlertEventRepository,
+            AlertRuleRepository,
+        },
+    };
+
+    let dir = temp_dir("alerts");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let pet = ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 11 };
+
+    let rule = store
+        .add(&NewAlertRule {
+            target: target.clone(),
+            item: pet.clone(),
+            condition: AlertCondition::BelowFloor {
+                span: Span::D7,
+                percentile: FloorPercentile::P25,
+            },
+            note: Some("pet floor".into()),
+        })
+        .expect("add rule");
+    assert_eq!(rule.id, 1, "ids are store-assigned and monotonic");
+    assert_eq!(
+        rule.condition,
+        AlertCondition::BelowFloor { span: Span::D7, percentile: FloorPercentile::P25 }
+    );
+    assert_eq!(rule.last_fired_at, None);
+
+    store.mark_fired(rule.id, 1_000_500).expect("mark fired");
+    let listed = store.list(&target).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].last_fired_at, Some(1_000_500));
+    assert_eq!(listed[0].item, pet, "identity rebuilds through the join");
+
+    let event_id = AlertEventRepository::record(
+        &store,
+        &NewAlertEvent {
+            rule_id: rule.id,
+            target: target.clone(),
+            item: pet.clone(),
+            condition: AlertCondition::BelowFloor {
+                span: Span::D7,
+                percentile: FloorPercentile::P25,
+            },
+            observed: Some(0.5),
+            message: "pet 264: d7 median at/below p25 floor".into(),
+            fired_at: 1_000_500,
+        },
+    )
+    .expect("record event");
+    let events = store.recent(&target, 10).expect("recent");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].id, event_id);
+    assert_eq!(events[0].observed, Some(0.5));
+
+    // Removing the rule keeps the event history (events are the audit log).
+    assert!(store.remove(rule.id).expect("remove rule"));
+    assert_eq!(store.list(&target).expect("list").len(), 0);
+    assert_eq!(store.recent(&target, 10).expect("recent").len(), 1);
+
+    // Rules of other targets stay separate.
+    store
+        .add(&NewAlertRule {
+            target: TargetId("eu-9".into()),
+            item: ItemRef::Item { item_id: 2589 },
+            condition: AlertCondition::SaleRateAbove { rate: 0.2 },
+            note: None,
+        })
+        .expect("add other rule");
+    assert_eq!(store.list(&target).expect("list").len(), 0);
+    assert_eq!(store.list(&TargetId("eu-9".into())).expect("list").len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

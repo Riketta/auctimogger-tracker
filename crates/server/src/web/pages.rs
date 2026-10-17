@@ -1309,6 +1309,187 @@ pub(crate) async fn watchlist_page(
     page("watchlist", "watchlist", &body, Some(switcher))
 }
 
+// -------------------------------------------------------------------- alerts
+
+/// Human one-liner for a stored alert condition.
+fn condition_label(condition: &amtracker_core::domain::AlertCondition) -> String {
+    use amtracker_core::domain::AlertCondition;
+    match *condition {
+        AlertCondition::PriceBelow { copper } => {
+            format!("d1 median ≤ {} copper", money(copper))
+        }
+        AlertCondition::BelowFloor { span, percentile } => {
+            format!("{} median ≤ {} floor", span.name(), percentile.as_str())
+        }
+        AlertCondition::SaleRateAbove { rate } => format!("14d sale rate ≥ {rate:.2}"),
+    }
+}
+
+/// `GET /alerts` — a target's alert rules, their fired history and (in open
+/// mutation mode) a rule form. Data-less until rules exist; evaluation runs
+/// after every ingest cycle when `[alerts].enabled`.
+pub(crate) async fn alerts_page(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let loaded = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || -> Result<_, StoreError> {
+            let rules = state.alerts.list_rules(&target)?;
+            let events = state.alerts.recent_events(&target, 50)?;
+            Ok((rules, events))
+        }
+    });
+    let (rules, events) = match loaded.await {
+        Ok(Ok(loaded)) => loaded,
+        Ok(Err(error)) => return render::store_error_page(error).await,
+        Err(error) => {
+            return render::store_error_page(StoreError::Backend(error.to_string())).await
+        }
+    };
+    let switcher = target_switcher(&state.config, "/alerts", &target, &[]);
+    let open = mutations_open(&state.config);
+
+    let delivery = state.config.alerts.delivery_kind();
+    let delivery_label = match delivery {
+        amtracker_core::config::AlertDelivery::Log => "log (events below + JSON API only)",
+        amtracker_core::config::AlertDelivery::Discord => "discord webhook",
+        amtracker_core::config::AlertDelivery::Telegram => "telegram bot",
+    };
+    let cooldown_label = format!("cooldown {}s", state.config.alerts.cooldown_secs);
+    let mut body = format!(
+        "<p class=\"muted\">{} <code>{}</code> — {} <code>{}</code>, {} {}</p>",
+        tip("alerts", "Rules evaluated after every ingest cycle; a fired rule re-fires at most once per cooldown window."),
+        html_escape(target.as_str()),
+        tip("delivery", "Where fired alerts are sent. \"log\" keeps them in this page and the JSON API only."),
+        html_escape(delivery_label),
+        tip("cooldown", "The minimum seconds between two fires of the same rule."),
+        cooldown_label,
+    );
+    if !state.config.alerts.enabled {
+        body.push_str(
+            "<div class=\"empty\">alert evaluation is disabled ([alerts].enabled = false) — \
+             rules and history stay browsable, nothing fires</div>",
+        );
+    }
+    body.push_str("<h2>rules</h2>");
+    if rules.is_empty() {
+        body.push_str("<div class=\"empty\">no alert rules on this target yet</div>");
+    } else {
+        body.push_str("<div class=\"scroll-x\"><table id=\"alert-rules\"><thead><tr>");
+        for (label, tip_text) in [
+            ("item", "The watched item or pet variant."),
+            ("condition", "What fires the rule (evaluated against the same cached blocks the item page shows)."),
+            ("note", "Your free-form label."),
+            ("created", "When the rule was added (UTC)."),
+            ("last fired", "The rule's cooldown anchor: null until it has fired once."),
+            ("", "Removal action (open mode only)."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        for rule in &rules {
+            let _ = write!(
+                body,
+                "<tr><td>{}</td><td>{}</td><td class=\"muted\">{}</td>\
+                 <td title=\"{}\">{}</td>\
+                 <td>{}</td><td>{}</td></tr>",
+                item_link(&target, &rule.item),
+                condition_label(&rule.condition),
+                html_escape(rule.note.as_deref().unwrap_or("")),
+                html_escape(&human_time(rule.created_at)),
+                html_escape(&human_time(rule.created_at)),
+                rule.last_fired_at.map_or("—".to_string(), |at| html_escape(&human_time(at))),
+                alert_remove_button(open, rule.id),
+            );
+        }
+        body.push_str("</tbody></table></div>");
+    }
+    if open {
+        let _ = write!(
+            body,
+            "<h2>add rule</h2>\
+             <form data-alert-form data-target=\"{}\" class=\"alert-form\">\
+             <input name=\"itemID\" type=\"number\" min=\"1\" placeholder=\"item id\" aria-label=\"item id\">\
+             <input name=\"speciesID\" type=\"number\" min=\"1\" placeholder=\"pet species (optional)\" aria-label=\"pet species id\">\
+             <input name=\"level\" type=\"number\" placeholder=\"pet level\" aria-label=\"pet level\">\
+             <input name=\"qualityID\" type=\"number\" placeholder=\"pet quality\" aria-label=\"pet quality id\">\
+             <input name=\"breedID\" type=\"number\" placeholder=\"pet breed\" aria-label=\"pet breed id\">\
+             <select name=\"type\" aria-label=\"condition\">\
+             <option value=\"price-below\">d1 median ≤ copper</option>\
+             <option value=\"below-floor\">median ≤ floor percentile</option>\
+             <option value=\"sale-rate-above\">14d sale rate ≥ rate</option>\
+             </select>\
+             <input name=\"copper\" type=\"number\" min=\"1\" placeholder=\"copper\" aria-label=\"copper threshold\">\
+             <select name=\"span\" aria-label=\"span\">\
+             <option value=\"d7\">d7</option><option value=\"d14\">d14</option>\
+             <option value=\"d30\">d30</option><option value=\"d1\">d1</option>\
+             </select>\
+             <select name=\"percentile\" aria-label=\"floor percentile\">\
+             <option value=\"p05\">p05</option><option value=\"p25\">p25</option>\
+             </select>\
+             <input name=\"rate\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" placeholder=\"rate\" aria-label=\"sale rate threshold\">\
+             <input name=\"note\" placeholder=\"note (optional)\" aria-label=\"rule note\">\
+             <button class=\"btn btn-sm\" type=\"submit\">add rule</button>\
+             </form>\
+             <p class=\"muted\">pets: fill species + level + quality + breed (they share one market per species).</p>",
+            html_escape(target.as_str()),
+        );
+    } else {
+        body.push_str(
+            "<p class=\"muted\">this instance requires an API token, so rules are \
+             API-only: POST/DELETE /api/alerts with the bearer token</p>",
+        );
+    }
+
+    body.push_str("<h2>recent fires</h2>");
+    if events.is_empty() {
+        body.push_str("<div class=\"empty\">nothing has fired on this target yet</div>");
+    } else {
+        body.push_str("<div class=\"scroll-x\"><table id=\"alert-events\"><thead><tr>");
+        for (label, tip_text) in [
+            ("fired at", "When the condition held (UTC)."),
+            ("rule", "The rule that fired."),
+            ("observed", "The number that fired it: median copper or sale-rate fraction."),
+            ("detail", "The recorded one-liner; delivery adapters send this text."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        for event in &events {
+            let _ = write!(
+                body,
+                "<tr><td title=\"{}\">{}</td><td>#{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td><td>{}</td></tr>",
+                html_escape(&human_time(event.fired_at)),
+                html_escape(&human_time(event.fired_at)),
+                event.rule_id,
+                event.observed.map_or(String::new(), |v| format!("{v:.4}")),
+                event.observed.map_or("—".to_string(), |v| format!("{v:.2}")),
+                html_escape(&event.message),
+            );
+        }
+        body.push_str("</tbody></table></div>");
+    }
+    page("alerts", "alerts", &body, Some(switcher))
+}
+
+/// Removal button for one alert rule (open mutation mode only).
+fn alert_remove_button(open: bool, rule_id: i64) -> String {
+    if !open {
+        return String::new();
+    }
+    format!(
+        "<button class=\"btn btn-sm btn-danger\" data-alert-remove='{rule_id}' \
+         title=\"remove this rule (its history stays)\">remove</button>"
+    )
+}
+
 // -------------------------------------------------------------------- help
 
 /// `GET /help` — every term the UI uses, explained once.
@@ -1334,6 +1515,9 @@ pub(crate) async fn help_page() -> Response {
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
         ("watchlist", "Your curated per-target list. Drives feed-slim.lua — the addon consumes exactly those items."),
+        ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle."),
+        ("cooldown", "A fired rule re-fires at most once per [alerts].cooldown_secs, so a persistently cheap item does not spam delivery. The anchor is the rule's last-fired stamp."),
+        ("delivery", "Where fired alerts go: log (this page + JSON API only), discord (webhook message) or telegram (bot message). Webhook/token values are read from the named environment variables on every send, so rotating them needs no restart."),
         ("generatedAt / source modified", "The feed's freshness anchor: taken from the source's Last-Modified header so the addon can trust how current its data is."),
     ];
     let mut body = String::from(

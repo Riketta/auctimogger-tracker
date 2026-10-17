@@ -433,6 +433,75 @@ pub trait WatchlistRepository: Send + Sync {
     fn list(&self, target: &TargetId) -> Result<Vec<WatchlistEntry>, StoreError>;
 }
 
+/// Outbound: alert rule persistence (the rule set the evaluator runs).
+pub trait AlertRuleRepository: Send + Sync {
+    /// Stores a new rule and returns the stamped version.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the rule cannot be written.
+    fn add(
+        &self,
+        rule: &crate::domain::NewAlertRule,
+    ) -> Result<crate::domain::AlertRule, StoreError>;
+    /// Removes the rule by id; returns whether anything was removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the rule cannot be deleted.
+    fn remove(&self, rule_id: i64) -> Result<bool, StoreError>;
+    /// All rules of a target, in insertion order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when rules cannot be read.
+    fn list(&self, target: &TargetId) -> Result<Vec<crate::domain::AlertRule>, StoreError>;
+    /// Stamps the rule's cooldown anchor after it fired. A no-op for unknown
+    /// ids.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the anchor cannot be written.
+    fn mark_fired(&self, rule_id: i64, at: i64) -> Result<(), StoreError>;
+}
+
+/// Outbound: fired-alert history.
+pub trait AlertEventRepository: Send + Sync {
+    /// Persists one fired alert and returns its id.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the event cannot be written.
+    fn record(&self, event: &crate::domain::NewAlertEvent) -> Result<i64, StoreError>;
+    /// The `limit` newest events of a target, newest first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when events cannot be read.
+    fn recent(
+        &self,
+        target: &TargetId,
+        limit: usize,
+    ) -> Result<Vec<crate::domain::AlertEvent>, StoreError>;
+}
+
+/// Outbound: alert delivery (Discord/Telegram/log adapters). Implementations
+/// must be cheap and side-effect-light: the evaluator records the event FIRST
+/// (delivery is best effort — a failed dispatch is counted and logged, never
+/// retried from here and never blocks evaluation).
+pub trait AlertDispatchPort: Send + Sync {
+    /// Delivers one fired alert.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::AlertDispatchError`] when the message could
+    /// not be delivered; the caller counts and logs it.
+    fn dispatch(
+        &self,
+        event: &crate::domain::AlertEvent,
+    ) -> Result<(), crate::error::AlertDispatchError>;
+}
+
 /// Outbound: feed rendering (lua / json).
 pub trait FeedRenderer: Send + Sync {
     /// Serializes `feed` into `format`.

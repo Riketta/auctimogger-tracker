@@ -40,6 +40,8 @@ use amtracker_core::{
     },
     fold::DayFold,
     ports::{
+        AlertEventRepository,
+        AlertRuleRepository,
         AuctionSourcePort,
         ClockPort,
         MetricsCacheRepository,
@@ -727,6 +729,231 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
     assert_eq!(second.trend.len(), 0);
 }
 
+#[test]
+fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
+    use amtracker_core::{
+        domain::{
+            AlertCondition,
+            NewAlertRule,
+        },
+        ports::{
+            AlertEventRepository,
+            AlertRuleRepository,
+        },
+        services::alert::AlertEvaluationService,
+    };
+
+    let today = 1_000_000; // utc day 11
+    let item1 = item(1);
+    let empty_item = item(2); // never gets folds: no data → never fires
+    let target = TargetId("us-4".into());
+
+    let history = Arc::new(FakeHistory::default());
+    let mut fold = DayFold::new(item1.clone());
+    fold.apply(&[listing(1, &item1, 100, 1)]);
+    history.save_fold(&target, &item1, utc_day(today), &fold).expect("save fold");
+
+    let rules = Arc::new(FakeAlertRules::default());
+    let events = Arc::new(FakeAlertEvents::default());
+    rules
+        .add(&NewAlertRule {
+            target: target.clone(),
+            item: item1.clone(),
+            condition: AlertCondition::PriceBelow { copper: 150 },
+            note: Some("cheap flip".into()),
+        })
+        .expect("add price rule");
+    rules
+        .add(&NewAlertRule {
+            target: target.clone(),
+            item: empty_item,
+            condition: AlertCondition::PriceBelow { copper: 150 },
+            note: None,
+        })
+        .expect("add no-data rule");
+
+    let clock = MutableClock::new(today);
+    let dispatched = Arc::new(RecordingDispatcher(Mutex::new(0)));
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history.clone(),
+            Arc::new(FakeCache::default()),
+            Arc::new(FakeSales::default()),
+            clock.clone(),
+        )),
+        Arc::new(FakeSales::default()),
+        Some(dispatched.clone()),
+        clock.clone(),
+    );
+
+    // First pass: the price rule fires (100 ≤ 150), the data-less one skips.
+    let run = service.evaluate(&target, 21_600).expect("evaluate");
+    assert_eq!(run.evaluated, 2);
+    assert_eq!(run.fired, 1);
+    assert_eq!(run.dispatched, 1);
+    assert_eq!(*dispatched.0.lock().unwrap(), 1);
+    let stored = events.recent(&target, 10).expect("recent");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].observed, Some(100.0));
+    assert!(stored[0].message.contains("item 1"), "message identifies the item");
+    // The fired rule's cooldown anchor is stamped.
+    let listed = rules.list(&target).expect("list");
+    assert_eq!(listed[0].last_fired_at, Some(today));
+
+    // An immediate second pass is inside the cooldown: nothing fires again.
+    let run = service.evaluate(&target, 21_600).expect("evaluate again");
+    assert_eq!(run.fired, 0);
+
+    // Past the cooldown the condition still holds, so it fires again — and a
+    // failing dispatcher only counts failures, never breaks evaluation.
+    clock.advance(21_601);
+    let failing = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history.clone(),
+            Arc::new(FakeCache::default()),
+            Arc::new(FakeSales::default()),
+            clock.clone(),
+        )),
+        Arc::new(FakeSales::default()),
+        Some(Arc::new(FailingDispatcher)),
+        clock.clone(),
+    );
+    let run = failing.evaluate(&target, 21_600).expect("evaluate after cooldown");
+    assert_eq!(run.fired, 1);
+    assert_eq!(run.dispatched, 0);
+    assert_eq!(run.dispatch_failures, 1);
+    assert_eq!(events.recent(&target, 10).expect("recent").len(), 2);
+
+    // A target without rules evaluates to a quiet zero-run.
+    let quiet = service.evaluate(&TargetId("eu-9".into()), 21_600).expect("evaluate empty");
+    assert_eq!(quiet.evaluated, 0);
+}
+
+#[derive(Default)]
+struct FakeAlertRules {
+    rules: Mutex<Vec<amtracker_core::domain::AlertRule>>,
+    next_id: Mutex<i64>,
+}
+
+impl AlertRuleRepository for FakeAlertRules {
+    fn add(
+        &self,
+        rule: &amtracker_core::domain::NewAlertRule,
+    ) -> Result<amtracker_core::domain::AlertRule, StoreError> {
+        let mut next = self.next_id.lock().unwrap();
+        *next += 1;
+        let id = *next;
+        let stored = amtracker_core::domain::AlertRule {
+            id,
+            target: rule.target.clone(),
+            item: rule.item.clone(),
+            condition: rule.condition,
+            note: rule.note.clone(),
+            created_at: 1,
+            last_fired_at: None,
+        };
+        self.rules.lock().unwrap().push(stored.clone());
+        Ok(stored)
+    }
+
+    fn remove(&self, rule_id: i64) -> Result<bool, StoreError> {
+        let mut rules = self.rules.lock().unwrap();
+        let before = rules.len();
+        rules.retain(|rule| rule.id != rule_id);
+        Ok(rules.len() != before)
+    }
+
+    fn list(
+        &self,
+        target: &TargetId,
+    ) -> Result<Vec<amtracker_core::domain::AlertRule>, StoreError> {
+        Ok(self
+            .rules
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|rule| rule.target == *target)
+            .cloned()
+            .collect())
+    }
+
+    fn mark_fired(&self, rule_id: i64, at: i64) -> Result<(), StoreError> {
+        for rule in self.rules.lock().unwrap().iter_mut() {
+            if rule.id == rule_id {
+                rule.last_fired_at = Some(at);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct FakeAlertEvents {
+    events: Mutex<Vec<amtracker_core::domain::AlertEvent>>,
+}
+
+impl AlertEventRepository for FakeAlertEvents {
+    fn record(&self, event: &amtracker_core::domain::NewAlertEvent) -> Result<i64, StoreError> {
+        let mut events = self.events.lock().unwrap();
+        let id = i64::try_from(events.len() + 1).unwrap_or(i64::MAX);
+        events.push(amtracker_core::domain::AlertEvent {
+            id,
+            rule_id: event.rule_id,
+            target: event.target.clone(),
+            item: event.item.clone(),
+            condition: event.condition,
+            observed: event.observed,
+            message: event.message.clone(),
+            fired_at: event.fired_at,
+        });
+        Ok(id)
+    }
+
+    fn recent(
+        &self,
+        target: &TargetId,
+        limit: usize,
+    ) -> Result<Vec<amtracker_core::domain::AlertEvent>, StoreError> {
+        let events = self.events.lock().unwrap();
+        Ok(events
+            .iter()
+            .filter(|event| event.target == *target)
+            .rev()
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+}
+
+/// Dispatcher that records deliveries — for asserting dispatch counts.
+struct RecordingDispatcher(Mutex<usize>);
+
+impl amtracker_core::ports::AlertDispatchPort for RecordingDispatcher {
+    fn dispatch(
+        &self,
+        _event: &amtracker_core::domain::AlertEvent,
+    ) -> Result<(), amtracker_core::error::AlertDispatchError> {
+        *self.0.lock().unwrap() += 1;
+        Ok(())
+    }
+}
+
+/// Dispatcher that always fails — for asserting failure isolation.
+struct FailingDispatcher;
+
+impl amtracker_core::ports::AlertDispatchPort for FailingDispatcher {
+    fn dispatch(
+        &self,
+        _event: &amtracker_core::domain::AlertEvent,
+    ) -> Result<(), amtracker_core::error::AlertDispatchError> {
+        Err(amtracker_core::error::AlertDispatchError::Status(500))
+    }
+}
+
 // --------------------------------------------------------- opportunity scans
 
 /// Clock the tests can move forward to simulate TTL expiry and debounce
@@ -908,6 +1135,14 @@ fn opportunity_config() -> TrackerConfig {
                 churn: 0.2,
                 stability: 0.1,
             },
+        },
+        alerts: amtracker_core::config::AlertsConfig {
+            enabled: false,
+            cooldown_secs: 21_600,
+            delivery: "log".into(),
+            webhook_env: None,
+            token_env: None,
+            chat_id_env: None,
         },
         targets: vec![target()],
     }

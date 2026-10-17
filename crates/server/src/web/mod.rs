@@ -86,6 +86,9 @@ pub struct AppState {
     /// Whole-watchlist market reports (blocks, sale rates, trends) behind
     /// the live watchlist page and `/api/watchlist/metrics`.
     pub watchlist_report: Arc<amtracker_core::services::watchlist_report::WatchlistReportService>,
+    /// Alert rule evaluation + CRUD behind the scheduler's post-cycle pass
+    /// and the `/alerts` page/API.
+    pub alerts: Arc<amtracker_core::services::alert::AlertEvaluationService>,
     /// Feed assembly shared by the JSON endpoint and the Lua downloads.
     pub feed_export: Arc<FeedExportService>,
     /// Published feed bytes backing the cached `/feed.lua` download.
@@ -171,6 +174,7 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/opportunities", get(pages::opportunities_page))
         .route("/overview", get(pages::overview_page))
         .route("/watchlist", get(pages::watchlist_page))
+        .route("/alerts", get(pages::alerts_page))
         .route("/help", get(pages::help_page))
         .route("/assets/app.css", get(assets::asset_css))
         .route("/assets/app.js", get(assets::asset_js))
@@ -191,6 +195,11 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         )
         .route("/api/watchlist/metrics", get(api::api_watchlist_metrics))
         .route("/api/snapshots", get(api::api_snapshots))
+        .route(
+            "/api/alerts",
+            get(api::api_alerts_get).post(api::api_alerts_post).delete(api::api_alerts_delete),
+        )
+        .route("/api/alerts/evaluate", post(api::api_alerts_evaluate))
         .route("/api/items/{target_id}/pet/{species_id}/metrics", get(api::api_item_pet_metrics))
         .route("/api/fetch", post(api::api_fetch))
         .fallback(not_found)
@@ -400,6 +409,14 @@ mod tests {
                     churn: 0.2,
                     stability: 0.1,
                 },
+            },
+            alerts: amtracker_core::config::AlertsConfig {
+                enabled: false,
+                cooldown_secs: 21_600,
+                delivery: "log".into(),
+                webhook_env: None,
+                token_env: None,
+                chat_id_env: None,
             },
             targets: vec![amtracker_core::config::TargetConfig {
                 id: TargetId("us-4".into()),

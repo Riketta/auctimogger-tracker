@@ -160,6 +160,14 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             min_samples: 3,
             weights: ScoreWeights { discount: 0.4, sale: 0.3, churn: 0.2, stability: 0.1 },
         },
+        alerts: amtracker_core::config::AlertsConfig {
+            enabled: false,
+            cooldown_secs: 21_600,
+            delivery: "log".into(),
+            webhook_env: None,
+            token_env: None,
+            chat_id_env: None,
+        },
         targets: vec![TargetConfig {
             id: TargetId(TARGET.into()),
             kind: TargetKind::BlizzardConnectedRealm { region: "us".into(), connected_realm_id: 4 },
@@ -204,6 +212,14 @@ fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
                 clock.clone(),
             ),
         ),
+        alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
+            store.clone(),
+            store.clone(),
+            metrics.clone(),
+            store.clone(),
+            None,
+            clock.clone(),
+        )),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),
             store.clone(),
@@ -537,5 +553,107 @@ async fn search_api_reports_the_paging_envelope() {
     assert_eq!(json.get("offset").and_then(Value::as_u64), Some(3));
     assert_eq!(json.get("limit").and_then(Value::as_u64), Some(5));
     assert_eq!(json.get("hasMore").and_then(Value::as_bool), Some(false));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The alert API end to end over the real store: rule add, evaluation firing
+/// against seeded folds, event history, rule removal (history retained), and
+/// bad conditions rejected with 400.
+#[tokio::test]
+async fn alert_api_adds_evaluates_and_removes_rules() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"target":"t1","type":"item","itemID":2589,
+                         "condition":{"type":"price-below","copper":300},"note":"flip"}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK, "rule add succeeds in open mode");
+
+    // Unknown condition shapes are rejected before any store write.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"target":"t1","type":"item","itemID":2589,
+                         "condition":{"type":"nonsense"}}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST, "unknown condition type");
+
+    // d1 median of the seeded folds is 200 ≤ 300, so evaluation fires once.
+    // POST (the mutation guard) with the documented empty JSON body.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts/evaluate?target=t1")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body();
+    let body = String::from_utf8(
+        http_body_util::BodyExt::collect(bytes).await.expect("body").to_bytes().to_vec(),
+    )
+    .expect("utf8");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json.get("evaluated").and_then(Value::as_u64), Some(1));
+    assert_eq!(json.get("fired").and_then(Value::as_u64), Some(1));
+
+    let (status, body) = get(router.clone(), "/api/alerts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let rules = json.get("rules").and_then(Value::as_array).expect("rules array");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(rules[0].get("note").and_then(Value::as_str), Some("flip"));
+    let events = json.get("events").and_then(Value::as_array).expect("events array");
+    assert_eq!(events.len(), 1, "the fired event is in the history");
+    let rule_id = rules[0].get("ruleID").and_then(Value::as_i64).expect("ruleID");
+
+    // Removal works by id and keeps the event history.
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("DELETE")
+                .uri("/api/alerts")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"ruleID":{rule_id}}}"#)))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let (_, body) = get(build_router_arc(Arc::clone(&state)), "/api/alerts?target=t1").await;
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json.get("rules").and_then(Value::as_array).map(std::vec::Vec::len), Some(0));
+    assert_eq!(
+        json.get("events").and_then(Value::as_array).map(std::vec::Vec::len),
+        Some(1),
+        "event history outlives the rule"
+    );
     std::fs::remove_dir_all(&root).ok();
 }

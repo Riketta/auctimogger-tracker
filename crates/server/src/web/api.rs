@@ -799,6 +799,252 @@ pub(crate) async fn api_watchlist_delete(
     }
 }
 
+// ------------------------------------------------------------------- alerts
+
+/// JSON shape of one alert condition (the tagged union of rule triggers).
+#[derive(Deserialize)]
+pub(crate) struct AlertConditionPost {
+    /// `price-below` | `below-floor` | `sale-rate-above`.
+    #[serde(rename = "type")]
+    kind: String,
+    copper: Option<i64>,
+    span: Option<String>,
+    percentile: Option<String>,
+    rate: Option<f64>,
+}
+
+impl AlertConditionPost {
+    /// Maps the wire union into the domain enum, rejecting incomplete or
+    /// out-of-range payloads with a human message.
+    fn to_condition(&self) -> Result<amtracker_core::domain::AlertCondition, String> {
+        use amtracker_core::domain::AlertCondition;
+        match self.kind.as_str() {
+            "price-below" => {
+                let copper = self.copper.ok_or("price-below requires copper")?;
+                if copper <= 0 {
+                    return Err("copper must be positive".into());
+                }
+                Ok(AlertCondition::PriceBelow { copper })
+            }
+            "below-floor" => {
+                let span = self
+                    .span
+                    .as_deref()
+                    .and_then(Span::parse)
+                    .ok_or("below-floor requires span d1|d7|d14|d30")?;
+                let percentile = self
+                    .percentile
+                    .as_deref()
+                    .and_then(amtracker_core::domain::FloorPercentile::parse)
+                    .ok_or("below-floor requires percentile p05|p25")?;
+                Ok(AlertCondition::BelowFloor { span, percentile })
+            }
+            "sale-rate-above" => {
+                let rate = self.rate.ok_or("sale-rate-above requires rate")?;
+                if !(0.0..=1.0).contains(&rate) {
+                    return Err("rate must be within 0.0..=1.0".into());
+                }
+                Ok(AlertCondition::SaleRateAbove { rate })
+            }
+            other => Err(format!(
+                "unknown condition type '{other}' (expected price-below|below-floor|sale-rate-above)"
+            )),
+        }
+    }
+}
+
+/// JSON shape of one condition, for rule/event responses.
+fn condition_json(condition: &amtracker_core::domain::AlertCondition) -> serde_json::Value {
+    use amtracker_core::domain::AlertCondition;
+    match *condition {
+        AlertCondition::PriceBelow { copper } => {
+            serde_json::json!({ "type": "price-below", "copper": copper })
+        }
+        AlertCondition::BelowFloor { span, percentile } => serde_json::json!({
+            "type": "below-floor",
+            "span": span.name(),
+            "percentile": percentile.as_str(),
+        }),
+        AlertCondition::SaleRateAbove { rate } => {
+            serde_json::json!({ "type": "sale-rate-above", "rate": rate })
+        }
+    }
+}
+
+/// JSON shape of one stored rule.
+fn alert_rule_json(rule: &amtracker_core::domain::AlertRule) -> serde_json::Value {
+    serde_json::json!({
+        "ruleID": rule.id,
+        "target": rule.target.as_str(),
+        "item": item_json(&rule.item),
+        "condition": condition_json(&rule.condition),
+        "note": rule.note,
+        "createdAt": rule.created_at,
+        "lastFiredAt": rule.last_fired_at,
+    })
+}
+
+/// JSON shape of one fired event.
+fn alert_event_json(event: &amtracker_core::domain::AlertEvent) -> serde_json::Value {
+    serde_json::json!({
+        "eventID": event.id,
+        "ruleID": event.rule_id,
+        "target": event.target.as_str(),
+        "item": item_json(&event.item),
+        "condition": condition_json(&event.condition),
+        "observed": event.observed,
+        "message": event.message,
+        "firedAt": event.fired_at,
+    })
+}
+
+/// `GET /api/alerts?target=&events=` — the target's rules plus (default 50)
+/// newest fired events; the alerts page's data source.
+pub(crate) async fn api_alerts_get(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let event_limit =
+        params.get("events").and_then(|v| v.parse::<usize>().ok()).map_or(50, |v| v.clamp(1, 500));
+    let loaded = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || -> Result<_, StoreError> {
+            let rules = state.alerts.list_rules(&target)?;
+            let events = state.alerts.recent_events(&target, event_limit)?;
+            Ok((rules, events))
+        }
+    });
+    match loaded.await {
+        Ok(Ok((rules, events))) => Json(serde_json::json!({
+            "target": target.as_str(),
+            "rules": rules.iter().map(alert_rule_json).collect::<Vec<_>>(),
+            "events": events.iter().map(alert_event_json).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("alerts-get", &error),
+        Err(error) => internal_error("alerts-get-join", &error),
+    }
+}
+
+/// Body of `POST /api/alerts` (token-gated): target + item union + condition
+/// union + optional note.
+#[derive(Deserialize)]
+pub(crate) struct AlertPost {
+    target: String,
+    #[serde(flatten)]
+    item: ApiItemRef,
+    condition: AlertConditionPost,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// `POST /api/alerts` — adds one rule (token-gated).
+pub(crate) async fn api_alerts_post(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AlertPost>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let target = match known_target(&state.config, &body.target) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let condition = match body.condition.to_condition() {
+        Ok(condition) => condition,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let added = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let item = body.item.to_ref();
+        move || {
+            state.alerts.add_rule(&amtracker_core::domain::NewAlertRule {
+                target,
+                item,
+                condition,
+                note: body.note,
+            })
+        }
+    });
+    match added.await {
+        Ok(Ok(rule)) => Json(alert_rule_json(&rule)).into_response(),
+        Ok(Err(error)) => internal_error("alerts-add", &error),
+        Err(error) => internal_error("alerts-add-join", &error),
+    }
+}
+
+/// Body of `DELETE /api/alerts` (token-gated).
+#[derive(Deserialize)]
+pub(crate) struct AlertDelete {
+    #[serde(rename = "ruleID")]
+    rule_id: i64,
+}
+
+/// `DELETE /api/alerts` — removes one rule by id (token-gated). Its event
+/// history stays.
+pub(crate) async fn api_alerts_delete(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AlertDelete>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let removed = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        move || state.alerts.remove_rule(body.rule_id)
+    });
+    match removed.await {
+        Ok(Ok(removed)) => {
+            Json(serde_json::json!({ "ok": true, "removed": removed })).into_response()
+        }
+        Ok(Err(error)) => internal_error("alerts-remove", &error),
+        Err(error) => internal_error("alerts-remove-join", &error),
+    }
+}
+
+/// `POST /api/alerts/evaluate?target=` — runs one evaluation pass now
+/// (token-gated); the same pass the scheduler runs after every cycle. The
+/// `Json` extractor doubles as the CSRF guard: simple cross-site forms cannot
+/// send `application/json`.
+pub(crate) async fn api_alerts_evaluate(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(params): Query<HashMap<String, String>>,
+    Json(_body): Json<serde_json::Value>,
+) -> Response {
+    if let Err(response) = authorize(&state, &headers) {
+        return *response;
+    }
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let cooldown = i64::try_from(state.config.alerts.cooldown_secs).unwrap_or(i64::MAX);
+    let run = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.alerts.evaluate(&target, cooldown)
+    });
+    match run.await {
+        Ok(Ok(run)) => Json(serde_json::json!({
+            "evaluated": run.evaluated,
+            "fired": run.fired,
+            "dispatched": run.dispatched,
+            "dispatchFailures": run.dispatch_failures,
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("alerts-evaluate", &error),
+        Err(error) => internal_error("alerts-evaluate-join", &error),
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct FetchParams {
     #[serde(default)]

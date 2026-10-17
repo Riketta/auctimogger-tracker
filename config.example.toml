@@ -37,6 +37,20 @@ spans = ["d1", "d7", "d14", "d30"]
 min_samples = 30
 weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 
+# Alert rules (per target, managed on the /alerts page or via the API) are
+# evaluated after every ingest cycle. A fired rule re-fires at most once per
+# cooldown window. Delivery: "log" records events in the UI/API only;
+# "discord" posts to the webhook URL read from webhook_env; "telegram" sends
+# via the bot token/chat id read from token_env/chat_id_env. Token values are
+# environment variables — never put secrets in this file.
+# [alerts]
+# enabled = true
+# cooldown_secs = 21600    # re-fire the same rule at most every 6 h
+# delivery = "log"
+# webhook_env = "AMT_DISCORD_WEBHOOK"   # required when delivery = "discord"
+# token_env = "AMT_TELEGRAM_TOKEN"      # required when delivery = "telegram"
+# chat_id_env = "AMT_TELEGRAM_CHAT"
+
 # Optional: persistent file logging. Startup-only: the subscriber is
 # installed once at boot, changes require a restart. Remove the section
 # to log to stdout only (systemd's journald usually suffices; otherwise
