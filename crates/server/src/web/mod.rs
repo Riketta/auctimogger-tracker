@@ -116,11 +116,15 @@ pub fn build_router(state: AppState) -> Router {
 /// `SIGTERM` on Unix (systemd stop); the binary then flushes queued
 /// logs/Sentry events before exiting.
 ///
+/// `bind` is the resolved socket address ([`startup::resolve_bind`]) — the
+/// listener and the startup loopback guard share one parse, so they can
+/// never disagree about what is actually exposed.
+///
 /// # Errors
 /// Returns the underlying [`std::io::Error`] when binding `bind` fails or
 /// when the accept loop surfaces a fatal IO error.
-pub async fn serve(state: Arc<AppState>, bind: String) -> std::io::Result<()> {
-    let listener = tokio::net::TcpListener::bind(&bind).await?;
+pub async fn serve(state: Arc<AppState>, bind: std::net::SocketAddr) -> std::io::Result<()> {
+    let listener = tokio::net::TcpListener::bind(bind).await?;
     axum::serve(listener, build_router_arc(state)).with_graceful_shutdown(shutdown_signal()).await
 }
 

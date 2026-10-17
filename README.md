@@ -105,7 +105,7 @@ only — never put secrets in this file.
 | Key | Default | Meaning |
 |---|---|---|
 | `debug` | `false` | louder stdout defaults for the tracker's own crates; `RUST_LOG` overrides entirely |
-| `server.bind` | `127.0.0.1:8080` | web UI/API listen address |
+| `server.bind` | `127.0.0.1:8080` | web UI/API listen address (a socket address, or `localhost:PORT` which is pinned to `127.0.0.1`; other hostnames are refused at startup) |
 | `server.token_env` | `AMT_API_TOKEN` | env var holding the mutation token; unset **or empty** = open on a loopback bind (localhost dev; one loud startup warning). On any other bind this **refuses to start `serve`** |
 | `server.allow_open` | `false` | explicit opt-out: set `true` to let `serve` start with an open mutating API on a non-loopback bind (strongly discouraged) |
 | `server.feed_publish_secs` | `300` | minimum seconds between feed re-publications per target |

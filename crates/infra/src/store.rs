@@ -199,9 +199,9 @@ impl SqliteStore {
     ///
     /// Returns [`StoreError::Backend`] when the data or archive directories
     /// cannot be created, the database cannot be opened or configured (WAL,
-    /// synchronous pragma), the schema batch cannot be applied, or a
-    /// pre-kind (schema v1) database is opened — those cannot be migrated
-    /// faithfully and must be rebuilt.
+    /// synchronous, foreign-keys pragmas), the schema batch cannot be
+    /// applied, or a pre-kind (schema v1) database is opened — those cannot
+    /// be migrated faithfully and must be rebuilt.
     pub fn open(
         database: &Path,
         archive_dir: &Path,
@@ -218,6 +218,10 @@ impl SqliteStore {
         // the README); a 5 s busy wait turns those races into waits instead
         // of `SQLITE_BUSY` errors.
         conn.pragma_update(None, "busy_timeout", 5_000).map_err(|e| backend("busy_timeout", e))?;
+        // The schema's `REFERENCES item_ref(id)` clauses are decoration
+        // without this: SQLite leaves foreign keys unenforced by default,
+        // so a write bug would silently orphan sale/sight/fold rows.
+        conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| backend("foreign_keys", e))?;
         let version = Self::read_schema_version(&conn)?;
         Self::check_schema_version(&conn, version)?;
         conn.execute_batch(SCHEMA).map_err(|e| backend("schema", e))?;
@@ -1088,6 +1092,34 @@ impl MetricsCacheRepository for SqliteStore {
         .map_err(|e| backend("metrics cache invalidate", e))?;
         Ok(())
     }
+
+    fn invalidate_items(&self, target: &TargetId, items: &[ItemRef]) -> Result<(), StoreError> {
+        /// Ids per statement — mirrors `sale_rates_by_id`'s chunking: one
+        /// market-scale cycle stays a handful of deletes, far under the
+        /// driver's bound-parameter ceiling.
+        const CACHE_INVALIDATE_CHUNK: usize = 500;
+        if items.is_empty() {
+            return Ok(());
+        }
+        let conn = self.open_transaction();
+        // Unknown identities have no cache rows: `put` resolves the same way.
+        let ids = resolve_item_ids(&conn, items)?;
+        for chunk in ids.chunks(CACHE_INVALIDATE_CHUNK) {
+            // Placeholders are bound values, never interpolated input.
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "DELETE FROM metrics_cache WHERE target_id = ? AND item_ref_id IN ({placeholders})"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+            for id in chunk {
+                params.push(rusqlite::types::Value::Integer(*id));
+            }
+            conn.execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(|e| backend("metrics cache invalidate items", e))?;
+        }
+        Ok(())
+    }
 }
 
 impl WatchlistRepository for SqliteStore {
@@ -1755,5 +1787,34 @@ impl From<SerMetricBlock> for MetricBlock {
             listing_count: ser.listing_count,
             sale_rate: ser.sale_rate,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
+    // inputs (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn foreign_keys_are_enforced_on_opened_connections() {
+        let dir =
+            std::env::temp_dir().join(format!("amtracker-fk-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = SqliteStore::open(
+            &dir.join("fk.db"),
+            &dir.join("raw"),
+            std::sync::Arc::new(crate::clock::SystemClock) as std::sync::Arc<dyn ClockPort>,
+        )
+        .expect("open");
+
+        let conn = store.open_transaction();
+        let enforced: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
+        assert_eq!(enforced, 1, "child-table REFERENCES clauses must be live");
+
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

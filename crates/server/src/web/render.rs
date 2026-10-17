@@ -343,13 +343,14 @@ pub fn distribution_svg(buckets: &BTreeMap<i64, PriceBucket>) -> String {
     svg
 }
 
-/// 500 page for failed store reads: logged server-side, named for the user.
+/// 500 page for failed store reads: logged server-side at full fidelity,
+/// generic for the user — internals (SQL text, paths) never reach the wire.
 pub async fn store_error_page(error: StoreError) -> Response {
     super::log_failure("page", &error);
     let mut response = page(
         "error",
         "",
-        &format!("<p class=\"bad\">store read failed: {}</p>", html_escape(&error.to_string())),
+        "<p class=\"bad\">store read failed - the server log has the details.</p>",
         None,
     );
     *response.status_mut() = StatusCode::INTERNAL_SERVER_ERROR;

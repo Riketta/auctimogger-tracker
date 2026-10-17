@@ -279,7 +279,7 @@ pub trait SalesRepository: Send + Sync {
     }
 }
 
-/// Outbound: memoized span metrics (invalidated per target on ingest).
+/// Outbound: memoized span metrics (invalidated per item on ingest).
 pub trait MetricsCacheRepository: Send + Sync {
     /// The cached block for one (target, item, span), if one is stored.
     ///
@@ -305,12 +305,27 @@ pub trait MetricsCacheRepository: Send + Sync {
         block: &MetricBlock,
         computed_at: i64,
     ) -> Result<(), StoreError>;
-    /// Drops all cached blocks for a target (called when fold state changes).
+    /// Drops all cached blocks for a target. Called when fold state changes
+    /// beyond what a per-item rule can see: the rolling span windows slide at
+    /// UTC day boundaries, so the first cycle after a day roll sweeps all of
+    /// a target's memoized blocks.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the cache cannot be cleared.
     fn invalidate(&self, target: &TargetId) -> Result<(), StoreError>;
+    /// Drops cached blocks for just the given items of a target (called
+    /// after a cycle that touched only those items' folds or sale state).
+    ///
+    /// The default falls back to the full sweep — correct for any adapter,
+    /// just less precise.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cache cannot be cleared.
+    fn invalidate_items(&self, target: &TargetId, _items: &[ItemRef]) -> Result<(), StoreError> {
+        self.invalidate(target)
+    }
 }
 
 /// Outbound: item/pet name catalog backing search + completions + browsing.

@@ -174,6 +174,16 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
         eprintln!("error: {message}");
         return 1;
     }
+    // validate_serve_startup already resolved this once; resolving again is
+    // cheap and keeps `serve`'s signature address-typed.
+    let bind = match amtracker_server::startup::resolve_bind(&config.server.bind) {
+        Ok(bind) => bind,
+        Err(message) => {
+            tracing::error!("{message}");
+            eprintln!("error: {message}");
+            return 1;
+        }
+    };
     let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
@@ -250,10 +260,8 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
             return 1;
         }
     };
-    tracing::info!(bind = %config.server.bind, "listening");
-    if let Err(error) =
-        runtime.block_on(amtracker_server::web::serve(state, config.server.bind.clone()))
-    {
+    tracing::info!(bind = %bind, "listening");
+    if let Err(error) = runtime.block_on(amtracker_server::web::serve(state, bind)) {
         tracing::error!(error = %error, "server error");
         eprintln!("error: server error: {error}");
         return 1;

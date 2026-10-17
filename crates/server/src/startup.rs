@@ -64,14 +64,46 @@ pub fn open_api_decision(
     }
 }
 
-/// Whether a bind string provably listens on loopback only. Unparseable
-/// binds cannot be proven loopback and count as exposed (conservative).
+/// Resolves the configured bind string to a concrete socket address: a
+/// strict `host:port` socket-address parse first, then the `localhost`
+/// hostname pinned to `127.0.0.1`. The pin is deliberate: handing
+/// `localhost` to the OS resolver could return `::1`, and the
+/// mutating-API guard (which must agree with what actually gets bound)
+/// would then disagree with the listener. Arbitrary hostnames stay
+/// unsupported — a DNS-dependent bind is neither predictable nor testable.
+///
+/// # Errors
+///
+/// Returns a startup-refusing message for any other shape.
+pub fn resolve_bind(bind: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(addr) = bind.parse::<std::net::SocketAddr>() {
+        return Ok(addr);
+    }
+    let Some((host, port)) = bind.rsplit_once(':') else {
+        return Err(invalid_bind_message(bind));
+    };
+    if !host.eq_ignore_ascii_case("localhost") {
+        return Err(invalid_bind_message(bind));
+    }
+    let Ok(port) = port.parse::<u16>() else {
+        return Err(invalid_bind_message(bind));
+    };
+    Ok(std::net::SocketAddr::from(([127, 0, 0, 1], port)))
+}
+
+fn invalid_bind_message(bind: &str) -> String {
+    format!(
+        "refusing to start `serve`: invalid [server].bind '{bind}' - use a socket address \
+         like `127.0.0.1:8833`, or `localhost:8833`"
+    )
+}
+
+/// Whether a bind string provably listens on loopback only. Binds that do
+/// not resolve cannot be proven loopback and count as exposed
+/// (conservative).
 #[must_use]
 pub fn bind_is_loopback(bind: &str) -> bool {
-    match bind.parse::<std::net::SocketAddr>() {
-        Ok(addr) => addr.ip().is_loopback(),
-        Err(_) => false,
-    }
+    resolve_bind(bind).is_ok_and(|addr| addr.ip().is_loopback())
 }
 
 /// Whether an env var name resolves to a non-blank value.
@@ -88,6 +120,11 @@ fn env_present(name: &str) -> bool {
 /// non-loopback bind without `[server].allow_open`, or when a configured
 /// Blizzard target's OAuth credential env vars are missing/empty.
 pub fn validate_serve_startup(config: &TrackerConfig) -> Result<(), String> {
+    // 0. The bind must resolve to the address `serve` will actually bind,
+    //    so the loopback posture below cannot disagree with the listener.
+    let bind = resolve_bind(&config.server.bind)?;
+    let loopback = bind.ip().is_loopback();
+
     // 1. Ingestion credentials must resolve NOW, not on the first cycle: a
     //    deploy with an expired secret would otherwise serve a UI that
     //    never ingests ("feed ingestion unavailable").
@@ -134,14 +171,14 @@ pub fn validate_serve_startup(config: &TrackerConfig) -> Result<(), String> {
         }
     }
 
-    // 3. Mutating-API posture (see `open_api_decision`).
+    // 3. Mutating-API posture (see `open_api_decision`) — `loopback` was
+    //    computed from the resolved bind in step 0.
     let token = config
         .server
         .token_env
         .as_ref()
         .and_then(|env| std::env::var(env).ok())
         .filter(|value| !value.trim().is_empty());
-    let loopback = bind_is_loopback(&config.server.bind);
     match open_api_decision(token.as_deref(), loopback, config.server.allow_open) {
         Ok(TokenPosture::Protected) => {}
         Ok(posture) => match posture {
@@ -229,8 +266,30 @@ mod tests {
         assert!(!bind_is_loopback("0.0.0.0:8080"));
         assert!(!bind_is_loopback("[::]:8080"));
         assert!(!bind_is_loopback("192.168.1.10:8080"));
-        // Unparseable binds cannot be proven loopback: exposed.
-        assert!(!bind_is_loopback("localhost:8080"));
+        // `localhost` is pinned to 127.0.0.1: guarded as loopback, matching
+        // what `serve` actually binds.
+        assert!(bind_is_loopback("localhost:8080"));
+        assert!(bind_is_loopback("LocalHost:8080"));
+        // Unresolvable binds cannot be proven loopback: exposed.
         assert!(!bind_is_loopback("not an address"));
+    }
+
+    #[test]
+    fn resolve_bind_pins_localhost_and_accepts_socket_addresses() {
+        let parsed = |text: &str| text.parse::<std::net::SocketAddr>().expect("fixture");
+        assert_eq!(resolve_bind("127.0.0.1:8833").expect("ipv4"), parsed("127.0.0.1:8833"));
+        assert_eq!(resolve_bind("[::1]:8080").expect("ipv6"), parsed("[::1]:8080"));
+        assert_eq!(resolve_bind("localhost:8833").expect("localhost"), parsed("127.0.0.1:8833"));
+        assert_eq!(resolve_bind("LocalHost:80").expect("case-insensitive"), parsed("127.0.0.1:80"));
+    }
+
+    #[test]
+    fn resolve_bind_refuses_undocumented_shapes() {
+        for bad in
+            ["not an address", "localhost", "localhost:none", "localhost:99999", "example.com:8080"]
+        {
+            let error = resolve_bind(bad).expect_err("must refuse");
+            assert!(error.contains("[server].bind"), "{bad}: {error}");
+        }
     }
 }

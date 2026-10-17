@@ -26,8 +26,9 @@ use crate::{
 };
 
 /// How long a memoized block may serve queries before recomputation. Ingest
-/// invalidates the whole target cache immediately; this bound only covers
-/// intra-day fold growth.
+/// invalidates the touched items' cache entries immediately (full sweep on a
+/// UTC day roll); this bound covers everything that escapes those rules —
+/// above all intra-day fold growth for untouched items.
 const MAX_CACHE_AGE_SECONDS: i64 = 300;
 
 /// Window for the sell-through rate attached to every block.

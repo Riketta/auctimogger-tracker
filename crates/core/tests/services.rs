@@ -90,6 +90,16 @@ fn item(id: i64) -> ItemRef {
     ItemRef::Item { item_id: id }
 }
 
+fn payload(listings: Vec<amtracker_core::domain::NormalizedListing>) -> FetchOutcome {
+    FetchOutcome::Payload(amtracker_core::domain::FetchedPayload {
+        kind: PayloadKind::Commodities,
+        source_last_modified: None,
+        listings,
+        dropped_count: 0,
+        raw: b"raw".to_vec(),
+    })
+}
+
 type FoldKey = (TargetId, ItemRef, i64);
 
 struct FakeSource {
@@ -243,6 +253,13 @@ impl PriceHistoryRepository for FakeHistory {
 #[derive(Default)]
 struct FakeCache {
     invalidations: Mutex<usize>,
+    targeted: Mutex<Vec<Vec<ItemRef>>>,
+}
+
+impl FakeCache {
+    fn targeted(&self) -> Vec<Vec<ItemRef>> {
+        self.targeted.lock().unwrap().clone()
+    }
 }
 
 impl MetricsCacheRepository for FakeCache {
@@ -268,6 +285,11 @@ impl MetricsCacheRepository for FakeCache {
 
     fn invalidate(&self, _target: &TargetId) -> Result<(), StoreError> {
         *self.invalidations.lock().unwrap() += 1;
+        Ok(())
+    }
+
+    fn invalidate_items(&self, _target: &TargetId, items: &[ItemRef]) -> Result<(), StoreError> {
+        self.targeted.lock().unwrap().push(items.to_vec());
         Ok(())
     }
 }
@@ -440,6 +462,83 @@ fn ingest_cycle_passes_conditional_timestamp_and_handles_304() {
     assert_eq!(*cache.invalidations.lock().unwrap(), 0, "304 must not invalidate");
     assert_eq!(*sales.observes.lock().unwrap(), 0, "304 must not touch sell-through");
     assert_eq!(report.sale_credits, 0);
+}
+
+/// Same-day cycles touch only the items they folded or credited: the cache
+/// drops exactly those blocks and keeps the rest of the target's memoized
+/// entries (the full sweep is reserved for day rolls).
+#[test]
+fn second_same_day_cycle_targets_the_affected_items_only() {
+    let item1 = item(1);
+    let item9 = item(9);
+    // FakeSource pops outcomes from the back: cycle 2's payload first.
+    let source = Arc::new(FakeSource::new(vec![
+        Ok(payload(vec![listing(20, &item1, 100, 2)])),
+        Ok(payload(vec![listing(10, &item1, 100, 1)])),
+    ]));
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let history = Arc::new(FakeHistory::default());
+    let cache = Arc::new(FakeCache::default());
+    // Every cycle's close_missing credits the same vanished item: its cache
+    // rows must go too, even though it never appears in the new snapshots.
+    let sales = Arc::new(FakeSales::with_credits(vec![amtracker_core::domain::SaleCredit {
+        auction_id: 3,
+        item: item9.clone(),
+        quantity: 1,
+        at: 1_030_000,
+    }]));
+    let clock = MutableClock::new(1_000_000); // day 11
+    let service =
+        IngestCycleService::new(source, snapshots, history, cache.clone(), sales, clock.clone());
+
+    service.run_cycle(&target(), PayloadKind::Commodities).expect("cycle 1");
+    assert_eq!(*cache.invalidations.lock().unwrap(), 1, "first cycle sweeps");
+    assert!(cache.targeted().is_empty(), "the sweep is not item-targeted");
+
+    clock.advance(30_000); // still day 11
+    let report = service.run_cycle(&target(), PayloadKind::Commodities).expect("cycle 2");
+
+    assert_eq!(*cache.invalidations.lock().unwrap(), 1, "same day: no second sweep");
+    let targeted = cache.targeted();
+    assert_eq!(targeted.len(), 1, "one targeted drop");
+    assert_eq!(targeted[0].len(), 2, "folded item + sale-credited item");
+    assert!(targeted[0].contains(&item1));
+    assert!(targeted[0].contains(&item9));
+    assert_eq!(report.sale_credits, 1);
+}
+
+/// The rolling span windows slide at UTC day boundaries — a change no
+/// per-item rule can see — so the first cycle after a day roll sweeps the
+/// whole target cache instead of dropping individual items.
+#[test]
+fn the_first_cycle_after_a_day_roll_sweeps_the_whole_target_cache() {
+    let item1 = item(1);
+    // FakeSource pops outcomes from the back: cycle 2's payload first.
+    let source = Arc::new(FakeSource::new(vec![
+        Ok(payload(vec![listing(20, &item1, 100, 2)])),
+        Ok(payload(vec![listing(10, &item1, 100, 1)])),
+    ]));
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let history = Arc::new(FakeHistory::default());
+    let cache = Arc::new(FakeCache::default());
+    let clock = MutableClock::new(1_000_000); // day 11
+    let service = IngestCycleService::new(
+        source,
+        snapshots,
+        history,
+        cache.clone(),
+        Arc::new(FakeSales::default()),
+        clock.clone(),
+    );
+
+    service.run_cycle(&target(), PayloadKind::Commodities).expect("cycle 1");
+    assert_eq!(*cache.invalidations.lock().unwrap(), 1, "first cycle sweeps");
+
+    clock.advance(100_000); // day 12: the windows slid
+    service.run_cycle(&target(), PayloadKind::Commodities).expect("cycle 2");
+
+    assert_eq!(*cache.invalidations.lock().unwrap(), 2, "day roll sweeps again");
+    assert!(cache.targeted().is_empty(), "the sweep is not item-targeted");
 }
 
 #[test]

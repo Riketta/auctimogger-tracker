@@ -30,6 +30,13 @@ const FALLBACK_DEBUG_FILTER: &str =
 const FILE_DEFAULT_FILTER: &str =
     "info,auctimogger_tracker=debug,amtracker_infra=debug,amtracker_server=debug";
 
+/// Dedicated `tracing` target for the panic hook's error record. The Sentry
+/// tracing layer ignores this target: panics already reach Sentry natively
+/// through the chained `PanicIntegration` hook (with a stack trace and the
+/// `mechanism` field), and shipping the tracing record too would
+/// double-report every crash.
+const PANIC_TARGET: &str = "panic_hook";
+
 /// Log file name prefix — `tracing-appender` appends the rotation date, so
 /// daily files are `auctimogger-tracker.log.2026-10-12` and `never` yields
 /// `auctimogger-tracker.log`.
@@ -175,14 +182,7 @@ pub fn init(settings: &ObservabilitySettings) -> ObservabilityGuards {
         Some(_) => registry
             .with(
                 sentry_tracing::layer()
-                    .event_filter(|metadata| match *metadata.level() {
-                        // Pinned contract: error-grade events surface as Issues
-                        // (the always-delivered path), warn/info ride along as
-                        // log items, debug/trace never ship.
-                        tracing::Level::ERROR => EventFilter::Event | EventFilter::Log,
-                        tracing::Level::WARN | tracing::Level::INFO => EventFilter::Log,
-                        tracing::Level::DEBUG | tracing::Level::TRACE => EventFilter::Ignore,
-                    })
+                    .event_filter(sentry_event_filter)
                     // The Sentry layer filters independently of stdout (and of
                     // RUST_LOG): audit-grade info must ship even when an
                     // operator quiets stdout.
@@ -197,14 +197,18 @@ pub fn init(settings: &ObservabilitySettings) -> ObservabilityGuards {
     ObservabilityGuards { _sentry: guard, _file: file_guard }
 }
 
-/// Routes panics through the tracing stack (the Sentry layer turns the
-/// error-grade record into an Issue) while keeping the default hook's stderr
-/// line: journald captures it even when no subscriber exists yet, and the
-/// file/Sentry layers must never be the only witness to a crash. Installed
-/// after the subscriber is up, so `init`'s own fail-fast panics keep the
-/// default behavior.
+/// Routes panics through the tracing stack for the stdout and file layers
+/// while preserving native Sentry capture: the hook chains to the previously
+/// installed one — Sentry's own panic hook when a DSN is configured (it
+/// reports the crash with a stack trace and `mechanism`), otherwise the
+/// default hook (stderr, which journald captures even without a
+/// subscriber). The tracing record carries [`PANIC_TARGET`] so the Sentry
+/// tracing layer can skip it — the chained hook already reports the panic,
+/// and emitting both would double-report. Installed after the subscriber is
+/// up, so `init`'s own fail-fast panics keep the default behavior.
 fn install_panic_hook() {
-    std::panic::set_hook(Box::new(|info| {
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
         let thread_name = std::thread::current().name().unwrap_or("<unnamed>").to_owned();
         let location = info.location().map_or_else(|| "unknown".to_owned(), ToString::to_string);
         let message = info
@@ -213,14 +217,38 @@ fn install_panic_hook() {
             .map(|message| (*message).to_owned())
             .or_else(|| info.payload().downcast_ref::<String>().cloned())
             .unwrap_or_else(|| "non-string panic payload".to_owned());
-        eprintln!("thread '{thread_name}' panicked at {location}: {message}");
         tracing::error!(
+            target: PANIC_TARGET,
             thread = %thread_name,
             location = %location,
             panic = %message,
             "panic"
         );
+        previous(info);
     }));
+}
+
+/// The Sentry routing for tracing records. Panic records (target
+/// [`PANIC_TARGET`]) are ignored: the chained panic hook reports panics
+/// natively, and the tracing record would double-report. Otherwise the
+/// pinned contract holds: error-grade events surface as Issues (the
+/// always-delivered path), warn/info ride along as log items, debug/trace
+/// never ship.
+fn sentry_event_filter(metadata: &tracing::Metadata<'_>) -> EventFilter {
+    sentry_filter_for(metadata.target(), *metadata.level())
+}
+
+/// The pure decision behind [`sentry_event_filter`], split out so the
+/// routing table is testable without constructing metadata.
+fn sentry_filter_for(target: &str, level: tracing::Level) -> EventFilter {
+    if target == PANIC_TARGET {
+        return EventFilter::Ignore;
+    }
+    match level {
+        tracing::Level::ERROR => EventFilter::Event | EventFilter::Log,
+        tracing::Level::WARN | tracing::Level::INFO => EventFilter::Log,
+        tracing::Level::DEBUG | tracing::Level::TRACE => EventFilter::Ignore,
+    }
 }
 
 /// The file layer's filter directives: an explicit `[logging].level` is used
@@ -331,5 +359,38 @@ mod tests {
         assert_eq!(usable_sample_rate(Some(-0.1)), None);
         assert_eq!(usable_sample_rate(Some(1.5)), None);
         assert_eq!(usable_sample_rate(Some(f32::NAN)), None);
+    }
+
+    /// The panic target is ignored at every level: the chained panic hook
+    /// reports crashes natively, and the tracing record would double-report.
+    /// (Ordinary targets' level routing is pinned by the test below.)
+    #[test]
+    fn panic_target_records_are_never_shipped_to_sentry() {
+        for level in [
+            tracing::Level::ERROR,
+            tracing::Level::WARN,
+            tracing::Level::INFO,
+            tracing::Level::DEBUG,
+            tracing::Level::TRACE,
+        ] {
+            assert!(sentry_filter_for(PANIC_TARGET, level).is_empty(), "level {level}");
+        }
+    }
+
+    /// Away from the panic target, the pinned contract holds: errors are
+    /// Issues (plus a log item), warn/info ride along as logs only.
+    #[test]
+    fn error_grade_records_surface_as_issues_and_warns_as_logs() {
+        let shipped = sentry_filter_for("amtracker_server::web", tracing::Level::ERROR);
+        assert!(shipped.contains(EventFilter::Event));
+        assert!(shipped.contains(EventFilter::Log));
+        assert!(
+            sentry_filter_for("amtracker_infra", tracing::Level::WARN).contains(EventFilter::Log)
+        );
+        assert!(
+            sentry_filter_for("amtracker_infra", tracing::Level::INFO).contains(EventFilter::Log)
+        );
+        assert!(sentry_filter_for("amtracker_infra", tracing::Level::DEBUG).is_empty());
+        assert!(sentry_filter_for("amtracker_infra", tracing::Level::TRACE).is_empty());
     }
 }

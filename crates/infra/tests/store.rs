@@ -630,6 +630,49 @@ fn metrics_cache_round_trips_and_invalidates() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The per-cycle targeted drop removes every cached span of the named items
+/// (all spans derive from the same folds/sales, so all go stale together);
+/// other items survive. Unknown identities are a no-op: they cannot have
+/// cache rows.
+#[test]
+fn metrics_cache_invalidation_targets_only_named_items() {
+    use amtracker_core::domain::MetricBlock;
+
+    let dir = temp_dir("cache-targeted");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let item_a = item(194_784);
+    let item_b = item(194_785);
+    let block = MetricBlock {
+        n: 42,
+        min: 100,
+        p05: 100,
+        p25: 150,
+        median: 200,
+        p75: 250,
+        p95: 300,
+        max: 400,
+        mad: 30,
+        vwap: 210,
+        qty_sum: 900,
+        listing_count: 42,
+        sale_rate: None,
+    };
+    store.put(&target, &item_a, Span::D1, &block, 1234).expect("put a d1");
+    store.put(&target, &item_b, Span::D1, &block, 1234).expect("put b d1");
+    store.put(&target, &item_a, Span::D7, &block, 1234).expect("put a d7");
+
+    store.invalidate_items(&target, std::slice::from_ref(&item_a)).expect("invalidate a");
+    assert!(store.get(&target, &item_a, Span::D1).expect("get a d1").is_none());
+    assert!(store.get(&target, &item_a, Span::D7).expect("get a d7").is_none());
+    assert!(store.get(&target, &item_b, Span::D1).expect("get b d1").is_some());
+
+    store.invalidate_items(&target, &[item(999_999_999)]).expect("unknown identity");
+    assert!(store.get(&target, &item_b, Span::D1).expect("get b d1").is_some());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// `sale_rates_by_id` runs chunked (500 ids per query), so the driver's
 /// 32 766 bound-parameter ceiling is unreachable by construction. This test
 /// pins that results merge correctly ACROSS chunk boundaries: 1200 items →

@@ -96,6 +96,15 @@ fn authorize(state: &AppState, headers: &HeaderMap) -> Result<(), Box<Response>>
     authorize_result(expected_api_token(&state.config).as_deref(), provided_token(headers))
 }
 
+/// Logs the failure at full fidelity and returns a generic 500 body:
+/// internals (SQL text, paths) stay in the server log, never on the wire.
+/// Any error flavor funnels through here — store failures and
+/// blocking-task join failures alike.
+fn internal_error(scope: &'static str, error: &impl std::fmt::Display) -> Response {
+    log_failure(scope, error);
+    (StatusCode::INTERNAL_SERVER_ERROR, "internal server error\n").into_response()
+}
+
 // ------------------------------------------------------------------- feeds
 
 async fn feed_file(
@@ -204,14 +213,8 @@ pub(crate) async fn api_health(State(state): State<Arc<AppState>>) -> Response {
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Ok(Err(error)) => {
-            log_failure("health", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("health-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("health", &error),
+        Err(error) => internal_error("health-join", &error),
     }
 }
 
@@ -273,14 +276,8 @@ pub(crate) async fn api_search(
             }).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Ok(Err(error)) => {
-            log_failure("search", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("search-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("search", &error),
+        Err(error) => internal_error("search-join", &error),
     }
 }
 
@@ -316,14 +313,8 @@ pub(crate) async fn api_opportunities(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Ok(Err(error)) => {
-            log_failure("opportunities", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("opportunities-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("opportunities", &error),
+        Err(error) => internal_error("opportunities-join", &error),
     }
 }
 
@@ -359,14 +350,8 @@ pub(crate) async fn api_overview(
             }))
             .into_response()
         }
-        Ok(Err(error)) => {
-            log_failure("overview", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("overview-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("overview", &error),
+        Err(error) => internal_error("overview-join", &error),
     }
 }
 
@@ -400,12 +385,10 @@ pub(crate) async fn api_item_metrics(
     let computed = match computed.await {
         Ok(Ok(computed)) => computed,
         Ok(Err(error)) => {
-            log_failure("item-metrics", &error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            return internal_error("item-metrics", &error);
         }
         Err(error) => {
-            log_failure("item-metrics-join", &error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            return internal_error("item-metrics-join", &error);
         }
     };
     let mut out = serde_json::Map::new();
@@ -452,14 +435,8 @@ pub(crate) async fn api_feed_json(
     });
     match payload.await {
         Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
-        Ok(Err(error)) => {
-            log_failure("feed-json", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("feed-json-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("feed-json", &error),
+        Err(error) => internal_error("feed-json-join", &error),
     }
 }
 
@@ -536,14 +513,8 @@ pub(crate) async fn api_watchlist_get(
             })).collect::<Vec<_>>(),
         }))
         .into_response(),
-        Ok(Err(error)) => {
-            log_failure("watchlist-get", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("watchlist-get-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("watchlist-get", &error),
+        Err(error) => internal_error("watchlist-get-join", &error),
     }
 }
 
@@ -573,14 +544,8 @@ pub(crate) async fn api_watchlist_post(
             Json(serde_json::json!({ "ok": true, "addedAt": entry.added_at })).into_response()
         }
         Ok(Err(StoreError::Conflict(message))) => (StatusCode::CONFLICT, message).into_response(),
-        Ok(Err(error)) => {
-            log_failure("watchlist-add", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("watchlist-add-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("watchlist-add", &error),
+        Err(error) => internal_error("watchlist-add-join", &error),
     }
 }
 
@@ -616,14 +581,8 @@ pub(crate) async fn api_watchlist_delete(
         Ok(Ok(removed)) => {
             Json(serde_json::json!({ "ok": true, "removed": removed })).into_response()
         }
-        Ok(Err(error)) => {
-            log_failure("watchlist-remove", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
-        Err(error) => {
-            log_failure("watchlist-remove-join", &error);
-            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
-        }
+        Ok(Err(error)) => internal_error("watchlist-remove", &error),
+        Err(error) => internal_error("watchlist-remove-join", &error),
     }
 }
 
@@ -715,8 +674,7 @@ pub(crate) async fn api_fetch(
     let reports = match reports.await {
         Ok(reports) => reports,
         Err(error) => {
-            log_failure("fetch", &error);
-            return (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response();
+            return internal_error("fetch", &error);
         }
     };
     Json(serde_json::json!({ "reports": reports })).into_response()

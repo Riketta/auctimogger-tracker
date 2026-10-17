@@ -29,7 +29,9 @@ pub struct TrackerConfig {
 /// HTTP server settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ServerConfig {
-    /// Socket address the server binds to (e.g. `127.0.0.1:8833`).
+    /// Socket address the server binds to (e.g. `127.0.0.1:8833`, or
+    /// `localhost:8833` — the hostname is pinned to `127.0.0.1`; other
+    /// hostnames are refused at startup).
     pub bind: String,
     /// Environment variable holding the API token; `None` = open (localhost).
     pub token_env: Option<String>,

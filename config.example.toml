@@ -8,7 +8,7 @@
 # debug = false
 
 [server]
-bind = "127.0.0.1:8080"
+bind = "127.0.0.1:8080" # `localhost:8080` also works (pinned to 127.0.0.1)
 token_env = "AMT_API_TOKEN" # unset or empty = mutating endpoints are open (localhost use)
 # Safety guard: with an unset/empty token, `serve` refuses to start on any
 # non-loopback bind (an open mutating API must not reach the network by

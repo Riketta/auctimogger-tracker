@@ -3,13 +3,20 @@
 //! a cycle stay in place (cycles are NOT transactional end-to-end; see the
 //! `run_cycle` doc for the exact per-stage failure semantics).
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        Mutex,
+    },
+};
 
 use crate::{
     config::TargetConfig,
     domain::{
         utc_day,
         FetchOutcome,
+        ItemRef,
         NewSnapshot,
         PayloadKind,
         SaleCredit,
@@ -39,6 +46,10 @@ pub struct IngestCycleService {
     cache: Arc<dyn MetricsCacheRepository>,
     sales: Arc<dyn SalesRepository>,
     clock: Arc<dyn ClockPort>,
+    /// Last UTC day each target's cache got a full sweep. Per-cycle
+    /// invalidation is item-targeted; the sweep covers the rolling-window
+    /// slide at UTC day boundaries, which no per-item rule can see.
+    last_sweep_day: Mutex<HashMap<TargetId, i64>>,
 }
 
 /// Terminal state of one cycle.
@@ -87,7 +98,15 @@ impl IngestCycleService {
         sales: Arc<dyn SalesRepository>,
         clock: Arc<dyn ClockPort>,
     ) -> Self {
-        Self { source, snapshots, history, cache, sales, clock }
+        Self {
+            source,
+            snapshots,
+            history,
+            cache,
+            sales,
+            clock,
+            last_sweep_day: Mutex::new(HashMap::new()),
+        }
     }
 
     /// Runs one fetch+ingest cycle for a target and payload kind.
@@ -161,6 +180,7 @@ impl IngestCycleService {
                     &payload.raw,
                 )?;
                 let grouped = group_by_item(&payload.listings);
+                let mut affected: Vec<ItemRef> = Vec::with_capacity(grouped.len());
                 for (item_ref, listings) in &grouped {
                     let mut fold = self
                         .history
@@ -168,15 +188,39 @@ impl IngestCycleService {
                         .unwrap_or_else(|| DayFold::new(item_ref.clone()));
                     fold.apply(listings);
                     self.history.save_fold(&target.id, item_ref, day, &fold)?;
+                    affected.push(item_ref.clone());
                 }
-                // Fold state changed: memoized span metrics are stale.
-                self.cache.invalidate(&target.id)?;
 
                 // Sell-through bookkeeping: register sightings, then close
                 // the ones absent from the newest snapshot of this kind.
                 self.sales.observe(&target.id, kind, &payload.listings, snapshot_id, now)?;
                 let credits: Vec<SaleCredit> =
                     self.sales.close_missing(&target.id, kind, snapshot_id, now)?;
+                affected.extend(credits.iter().map(|credit| credit.item.clone()));
+
+                // Fold + sale state changed for the affected items only:
+                // drop just their memoized blocks (cache is an optimization —
+                // the read-side TTL heals any entry left stale by a failed
+                // cycle). The rolling span windows slide at UTC day
+                // boundaries — a change no per-item rule can see — so the
+                // first cycle after a day roll sweeps the whole target cache
+                // instead. A poisoned mutex degrades to one extra sweep.
+                let sweep = {
+                    let mut sweeps = self
+                        .last_sweep_day
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
+                    let sweep = sweeps.get(&target.id) != Some(&day);
+                    if sweep {
+                        sweeps.insert(target.id.clone(), day);
+                    }
+                    sweep
+                };
+                if sweep {
+                    self.cache.invalidate(&target.id)?;
+                } else {
+                    self.cache.invalidate_items(&target.id, &affected)?;
+                }
 
                 Ok(CycleReport {
                     target: target.id.clone(),

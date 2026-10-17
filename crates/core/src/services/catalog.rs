@@ -2,7 +2,10 @@
 //! item-info port) so search and the UI have human-readable labels.
 
 use std::{
-    collections::HashMap,
+    collections::{
+        HashMap,
+        VecDeque,
+    },
     sync::{
         Arc,
         Mutex,
@@ -30,12 +33,73 @@ use crate::{
 /// dumps carry plenty) re-hits the external item API.
 const NEGATIVE_TTL_SECONDS: u64 = 600;
 
+/// How many "not found" ids are remembered at once. Negative ids are junk
+/// ids, and junk comes in bursts; the FIFO bound keeps one burst from
+/// growing memory while preserving every unrelated entry.
+const NEGATIVE_CACHE_CAP: usize = 10_000;
+
+/// Bounded map of "known junk" ids, remembered for [`NEGATIVE_TTL_SECONDS`].
+/// Eviction is FIFO, not LRU: all entries share one TTL, so insertion order
+/// is as good a victim rule as recency, and FIFO keeps eviction O(1).
+/// (The previous full `clear()` on overflow let a single junk-id burst
+/// re-trigger an external-API fetch storm for every other remembered id.)
+struct NegativeCache {
+    /// `id -> (remembered at, insertion sequence)` — the sequence lets the
+    /// eviction queue tell superseded entries apart from live ones.
+    entries: HashMap<i64, (Instant, u64)>,
+    /// Insertion order for FIFO eviction: `(id, sequence it was pushed with)`.
+    order: VecDeque<(i64, u64)>,
+    /// Monotonic insertion counter backing the sequence tags.
+    seq: u64,
+    /// Entry ceiling; overshoot is shed oldest-first.
+    cap: usize,
+}
+
+impl NegativeCache {
+    fn new(cap: usize) -> Self {
+        Self { entries: HashMap::new(), order: VecDeque::new(), seq: 0, cap }
+    }
+
+    /// Whether the key is remembered and still fresh. An expired entry is
+    /// dropped on sight; its stale queue entry becomes eviction litter that
+    /// [`Self::remember`] skips over.
+    fn contains_fresh(&mut self, key: i64) -> bool {
+        match self.entries.get(&key) {
+            Some((at, _)) if at.elapsed().as_secs() < NEGATIVE_TTL_SECONDS => true,
+            _ => {
+                self.entries.remove(&key);
+                false
+            }
+        }
+    }
+
+    /// Remembers `key` until the TTL expires, evicting oldest-first once over
+    /// capacity. Re-remembering an id supersedes its old queue entry, which
+    /// the eviction loop then skips as litter.
+    fn remember(&mut self, key: i64) {
+        self.seq = self.seq.wrapping_add(1);
+        self.entries.insert(key, (Instant::now(), self.seq));
+        self.order.push_back((key, self.seq));
+        while self.entries.len() > self.cap {
+            match self.order.pop_front() {
+                // Only a queue entry matching the live map entry evicts;
+                // superseded or expired ids are just queue litter.
+                Some((id, seq)) if self.entries.get(&id).map(|(_, s)| *s) == Some(seq) => {
+                    self.entries.remove(&id);
+                }
+                Some(_) => {}
+                None => break,
+            }
+        }
+    }
+}
+
 /// Resolves and caches human-readable item/pet names for the catalog.
 pub struct CatalogService {
     catalog: Arc<dyn ItemCatalogRepository>,
     info: Arc<dyn ItemInfoPort>,
-    negative: Mutex<HashMap<i64, Instant>>,
-    negative_pets: Mutex<HashMap<i64, Instant>>,
+    negative: Mutex<NegativeCache>,
+    negative_pets: Mutex<NegativeCache>,
 }
 
 impl CatalogService {
@@ -45,8 +109,8 @@ impl CatalogService {
         Self {
             catalog,
             info,
-            negative: Mutex::new(HashMap::new()),
-            negative_pets: Mutex::new(HashMap::new()),
+            negative: Mutex::new(NegativeCache::new(NEGATIVE_CACHE_CAP)),
+            negative_pets: Mutex::new(NegativeCache::new(NEGATIVE_CACHE_CAP)),
         }
     }
 
@@ -100,26 +164,17 @@ impl CatalogService {
         Ok(None)
     }
 
-    /// Locks a negative cache. A poisoned mutex (a panic while holding it)
-    /// degrades to "cache missed" instead of failing the request.
-    fn negatively_cached(cache: &Mutex<HashMap<i64, Instant>>, key: i64) -> bool {
-        let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        match cache.get(&key) {
-            Some(at) if at.elapsed().as_secs() < NEGATIVE_TTL_SECONDS => true,
-            _ => {
-                cache.remove(&key);
-                false
-            }
-        }
+    /// Locks a negative cache and checks freshness. A poisoned mutex (a
+    /// panic while holding it) degrades to "cache missed" instead of failing
+    /// the request.
+    fn negatively_cached(cache: &Mutex<NegativeCache>, key: i64) -> bool {
+        cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).contains_fresh(key)
     }
 
-    fn remember_negative(cache: &Mutex<HashMap<i64, Instant>>, key: i64) {
-        let mut cache = cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        cache.insert(key, Instant::now());
-        // Bound the map: negative ids are junk ids, and junk comes in bursts.
-        if cache.len() > 10_000 {
-            cache.clear();
-        }
+    /// Locks a negative cache and remembers the id. Poisoning degrades to
+    /// "cache missed" on the next check, never to a failed request.
+    fn remember_negative(cache: &Mutex<NegativeCache>, key: i64) {
+        cache.lock().unwrap_or_else(std::sync::PoisonError::into_inner).remember(key);
     }
 
     /// Substring search over known names, items and pets (completions).
@@ -151,5 +206,49 @@ impl CatalogService {
     /// Returns `StoreError::Backend` when the catalog cannot be read.
     pub fn counts(&self) -> Result<CatalogCounts, StoreError> {
         self.catalog.counts()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
+    // inputs (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn eviction_drops_the_oldest_and_keeps_the_rest() {
+        let mut cache = NegativeCache::new(3);
+        for id in 1..=5 {
+            cache.remember(id);
+        }
+        assert!(!cache.contains_fresh(1), "oldest is evicted first");
+        assert!(!cache.contains_fresh(2));
+        assert!(cache.contains_fresh(3));
+        assert!(cache.contains_fresh(4));
+        assert!(cache.contains_fresh(5), "the newest id survives");
+    }
+
+    /// Re-remembering an id leaves stale queue litter behind; the eviction
+    /// loop must skip it and evict the genuinely oldest entry instead.
+    #[test]
+    fn reremembering_supersedes_the_queue_entry_not_the_entry() {
+        let mut cache = NegativeCache::new(3);
+        cache.remember(1);
+        cache.remember(2);
+        cache.remember(3);
+        cache.remember(2); // supersede 2's queue entry
+        cache.remember(4); // over cap: evicts 1, 2 stays live
+        assert!(!cache.contains_fresh(1));
+        assert!(cache.contains_fresh(2), "the re-remembered id stays live");
+        assert!(cache.contains_fresh(3));
+        assert!(cache.contains_fresh(4));
+
+        cache.remember(5); // over cap: 2's old queue entry is litter, 3 evicts
+        assert!(!cache.contains_fresh(3));
+        assert!(cache.contains_fresh(2));
+        assert!(cache.contains_fresh(4));
+        assert!(cache.contains_fresh(5));
     }
 }
