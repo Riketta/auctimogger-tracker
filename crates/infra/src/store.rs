@@ -182,6 +182,16 @@ fn backend<E: std::fmt::Display>(context: &str, error: E) -> StoreError {
     StoreError::Backend(format!("{context}: {error}"))
 }
 
+/// Process-unique suffix for temporary write targets: pid plus an in-process
+/// counter. Two writers (serve + a CLI one-off against the same volume) must
+/// never interleave bytes into the same `.tmp` path before the rename.
+#[allow(clippy::cast_possible_truncation)] // pid fits u32 on every supported OS
+pub(crate) fn unique_tmp_suffix() -> String {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{seq}", std::process::id())
+}
+
 impl SqliteStore {
     /// Opens (creating if needed) the database and applies the schema.
     ///
@@ -277,7 +287,10 @@ impl SqliteStore {
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| backend("archive dir", e))?;
             }
-            let tmp = full.with_extension("tmp");
+            // Unique tmp name per call: two processes (serve + a CLI one-off)
+            // archiving the same sha concurrently must not interleave writes
+            // into one tmp file.
+            let tmp = full.with_extension(format!("tmp.{}", unique_tmp_suffix()));
             std::fs::write(&tmp, raw).map_err(|e| backend("archive write", e))?;
             std::fs::rename(&tmp, &full).map_err(|e| backend("archive rename", e))?;
         }
@@ -722,10 +735,29 @@ impl SalesRepository for SqliteStore {
     ) -> Result<Vec<Option<f64>>, StoreError> {
         let conn = self.open_transaction();
         // One pass resolves identities in order (None = unknown item), so the
-        // result stays positionally aligned with `items`.
+        // result stays positionally aligned with `items`. One prepared
+        // statement is reused for the whole market scan: full-market scans
+        // cover thousands of items, and a prepare per item would dominate the
+        // mutex hold. Same SQL as `lookup_item_ref`.
         let mut ids: Vec<Option<i64>> = Vec::with_capacity(items.len());
-        for item in items {
-            ids.push(lookup_item_ref(&conn, item)?);
+        {
+            let mut statement = conn
+                .prepare(
+                    "SELECT id FROM item_ref WHERE kind = ?1 AND item_id = ?2 AND pet_species = ?3
+                     AND pet_level = ?4 AND pet_quality = ?5 AND pet_breed = ?6",
+                )
+                .map_err(|e| backend("prepare item_ref", e))?;
+            for item in items {
+                let (kind, item_id, species, level, quality, breed) = split_item_ref(item);
+                let mut rows = statement
+                    .query(rusqlite::params![kind, item_id, species, level, quality, breed])
+                    .map_err(|e| backend("query item_ref", e))?;
+                let id = match rows.next().map_err(|e| backend("item_ref row", e))? {
+                    Some(row) => Some(row.get(0).map_err(|e| backend("item_ref id", e))?),
+                    None => None,
+                };
+                ids.push(id);
+            }
         }
         let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
         if known.is_empty() {
@@ -823,37 +855,47 @@ fn resolve_item_ids(conn: &Connection, items: &[ItemRef]) -> Result<Vec<i64>, St
     Ok(ids)
 }
 
-/// Credited/listings sums per `item_ref` id over the trailing day window, in
-/// one grouped query (the batched fuel for `sale_rate_multi`/
+/// Credited/listings sums per `item_ref` id over the trailing day window,
+/// in one grouped query per chunk (the batched fuel for `sale_rate_multi`/
 /// `sale_rate_each`). Placeholders are bound values, never interpolated
 /// input.
+///
+/// The id list is chunked far below SQLite's 32 766 bound-parameter
+/// ceiling: a very large market must not fail the whole ranking scan with
+/// "too many SQL variables".
 fn sale_rates_by_id(
     conn: &Connection,
     target: &TargetId,
     ids: &[i64],
     cutoff_day: i64,
 ) -> Result<HashMap<i64, (i64, i64)>, StoreError> {
-    // Placeholders are bound values, never interpolated input.
-    let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
-    let sql = format!(
-        "SELECT item_ref_id, COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
-         WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ?
-         GROUP BY item_ref_id"
-    );
-    let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(ids.len() + 2);
-    params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
-    for id in ids {
-        params.push(rusqlite::types::Value::Integer(*id));
+    /// Ids per query — 500 keeps one market-scale scan at a handful of
+    /// grouped queries while sitting 60× under the driver's bound ceiling.
+    const SALE_RATE_CHUNK: usize = 500;
+    let mut out: HashMap<i64, (i64, i64)> = HashMap::new();
+    for chunk in ids.chunks(SALE_RATE_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT item_ref_id, COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
+             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ?
+             GROUP BY item_ref_id"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Integer(cutoff_day));
+        let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare sale_rates", e))?;
+        let rows = statement
+            .query(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| backend("query sale_rates", e))?
+            .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("sale_rates row", e))?;
+        out.extend(rows.into_iter().map(|(id, credited, listings)| (id, (credited, listings))));
     }
-    params.push(rusqlite::types::Value::Integer(cutoff_day));
-    let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare sale_rates", e))?;
-    let rows = statement
-        .query(rusqlite::params_from_iter(params.iter()))
-        .map_err(|e| backend("query sale_rates", e))?
-        .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|e| backend("sale_rates row", e))?;
-    Ok(rows.into_iter().map(|(id, credited, listings)| (id, (credited, listings))).collect())
+    Ok(out)
 }
 
 /// Sales-aggregate deltas for one (target, item, day) row.
@@ -1387,6 +1429,23 @@ impl PriceHistoryRepository for SqliteStore {
             .filter(|path| !path.is_empty())
             .collect();
         for path in paths {
+            // Shared-payload guard: identical raw bytes collapse to one
+            // `<sha>.json` archive path, so a path surfaced via an old
+            // snapshot may still be the live archive of a newer one. Only
+            // reclaim paths with no recent referent — the old row keeps a
+            // path pointing at an existing file, which is harmless (and the
+            // alternative would destroy the recent snapshot's raw payload).
+            let recent: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM snapshots
+                     WHERE target_id = ?1 AND archive_path = ?2 AND fetched_at >= ?3",
+                    rusqlite::params![target.as_str(), path, day * 86_400],
+                    |row| row.get(0),
+                )
+                .map_err(|e| backend("prune shared-path check", e))?;
+            if recent > 0 {
+                continue;
+            }
             let _ = std::fs::remove_file(self.archive_dir.join(&path));
             let _ = conn.execute(
                 "UPDATE snapshots SET archive_path = NULL

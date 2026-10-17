@@ -560,13 +560,25 @@ pub(crate) async fn api_watchlist_post(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    match state.watchlist.add(&target, body.item.to_ref(), body.note) {
-        Ok(entry) => {
+    // SQLite access stays off the async workers, like every other store path:
+    // the single connection mutex can be held for a while by ingest
+    // transactions, and a blocked worker stalls the whole runtime.
+    let written = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let item = body.item.to_ref();
+        move || state.watchlist.add(&target, item, body.note)
+    });
+    match written.await {
+        Ok(Ok(entry)) => {
             Json(serde_json::json!({ "ok": true, "addedAt": entry.added_at })).into_response()
         }
-        Err(StoreError::Conflict(message)) => (StatusCode::CONFLICT, message).into_response(),
-        Err(error) => {
+        Ok(Err(StoreError::Conflict(message))) => (StatusCode::CONFLICT, message).into_response(),
+        Ok(Err(error)) => {
             log_failure("watchlist-add", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("watchlist-add-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -594,10 +606,22 @@ pub(crate) async fn api_watchlist_delete(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    match state.watchlist.remove(&target, &body.item.to_ref()) {
-        Ok(removed) => Json(serde_json::json!({ "ok": true, "removed": removed })).into_response(),
-        Err(error) => {
+    // Same spawn_blocking discipline as the POST path above.
+    let removed = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let item = body.item.to_ref();
+        move || state.watchlist.remove(&target, &item)
+    });
+    match removed.await {
+        Ok(Ok(removed)) => {
+            Json(serde_json::json!({ "ok": true, "removed": removed })).into_response()
+        }
+        Ok(Err(error)) => {
             log_failure("watchlist-remove", &error);
+            (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
+        }
+        Err(error) => {
+            log_failure("watchlist-remove-join", &error);
             (StatusCode::INTERNAL_SERVER_ERROR, error.to_string()).into_response()
         }
     }
@@ -610,10 +634,17 @@ pub(crate) struct FetchParams {
 }
 
 /// `POST /api/fetch?target=` — run one ingest cycle now (bearer-gated).
+///
+/// The JSON body requirement (`{}` is fine) is deliberate CSRF hygiene: a
+/// cross-site form can fire simple `POST`s with arbitrary query strings but
+/// cannot send `application/json`, so requiring the content type keeps the
+/// open-mode (token-less) mutating endpoint unreachable from drive-by web
+/// pages. Bearer-gated deployments are unaffected either way.
 pub(crate) async fn api_fetch(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
     Query(params): Query<FetchParams>,
+    Json(_body): Json<serde_json::Value>,
 ) -> Response {
     if let Err(response) = authorize(&state, &headers) {
         return *response;
@@ -629,14 +660,14 @@ pub(crate) async fn api_fetch(
     };
     // A cycle can block on the wire for minutes; keep it off the async
     // workers. The cycle lock serializes against the scheduler's cycles so
-    // observe/close_missing sequences never interleave, and a successful
-    // fetch republishes the target's feed right here (the scheduler only
-    // does that on its own cadence — without this, `/api/fetch` never
-    // refreshed what `/feed.lua` serves).
+    // observe/close_missing sequences never interleave — scoped PER CYCLE
+    // (like the scheduler), not across the whole loop: one slow manual fetch
+    // must not stall scheduled ingestion for every other target for minutes.
+    // A successful fetch republishes the target's feed right here (the
+    // scheduler only does that on its own cadence).
     let reports = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         move || {
-            let _guard = state.cycle_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let mut reports = Vec::new();
             for target in &state.config.targets {
                 if let Some(wanted) = &wanted {
@@ -646,7 +677,14 @@ pub(crate) async fn api_fetch(
                 }
                 let mut fetched = false;
                 for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
-                    match state.cycle.run_cycle(target, kind) {
+                    let outcome = {
+                        let _guard = state
+                            .cycle_lock
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        state.cycle.run_cycle(target, kind)
+                    };
+                    match outcome {
                         Ok(report) => {
                             fetched = true;
                             reports.push(serde_json::json!({

@@ -66,7 +66,9 @@ pub struct Opportunity {
     pub discount: f64,
     /// 14-day sale rate: share of vanished listings credited as sold.
     pub reliability: f64,
-    /// Average unique listings per day over the window.
+    /// Average unique listings per day across the whole window — days the
+    /// item did not appear count as zero, so a single-day spike cannot read
+    /// as sustained volume.
     pub churn_per_day: f64,
     /// Churn component: `churn_per_day` normalized against the anchor,
     /// capped at 1.
@@ -92,7 +94,8 @@ pub struct MoverRow {
     pub median_prev: f64,
     /// `median_now / median_prev - 1` (fraction, may be negative).
     pub change: f64,
-    /// Average unique listings per day over the window.
+    /// Average unique listings per day across the whole window (zero days
+    /// count as zero).
     pub churn_per_day: f64,
 }
 
@@ -367,14 +370,16 @@ impl OpportunityService {
         let median7 = weighted_median(&weighted);
         let mad7 = if mad_weight_sum > 0 { mad_weighted / mad_weight_sum as f64 } else { 0.0 };
         let (floor_now, median_now) = newest.map_or((0, 0), |row| (row.min, row.median));
+        // Window-denominator churn: days without a fold count as zero, so a
+        // single busy day reads as that day's count spread over the window,
+        // not as sustained per-day volume (the docs and the `min_churn`
+        // filter both describe window semantics).
+        #[allow(clippy::cast_precision_loss)] // const 7 is exact in f64
+        let churn_per_day = churn_sum / SCAN_WINDOW_DAYS as f64;
         ItemScan {
             item: item.clone(),
             samples7,
-            churn_per_day: if day_rows.is_empty() {
-                0.0
-            } else {
-                churn_sum / day_rows.len() as f64
-            },
+            churn_per_day,
             floor_now,
             median_now,
             median7,
@@ -506,7 +511,26 @@ mod tests {
         let scan = OpportunityService::scan_item(&item(1), &rows);
         assert_eq!(scan.floor_now, 55_000);
         assert_eq!(scan.samples7, 2_000);
-        assert!((scan.churn_per_day - 1_000.0).abs() < 1e-9);
+        // Window denominator: 2 000 listings across a 7-day window, even
+        // though only two of those days have folds.
+        assert!((scan.churn_per_day - 2_000.0 / 7.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn churn_uses_the_window_denominator_not_days_with_data() {
+        // A single-day spike must read as spike-over-window, not as sustained
+        // per-day volume: 50 listings on one day are 50/7 per day, not 50.
+        let rows = vec![ItemDayRow {
+            item: item(2),
+            day: 9,
+            listing_count: 50,
+            qty_sum: 50,
+            min: 100,
+            median: 100,
+            mad: 0,
+        }];
+        let scan = OpportunityService::scan_item(&item(2), &rows);
+        assert!((scan.churn_per_day - 50.0 / 7.0).abs() < 1e-9);
     }
 
     // ---- helpers ---------------------------------------------------------

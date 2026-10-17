@@ -194,7 +194,8 @@ pub fn item_link(target: &TargetId, item: &ItemRef) -> String {
 }
 
 /// The shared page shell: topbar, nav (active marker), optional target
-/// switcher, footer. `body` is fully-rendered HTML.
+/// switcher, footer. `title` is escaped here — callers pass RAW titles; only
+/// `body` is fully-rendered HTML.
 #[must_use]
 pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> Response {
     const NAV: &[(&str, &str, &str)] = &[
@@ -205,6 +206,7 @@ pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> 
         ("/watchlist", "watchlist", "watchlist"),
         ("/snapshots", "snapshots", "snapshots"),
     ];
+    let title = html_escape(title);
     let mut nav = String::new();
     for (href, key, label) in NAV {
         let class = if *key == active { " class=\"active\"" } else { "" };

@@ -80,7 +80,7 @@ export BLIZZARD_CLIENT_SECRET=<from develop.battle.net>
 export AMT_API_TOKEN=<random string>                # gates mutating API endpoints
 
 ./target/release/auctimogger-tracker config-check config.toml
-./target/release/auctimogger-tracker fetch  --config config.toml   # one cycle, all targets
+./target/release/auctimogger-tracker fetch  --config config.toml   # one cycle, all targets (analysis only — no feeds published)
 ./target/release/auctimogger-tracker serve  --config config.toml   # poll loop + UI on 127.0.0.1:8080
 ```
 
@@ -90,7 +90,8 @@ re-renders and publishes `feed.lua` + `feed.json` to
 `server.feed_publish_secs`, default 300), applies raw-listing retention once
 per UTC day, and keeps the poll loop running. The DB path comes from the
 config. Then open `http://127.0.0.1:8080`. The `export-feed` subcommand
-remains for one-off/manual exports.
+remains for one-off/manual exports; the plain `fetch` subcommand runs
+ingestion only — feeds, retention and ranking refreshes are `serve`'s job.
 
 Prebuilt binaries (linux-gnu / windows-msvc archives with
 `config.example.toml`) are attached to GitHub releases — see
@@ -181,7 +182,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
-| `POST /api/fetch` | trigger a cycle (token-gated); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
+| `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
 
 Mutation buttons are rendered only in open mode (no usable API token): with a
@@ -392,7 +393,7 @@ curl -s -X DELETE http://localhost:8080/api/watchlist \
   -H "Authorization: Bearer $AMT_API_TOKEN" -H 'Content-Type: application/json' \
   -d '{"target":"wowforever-main","type":"item","itemID":194784}'
 curl -s -X POST 'http://localhost:8080/api/fetch?target=wowforever-main' \
-  -H "Authorization: Bearer $AMT_API_TOKEN"
+  -H "Authorization: Bearer $AMT_API_TOKEN" -H "Content-Type: application/json" -d '{}'
 ```
 
 Pets use `"type":"pet"` with `speciesID`/`level`/`qualityID`/`breedID`.
@@ -539,8 +540,9 @@ example (nightly, keep 14):
   DSN). No DSN = stdout/journald only.
 - Restarts on failure (`Restart=on-failure`, 5 s backoff); probe
   `GET /api/health`.
-- `Ctrl+C` / `SIGTERM` shut down gracefully: in-flight requests finish and
-  queued log/Sentry events are flushed before exit.
+- `Ctrl+C` / `SIGTERM` shut down gracefully: in-flight requests finish, the
+  file-log worker is shut down cleanly, and queued Sentry events are flushed
+  before exit.
 - Reads are open on the loopback bind; mutations (`POST /api/fetch`,
   watchlist changes) require the `AMT_API_TOKEN` value. `serve` refuses to
   start with an unset/empty token on a non-loopback bind unless

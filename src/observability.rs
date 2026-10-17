@@ -59,8 +59,9 @@ pub fn flush() {
 }
 
 /// Prints `message` to stderr, flushes Sentry, and exits the process with
-/// `code`. The CLI's error paths use this instead of bare `process::exit`
-/// so error-grade events reach the reporting endpoint.
+/// `code`. Used ONLY on the pre-init path (config load failure), where no
+/// guards exist yet. Every post-init exit flows through `main`'s `exit`, so
+/// the guards' drops drain the file-log worker before the process ends.
 pub fn exit_with_flush(code: i32, message: &str) -> ! {
     if !message.is_empty() {
         eprintln!("{message}");

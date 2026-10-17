@@ -62,13 +62,16 @@ name = "amtracker-server"
 version = "0.1.0"
 dependencies = [
  "amtracker-core",
+ "amtracker-infra",
  "axum",
+ "http-body-util",
  "serde",
  "serde_json",
  "thiserror",
  "time",
  "tokio",
  "toml",
+ "tower",
  "tracing",
 ]
 

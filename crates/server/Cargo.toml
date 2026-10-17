@@ -6,6 +6,11 @@ rust-version = "1.89"
 publish = false
 description = "Driving adapters for the auctimogger-tracker: TOML config loading, HTTP API + UI, poll-loop scheduler, CLI."
 
+[dev-dependencies]
+amtracker-infra = { path = "../infra" }
+http-body-util = "0.1"
+tower = { version = "0.5", features = ["util"] }
+
 [lints]
 workspace = true
 

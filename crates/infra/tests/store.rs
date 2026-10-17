@@ -33,6 +33,7 @@ use amtracker_core::{
         ClockPort,
         MetricsCacheRepository,
         PriceHistoryRepository,
+        SalesRepository,
         SnapshotRepository,
     },
 };
@@ -625,6 +626,97 @@ fn metrics_cache_round_trips_and_invalidates() {
 
     store.invalidate(&target).expect("invalidate");
     assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `sale_rates_by_id` runs chunked (500 ids per query), so the driver's
+/// 32 766 bound-parameter ceiling is unreachable by construction. This test
+/// pins that results merge correctly ACROSS chunk boundaries: 1200 items →
+/// three chunks (500/500/200), with credited and uncredited items planted on
+/// both sides of each boundary.
+#[test]
+fn sale_rates_chunking_merges_results_across_chunk_boundaries() {
+    const N: i64 = 1200;
+    const CHUNK: i64 = 500; // mirrors sale_rates_by_id's SALE_RATE_CHUNK
+
+    let dir = temp_dir("sale-chunks");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let item = |i: i64| item(1000 + i);
+
+    // Cycle 1: every item is sighted once.
+    let batch_a: Vec<NormalizedListing> =
+        (0..N).map(|i| listing(900_000 + i, &item(i), 100, 1)).collect();
+    store
+        .observe(&target, PayloadKind::Commodities, &batch_a, 1, 1_000_000)
+        .expect("observe batch a");
+
+    // Cycle 2: everything survives except items 600 and 1190..N — planted
+    // deliberately so credited rows exist in all three chunks.
+    let dropped: Vec<i64> = [600].into_iter().chain(1190..N).collect();
+    let batch_b: Vec<NormalizedListing> = (0..N)
+        .filter(|i| !dropped.contains(i))
+        .map(|i| listing(900_000 + i, &item(i), 100, 1))
+        .collect();
+    store
+        .observe(&target, PayloadKind::Commodities, &batch_b, 2, 1_000_600)
+        .expect("observe batch b");
+    let credits = store
+        .close_missing(&target, PayloadKind::Commodities, 2, 1_001_200)
+        .expect("close missing");
+    assert_eq!(credits.len(), dropped.len(), "every vanished listing is credited");
+
+    let items: Vec<ItemRef> = (0..N).map(&item).collect();
+    let rates = store.sale_rate_each(&target, &items, 14).expect("rates");
+    let expected_len = usize::try_from(N).unwrap();
+    assert_eq!(rates.len(), expected_len, "positionally aligned across all chunks");
+    for (index, rate) in rates.iter().enumerate() {
+        let index = i64::try_from(index).unwrap();
+        let expected = if dropped.contains(&index) { 1.0 } else { 0.0 };
+        assert_eq!(*rate, Some(expected), "index {index} (chunk {})", index / CHUNK);
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Pruning must not reclaim an archive path that a RECENT snapshot still
+/// references: identical raw payloads collapse to one `<sha>.json`, so the
+/// old snapshot's path can simultaneously be the live archive of a new one.
+#[test]
+fn prune_keeps_archives_shared_with_recent_snapshots() {
+    let dir = temp_dir("prune-shared-sha");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+
+    let snapshot = |fetched_at: i64| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: 0,
+        dropped_count: 0,
+        status: SnapshotStatus::Ok,
+    };
+    store.record(&snapshot(50_000), &[], b"shared-payload").expect("old shared");
+    store.record(&snapshot(60_000), &[], b"unique-payload").expect("old unique");
+    store.record(&snapshot(500_000), &[], b"shared-payload").expect("recent shared");
+
+    // Cutoff day 2 → 172 800: both old snapshots prune, the recent one (and
+    // its shared archive) must survive.
+    let removed = store.prune_raw_before(&target, 2).expect("prune");
+    assert_eq!(removed, 0, "no listing rows were written");
+
+    // Exactly one archive file survives — the shared payload. Before the
+    // shared-path guard this was 0: the old snapshot's prune deleted the
+    // file the recent snapshot still referenced.
+    let kind_dir = dir.join("raw").join("us-4").join("commodities");
+    let survivors: Vec<String> = std::fs::read_dir(&kind_dir)
+        .expect("archive dir")
+        .filter_map(Result::ok)
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(survivors.len(), 1, "only the shared archive survives: {survivors:?}");
 
     std::fs::remove_dir_all(&dir).ok();
 }

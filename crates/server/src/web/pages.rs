@@ -64,9 +64,16 @@ use super::{
     AppState,
 };
 
-/// What the item detail page renders from the store: the item-scoped day
-/// rows plus one optional metric block per span.
-type ItemPageData = (Vec<amtracker_core::domain::ItemDayRow>, Vec<(Span, Option<MetricBlock>)>);
+/// What the item detail page renders from the store, in one store pass: the
+/// item-scoped day rows, the per-span metric blocks, the per-day chart rows
+/// (via the golden single-day engine) and today's price-distribution
+/// buckets.
+type ItemPageData = (
+    Vec<amtracker_core::domain::ItemDayRow>,
+    Vec<(Span, Option<MetricBlock>)>,
+    Vec<serde_json::Value>,
+    std::collections::BTreeMap<i64, amtracker_core::domain::PriceBucket>,
+);
 
 /// Watchlist membership key: kind-prefixed identity string, so items and
 /// pets (and different pet variants) can never collide.
@@ -290,7 +297,7 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
             ("credits", "Sell-through credits granted by closing vanished listings."),
             ("message", "Error detail for failed or panicked cycles."),
         ] {
-            let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
         for cycle in cycles.iter().rev() {
@@ -395,7 +402,7 @@ pub(crate) async fn snapshots_page(State(state): State<Arc<AppState>>) -> Respon
             ("dropped", "Listings rejected by the strict parse (counted, never ingested)."),
             ("status", "Storage status of the snapshot."),
         ] {
-            let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
         for meta in rows {
@@ -435,12 +442,13 @@ pub(crate) async fn items_page(
     let query = params.get("q").cloned().unwrap_or_default();
     let switcher = target_switcher(&state.config, "/items", &target, &[("q", &query)]);
 
-    let mut body = String::from(
+    let mut body = format!(
         "<div class=\"searchbox\"><input type=\"search\" id=\"q\" \
          placeholder=\"search item or pet name…\" autocomplete=\"off\" \
-         data-search-endpoint=\"/api/search\" /></div>\
+         data-search-endpoint=\"/api/search\" data-search-target=\"{}\" /></div>\
          <p class=\"muted\">type at least 2 characters — completions cover named items and pet species \
          (names resolve through the Blizzard item/pet APIs as items are seen or visited)</p>",
+        html_escape(target.as_str())
     );
 
     if !query.trim().is_empty() {
@@ -467,7 +475,7 @@ pub(crate) async fn items_page(
                         ("quality", "Quality label, color-coded with the loot convention."),
                         ("id", "Item id or pet species id."),
                     ] {
-                        let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+                        let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
                     }
                     body.push_str("</tr></thead><tbody>");
                     for hit in &hits {
@@ -533,7 +541,7 @@ pub(crate) async fn items_page(
                     ("kind", "item or pet species."),
                     ("id", "Item id or species id."),
                 ] {
-                    let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+                    let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
                 }
                 body.push_str("</tr></thead><tbody>");
                 for hit in &hits {
@@ -696,12 +704,15 @@ async fn item_detail_page(
     id_label: String,
     note: String,
 ) -> Response {
-    let title = html_escape(
-        &name.unwrap_or_else(|| format!("{} (name unknown)", render::item_label(&item))),
-    );
+    let title_raw = name.unwrap_or_else(|| format!("{} (name unknown)", render::item_label(&item)));
+    let title = html_escape(&title_raw);
 
-    // Window + analytics all read SQLite through the injected clock; keep the
-    // blocking body off the async workers.
+    // The whole page's store reads happen in ONE blocking pass: day rows,
+    // per-span blocks, per-day chart rows and today's distribution. The
+    // chart/distribution folds come out of the same loop; `metrics.block`
+    // re-reads folds per span, but its block cache makes repeat views cheap,
+    // and duplicating its cache + sale-rate plumbing here would risk engine
+    // drift. Day labels stay numeric and become UTC dates after the await.
     let today = utc_day(state.clock.now());
     let since = today - 29;
     let page_data = tokio::task::spawn_blocking({
@@ -710,53 +721,41 @@ async fn item_detail_page(
         let item = item.clone();
         move || -> Result<ItemPageData, StoreError> {
             let rows = state.history.item_day_rows_for_item(&target, &item, since)?;
+            let mut days: Vec<i64> = rows.iter().map(|row| row.day).collect();
+            days.sort_unstable();
+            days.dedup();
+            let mut chart_rows = Vec::with_capacity(days.len());
+            let mut distribution = std::collections::BTreeMap::new();
+            for day in days {
+                let Some(fold) = state.history.load_fold(&target, &item, day)? else {
+                    continue;
+                };
+                let histogram = fold.histogram();
+                if day == today {
+                    distribution = histogram.buckets.clone();
+                }
+                // Golden engine on the single-day fold: the chart's
+                // percentiles are exactly what the addon would compute.
+                if let Some(block) = block_from_histograms(std::slice::from_ref(&histogram), None) {
+                    chart_rows.push(serde_json::json!({
+                        "label": day,
+                        "median": block.median,
+                        "p05": block.p05,
+                        "p75": block.p75,
+                        "qty": block.qty_sum,
+                        "n": block.n,
+                    }));
+                }
+            }
             let mut blocks = Vec::with_capacity(4);
             for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
                 blocks.push((span, state.metrics.block(&target, &item, span)?));
             }
-            Ok((rows, blocks))
+            Ok((rows, blocks, chart_rows, distribution))
         }
     });
-    let (rows, blocks) = match page_data.await {
+    let (rows, blocks, mut chart_rows, distribution) = match page_data.await {
         Ok(Ok(data)) => data,
-        Ok(Err(error)) => return render::store_error_page(error).await,
-        Err(error) => {
-            return render::store_error_page(StoreError::Backend(error.to_string())).await
-        }
-    };
-
-    // Per-day chart rows reuse the golden metric engine on single-day folds,
-    // so the chart's percentiles are exactly what the addon would compute.
-    // Day labels stay numeric here and become UTC dates below (needs `time`).
-    let chart = tokio::task::spawn_blocking({
-        let state = Arc::clone(&state);
-        let target = target.clone();
-        let item = item.clone();
-        let days: Vec<i64> = rows.iter().map(|row| row.day).collect();
-        move || -> Result<Vec<serde_json::Value>, StoreError> {
-            let mut out = Vec::with_capacity(days.len());
-            for day in days {
-                if let Some(fold) = state.history.load_fold(&target, &item, day)? {
-                    let histogram = fold.histogram();
-                    if let Some(block) =
-                        block_from_histograms(std::slice::from_ref(&histogram), None)
-                    {
-                        out.push(serde_json::json!({
-                            "label": day,
-                            "median": block.median,
-                            "p05": block.p05,
-                            "p75": block.p75,
-                            "qty": block.qty_sum,
-                            "n": block.n,
-                        }));
-                    }
-                }
-            }
-            Ok(out)
-        }
-    });
-    let mut chart_rows = match chart.await {
-        Ok(Ok(rows)) => rows,
         Ok(Err(error)) => return render::store_error_page(error).await,
         Err(error) => {
             return render::store_error_page(StoreError::Backend(error.to_string())).await
@@ -799,40 +798,22 @@ async fn item_detail_page(
              <span class=\"key\"><span class=\"swatch\" style=\"background:rgba(90,162,255,0.35)\"></span> {}</span>\
              <span class=\"key\"><span class=\"swatch\" style=\"background:#5aa2ff\"></span> {}</span>\
              </div>",
-            json_island(&serde_json::Value::Array(chart_rows.clone())),
+            json_island(&serde_json::json!({ "days": chart_rows.clone() })),
             tip("typical range", "p05–p75 band: 80% of observed prices fell inside it (the golden engine computes it per day)."),
             tip("median", "Day median of unique auctions, each counted once at its last observed price.")
         );
     }
     body.push_str("</div>");
 
-    // Today's price distribution (server-rendered; no JS required).
-    let distribution = tokio::task::spawn_blocking({
-        let state = Arc::clone(&state);
-        let target = target.clone();
-        let item = item.clone();
-        move || -> Result<std::collections::BTreeMap<i64, amtracker_core::domain::PriceBucket>, StoreError> {
-            Ok(state
-                .history
-                .load_fold(&target, &item, utc_day(state.clock.now()))?
-                .map(|fold| fold.histogram().buckets)
-                .unwrap_or_default())
-        }
-    });
-    match distribution.await {
-        Ok(Ok(buckets)) if !buckets.is_empty() => {
-            let _ = write!(
-                body,
-                "<h2>{} today</h2><div class=\"chart-card\">{}</div>",
-                tip("price distribution", "Unique auctions folded so far today, bucketed by unit price. Bar height = number of listings at that price; hover a bar for details."),
-                distribution_svg(&buckets)
-            );
-        }
-        Ok(Ok(_)) => {}
-        Ok(Err(error)) => return render::store_error_page(error).await,
-        Err(error) => {
-            return render::store_error_page(StoreError::Backend(error.to_string())).await
-        }
+    // Today's price distribution (server-rendered; no JS required); the
+    // buckets arrived with the same store pass as everything else above.
+    if !distribution.is_empty() {
+        let _ = write!(
+            body,
+            "<h2>{} today</h2><div class=\"chart-card\">{}</div>",
+            tip("price distribution", "Unique auctions folded so far today, bucketed by unit price. Bar height = number of listings at that price; hover a bar for details."),
+            distribution_svg(&distribution)
+        );
     }
 
     body.push_str("<h2>metric blocks</h2><div class=\"scroll-x\"><table id=\"blocks\"><thead><tr>");
@@ -851,7 +832,7 @@ async fn item_detail_page(
         ("qty", "Summed quantity across the window's auctions."),
         ("sale rate", "Estimated sell-through over 14 days: fraction of daily sightings that vanish and stay gone long enough to count as sold. “—” = no sell-through evidence yet."),
     ] {
-        let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+        let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
     }
     body.push_str("</tr></thead><tbody>");
     for (span, block) in &blocks {
@@ -1001,7 +982,7 @@ pub(crate) async fn opportunities_page(
             ("samples 7d", "Unique listings folded over the last 7 days (the evidence behind confidence)."),
             ("", "Watchlist action (open mode only)."),
         ] {
-            let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
         let open = mutations_open(&state.config);
@@ -1094,7 +1075,7 @@ fn mover_table(
     }
     let mut out = format!(
         "<div class=\"scroll-x\"><table id=\"{table_id}\"><thead><tr>\
-         <th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th><th>{}</th></tr></thead><tbody>",
+         <th data-sortable>{}</th><th data-sortable>{}</th><th data-sortable>{}</th><th data-sortable>{}</th><th data-sortable>{}</th><th data-sortable>{}</th></tr></thead><tbody>",
         tip("item", "Click through for the full 30-day history."),
         tip("median now", "Today's folded median."),
         tip("median 7d", "Median over the previous 7-day window."),
@@ -1239,7 +1220,7 @@ pub(crate) async fn watchlist_page(
             ("added", "When the entry was added (UTC)."),
             ("", "Removal action (open mode only)."),
         ] {
-            let _ = write!(body, "<th>{}</th>", tip(label, tip_text));
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
         for entry in &entries {
@@ -1284,8 +1265,8 @@ pub(crate) async fn help_page() -> Response {
         ("floor now", "Cheapest listing folded for the current UTC day."),
         ("discount", "1 − floor_now ÷ median7: how far today's floor sits under the weekly median."),
         ("reliability", "Sell-through strength feeding the ranking — how confidently listings actually sell on this item."),
-        ("churn/day", "Average unique listings appearing per day: volume you can realistically trade through."),
-        ("stability", "Low MAD relative to the median — tight pricing bands."),
+        ("churn/day", "Average unique listings per day across the whole 7-day window — days without data count as zero, so a single-day spike reads as a spike, not sustained volume."),
+        ("stability", "Low MAD relative to the median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
         ("watchlist", "Your curated per-target list. Drives feed-slim.lua — the addon consumes exactly those items."),

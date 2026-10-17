@@ -151,7 +151,10 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
-fn build_router_arc(state: Arc<AppState>) -> Router {
+/// Builds the full HTTP router (pages, JSON API, feed downloads, token-gated
+/// mutations) over shared state — the `Arc<AppState>` form `serve` uses, and
+/// the form integration tests drive.
+pub fn build_router_arc(state: Arc<AppState>) -> Router {
     Router::new()
         .route("/", get(pages::dashboard))
         .route("/snapshots", get(pages::snapshots_page))

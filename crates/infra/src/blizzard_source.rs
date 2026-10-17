@@ -360,7 +360,10 @@ impl AuctionSourcePort for BlizzardSource {
 
 #[derive(Deserialize)]
 struct WirePayload {
-    #[serde(default)]
+    /// Required, not defaulted: a document without an `auctions` array is
+    /// structurally wrong for both wire shapes (Blizzard's commodity and
+    /// auction dumps carry the key alike), and must fail the snapshot
+    /// instead of silently reading as a healthy-but-empty market.
     auctions: Vec<WireAuction>,
 }
 

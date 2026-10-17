@@ -96,46 +96,60 @@ enum Commands {
 
 fn main() {
     let cli = Cli::parse();
-    match cli.command {
+    let code = match cli.command {
         Commands::ConfigCheck { path } => run_config_check(&path),
         Commands::Fetch { config, target } => {
-            with_observability(&config, |loaded| run_fetch(&loaded.tracker, target.as_deref()));
+            with_observability(&config, |loaded| run_fetch(&loaded.tracker, target.as_deref()))
         }
         Commands::Serve { config } => {
-            with_observability(&config, |loaded| run_serve(&loaded.tracker));
+            with_observability(&config, |loaded| run_serve(&loaded.tracker))
         }
         Commands::Metrics { config, target, item, span } => {
-            with_observability(&config, |loaded| {
-                run_metrics(&loaded.tracker, &target, item, &span);
-            });
+            with_observability(&config, |loaded| run_metrics(&loaded.tracker, &target, item, &span))
         }
         Commands::ExportFeed { config, target, out, slim } => {
             with_observability(&config, |loaded| {
-                run_export_feed(&loaded.tracker, target.as_deref(), &out, slim);
-            });
+                run_export_feed(&loaded.tracker, target.as_deref(), &out, slim)
+            })
         }
-    }
+    };
+    exit(code);
 }
 
-/// Loads the config, installs logging/Sentry, and runs `command` with the
-/// loaded pair. The observability guards live in this frame; the command
-/// diverges (`-> !`), so explicit flushes on the exit paths (see
-/// [`observability::exit_with_flush`]) are what carry queued events out.
-fn with_observability(path: &Path, command: impl FnOnce(&LoadedConfig)) {
+/// Loads the config, installs logging/Sentry, runs `command`, and returns
+/// its exit code. This frame — not the commands — owns the exit: dropping
+/// the guards is what flushes the non-blocking file-log worker, and
+/// destructors never run on `process::exit`, so the drop must happen here,
+/// before the explicit exit.
+fn with_observability(path: &Path, command: impl FnOnce(&LoadedConfig) -> i32) -> i32 {
     let loaded = match load_config(path) {
         Ok(loaded) => loaded,
+        // Pre-init: no guards exist yet; the explicit flush only covers the
+        // parse error's own reporting path.
         Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
     };
-    let _guards = observability::init(&loaded.observability);
+    let guards = observability::init(&loaded.observability);
     tracing::debug!(config = %path.display(), "configuration loaded");
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "auctimogger-tracker starting");
-    command(&loaded);
+    let code = command(&loaded);
+    drop(guards);
+    code
 }
 
-fn run_config_check(path: &Path) -> ! {
+/// Single process exit: flush queued Sentry events, then exit. File-log
+/// buffers are already drained by `with_observability` dropping the guards.
+fn exit(code: i32) -> ! {
+    observability::flush();
+    std::process::exit(code);
+}
+
+fn run_config_check(path: &Path) -> i32 {
     let loaded = match load_config(path) {
         Ok(loaded) => loaded,
-        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
     };
     let config = &loaded.tracker;
     println!("config ok: {} target(s)", config.targets.len());
@@ -148,21 +162,25 @@ fn run_config_check(path: &Path) -> ! {
             target.poll.auctions_secs
         );
     }
-    observability::exit_with_flush(0, "");
+    0
 }
 
-fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
+fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
     // Fail fast BEFORE any state is created: an open mutating API on a
     // non-loopback bind, or missing ingestion credentials, must abort in
     // milliseconds with a message instead of serving a broken instance.
     if let Err(message) = amtracker_server::startup::validate_serve_startup(config) {
         tracing::error!("{message}");
-        observability::exit_with_flush(1, &format!("error: {message}"));
+        eprintln!("error: {message}");
+        return 1;
     }
     let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
-        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
     };
     let item_info = Arc::new(BlizzardItemInfo::from_config(config));
     let metrics =
@@ -220,14 +238,16 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
 
     if let Err(error) = amtracker_server::scheduler::spawn(state.clone()) {
         tracing::error!(error = %error, "scheduler thread failed to start");
-        observability::exit_with_flush(1, "");
+        eprintln!("error: scheduler thread failed to start: {error}");
+        return 1;
     }
 
     let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
         Ok(runtime) => runtime,
         Err(error) => {
             tracing::error!(error = %error, "tokio runtime build failed");
-            observability::exit_with_flush(1, "");
+            eprintln!("error: tokio runtime build failed: {error}");
+            return 1;
         }
     };
     tracing::info!(bind = %config.server.bind, "listening");
@@ -235,9 +255,10 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> ! {
         runtime.block_on(amtracker_server::web::serve(state, config.server.bind.clone()))
     {
         tracing::error!(error = %error, "server error");
-        observability::exit_with_flush(1, "");
+        eprintln!("error: server error: {error}");
+        return 1;
     }
-    observability::exit_with_flush(0, "");
+    0
 }
 
 /// Opens the SQLite store (shared by every command that touches state).
@@ -259,13 +280,16 @@ fn run_export_feed(
     only_target: Option<&str>,
     out_dir: &std::path::Path,
     slim: bool,
-) -> ! {
+) -> i32 {
     use amtracker_core::ports::FeedPublisher;
 
     let clock = Arc::new(SystemClock);
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
-        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
     };
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
@@ -328,9 +352,10 @@ fn run_export_feed(
     }
     tracing::info!(out = %out_dir.display(), "feeds written");
     if failures > 0 {
-        observability::exit_with_flush(1, &format!("{failures} export(s) failed"));
+        eprintln!("error: {failures} export(s) failed");
+        return 1;
     }
-    observability::exit_with_flush(0, "");
+    0
 }
 
 fn run_metrics(
@@ -338,26 +363,26 @@ fn run_metrics(
     target_id: &str,
     item_id: i64,
     span_name: &str,
-) -> ! {
+) -> i32 {
     let Some(span) = amtracker_core::domain::Span::parse(span_name) else {
-        observability::exit_with_flush(
-            1,
-            &format!("error: unknown span '{span_name}' (expected d1|d7|d14|d30)"),
-        );
+        eprintln!("error: unknown span '{span_name}' (expected d1|d7|d14|d30)");
+        return 1;
     };
     if !config.metrics.spans.contains(&span) {
-        observability::exit_with_flush(
-            1,
-            &format!("error: span {} is not enabled in the config", span.name()),
-        );
+        eprintln!("error: span {} is not enabled in the config", span.name());
+        return 1;
     }
     let Some(target) = config.targets.iter().find(|t| t.id.as_str() == target_id) else {
-        observability::exit_with_flush(1, &format!("error: unknown target '{target_id}'"));
+        eprintln!("error: unknown target '{target_id}'");
+        return 1;
     };
     let clock = Arc::new(SystemClock);
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
-        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
     };
     let metrics = amtracker_core::services::metrics::MetricsService::new(
         store.clone(),
@@ -388,26 +413,31 @@ fn run_metrics(
                     .sale_rate
                     .map_or_else(|| "n/a".into(), |rate| format!("{rate:.3}")),
             );
-            observability::exit_with_flush(0, "");
+            0
         }
         Ok(None) => {
-            observability::exit_with_flush(
-                1,
-                &format!("no data for item {item_id} in the {} window", span.name()),
-            );
+            eprintln!("no data for item {item_id} in the {} window", span.name());
+            1
         }
         Err(error) => {
             tracing::error!(error = %error, "metrics query failed");
-            observability::exit_with_flush(1, "");
+            1
         }
     }
 }
 
-fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option<&str>) -> ! {
+/// Runs one ingestion cycle per target/kind and exits. Analysis-only by
+/// design: unlike the serve loop (and `/api/fetch`), no feed is published,
+/// no retention prune runs, and no ranking scan is refreshed — the next
+/// `serve` cycle picks all of that up. Documented in the README.
+fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option<&str>) -> i32 {
     let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
-        Err(error) => observability::exit_with_flush(1, &format!("error: {error}")),
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
     };
     let cycle = IngestCycleService::new(
         Arc::new(BlizzardSource::new()),
@@ -450,7 +480,8 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
         }
     }
     if failures > 0 {
-        observability::exit_with_flush(1, &format!("{failures} cycle(s) failed"));
+        eprintln!("error: {failures} cycle(s) failed");
+        return 1;
     }
-    observability::exit_with_flush(0, "");
+    0
 }

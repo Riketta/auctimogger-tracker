@@ -181,7 +181,15 @@ impl FeedPublisher for FileFeedPublisher {
         let dir = self.dir.join(target.as_str());
         std::fs::create_dir_all(&dir).map_err(|e| StoreError::Backend(format!("feed dir: {e}")))?;
         let final_path = dir.join(format!("feed.{}", extension(format)));
-        let tmp = dir.join(format!(".feed.{}.tmp", extension(format)));
+        // Unique tmp name per call: a scheduled publish and a manual-fetch
+        // publish for the same target can overlap, and CLI one-offs against
+        // the same volume are documented — interleaved writes to one shared
+        // tmp path would tear the file before the rename.
+        let tmp = dir.join(format!(
+            ".feed.{}.{}.tmp",
+            extension(format),
+            crate::store::unique_tmp_suffix()
+        ));
         std::fs::write(&tmp, bytes).map_err(|e| StoreError::Backend(format!("feed write: {e}")))?;
         std::fs::rename(&tmp, &final_path)
             .map_err(|e| StoreError::Backend(format!("feed rename: {e}")))?;

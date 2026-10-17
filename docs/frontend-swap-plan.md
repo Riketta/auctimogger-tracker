@@ -61,7 +61,8 @@ decision time — both projects moved quickly through 2025 and will keep doing s
 
 ## 2. Why the current UI fits — and when that flips
 
-The server-rendered UI in `crates/server/src/web.rs` is unusually well matched to this
+The server-rendered UI in `crates/server/src/web/` (split into `pages`, `api`,
+`render` and embedded `assets`) is unusually well matched to this
 product:
 
 - **Single binary, zero toolchain.** Pages are Rust functions returning HTML strings
@@ -135,7 +136,7 @@ without any extra files.
 
 ### 3.2 The JSON API as the contract (as it exists today)
 
-Verified against `build_router_arc` in `crates/server/src/web.rs`:
+Verified against `build_router_arc` in `crates/server/src/web/mod.rs`:
 
 | Endpoint | Shape today |
 |---|---|
@@ -161,9 +162,11 @@ These are the concrete server-side tasks a swap implies (all verified absent tod
 1. **Pet-addressable metrics.** `api_item_metrics` always constructs
    `ItemRef::Item { item_id }` from the path — pets (whose identity is the
    `speciesID`/`level`/`qualityID`/`breedID` tuple, already modeled in `ApiItemRef`
-   and supported by watchlist POST/DELETE) cannot be fetched. Needs either a query
-   parameter variant or a canonical composite ID scheme, matched by the HTML
-   `item_link` helper which currently stuffs the species ID into the item-ID slot.
+   and supported by watchlist POST/DELETE) cannot be fetched in one call.
+   Needs either a query-parameter variant or a canonical composite ID scheme,
+   matched by the HTML `item_link` helper (which now emits dedicated
+   `/items/{t}/pet/{species}?level=&quality=&breed=` links — the HTML side is
+   solved; only the JSON API still lacks a pet-addressable metrics route).
 2. **Bulk metrics.** A watchlist dashboard needs one call, not N ×
    `/api/items/.../metrics`. Add `GET /api/watchlist/metrics?target=&span=` (or accept
    an item list) joining entries to their latest blocks in one SQLite pass.
@@ -229,7 +232,8 @@ GHCR gated to main/tags, `release` = matrix `x86_64-unknown-linux-gnu` +
 ## 5. State and statefulness
 
 - **URL as state.** The server pages already treat query parameters as the entire
-  state model (`target_param` / `required_target` / `known_target` in `web.rs`). A
+  state model (`target_param` / `required_target` / `known_target` in
+  `crates/server/src/web/mod.rs`). A
   WASM UI should keep exactly that: targets, search queries, selected spans, table
   filters live in the URL, navigation is just routing. This preserves deep links,
   makes browser back/forward correct, and means no global store, no redux-equivalent,

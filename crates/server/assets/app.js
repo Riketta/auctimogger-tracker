@@ -264,7 +264,9 @@
   });
   $all("[data-fetch-now]").forEach(function (button) {
     button.addEventListener("click", function () {
-      act(button, "/api/fetch?target=" + encodeURIComponent(button.getAttribute("data-fetch-now")), "POST", null);
+      // The JSON body is required (CSRF hygiene: simple cross-site forms
+      // cannot send application/json). `{}` is the documented empty body.
+      act(button, "/api/fetch?target=" + encodeURIComponent(button.getAttribute("data-fetch-now")), "POST", "{}");
     });
   });
 
