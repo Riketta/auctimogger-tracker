@@ -148,9 +148,12 @@
   function renderChart(mount, data) {
     var W = 800, H = 240, PAD_L = 8, PAD_R = 8, PAD_T = 14, PAD_B = 26;
     var days = data.days;
+    // Band top is p95 when the island carries it; p75 keeps old islands alive.
+    function bandTop(d) { return typeof d.p95 === "number" ? d.p95 : d.p75; }
     var low = Infinity, high = -Infinity;
     days.forEach(function (d) {
-      [d.p05, d.median, d.p75].forEach(function (v) {
+      [d.p05, d.median, bandTop(d), d.vwap].forEach(function (v) {
+        if (typeof v !== "number") return;
         if (v < low) low = v;
         if (v > high) high = v;
       });
@@ -170,17 +173,30 @@
 
     var svg = el("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": "price history band chart" });
 
-    // p05-p75 typical-range band.
+    // p05-p95 typical-range band.
     var bandPoints = [];
     days.forEach(function (d, i) { bandPoints.push(x(i) + "," + y(d.p05)); });
     for (var i = days.length - 1; i >= 0; i -= 1) {
-      bandPoints.push(x(i) + "," + y(days[i].p75));
+      bandPoints.push(x(i) + "," + y(bandTop(days[i])));
     }
     svg.appendChild(el("polygon", {
       points: bandPoints.join(" "),
       fill: "rgba(90,162,255,0.16)",
       stroke: "none"
     }));
+
+    // VWAP line: dashed gold, only when every day carries a numeric vwap.
+    if (days.every(function (d) { return typeof d.vwap === "number"; })) {
+      svg.appendChild(el("polyline", {
+        points: days.map(function (d, i) { return x(i) + "," + y(d.vwap); }).join(" "),
+        fill: "none",
+        stroke: "#f0b429",
+        "stroke-width": "1.5",
+        "stroke-dasharray": "5,4",
+        "stroke-linejoin": "round",
+        "stroke-linecap": "round"
+      }));
+    }
 
     // Median line.
     var linePoints = days.map(function (d, i) { return x(i) + "," + y(d.median); });
@@ -235,6 +251,8 @@
       dot.setAttribute("cy", y(d.median));
       dot.setAttribute("visibility", "visible");
       var bits = [d.label, "median " + copperToText(d.median)];
+      if (typeof d.p95 === "number") bits.push("p95 " + copperToText(d.p95));
+      if (typeof d.vwap === "number") bits.push("vwap " + copperToText(d.vwap));
       if (typeof d.qty === "number" && d.qty > 0) bits.push(d.qty + " qty");
       if (typeof d.n === "number" && d.n > 0) bits.push(d.n + " samples");
       tip.textContent = bits.join("  ·  ");

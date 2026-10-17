@@ -112,6 +112,9 @@ only — never put secrets in this file.
 | `storage.database` | `./data/tracker.sqlite3` | SQLite database (WAL) |
 | `storage.archive_dir` | `./data/raw` | raw payload archive |
 | `storage.raw_listing_days` | `7` | raw working-set retention; metadata/folds stay forever |
+| `storage.backup_dir` | absent | directory for scheduled online backups; absent = off |
+| `storage.backup_secs` | `0` | minimum seconds between scheduled backups (`0` = off) |
+| `storage.backup_keep` | `7` | recent backups kept (oldest pruned after each backup) |
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
 | `opportunities.min_samples` | `30` | samples before an item is scored |
 | `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | score mix, tunable without code changes |
@@ -153,6 +156,7 @@ fail loudly rather than silently disable the setting it was meant to set.
 | Command | Purpose |
 |---|---|
 | `config-check <path>` | parse + validate a config, print a target summary |
+| `backup --config <p> --out <path>` | write one consistent online backup of the database, then exit |
 | `fetch --config <p> [--target <id>]` | run one ingestion cycle now |
 | `serve --config <p>` | poll scheduler + web UI/API (the service mode) |
 | `metrics --config <p> --target <id> --item <id> [--span d1]` | print one analytics block (debug aid) |
@@ -516,20 +520,33 @@ the binary under `/opt`, and restarts the unit.
   migrated faithfully — the tracker refuses to start with a clear message;
   delete the database file and let it rebuild (folds regenerate within a
   day).
-- **Never `cp` a live WAL database by itself** — use the backup API:
+- **Never `cp` a live WAL database by itself** — use the backup API, e.g.
+  the built-in subcommand (`VACUUM INTO` — a consistent copy, safe while
+  `serve` runs; parent directories are created, an existing file is
+  refused):
 
 ```sh
-sqlite3 /var/lib/auctimogger-tracker/data/tracker.sqlite3 \
-    ".backup '/backups/tracker-$(date +%F).sqlite3'"
+auctimogger-tracker backup --config /etc/auctimogger-tracker/config.toml \
+    --out "/backups/tracker-$(date +%F).sqlite3"
 ```
 
-With the service stopped, copy all three files together, or checkpoint first
+`sqlite3 … ".backup …"` works identically. With the service stopped, copy
+all three files together, or checkpoint first
 (`PRAGMA wal_checkpoint(TRUNCATE);`) and copy the single `.sqlite3`. Cron
 example (nightly, keep 14):
 
 ```cron
 0 4 * * * sqlite3 /var/lib/auctimogger-tracker/data/tracker.sqlite3 ".backup '/backups/tracker-$(date +\%F).sqlite3'" && find /backups -name 'tracker-*.sqlite3' -mtime +14 -delete
 ```
+
+**Scheduled backups** replace that cron: with `[storage].backup_dir` set
+and `backup_secs > 0`, `serve` writes a consistent online backup every
+`backup_secs` — `amtracker-backup-<UTC timestamp>.sqlite3` files in that
+directory, pruned after each backup down to the newest `backup_keep`. A
+failed or panicking backup is logged (warn) and never disturbs ingestion;
+apply the same disk rules as the database itself (local disk, never
+NFS/CIFS). Backups run on the scheduler thread, so very large databases
+may briefly delay a poll cycle — size `backup_secs` accordingly.
 
 ### Operations
 

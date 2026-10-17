@@ -1,7 +1,10 @@
 //! TOML config loading — an ACL over the file format. Serde types here mirror
 //! the file exactly; the mapping output is the core's plain config model.
 
-use std::path::Path;
+use std::path::{
+    Path,
+    PathBuf,
+};
 
 use amtracker_core::{
     config::{
@@ -204,9 +207,28 @@ pub struct FileStorage {
     pub raw_listing_days: u32,
     /// Directory where raw snapshot payloads are archived.
     pub archive_dir: String,
+    /// Directory for scheduled online backups; absent = they stay off.
+    #[serde(default)]
+    pub backup_dir: Option<PathBuf>,
+    /// Minimum seconds between scheduled online backups; defaults to 0
+    /// (disabled).
+    #[serde(default = "default_backup_secs")]
+    pub backup_secs: u64,
+    /// How many recent backup files to keep (oldest pruned after each
+    /// backup); defaults to 7.
+    #[serde(default = "default_backup_keep")]
+    pub backup_keep: u32,
 }
 
 fn default_raw_days() -> u32 {
+    7
+}
+
+fn default_backup_secs() -> u64 {
+    0
+}
+
+fn default_backup_keep() -> u32 {
     7
 }
 
@@ -397,6 +419,9 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             database: file.storage.database,
             raw_listing_days: file.storage.raw_listing_days,
             archive_dir: file.storage.archive_dir,
+            backup_dir: file.storage.backup_dir,
+            backup_secs: file.storage.backup_secs,
+            backup_keep: file.storage.backup_keep,
         },
         metrics: MetricsConfig { spans },
         opportunities: OpportunitiesConfig {
@@ -440,7 +465,14 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
         collect_unknown(
             storage,
             "storage",
-            &["database", "raw_listing_days", "archive_dir"],
+            &[
+                "database",
+                "raw_listing_days",
+                "archive_dir",
+                "backup_dir",
+                "backup_secs",
+                "backup_keep",
+            ],
             &mut unknown,
         );
     }

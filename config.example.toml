@@ -22,6 +22,13 @@ token_env = "AMT_API_TOKEN" # unset or empty = mutating endpoints are open (loca
 database = "./data/tracker.sqlite3"
 raw_listing_days = 7      # raw listing working set; snapshot metadata live forever
 archive_dir = "./data/raw"
+# Scheduled online backups: with backup_dir set and backup_secs > 0, `serve`
+# writes a consistent copy of the database (VACUUM INTO - safe while serving)
+# to amtracker-backup-<UTC timestamp>.sqlite3 in that directory and prunes
+# the oldest down to backup_keep files.
+# backup_dir = "./data/backups"
+# backup_secs = 86400      # one backup per day; 0 = scheduled backups off
+# backup_keep = 7
 
 [metrics]
 spans = ["d1", "d7", "d14", "d30"]

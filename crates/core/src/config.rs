@@ -2,6 +2,8 @@
 //! driving-adapter concern (`amtracker-server`); the core only validates and
 //! consumes the mapped result.
 
+use std::path::PathBuf;
+
 use crate::{
     domain::{
         Span,
@@ -45,7 +47,8 @@ pub struct ServerConfig {
     pub feed_publish_secs: u64,
 }
 
-/// Persistence settings.
+/// Persistence settings: database location, retention, payload archives and
+/// optional scheduled online backups.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct StorageConfig {
     /// Path of the backing database file.
@@ -54,6 +57,15 @@ pub struct StorageConfig {
     pub raw_listing_days: u32,
     /// Directory raw payload archives are written to.
     pub archive_dir: String,
+    /// Directory for scheduled online backups: when set together with a
+    /// positive `backup_secs`, `serve` writes rotated
+    /// `amtracker-backup-*.sqlite3` copies here; `None` disables them.
+    pub backup_dir: Option<PathBuf>,
+    /// Minimum seconds between scheduled online backups; `0` disables them.
+    pub backup_secs: u64,
+    /// How many recent backup files to keep (the oldest are pruned after
+    /// each backup).
+    pub backup_keep: u32,
 }
 
 /// Analytics exposure settings.

@@ -28,6 +28,7 @@ use amtracker_core::{
         TargetId,
         TimeLeftBand,
     },
+    error::StoreError,
     fold::DayFold,
     ports::{
         ClockPort,
@@ -996,6 +997,59 @@ fn metrics_cache_get_many_aligns_blocks_with_identities() {
     // come back empty.
     let other = store.get_many(&target, Span::D1, &items).expect("get_many d1");
     assert!(other.iter().all(Option::is_none));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// `backup_to` writes a consistent copy of the live database (readable with
+/// plain SQLite), creates missing parent directories, and refuses to
+/// overwrite an existing file (callers rotate first).
+#[test]
+fn backup_to_writes_consistent_copy_and_refuses_existing_target() {
+    let dir = temp_dir("backup");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    store
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: 1_000_000,
+                source_last_modified: Some(999_000),
+                entry_count: 1,
+                dropped_count: 0,
+                status: SnapshotStatus::Ok,
+            },
+            &[listing(10, &item(1), 100, 20)],
+            b"payload".as_slice(),
+        )
+        .expect("record");
+
+    // The backup's parent directory does not exist yet: it is created.
+    let backup_path = dir.join("backups").join("nightly.sqlite3");
+    store.backup_to(&backup_path).expect("backup_to");
+    assert!(
+        std::fs::metadata(&backup_path).expect("backup file exists").len() > 0,
+        "backup file is non-empty"
+    );
+
+    // The copy is a real database holding the seeded snapshot row.
+    let copy = rusqlite::Connection::open_with_flags(
+        &backup_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open backup read-only");
+    let (backed_target, entry_count): (String, i64) = copy
+        .query_row("SELECT target_id, entry_count FROM snapshots WHERE id = 1", [], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })
+        .expect("seeded snapshot row in backup");
+    assert_eq!(backed_target, "us-4");
+    assert_eq!(entry_count, 1);
+
+    // `VACUUM INTO` refuses an existing target file.
+    let error = store.backup_to(&backup_path).expect_err("second backup must fail");
+    assert!(matches!(error, StoreError::Backend(message) if message.contains("backup")));
 
     std::fs::remove_dir_all(&dir).ok();
 }

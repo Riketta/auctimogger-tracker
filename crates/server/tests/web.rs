@@ -149,6 +149,9 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             database: "web-test.sqlite3".into(),
             raw_listing_days: 7,
             archive_dir: "raw".into(),
+            backup_dir: None,
+            backup_secs: 0,
+            backup_keep: 7,
         },
         metrics: MetricsConfig {
             spans: vec![amtracker_core::domain::Span::D1, amtracker_core::domain::Span::D7],

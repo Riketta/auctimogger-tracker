@@ -893,6 +893,9 @@ fn opportunity_config() -> TrackerConfig {
             database: "mem.sqlite3".into(),
             raw_listing_days: 7,
             archive_dir: "raw".into(),
+            backup_dir: None,
+            backup_secs: 0,
+            backup_keep: 7,
         },
         metrics: amtracker_core::config::MetricsConfig {
             spans: vec![amtracker_core::domain::Span::D1],

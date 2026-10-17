@@ -17,6 +17,7 @@ use std::{
         self,
         AssertUnwindSafe,
     },
+    path::Path,
     sync::{
         Arc,
         Mutex,
@@ -36,6 +37,7 @@ use amtracker_core::{
         PayloadKind,
         TargetId,
     },
+    error::StoreError,
     services::{
         feed_export::ExportOptions,
         opportunity::SCAN_TTL_SECONDS,
@@ -47,6 +49,11 @@ use crate::web::AppState;
 /// How often the loop wakes up to check whether a cycle is due.
 const TICK: Duration = Duration::from_secs(30);
 
+/// Store-wide online-backup hook: writes a consistent copy of the database to
+/// the given path. Injected by the composition root (which owns the concrete
+/// store) so the scheduler — and this crate — never needs the adapter type.
+pub type BackupHook = Arc<dyn Fn(&Path) -> Result<(), StoreError> + Send + Sync>;
+
 /// Per-target operational state: last cycle run, last prune day, last publish.
 #[derive(Default)]
 struct TargetTimers {
@@ -57,16 +64,24 @@ struct TargetTimers {
 
 /// Spawns the background poll loop: ingestion cycles for every configured
 /// target on its configured cadence, raw-listing pruning once per UTC day per
-/// target, and feed re-publication per target at most every
-/// `server.feed_publish_secs`. Outcomes are emitted via `tracing` (info on
-/// success, warn on failures — the warn path is what surfaces in Sentry). A
-/// panicking cycle is caught and logged so one bad fetch can never silently
-/// kill ingestion while the web UI keeps serving.
+/// target, feed re-publication per target at most every
+/// `server.feed_publish_secs`, and — when `storage.backup_dir` is configured
+/// with a positive `backup_secs` — a store-wide online backup through `hook`
+/// (retention-pruned to `storage.backup_keep`). Outcomes are emitted via
+/// `tracing` (info on success, warn on failures — the warn path is what
+/// surfaces in Sentry). A panicking cycle is caught and logged so one bad
+/// fetch can never silently kill ingestion while the web UI keeps serving.
+///
+/// `backup` is the composition root's store-backed writer; `None` simply
+/// disables the backup branch (the CLI never schedules backups).
 ///
 /// # Errors
 /// Returns the [`std::io::Error`] from [`thread::Builder::spawn`] when the OS
 /// refuses to start the scheduler thread.
-pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
+pub fn spawn(
+    state: Arc<AppState>,
+    backup: Option<BackupHook>,
+) -> std::io::Result<thread::JoinHandle<()>> {
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
         // Prepare every configured target's opportunity scan before the first
@@ -82,6 +97,7 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
         // lock can only come from a panic inside this very loop; recover
         // the guard instead of panicking on poison.
         let timers = Mutex::new(TargetTimers::default());
+        let mut last_backup: Option<Instant> = None;
         loop {
             for target in &config.targets {
                 for (kind, interval) in [
@@ -123,10 +139,101 @@ pub fn spawn(state: Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
                     });
                 }
             }
+            // Store-wide online backup on its own cadence (disabled unless
+            // both `backup_dir` and a positive `backup_secs` are set).
+            if let Some(hook) = &backup {
+                if config.storage.backup_dir.is_some() && config.storage.backup_secs > 0 {
+                    let due = last_backup
+                        .is_none_or(|last| last.elapsed().as_secs() >= config.storage.backup_secs);
+                    if due {
+                        run_backup_logged(&state, &config, hook);
+                        last_backup = Some(Instant::now());
+                    }
+                }
+            }
             tracing::trace!(tick_secs = TICK.as_secs(), "scheduler tick");
             thread::sleep(TICK);
         }
     })
+}
+
+/// Runs one scheduled online backup under `catch_unwind`: writes
+/// `amtracker-backup-<UTC stamp>.sqlite3` into `storage.backup_dir`, then
+/// prunes the oldest backup files down to `storage.backup_keep`. Failures are
+/// logged and retried on the next cadence tick.
+fn run_backup_logged(
+    state: &Arc<AppState>,
+    config: &amtracker_core::config::TrackerConfig,
+    hook: &BackupHook,
+) {
+    survive("backup", "-", || {
+        let Some(dir) = &config.storage.backup_dir else {
+            return;
+        };
+        std::fs::create_dir_all(dir)
+            .map_err(
+                |e| tracing::warn!(error = %e, dir = %dir.display(), "backup dir create failed"),
+            )
+            .ok();
+        let stamp = time::OffsetDateTime::from_unix_timestamp(state.clock.now())
+            .ok()
+            .and_then(|ts| {
+                ts.format(&time::macros::format_description!(
+                    "[year][month][day]T[hour][minute][second]Z"
+                ))
+                .ok()
+            })
+            .unwrap_or_else(|| state.clock.now().to_string());
+        let mut path = dir.join(format!("amtracker-backup-{stamp}.sqlite3"));
+        if path.exists() {
+            // Same-second collision: disambiguate with the pid.
+            path = dir.join(format!("amtracker-backup-{stamp}-{}.sqlite3", std::process::id()));
+        }
+        match hook(&path) {
+            Ok(()) => {
+                let bytes = std::fs::metadata(&path).map_or(0, |m| m.len());
+                tracing::info!(path = %path.display(), bytes, "scheduled backup written");
+                prune_backups(dir, config.storage.backup_keep);
+            }
+            Err(error) => {
+                tracing::warn!(error = %error, path = %path.display(), "scheduled backup failed");
+            }
+        }
+    });
+}
+
+/// Keeps the newest `keep` files named `amtracker-backup-*.sqlite3` in `dir`
+/// (names sort chronologically); anything older is removed. Best effort:
+/// listing or unlink failures are logged, never fatal.
+fn prune_backups(dir: &Path, keep: u32) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut backups: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name().and_then(|name| name.to_str()).is_some_and(|name| {
+                name.starts_with("amtracker-backup-") && name.ends_with(".sqlite3")
+            })
+        })
+        .collect();
+    backups.sort();
+    // `usize::from(u32)` does not exist (lossy on 16-bit targets); the
+    // TryFrom conversion is total on everything we support.
+    let keep = usize::try_from(u64::from(keep)).unwrap_or(usize::MAX);
+    if backups.len() <= keep {
+        return;
+    }
+    let stale = backups.len() - keep;
+    for path in backups.into_iter().take(stale) {
+        match std::fs::remove_file(&path) {
+            Ok(()) => tracing::debug!(path = %path.display(), "old backup pruned"),
+            Err(error) => {
+                tracing::warn!(error = %error, path = %path.display(), "backup prune failed");
+            }
+        }
+    }
 }
 
 /// Runs one due ingest cycle under `catch_unwind`, logging the outcome and

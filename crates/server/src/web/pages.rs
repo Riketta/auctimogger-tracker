@@ -742,6 +742,8 @@ async fn item_detail_page(
                         "median": block.median,
                         "p05": block.p05,
                         "p75": block.p75,
+                        "p95": block.p95,
+                        "vwap": block.vwap,
                         "qty": block.qty_sum,
                         "n": block.n,
                     }));
@@ -797,10 +799,12 @@ async fn item_detail_page(
              <div class=\"chart-legend\">\
              <span class=\"key\"><span class=\"swatch\" style=\"background:rgba(90,162,255,0.35)\"></span> {}</span>\
              <span class=\"key\"><span class=\"swatch\" style=\"background:#5aa2ff\"></span> {}</span>\
+             <span class=\"key\"><span class=\"swatch vwap\"></span> {}</span>\
              </div>",
             json_island(&serde_json::json!({ "days": chart_rows.clone() })),
-            tip("typical range", "p05–p75 band: 80% of observed prices fell inside it (the golden engine computes it per day)."),
-            tip("median", "Day median of unique auctions, each counted once at its last observed price.")
+            tip("typical range", "p05–p95 band: 90% of observed prices fell inside it (the golden engine computes it per day)."),
+            tip("median", "Day median of unique auctions, each counted once at its last observed price."),
+            tip("vwap", "Volume-weighted average price: Σ(price × qty) ÷ Σqty over the day's auctions.")
         );
     }
     body.push_str("</div>");

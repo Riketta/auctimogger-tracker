@@ -57,6 +57,13 @@ struct Cli {
 enum Commands {
     /// Parse and validate a config file, then print a summary.
     ConfigCheck { path: PathBuf },
+    /// Write a consistent online backup of the database, then exit.
+    Backup {
+        #[arg(long)]
+        config: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     /// Run one ingestion cycle now (all targets, or `--target` only).
     Fetch {
         #[arg(long)]
@@ -98,6 +105,7 @@ fn main() {
     let cli = Cli::parse();
     let code = match cli.command {
         Commands::ConfigCheck { path } => run_config_check(&path),
+        Commands::Backup { config, out } => run_backup(&config, &out),
         Commands::Fetch { config, target } => {
             with_observability(&config, |loaded| run_fetch(&loaded.tracker, target.as_deref()))
         }
@@ -165,6 +173,37 @@ fn run_config_check(path: &Path) -> i32 {
     0
 }
 
+/// Writes one consistent online backup of the database (`VACUUM INTO`), then
+/// exits: safe to run against a live `serve`, since it reads the store like
+/// any other client.
+fn run_backup(path: &Path, out: &Path) -> i32 {
+    let loaded = match load_config(path) {
+        Ok(loaded) => loaded,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
+    let store = match open_store(&loaded.tracker, clock) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    match store.backup_to(out) {
+        Ok(()) => {
+            println!("backup written: {}", out.display());
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {error}");
+            1
+        }
+    }
+}
+
 fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
     // Fail fast BEFORE any state is created: an open mutating API on a
     // non-loopback bind, or missing ingestion credentials, must abort in
@@ -195,8 +234,47 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
     let item_info = Arc::new(BlizzardItemInfo::from_config(config));
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
+    let state = build_app_state(config, &clock, &store, item_info, metrics);
 
-    let state = Arc::new(AppState {
+    // Store-backed online-backup writer for the scheduler; the hook keeps the
+    // server crate free of the concrete adapter type.
+    let backup_hook: amtracker_server::scheduler::BackupHook = {
+        let store = store.clone();
+        Arc::new(move |path| store.backup_to(path))
+    };
+    if let Err(error) = amtracker_server::scheduler::spawn(state.clone(), Some(backup_hook)) {
+        tracing::error!(error = %error, "scheduler thread failed to start");
+        eprintln!("error: scheduler thread failed to start: {error}");
+        return 1;
+    }
+
+    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            tracing::error!(error = %error, "tokio runtime build failed");
+            eprintln!("error: tokio runtime build failed: {error}");
+            return 1;
+        }
+    };
+    tracing::info!(bind = %bind, "listening");
+    if let Err(error) = runtime.block_on(amtracker_server::web::serve(state, bind)) {
+        tracing::error!(error = %error, "server error");
+        eprintln!("error: server error: {error}");
+        return 1;
+    }
+    0
+}
+
+/// Assembles the shared application state for `serve`: every port wiring
+/// lives here so `run_serve` stays a readable startup sequence.
+fn build_app_state(
+    config: &amtracker_core::config::TrackerConfig,
+    clock: &Arc<dyn amtracker_core::ports::ClockPort>,
+    store: &Arc<SqliteStore>,
+    item_info: Arc<BlizzardItemInfo>,
+    metrics: Arc<MetricsService>,
+) -> Arc<AppState> {
+    Arc::new(AppState {
         config: config.clone(),
         clock: clock.clone(),
         health: Arc::new(amtracker_core::services::health::HealthService::new(
@@ -253,29 +331,7 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         // Dashboard-visible ingest history (bounded ring).
         recent_cycles: Arc::new(amtracker_server::web::RecentCycles::new(24)),
-    });
-
-    if let Err(error) = amtracker_server::scheduler::spawn(state.clone()) {
-        tracing::error!(error = %error, "scheduler thread failed to start");
-        eprintln!("error: scheduler thread failed to start: {error}");
-        return 1;
-    }
-
-    let runtime = match tokio::runtime::Builder::new_multi_thread().enable_all().build() {
-        Ok(runtime) => runtime,
-        Err(error) => {
-            tracing::error!(error = %error, "tokio runtime build failed");
-            eprintln!("error: tokio runtime build failed: {error}");
-            return 1;
-        }
-    };
-    tracing::info!(bind = %bind, "listening");
-    if let Err(error) = runtime.block_on(amtracker_server::web::serve(state, bind)) {
-        tracing::error!(error = %error, "server error");
-        eprintln!("error: server error: {error}");
-        return 1;
-    }
-    0
+    })
 }
 
 /// Opens the SQLite store (shared by every command that touches state).

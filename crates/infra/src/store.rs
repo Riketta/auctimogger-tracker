@@ -303,6 +303,27 @@ impl SqliteStore {
             .map(str::to_string)
             .ok_or_else(|| StoreError::Backend("archive path is not valid utf-8".into()))
     }
+
+    /// Writes a consistent online backup of the database to `path` using
+    /// `VACUUM INTO` (a read transaction over the live store; safe while
+    /// `serve` runs). The parent directory is created if needed. Fails when
+    /// the file already exists — callers rotate first.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`StoreError::Backend`] when the parent directory cannot be
+    /// created or the `VACUUM INTO` statement fails (including an existing
+    /// target file).
+    pub fn backup_to(&self, path: &Path) -> Result<(), StoreError> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| backend("create backup dir", e))?;
+        }
+        // `VACUUM INTO` takes a filename literal, not a bound parameter, so
+        // the path is inlined as a quoted SQL string (single quotes doubled).
+        let sql = format!("VACUUM INTO '{}'", path.to_string_lossy().replace('\'', "''"));
+        self.open_transaction().execute_batch(&sql).map_err(|e| backend("backup", e))?;
+        Ok(())
+    }
 }
 
 impl SnapshotRepository for SqliteStore {

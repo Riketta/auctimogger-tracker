@@ -387,6 +387,9 @@ mod tests {
                 database: "mem.sqlite3".into(),
                 raw_listing_days: 7,
                 archive_dir: "raw".into(),
+                backup_dir: None,
+                backup_secs: 0,
+                backup_keep: 7,
             },
             metrics: amtracker_core::config::MetricsConfig { spans: vec![Span::D1] },
             opportunities: amtracker_core::config::OpportunitiesConfig {
