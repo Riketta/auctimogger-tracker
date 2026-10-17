@@ -36,8 +36,10 @@ use amtracker_core::{
         FetchOutcome,
         ItemRef,
         ListingKind,
+        NewSnapshot,
         NormalizedListing,
         PayloadKind,
+        SnapshotStatus,
         TargetId,
         TimeLeftBand,
     },
@@ -190,6 +192,15 @@ fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
             &config,
         )),
         watchlist: Arc::new(WatchlistService::new(store.clone(), clock.clone())),
+        watchlist_report: Arc::new(
+            amtracker_core::services::watchlist_report::WatchlistReportService::new(
+                store.clone(),
+                metrics.clone(),
+                store.clone(),
+                store.clone(),
+                clock.clone(),
+            ),
+        ),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),
             store.clone(),
@@ -401,5 +412,127 @@ async fn protected_mode_rejects_unauthenticated_mutations() {
         .expect("response");
     assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "missing bearer rejected");
     std::env::remove_var(TOKEN_ENV);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The live watchlist report: entries join to metric blocks, sale rates and
+/// trend rows, positionally in watchlist order — the JSON contract behind the
+/// watchlist page columns.
+#[tokio::test]
+async fn watchlist_metrics_api_joins_entries_to_market_numbers() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    let target = TargetId(TARGET.into());
+    state
+        .watchlist
+        .add(&target, ItemRef::Item { item_id: 2589 }, Some("flip".into()))
+        .expect("watch item");
+    state
+        .watchlist
+        .add(&target, ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 11 }, None)
+        .expect("watch pet");
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/watchlist/metrics?target=t1&span=d1,d7")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let entries = json.get("entries").and_then(Value::as_array).expect("entries array");
+    assert_eq!(entries.len(), 2, "one entry per watchlist row, in order");
+    let item_entry = &entries[0];
+    assert_eq!(item_entry.get("note").and_then(Value::as_str), Some("flip"));
+    assert!(
+        item_entry.get("metrics").and_then(|m| m.get("d7")).is_some(),
+        "seeded folds produce a d7 block"
+    );
+    assert!(
+        item_entry.get("trend").and_then(Value::as_array).is_some_and(|t| t.len() >= 2),
+        "both seeded days are trend rows"
+    );
+    let pet_entry = &entries[1];
+    assert!(
+        pet_entry.get("metrics").and_then(Value::as_object).is_some_and(serde_json::Map::is_empty),
+        "a data-less pet yields an empty metrics map, not an error"
+    );
+
+    let (status, _) =
+        get(build_router_arc(Arc::clone(&state)), "/api/watchlist/metrics?target=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown target rejected");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Pet metrics need the full identity tuple: partial queries are rejected,
+/// complete ones serve the (possibly empty) span map.
+#[tokio::test]
+async fn pet_metrics_api_requires_the_full_identity_tuple() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) = get(router.clone(), "/api/items/t1/pet/264/metrics").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "missing level/quality/breed rejected");
+    let (status, body) =
+        get(router, "/api/items/t1/pet/264/metrics?level=1&quality=3&breed=11").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert!(json.as_object().is_some_and(serde_json::Map::is_empty), "no data → no span keys");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The snapshot browser's JSON twin: metadata rows with the wire field
+/// spellings, filterable by payload kind.
+#[tokio::test]
+async fn snapshots_api_serves_filterable_metadata() {
+    let (state, root) = test_state(None);
+    let target = TargetId(TARGET.into());
+    state
+        .snapshots
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: 1_000_001,
+                source_last_modified: Some(999),
+                entry_count: 3,
+                dropped_count: 1,
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            br"[]",
+        )
+        .expect("record");
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/snapshots?target=t1&limit=10").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let rows = json.get("snapshots").and_then(Value::as_array).expect("snapshots array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].get("entryCount").and_then(Value::as_u64), Some(3));
+    assert_eq!(rows[0].get("droppedCount").and_then(Value::as_u64), Some(1));
+    assert_eq!(rows[0].get("sourceLastModified").and_then(Value::as_i64), Some(999));
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/snapshots?target=t1&kind=auctions").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        json.get("snapshots").and_then(Value::as_array).map(std::vec::Vec::len),
+        Some(0),
+        "kind filter excludes other kinds"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Search responses carry the paging envelope (offset/limit/hasMore) so
+/// clients can page without guessing.
+#[tokio::test]
+async fn search_api_reports_the_paging_envelope() {
+    let (state, root) = test_state(None);
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/search?q=linen&limit=5&offset=3").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json.get("offset").and_then(Value::as_u64), Some(3));
+    assert_eq!(json.get("limit").and_then(Value::as_u64), Some(5));
+    assert_eq!(json.get("hasMore").and_then(Value::as_bool), Some(false));
     std::fs::remove_dir_all(&root).ok();
 }

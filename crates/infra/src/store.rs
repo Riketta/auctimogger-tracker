@@ -1120,6 +1120,61 @@ impl MetricsCacheRepository for SqliteStore {
         }
         Ok(())
     }
+
+    fn get_many(
+        &self,
+        target: &TargetId,
+        span: Span,
+        items: &[ItemRef],
+    ) -> Result<Vec<Option<amtracker_core::domain::CachedBlock>>, StoreError> {
+        /// Ids per query — mirrors `sale_rates_by_id`'s chunking: one
+        /// watchlist-scale read stays a handful of selects, far under the
+        /// driver's bound-parameter ceiling.
+        const CACHE_GET_CHUNK: usize = 500;
+        if items.is_empty() {
+            return Ok(Vec::new());
+        }
+        let conn = self.open_transaction();
+        // Positional resolution: unknown identities have no cache rows (the
+        // same rule `put` applies), so they read back as `None`.
+        let mut ids: Vec<Option<i64>> = Vec::with_capacity(items.len());
+        for item in items {
+            ids.push(lookup_item_ref(&conn, item)?);
+        }
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        let mut by_id: HashMap<i64, amtracker_core::domain::CachedBlock> = HashMap::new();
+        for chunk in known.chunks(CACHE_GET_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT item_ref_id, computed_at, block_json FROM metrics_cache
+                 WHERE target_id = ? AND span = ? AND item_ref_id IN ({placeholders})"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+            params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+            params.push(rusqlite::types::Value::Text(span.name().to_string()));
+            for id in chunk {
+                params.push(rusqlite::types::Value::Integer(*id));
+            }
+            let mut statement =
+                conn.prepare(&sql).map_err(|e| backend("prepare metrics cache get_many", e))?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|e| backend("query metrics cache get_many", e))?;
+            for row in rows {
+                let (id, computed_at, json) =
+                    row.map_err(|e| backend("metrics cache get_many row", e))?;
+                let ser: SerMetricBlock =
+                    serde_json::from_str(&json).map_err(|e| backend("deserialize block", e))?;
+                by_id.insert(
+                    id,
+                    amtracker_core::domain::CachedBlock { block: ser.into(), computed_at },
+                );
+            }
+        }
+        Ok(ids.into_iter().map(|id| id.and_then(|id| by_id.remove(&id))).collect())
+    }
 }
 
 impl WatchlistRepository for SqliteStore {
@@ -1229,7 +1284,12 @@ impl ItemCatalogRepository for SqliteStore {
         Ok(())
     }
 
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>, StoreError> {
         let conn = self.open_transaction();
         let sanitized = query.replace(['%', '_'], "");
         let pattern = format!("%{sanitized}%");
@@ -1244,11 +1304,16 @@ impl ItemCatalogRepository for SqliteStore {
                      WHERE name LIKE ?1 COLLATE NOCASE
                  )
                  ORDER BY (name LIKE ?2 COLLATE NOCASE) DESC, name
-                 LIMIT ?3",
+                 LIMIT ?3 OFFSET ?4",
             )
             .map_err(|e| backend("prepare search", e))?;
         let mut rows = statement
-            .query(rusqlite::params![pattern, prefix, i64::try_from(limit).unwrap_or(i64::MAX)])
+            .query(rusqlite::params![
+                pattern,
+                prefix,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+                i64::try_from(offset).unwrap_or(i64::MAX),
+            ])
             .map_err(|e| backend("query search", e))?;
         let mut out = Vec::new();
         while let Some(row) = rows.next().map_err(|e| backend("search next", e))? {

@@ -220,6 +220,15 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
             store.clone(),
             clock.clone(),
         )),
+        watchlist_report: Arc::new(
+            amtracker_core::services::watchlist_report::WatchlistReportService::new(
+                store.clone(),
+                metrics.clone(),
+                store.clone(),
+                store.clone(),
+                clock.clone(),
+            ),
+        ),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),
             store.clone(),

@@ -177,11 +177,14 @@ switcher in the top bar works on every target-scoped page.
 | Endpoint | Purpose |
 |---|---|
 | `GET /api/health` | liveness probe (uptime monitoring) |
-| `GET /api/search?q=…` | id/name search over items and pet species (kind-aware hits) |
-| `GET /api/opportunities` · `/api/overview` | ranked deals, market dynamics |
+| `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
+| `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics (overview rows 1–50, default 15) |
 | `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
+| `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
+| `GET /api/snapshots?target=&kind=&limit=` | snapshot metadata rows, newest first (`kind=commodities\|auctions`) |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
+| `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` | every watchlist entry joined to its metric blocks, sale rate and 30-day trend — one batched read (the live watchlist page's contract) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
 

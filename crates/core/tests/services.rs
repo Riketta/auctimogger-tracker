@@ -20,6 +20,7 @@ use amtracker_core::{
         TrackerConfig,
     },
     domain::{
+        utc_day,
         FetchOutcome,
         ItemDayRow,
         ItemRef,
@@ -28,6 +29,7 @@ use amtracker_core::{
         PayloadKind,
         SnapshotMeta,
         SnapshotStatus,
+        Span,
         TargetId,
         TimeLeftBand,
     },
@@ -197,6 +199,9 @@ impl SnapshotRepository for FakeSnapshots {
 #[derive(Default)]
 struct FakeHistory {
     folds: Mutex<HashMap<FoldKey, DayFold>>,
+    /// Rows served by `item_day_rows_for_item` (filtered by item and
+    /// `since_day`).
+    item_rows: Mutex<Vec<ItemDayRow>>,
 }
 
 impl PriceHistoryRepository for FakeHistory {
@@ -243,10 +248,11 @@ impl PriceHistoryRepository for FakeHistory {
     fn item_day_rows_for_item(
         &self,
         _target: &TargetId,
-        _item: &ItemRef,
-        _since_day: i64,
+        item: &ItemRef,
+        since_day: i64,
     ) -> Result<Vec<amtracker_core::domain::ItemDayRow>, StoreError> {
-        Ok(Vec::new())
+        let rows = self.item_rows.lock().unwrap();
+        Ok(rows.iter().filter(|row| &row.item == item && row.day >= since_day).cloned().collect())
     }
 }
 
@@ -299,11 +305,18 @@ struct FakeSales {
     observes: Mutex<usize>,
     closes: Mutex<usize>,
     credits: Mutex<Vec<amtracker_core::domain::SaleCredit>>,
+    /// Optional per-item rates served by `sale_rate` (default: none).
+    rates: Mutex<HashMap<ItemRef, f64>>,
 }
 
 impl FakeSales {
     fn with_credits(credits: Vec<amtracker_core::domain::SaleCredit>) -> Self {
-        Self { observes: Mutex::new(0), closes: Mutex::new(0), credits: Mutex::new(credits) }
+        Self {
+            observes: Mutex::new(0),
+            closes: Mutex::new(0),
+            credits: Mutex::new(credits),
+            rates: Mutex::new(HashMap::new()),
+        }
     }
 }
 
@@ -334,10 +347,10 @@ impl SalesRepository for FakeSales {
     fn sale_rate(
         &self,
         _target: &TargetId,
-        _item: &ItemRef,
+        item: &ItemRef,
         _days: i64,
     ) -> Result<Option<f64>, StoreError> {
-        Ok(None)
+        Ok(self.rates.lock().unwrap().get(item).copied())
     }
 }
 
@@ -618,6 +631,100 @@ fn watchlist_service_adds_lists_and_rejects_duplicates() {
     assert!(service.remove(&target, &pet).expect("remove"));
     assert!(!service.remove(&target, &pet).expect("remove again"));
     assert_eq!(service.list(&target).expect("list").len(), 0);
+}
+
+#[test]
+fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
+    let today = 1_000_000; // utc day 11
+    let item1 = item(1);
+    let pet = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
+
+    let watchlist = Arc::new(FakeWatchlist::default());
+    watchlist
+        .add(&NewWatchlistEntry {
+            target: TargetId("us-4".into()),
+            item: item1.clone(),
+            note: Some("flip candidate".into()),
+        })
+        .expect("add item");
+    watchlist
+        .add(&NewWatchlistEntry { target: TargetId("us-4".into()), item: pet.clone(), note: None })
+        .expect("add pet");
+
+    // One fold per day for the last 7 days at price 100; the pet has none.
+    let history = Arc::new(FakeHistory::default());
+    for offset in 0..7 {
+        let mut fold = DayFold::new(item1.clone());
+        fold.apply(&[listing(offset, &item1, 100, 1)]);
+        history
+            .save_fold(&TargetId("us-4".into()), &item1, utc_day(today) - offset, &fold)
+            .expect("save fold");
+    }
+    // Trend rows: one inside the 30-day window, one far outside it.
+    *history.item_rows.lock().unwrap() = vec![
+        ItemDayRow {
+            item: item1.clone(),
+            day: utc_day(today),
+            listing_count: 1,
+            qty_sum: 1,
+            min: 90,
+            median: 100,
+            mad: 0,
+        },
+        ItemDayRow {
+            item: item1.clone(),
+            day: utc_day(today) - 40,
+            listing_count: 1,
+            qty_sum: 1,
+            min: 500,
+            median: 500,
+            mad: 0,
+        },
+    ];
+
+    let sales = Arc::new(FakeSales::default());
+    sales.rates.lock().unwrap().insert(item1.clone(), 0.5);
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history.clone(),
+        Arc::new(FakeCache::default()),
+        sales.clone(),
+        Arc::new(FixedClock(today)),
+    ));
+    let report_service = amtracker_core::services::watchlist_report::WatchlistReportService::new(
+        watchlist,
+        metrics,
+        sales,
+        history,
+        Arc::new(FixedClock(today)),
+    );
+
+    let report = report_service
+        .report(&TargetId("us-4".into()), &[Span::D1, Span::D7], 14, 30)
+        .expect("report");
+    assert_eq!(report.len(), 2);
+
+    // Entry order follows the watchlist; blocks align with the spans.
+    let first = &report[0];
+    assert_eq!(first.entry.item, item1);
+    assert_eq!(first.blocks.len(), 2);
+    let d1 = first.blocks[0].as_ref().expect("d1 block");
+    let d7 = first.blocks[1].as_ref().expect("d7 block");
+    assert_eq!(d1.n, 1);
+    assert_eq!(d1.median, 100);
+    assert_eq!(d7.n, 7);
+    assert_eq!(d7.median, 100);
+    assert_eq!(first.sale_rate, Some(0.5));
+    // The 40-day-old trend row is outside the 30-day window.
+    assert_eq!(first.trend.len(), 1);
+    assert_eq!(first.trend[0].median, 100);
+
+    // The pet has no folds, no sales and no trend rows — all `None`, but
+    // still positionally present.
+    let second = &report[1];
+    assert_eq!(second.entry.item, pet);
+    assert!(second.blocks.iter().all(Option::is_none));
+    assert_eq!(second.sale_rate, None);
+    assert_eq!(second.trend.len(), 0);
 }
 
 // --------------------------------------------------------- opportunity scans

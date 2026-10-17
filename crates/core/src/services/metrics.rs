@@ -141,4 +141,34 @@ impl MetricsService {
         let sale_rate = self.sales.sale_rate_multi(target, items, SALE_RATE_WINDOW_DAYS)?;
         Ok(block_from_histograms(std::slice::from_ref(&merged), sale_rate))
     }
+
+    /// Cached-first metric blocks for several identities of one span,
+    /// positionally aligned with `items`; missing or expired entries are
+    /// recomputed (and re-cached) through [`MetricsService::block`]. Batched
+    /// fuel for whole-watchlist views: one bulk cache read, then per-item
+    /// work only for the cold entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cache or any recomputation
+    /// fails.
+    pub fn blocks(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        span: Span,
+    ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
+        let now = self.clock.now();
+        let mut out = Vec::with_capacity(items.len());
+        for (item, cached) in items.iter().zip(self.cache.get_many(target, span, items)?) {
+            if let Some(cached) = cached {
+                if now - cached.computed_at <= MAX_CACHE_AGE_SECONDS {
+                    out.push(Some(cached.block));
+                    continue;
+                }
+            }
+            out.push(self.block(target, item, span)?);
+        }
+        Ok(out)
+    }
 }

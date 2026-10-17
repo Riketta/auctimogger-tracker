@@ -9,3 +9,4 @@ pub mod metrics;
 pub mod opportunity;
 pub mod search;
 pub mod watchlist;
+pub mod watchlist_report;

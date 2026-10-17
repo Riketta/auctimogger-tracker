@@ -83,6 +83,9 @@ pub struct AppState {
     pub opportunities: Arc<OpportunityService>,
     /// User-curated watch list that drives the slim feed export.
     pub watchlist: Arc<WatchlistService>,
+    /// Whole-watchlist market reports (blocks, sale rates, trends) behind
+    /// the live watchlist page and `/api/watchlist/metrics`.
+    pub watchlist_report: Arc<amtracker_core::services::watchlist_report::WatchlistReportService>,
     /// Feed assembly shared by the JSON endpoint and the Lua downloads.
     pub feed_export: Arc<FeedExportService>,
     /// Published feed bytes backing the cached `/feed.lua` download.
@@ -186,6 +189,9 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
                 .post(api::api_watchlist_post)
                 .delete(api::api_watchlist_delete),
         )
+        .route("/api/watchlist/metrics", get(api::api_watchlist_metrics))
+        .route("/api/snapshots", get(api::api_snapshots))
+        .route("/api/items/{target_id}/pet/{species_id}/metrics", get(api::api_item_pet_metrics))
         .route("/api/fetch", post(api::api_fetch))
         .fallback(not_found)
         .with_state(state)

@@ -24,11 +24,16 @@ impl SearchService {
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>, StoreError> {
         let query = query.trim();
         if query.is_empty() {
             return Ok(Vec::new());
         }
-        self.catalog.search(query, limit.max(1))
+        self.catalog.search(query, limit.max(1), offset)
     }
 }

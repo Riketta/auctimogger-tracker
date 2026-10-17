@@ -223,6 +223,8 @@ pub(crate) struct SearchParams {
     q: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    offset: usize,
 }
 
 fn default_limit() -> usize {
@@ -247,35 +249,45 @@ fn item_json(item: &amtracker_core::domain::ItemRef) -> serde_json::Value {
     }
 }
 
-/// `GET /api/search?q=&limit=` — kind-aware catalog search (completions).
+/// `GET /api/search?q=&limit=&offset=` — kind-aware catalog search
+/// (completions and browse pages; page with `offset` until `hasMore` is
+/// false).
 pub(crate) async fn api_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
 ) -> Response {
+    let limit = params.limit.clamp(1, 200);
+    let offset = params.offset;
     let hits = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let q = params.q.clone();
-        let limit = params.limit;
-        move || state.search.search(&q, limit)
+        move || state.search.search(&q, limit, offset)
     });
     match hits.await {
-        Ok(Ok(hits)) => Json(serde_json::json!({
-            "hits": hits.iter().map(|hit| match hit {
-                amtracker_core::domain::SearchHit::Item(record) => serde_json::json!({
-                    "type": "item",
-                    "itemID": record.item_id,
-                    "name": record.name,
-                    "itemClass": record.item_class,
-                    "quality": record.quality,
-                }),
-                amtracker_core::domain::SearchHit::Pet(record) => serde_json::json!({
-                    "type": "pet",
-                    "speciesID": record.species_id,
-                    "name": record.name,
-                }),
-            }).collect::<Vec<_>>(),
-        }))
-        .into_response(),
+        Ok(Ok(hits)) => {
+            let has_more = hits.len() == limit;
+            Json(serde_json::json!({
+                "offset": offset,
+                "limit": limit,
+                "hasMore": has_more,
+                "hits": hits.iter().map(|hit| match hit {
+                    amtracker_core::domain::SearchHit::Item(record) => serde_json::json!({
+                        "type": "item",
+                        "itemID": record.item_id,
+                        "name": record.name,
+                        "itemClass": record.item_class,
+                        "quality": record.quality,
+                    }),
+                    amtracker_core::domain::SearchHit::Pet(record) => serde_json::json!({
+                        "type": "pet",
+                        "speciesID": record.species_id,
+                        "name": record.name,
+                    }),
+                })
+                .collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
         Ok(Err(error)) => internal_error("search", &error),
         Err(error) => internal_error("search-join", &error),
     }
@@ -318,7 +330,7 @@ pub(crate) async fn api_opportunities(
     }
 }
 
-/// `GET /api/overview?target=`
+/// `GET /api/overview?target=&limit=`
 pub(crate) async fn api_overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -327,10 +339,12 @@ pub(crate) async fn api_overview(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let limit =
+        params.get("limit").and_then(|v| v.parse::<usize>().ok()).map_or(15, |v| v.clamp(1, 50));
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.overview(&target, 15)
+        move || state.opportunities.overview(&target, limit)
     });
     match data.await {
         Ok(Ok(data)) => {
@@ -355,9 +369,41 @@ pub(crate) async fn api_overview(
     }
 }
 
+/// JSON shape for one metric block (camelCase on the wire).
+fn metric_block_json(block: &amtracker_core::domain::MetricBlock) -> serde_json::Value {
+    serde_json::json!({
+        "n": block.n, "min": block.min, "p05": block.p05, "p25": block.p25,
+        "median": block.median, "p75": block.p75, "p95": block.p95, "max": block.max,
+        "mad": block.mad, "vwap": block.vwap, "qtySum": block.qty_sum,
+        "listingCount": block.listing_count, "saleRate": block.sale_rate,
+    })
+}
+
+/// Parses the `?span=` list (comma-separated); `d1` when absent.
+fn spans_param(params: &HashMap<String, String>, default: Span) -> Vec<Span> {
+    params
+        .get("span")
+        .map_or_else(|| vec![default], |s| s.split(',').filter_map(Span::parse).collect())
+}
+
+/// Blocking read of one item identity's blocks across `spans`; the shared
+/// body of the item and pet metrics handlers.
+type SpanBlocks = Vec<(Span, Option<amtracker_core::domain::MetricBlock>)>;
+fn fetch_span_blocks(
+    state: &Arc<AppState>,
+    target: &amtracker_core::domain::TargetId,
+    item: &amtracker_core::domain::ItemRef,
+    spans: Vec<Span>,
+) -> Result<SpanBlocks, StoreError> {
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+        out.push((span, state.metrics.block(target, item, span)?));
+    }
+    Ok(out)
+}
+
 /// `GET /api/items/{target_id}/{item_id}/metrics?span=d7,d30` — the same
-/// blocks the item page shows, JSON-shaped. Plain items only (the URL cannot
-/// carry the pet variant tuple).
+/// blocks the item page shows, JSON-shaped.
 pub(crate) async fn api_item_metrics(
     State(state): State<Arc<AppState>>,
     Path((target_id, item_id)): Path<(String, i64)>,
@@ -367,45 +413,91 @@ pub(crate) async fn api_item_metrics(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    let spans: Vec<Span> = params
-        .get("span")
-        .map_or_else(|| vec![Span::D1], |s| s.split(',').filter_map(Span::parse).collect());
+    let spans = spans_param(&params, Span::D1);
     let item = amtracker_core::domain::ItemRef::Item { item_id };
     let computed = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || -> Result<Vec<(Span, Option<amtracker_core::domain::MetricBlock>)>, StoreError> {
-            let mut out = Vec::with_capacity(spans.len());
-            for span in spans {
-                out.push((span, state.metrics.block(&target, &item, span)?));
-            }
-            Ok(out)
-        }
+        move || fetch_span_blocks(&state, &target, &item, spans)
     });
-    let computed = match computed.await {
-        Ok(Ok(computed)) => computed,
-        Ok(Err(error)) => {
-            return internal_error("item-metrics", &error);
-        }
-        Err(error) => {
-            return internal_error("item-metrics-join", &error);
-        }
+    blocks_response(computed.await)
+}
+
+/// `GET /api/items/{target_id}/pet/{species_id}/metrics?level=&quality=&breed=&span=…`
+/// — the pet-variant twin of [`api_item_metrics`]: the identity is the full
+/// species/level/quality/breed tuple, matching the HTML pet links and the
+/// watchlist item shape.
+pub(crate) async fn api_item_pet_metrics(
+    State(state): State<Arc<AppState>>,
+    Path((target_id, species_id)): Path<(String, i64)>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match known_target(&state.config, &target_id) {
+        Ok(target) => target,
+        Err(response) => return *response,
     };
-    let mut out = serde_json::Map::new();
-    for (span, block) in computed {
-        if let Some(block) = block {
-            out.insert(
-                span.name().to_string(),
-                serde_json::json!({
-                    "n": block.n, "min": block.min, "p05": block.p05, "p25": block.p25,
-                    "median": block.median, "p75": block.p75, "p95": block.p95, "max": block.max,
-                    "mad": block.mad, "vwap": block.vwap, "qtySum": block.qty_sum,
-                    "listingCount": block.listing_count, "saleRate": block.sale_rate,
-                }),
-            );
-        }
+    let item = match pet_ref_from_params(&params, species_id) {
+        Ok(item) => item,
+        Err(response) => return *response,
+    };
+    let spans = spans_param(&params, Span::D1);
+    let computed = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || fetch_span_blocks(&state, &target, &item, spans)
+    });
+    blocks_response(computed.await)
+}
+
+/// Builds the pet [`ItemRef`] from the required `level`, `quality` and
+/// `breed` query parameters (all three, or the identity is ambiguous).
+fn pet_ref_from_params(
+    params: &HashMap<String, String>,
+    species_id: i64,
+) -> Result<amtracker_core::domain::ItemRef, Box<Response>> {
+    let missing = ["level", "quality", "breed"]
+        .into_iter()
+        .filter(|key| params.get(*key).is_none_or(|v| v.parse::<i32>().is_err()))
+        .collect::<Vec<_>>();
+    if !missing.is_empty() {
+        return Err(Box::new(
+            (
+                StatusCode::BAD_REQUEST,
+                format!("missing or non-numeric query parameter(s): {}", missing.join(", ")),
+            )
+                .into_response(),
+        ));
     }
-    Json(serde_json::Value::Object(out)).into_response()
+    // Unwrap-free parsing: the `missing` filter proved every value parses.
+    let parse =
+        |key: &str| -> i32 { params.get(key).and_then(|v| v.parse().ok()).unwrap_or_default() };
+    Ok(amtracker_core::domain::ItemRef::Pet {
+        species: species_id,
+        level: parse("level"),
+        quality: parse("quality"),
+        breed: parse("breed"),
+    })
+}
+
+/// Shared response assembly for the metrics handlers: span-keyed JSON object
+/// holding each block; spans without data are omitted (matching the item
+/// page, which shows "no data").
+fn blocks_response(
+    computed: Result<Result<SpanBlocks, StoreError>, tokio::task::JoinError>,
+) -> Response {
+    match computed {
+        Ok(Ok(computed)) => {
+            let mut out = serde_json::Map::new();
+            for (span, block) in computed {
+                if let Some(block) = block {
+                    out.insert(span.name().to_string(), metric_block_json(&block));
+                }
+            }
+            Json(serde_json::Value::Object(out)).into_response()
+        }
+        Ok(Err(error)) => internal_error("item-metrics", &error),
+        Err(error) => internal_error("item-metrics-join", &error),
+    }
 }
 
 /// `GET /api/feed.json?target=` — the full feed, JSON rendering.
@@ -438,6 +530,127 @@ pub(crate) async fn api_feed_json(
         Ok(Err(error)) => internal_error("feed-json", &error),
         Err(error) => internal_error("feed-json-join", &error),
     }
+}
+
+/// `GET /api/snapshots?target=&kind=&limit=` — the snapshot browser's rows,
+/// JSON-shaped: newest first per payload kind, filtered to one kind when
+/// `kind=commodities|auctions` is given.
+pub(crate) async fn api_snapshots(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let kinds: Vec<PayloadKind> = match params.get("kind") {
+        Some(raw) => match PayloadKind::parse(raw) {
+            Some(kind) => vec![kind],
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind '{raw}' (expected commodities|auctions)"),
+                )
+                    .into_response();
+            }
+        },
+        None => vec![PayloadKind::Commodities, PayloadKind::Auctions],
+    };
+    let limit =
+        params.get("limit").and_then(|v| v.parse::<usize>().ok()).map_or(50, |v| v.clamp(1, 500));
+    let rows = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || -> Result<Vec<amtracker_core::domain::SnapshotMeta>, StoreError> {
+            let mut out = Vec::new();
+            for kind in kinds {
+                out.extend(state.snapshots.list_recent(&target, kind, limit)?);
+            }
+            Ok(out)
+        }
+    });
+    match rows.await {
+        Ok(Ok(rows)) => Json(serde_json::json!({
+            "target": target.as_str(),
+            "snapshots": rows.iter().map(|meta| serde_json::json!({
+                "id": meta.id,
+                "target": meta.target.as_str(),
+                "kind": meta.kind.as_str(),
+                "fetchedAt": meta.fetched_at,
+                "sourceLastModified": meta.source_last_modified,
+                "entryCount": meta.entry_count,
+                "droppedCount": meta.dropped_count,
+                "status": format!("{:?}", meta.status),
+            }))
+            .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("snapshots", &error),
+        Err(error) => internal_error("snapshots-join", &error),
+    }
+}
+
+/// `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` — every
+/// watchlist entry joined to its current market numbers in one batched read:
+/// metric blocks per requested span, trailing sale rate and per-day trend
+/// rows. The machine contract behind the live watchlist page.
+pub(crate) async fn api_watchlist_metrics(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let spans = spans_param(&params, Span::D7);
+    let sale_days = days_param(&params, "sale_days", 14);
+    let trend_days = days_param(&params, "trend_days", 30);
+    let report = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        let spans = spans.clone();
+        move || state.watchlist_report.report(&target, &spans, sale_days, trend_days)
+    });
+    let span_names: Vec<&'static str> = spans.iter().map(Span::name).collect();
+    match report.await {
+        Ok(Ok(entries)) => Json(serde_json::json!({
+            "target": target.as_str(),
+            "spans": span_names,
+            "saleDays": sale_days,
+            "trendDays": trend_days,
+            "entries": entries.iter().map(|entry| serde_json::json!({
+                "item": item_json(&entry.entry.item),
+                "note": entry.entry.note,
+                "addedAt": entry.entry.added_at,
+                "metrics": entry
+                    .blocks
+                    .iter()
+                    .zip(spans.iter())
+                    .filter_map(|(block, span)| block.as_ref().map(|b| (span.name(), b)))
+                    .map(|(name, block)| (name.to_string(), metric_block_json(block)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>(),
+                "saleRate": entry.sale_rate,
+                "trend": entry.trend.iter().map(|row| serde_json::json!({
+                    "day": row.day,
+                    "listingCount": row.listing_count,
+                    "qtySum": row.qty_sum,
+                    "min": row.min,
+                    "median": row.median,
+                    "mad": row.mad,
+                }))
+                .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("watchlist-metrics", &error),
+        Err(error) => internal_error("watchlist-metrics-join", &error),
+    }
+}
+
+/// Parses an optional day-window query parameter, clamped to 1..=90.
+fn days_param(params: &HashMap<String, String>, key: &str, default: i64) -> i64 {
+    params.get(key).and_then(|v| v.parse::<i64>().ok()).map_or(default, |v| v.clamp(1, 90))
 }
 
 #[derive(Deserialize)]

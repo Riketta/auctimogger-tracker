@@ -455,7 +455,7 @@ pub(crate) async fn items_page(
         let hits = tokio::task::spawn_blocking({
             let state = Arc::clone(&state);
             let query = query.clone();
-            move || state.search.search(&query, 25)
+            move || state.search.search(&query, 25, 0)
         });
         match hits.await {
             Ok(Ok(hits)) => {
@@ -1178,13 +1178,13 @@ pub(crate) async fn watchlist_page(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    let entries = tokio::task::spawn_blocking({
+    let report = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.watchlist.list(&target)
+        move || state.watchlist_report.report(&target, &[Span::D1, Span::D7], 14, 30)
     });
-    let entries = match entries.await {
-        Ok(Ok(entries)) => entries,
+    let report = match report.await {
+        Ok(Ok(report)) => report,
         Ok(Err(error)) => return render::store_error_page(error).await,
         Err(error) => {
             return render::store_error_page(StoreError::Backend(error.to_string())).await
@@ -1200,7 +1200,7 @@ pub(crate) async fn watchlist_page(
         tip("drives", "The slim feed is built on demand from exactly these entries."),
         tip("feed-slim.lua", "Download it from the dashboard or /feed-slim.lua?target=…")
     );
-    if entries.is_empty() {
+    if report.is_empty() {
         let _ = write!(
             body,
             "<div class=\"empty\">nothing watched on this target yet — use the watch buttons on \
@@ -1213,9 +1213,36 @@ pub(crate) async fn watchlist_page(
             )
         );
     } else {
+        // Display-only percentage math in f64 (rendering, not decisions).
+        #[allow(clippy::cast_precision_loss)]
+        let delta_pct =
+            |now: i64, baseline: i64| -> f64 { (now - baseline) as f64 / baseline as f64 * 100.0 };
         body.push_str("<div class=\"scroll-x\"><table id=\"watchlist\"><thead><tr>");
         for (label, tip_text) in [
             ("item", "Watched item or pet variant."),
+            (
+                "now (d1)",
+                "Median unit price of the current UTC day-to-date — thin right after midnight.",
+            ),
+            (
+                "median d7",
+                "Median unit price over the trailing 7 days: what this item normally sells for.",
+            ),
+            (
+                "floor d7",
+                "5th-percentile price over the trailing 7 days — the deal floor. Listings near \
+                 it are cheap relative to the week, not necessarily rare.",
+            ),
+            (
+                "Δ vs d7",
+                "How today's median compares to the 7-day median: negative means trading below \
+                 its weekly norm.",
+            ),
+            (
+                "sale rate 14d",
+                "Share of this item's listings credited as sold within the last 14 days.",
+            ),
+            ("trend 30d", "Daily medians over the last 30 days."),
             ("note", "Your free-form note."),
             ("added", "When the entry was added (UTC)."),
             ("", "Removal action (open mode only)."),
@@ -1223,15 +1250,48 @@ pub(crate) async fn watchlist_page(
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
-        for entry in &entries {
+        for row in &report {
+            let now = row.blocks.first().and_then(|block| block.as_ref()).map(|b| b.median);
+            let week = row.blocks.get(1).and_then(|block| block.as_ref());
+            let delta = match (now, week) {
+                (Some(now), Some(week)) if week.median > 0 => {
+                    format!(
+                        "<span class=\"num\" data-v=\"{:.1}\">{:+.1}%</span>",
+                        delta_pct(now, week.median),
+                        delta_pct(now, week.median)
+                    )
+                }
+                _ => "—".to_string(),
+            };
+            let mut days: Vec<&amtracker_core::domain::ItemDayRow> = row.trend.iter().collect();
+            days.sort_unstable_by_key(|day| day.day);
+            let medians: Vec<i64> = days.iter().map(|day| day.median).collect();
             let _ = write!(
                 body,
-                "<tr><td>{}</td><td class=\"muted\">{}</td><td title=\"{}\">{}</td><td>{}</td></tr>",
-                item_link(&target, &entry.item),
-                html_escape(entry.note.as_deref().unwrap_or("")),
-                html_escape(&human_time(entry.added_at)),
-                html_escape(&human_time(entry.added_at)),
-                watch_button(open, true, &target, &entry.item)
+                "<tr><td>{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td>{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td>{}</td>\
+                 <td class=\"muted\">{}</td>\
+                 <td title=\"{}\">{}</td><td>{}</td></tr>",
+                item_link(&target, &row.entry.item),
+                now.map_or(String::new(), |v| v.to_string()),
+                now.map_or("—".to_string(), money),
+                week.map_or(String::new(), |w| w.median.to_string()),
+                week.map_or("—".to_string(), |w| money(w.median)),
+                week.map_or(String::new(), |w| w.p05.to_string()),
+                week.map_or("—".to_string(), |w| money(w.p05)),
+                delta,
+                row.sale_rate.map_or(String::new(), |r| format!("{r:.2}")),
+                row.sale_rate.map_or("—".to_string(), |r| format!("{:.0}%", r * 100.0)),
+                sparkline(&medians),
+                html_escape(row.entry.note.as_deref().unwrap_or("")),
+                html_escape(&human_time(row.entry.added_at)),
+                html_escape(&human_time(row.entry.added_at)),
+                watch_button(open, true, &target, &row.entry.item)
             );
         }
         body.push_str("</tbody></table></div>");

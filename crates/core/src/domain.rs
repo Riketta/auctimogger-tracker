@@ -167,6 +167,16 @@ impl PayloadKind {
             PayloadKind::Auctions => "auctions",
         }
     }
+
+    /// Parses the lowercase wire/log spelling (see [`PayloadKind::as_str`]).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "commodities" => Some(PayloadKind::Commodities),
+            "auctions" => Some(PayloadKind::Auctions),
+            _ => None,
+        }
+    }
 }
 
 /// Terminal state of one snapshot fetch+ingest attempt. Failed fetches/parse

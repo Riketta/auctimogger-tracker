@@ -326,6 +326,28 @@ pub trait MetricsCacheRepository: Send + Sync {
     fn invalidate_items(&self, target: &TargetId, _items: &[ItemRef]) -> Result<(), StoreError> {
         self.invalidate(target)
     }
+    /// Cached blocks for several identities of one target/span, positionally
+    /// aligned (`blocks[i]` belongs to `items[i]`); `None` entries have no
+    /// cached block. Batched fuel for whole-watchlist views.
+    ///
+    /// The default falls back to per-item reads — correct for any adapter,
+    /// just less efficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cache cannot be read.
+    fn get_many(
+        &self,
+        target: &TargetId,
+        span: Span,
+        items: &[ItemRef],
+    ) -> Result<Vec<Option<crate::domain::CachedBlock>>, StoreError> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(self.get(target, item, span)?);
+        }
+        Ok(out)
+    }
 }
 
 /// Outbound: item/pet name catalog backing search + completions + browsing.
@@ -343,12 +365,18 @@ pub trait ItemCatalogRepository: Send + Sync {
     /// Returns `StoreError::Backend` when records cannot be written.
     fn upsert_pets(&self, records: &[PetNameRecord]) -> Result<(), StoreError>;
     /// Kind-aware substring search over known names, at most `limit` hits
-    /// (prefix matches first, then alphabetical).
+    /// starting at `offset` (prefix matches first, then alphabetical). The
+    /// paging pair for completion boxes and browse pages alike.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
-    fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError>;
+    fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>, StoreError>;
     /// The catalog record for one item id, if known.
     ///
     /// # Errors

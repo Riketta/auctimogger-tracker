@@ -182,8 +182,13 @@ impl CatalogService {
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, StoreError> {
-        self.catalog.search(query, limit)
+    pub fn search(
+        &self,
+        query: &str,
+        limit: usize,
+        offset: usize,
+    ) -> Result<Vec<SearchHit>, StoreError> {
+        self.catalog.search(query, limit, offset)
     }
 
     /// Alphabetical catalog page (keyset-paginated, see the port).

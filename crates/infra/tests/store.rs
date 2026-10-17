@@ -873,7 +873,7 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
     assert!(store.pet_by_species(999_999).expect("by_species").is_none());
 
     // Kind-aware search: both pets share the substring with the item.
-    let hits = store.search("linen", 10).expect("search");
+    let hits = store.search("linen", 10, 0).expect("search");
     assert_eq!(hits.len(), 2, "item hit plus pet hit");
     assert!(hits
         .iter()
@@ -881,7 +881,7 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
     assert!(hits
         .iter()
         .any(|hit| matches!(hit, SearchHit::Pet(record) if record.species_id == 42)));
-    let pet_hits = store.search("squirrel", 10).expect("search");
+    let pet_hits = store.search("squirrel", 10, 0).expect("search");
     assert_eq!(pet_hits.len(), 1, "pets are searchable by name");
     assert!(matches!(pet_hits[0], SearchHit::Pet(ref record) if record.species_id == 264));
 
@@ -905,6 +905,97 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
 
     let counts = store.counts().expect("counts");
     assert_eq!(counts, CatalogCounts { items: 1, pets: 2 }, "per-kind totals");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Search pagination: `offset` skips the leading hits so clients can page
+/// through a catalog with `(limit, offset)` pairs.
+#[test]
+fn search_offset_pages_through_hits() {
+    use amtracker_core::{
+        domain::NameRecord,
+        ports::ItemCatalogRepository,
+    };
+
+    let dir = temp_dir("search-offset");
+    let store = open_store(&dir, 1_000_000);
+    store
+        .upsert(&[
+            NameRecord { item_id: 1, name: "Linen Cloth".into(), item_class: None, quality: None },
+            NameRecord {
+                item_id: 2,
+                name: "Bolts of Linen Cloth".into(),
+                item_class: None,
+                quality: None,
+            },
+            NameRecord {
+                item_id: 3,
+                name: "Heavy Linen Glove".into(),
+                item_class: None,
+                quality: None,
+            },
+        ])
+        .expect("upsert");
+
+    let page1 = store.search("linen", 2, 0).expect("page 1");
+    let page2 = store.search("linen", 2, 2).expect("page 2");
+    assert_eq!(page1.len(), 2);
+    assert_eq!(page2.len(), 1, "the trailing hit lands on the second page");
+    let id = |hits: &[amtracker_core::domain::SearchHit]| -> Vec<i64> {
+        hits.iter()
+            .map(|hit| match hit {
+                amtracker_core::domain::SearchHit::Item(record) => record.item_id,
+                amtracker_core::domain::SearchHit::Pet(record) => record.species_id,
+            })
+            .collect()
+    };
+    assert_eq!(id(&page1), vec![1, 2], "prefix match first, then alphabetical");
+    assert_eq!(id(&page2), vec![3]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Batched cache reads: `get_many` returns one slot per requested identity,
+/// positionally aligned, with unknown identities reading back as `None`.
+#[test]
+fn metrics_cache_get_many_aligns_blocks_with_identities() {
+    let dir = temp_dir("cache-get-many");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let item1 = ItemRef::Item { item_id: 1 };
+    let item2 = ItemRef::Item { item_id: 2 };
+    let unknown = ItemRef::Item { item_id: 999 };
+    let block = |median: i64| amtracker_core::domain::MetricBlock {
+        n: 1,
+        min: median,
+        p05: median,
+        p25: median,
+        median,
+        p75: median,
+        p95: median,
+        max: median,
+        mad: 0,
+        vwap: median,
+        qty_sum: 1,
+        listing_count: 1,
+        sale_rate: None,
+    };
+
+    store.put(&target, &item1, Span::D7, &block(100), 999).expect("put item1");
+    store.put(&target, &item2, Span::D7, &block(200), 999).expect("put item2");
+
+    let items = vec![item1.clone(), unknown.clone(), item2.clone()];
+    let blocks = store.get_many(&target, Span::D7, &items).expect("get_many");
+    assert_eq!(blocks.len(), 3, "one slot per requested identity");
+    assert_eq!(blocks[0].as_ref().expect("item1 cached").block.median, 100);
+    assert!(blocks[1].is_none(), "unknown identity has no cache rows");
+    assert_eq!(blocks[2].as_ref().expect("item2 cached").block.median, 200);
+
+    // Spans partition the cache: the same items read under another span
+    // come back empty.
+    let other = store.get_many(&target, Span::D1, &items).expect("get_many d1");
+    assert!(other.iter().all(Option::is_none));
 
     std::fs::remove_dir_all(&dir).ok();
 }
