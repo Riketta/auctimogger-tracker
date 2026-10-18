@@ -40,6 +40,7 @@ use amtracker_core::{
     domain::{
         utc_day,
         FeedFormat,
+        ItemRef,
         PayloadKind,
         TargetId,
     },
@@ -611,6 +612,71 @@ fn run_pass(
 
     refresh_opportunities(state, &TargetId(target.to_string()));
     evaluate_alerts(state, target);
+    // Last, so the (pacing-sleeping) name warm-up never delays the critical
+    // maintenance work above it.
+    warm_item_names(state, config, target);
+}
+
+/// Background name warm-up for one target after a successful cycle: the
+/// target's still-unnamed items/pets with recent fold data go through the
+/// catalog at the configured politeness pace, so tables usually show names
+/// before they are first viewed. Bounded per pass (`[catalog].idle_names_per_cycle`,
+/// `0` disables) and best effort — a source outage just pauses the warm-up
+/// until a later cycle. The pacing sleeps run on the maintenance worker,
+/// which is exactly the idle time this work belongs on.
+fn warm_item_names(
+    state: &Arc<AppState>,
+    config: &amtracker_core::config::TrackerConfig,
+    target: &str,
+) {
+    let Some(target_config) = config.find_target(target) else { return };
+    let flavor = &target_config.flavor;
+    let pace = Duration::from_millis(config.catalog.idle_pace_ms);
+    let since_day = utc_day(state.clock.now()).saturating_sub(1);
+    let items = match state.history.items_with_data(&TargetId(target.to_string()), since_day) {
+        Ok(items) => items,
+        Err(error) => {
+            tracing::warn!(target, error = %error, "name warm-up listing failed");
+            return;
+        }
+    };
+    let mut warmed = 0u32;
+    for item in items {
+        if warmed >= config.catalog.idle_names_per_cycle {
+            break;
+        }
+        // Only ids the catalog has never seen cost a request; known ones are
+        // a single local read away, and the negative cache makes junk ids
+        // free after the first sight.
+        let outcome = match &item {
+            ItemRef::Item { item_id }
+                if !matches!(state.catalog.known(flavor, *item_id), Ok(true)) =>
+            {
+                state.catalog.ensure(flavor, *item_id).map(|_| ())
+            }
+            ItemRef::Pet { species, .. }
+                if !matches!(state.catalog.known(flavor, *species), Ok(true)) =>
+            {
+                state.catalog.ensure_pet(flavor, *species).map(|_| ())
+            }
+            _ => continue,
+        };
+        match outcome {
+            Ok(()) => warmed += 1,
+            Err(error) => {
+                tracing::warn!(
+                    target,
+                    error = %error,
+                    "name warm-up lookup failed; pausing until a later cycle"
+                );
+                break;
+            }
+        }
+        thread::sleep(pace);
+    }
+    if warmed > 0 {
+        tracing::info!(target, warmed, "background item-name warm-up pass");
+    }
 }
 
 /// Applies retention pruning when the target has not been pruned today yet.

@@ -168,6 +168,16 @@ impl CatalogService {
         }
     }
 
+    /// Whether the catalog already holds `(flavor, item_id)` — the cheap
+    /// pre-check the background warmer uses to pace only real fetches.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    pub fn known(&self, flavor: &Flavor, item_id: i64) -> Result<bool, StoreError> {
+        self.catalog.by_id(flavor, item_id).map(|record| record.is_some())
+    }
+
     /// Returns the pet-species catalog record for `(flavor, species_id)`,
     /// fetching it from the pet API on first sight (same negative-cache and
     /// error policy as items).

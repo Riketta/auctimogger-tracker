@@ -3,6 +3,7 @@
 
 pub mod alert;
 pub mod catalog;
+pub mod chain;
 pub mod cycle;
 pub mod feed_export;
 pub mod health;

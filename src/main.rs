@@ -10,9 +10,18 @@ use std::{
 };
 
 use amtracker_core::{
+    config::{
+        AuthConfig,
+        TargetKind,
+        TrackerConfig,
+    },
     domain::PayloadKind,
-    ports::FeedRenderer,
+    ports::{
+        FeedRenderer,
+        ItemInfoPort,
+    },
     services::{
+        chain::ChainedItemInfo,
         cycle::IngestCycleService,
         feed_export::FeedExportService,
         metrics::MetricsService,
@@ -27,6 +36,7 @@ use amtracker_infra::{
         FileFeedPublisher,
     },
     store::SqliteStore,
+    wowhead_item_info::WowheadItemInfo,
 };
 use amtracker_server::{
     config_file::{
@@ -160,12 +170,17 @@ fn run_config_check(path: &Path) -> i32 {
         }
     };
     let config = &loaded.tracker;
-    println!("config ok: {} target(s)", config.targets.len());
+    println!(
+        "config ok: {} target(s), catalog source={}",
+        config.targets.len(),
+        config.catalog.source
+    );
     for target in &config.targets {
         println!(
-            "  {} : {}, poll commodities={}s auctions={}s",
+            "  {} : {}, flavor={}, poll commodities={}s auctions={}s",
             target.id,
             target.describe(),
+            target.flavor,
             target.poll.commodities_secs,
             target.poll.auctions_secs
         );
@@ -231,7 +246,7 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
             return 1;
         }
     };
-    let item_info = Arc::new(BlizzardItemInfo::from_config(config));
+    let item_info = build_item_info(config);
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
     let state = build_app_state(config, &clock, &store, item_info, metrics);
@@ -265,13 +280,57 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
     0
 }
 
+/// Assembles the item/pet name-resolution chain from `[catalog].source`:
+/// `"wowhead"` runs the credential-free adapter alone, `"blizzard"` the
+/// authenticated one alone, and `"chain"` (the default) tries Wowhead first
+/// with Blizzard as the fallback leg — omitted entirely (with one log line)
+/// when no Blizzard credentials are configured, so the chain never burns a
+/// doomed request per lookup.
+fn build_item_info(config: &TrackerConfig) -> Arc<dyn ItemInfoPort> {
+    match config.catalog.source.as_str() {
+        "wowhead" => Arc::new(WowheadItemInfo::from_config(config)) as Arc<dyn ItemInfoPort>,
+        "blizzard" => Arc::new(BlizzardItemInfo::from_config(config)) as Arc<dyn ItemInfoPort>,
+        _ => {
+            let mut legs: Vec<Arc<dyn ItemInfoPort>> =
+                vec![Arc::new(WowheadItemInfo::from_config(config))];
+            if blizzard_credentials_present(config) {
+                legs.push(Arc::new(BlizzardItemInfo::from_config(config)));
+            } else {
+                tracing::info!("no Blizzard credentials configured; name chain runs wowhead-only");
+            }
+            Arc::new(ChainedItemInfo::new(legs))
+        }
+    }
+}
+
+/// Whether the Blizzard item API is actually reachable with the configured
+/// credentials: the first Blizzard target's auth (or the OAuth default) must
+/// name environment variables that are set and non-empty right now.
+fn blizzard_credentials_present(config: &TrackerConfig) -> bool {
+    let auth = config
+        .targets
+        .iter()
+        .find_map(|target| match &target.kind {
+            TargetKind::BlizzardConnectedRealm { .. } => target.auth.clone(),
+            TargetKind::StaticUrls { .. } => None,
+        })
+        .unwrap_or_else(AuthConfig::default_blizzard);
+    let env_set = |name: &str| std::env::var(name).is_ok_and(|value| !value.trim().is_empty());
+    match auth {
+        AuthConfig::Bearer { env } => env_set(&env),
+        AuthConfig::ClientCredentials { client_id_env, client_secret_env } => {
+            env_set(&client_id_env) && env_set(&client_secret_env)
+        }
+    }
+}
+
 /// Assembles the shared application state for `serve`: every port wiring
 /// lives here so `run_serve` stays a readable startup sequence.
 fn build_app_state(
     config: &amtracker_core::config::TrackerConfig,
     clock: &Arc<dyn amtracker_core::ports::ClockPort>,
     store: &Arc<SqliteStore>,
-    item_info: Arc<BlizzardItemInfo>,
+    item_info: Arc<dyn ItemInfoPort>,
     metrics: Arc<MetricsService>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
