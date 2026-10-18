@@ -120,6 +120,11 @@ nav.main a.active { color: var(--text); background: var(--accent-soft); }
 
 .wrap { max-width: 1180px; margin: 0 auto; padding: 1.2rem 1.4rem 3rem; }
 
+/* The opportunities page hosts the UI's widest table (11 columns, three of
+   them with component bars): give it a wider measure so the ranking uses
+   the screen instead of scrolling inside the default one. */
+body.wide .wrap, body.wide footer.page { max-width: 1720px; }
+
 footer.page {
   max-width: 1180px;
   margin: 0 auto;

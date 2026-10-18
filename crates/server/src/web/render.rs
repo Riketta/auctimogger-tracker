@@ -285,13 +285,17 @@ pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> 
         let _ = write!(nav, "<a href=\"{href}\"{class}>{label}</a>");
     }
     let switcher_html = switcher.unwrap_or_else(|| "<span class=\"spacer\"></span>".into());
+    // The opportunities ranking is the UI's widest table (11 columns, three
+    // with component bars); its page opts into the wider `body.wide` measure
+    // (see app.css) instead of scrolling inside the default 1180px one.
+    let body_class = if active == "opportunities" { r#" class="wide""# } else { "" };
     Html(format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
          <title>{title} — auctimogger-tracker</title>\
          <link rel=\"icon\" href=\"/favicon.svg\" type=\"image/svg+xml\">\
          <link rel=\"stylesheet\" href=\"/assets/app.css\">\
-         </head><body>\
+         </head><body{body_class}>\
          <header class=\"topbar\"><a class=\"brand\" href=\"/\"><span class=\"dot\"></span>auctimogger-tracker</a>\
          <nav class=\"main\">{nav}</nav>{switcher_html}</header>\
          <main class=\"wrap\"><h1>{title}</h1>{body}</main>\
