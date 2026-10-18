@@ -1,18 +1,23 @@
 //! Poll-loop scheduler: a plain thread that runs ingestion cycles per target
-//! on the configured cadence, then keeps the operational side effects that
-//! belong to ingestion flowing: raw-listing retention (`prune_raw_before`),
-//! feed publication (the files `/feed.lua` serves), and the prepared
-//! opportunity/overview scans (`OpportunityService::refresh` — at startup,
-//! after every successful cycle, and when a scan outlives its TTL, so
-//! requests serve prepared data with no store reads). Doing all of this here
-//! means a plain `serve` is self-contained — no cron, no exporter sidecar.
+//! on the configured cadence, while the operational side effects that belong
+//! to ingestion — raw-listing retention (`prune_raw_before`), feed
+//! publication (the files `/feed.lua` serves), and the prepared
+//! opportunity/overview scans (`OpportunityService::refresh`) — run on a
+//! companion maintenance thread fed by a deduplicated per-target queue, so a
+//! slow publish or prune can never delay the next target's fetch. Requests
+//! serve prepared data with no store reads; a plain `serve` stays
+//! self-contained — no cron, no exporter sidecar.
 //!
 //! D13: no async in or around the core; everything below is blocking and
-//! runs on this dedicated thread.
+//! runs on these two dedicated threads.
 
 use std::{
     any::Any,
-    collections::HashMap,
+    collections::{
+        HashMap,
+        HashSet,
+        VecDeque,
+    },
     panic::{
         self,
         AssertUnwindSafe,
@@ -20,6 +25,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
+        Condvar,
         Mutex,
         PoisonError,
     },
@@ -49,6 +55,10 @@ use crate::web::AppState;
 /// How often the loop wakes up to check whether a cycle is due.
 const TICK: Duration = Duration::from_secs(30);
 
+/// How long an idle maintenance worker waits before waking up anyway: due
+/// retention prunes depend on UTC day rolls, which enqueue nothing.
+const MAINTENANCE_IDLE_TICK: Duration = Duration::from_secs(60);
+
 /// Backoff applied to a rate-limited (target, kind) when the source sent no
 /// parseable `Retry-After` hint.
 const DEFAULT_BACKOFF_SECS: u64 = 60;
@@ -58,14 +68,64 @@ const DEFAULT_BACKOFF_SECS: u64 = 60;
 /// store) so the scheduler — and this crate — never needs the adapter type.
 pub type BackupHook = Arc<dyn Fn(&Path) -> Result<(), StoreError> + Send + Sync>;
 
-/// Per-target operational state: last cycle run, last prune day, last publish.
+/// Per-target ingest-loop state: last cycle run and rate-limit backoff.
+/// Maintenance bookkeeping lives in [`MaintenanceState`] on the worker
+/// thread, so cycle pacing and slow side effects never share a thread.
 #[derive(Default)]
 struct TargetTimers {
     cycle_run: HashMap<(String, PayloadKind), Instant>,
-    prune_day: HashMap<String, i64>,
-    feed_publish: HashMap<String, Instant>,
     /// Until when a (target, kind) is rate-limit-backed off (skipped entirely).
     backoff_until: HashMap<(String, PayloadKind), Instant>,
+}
+
+/// Maintenance-worker bookkeeping: last retention-prune day and last feed
+/// publication per target (the exact state the ingest loop used to carry).
+#[derive(Default)]
+struct MaintenanceState {
+    prune_day: HashMap<String, i64>,
+    feed_publish: HashMap<String, Instant>,
+}
+
+/// Deduplicated maintenance queue: at most one pending pass per target — a
+/// second cycle for the same target collapses into the still-queued entry
+/// (the pass re-reads everything fresh anyway).
+#[derive(Default)]
+struct MaintenanceQueue {
+    pending: HashSet<String>,
+    queue: VecDeque<String>,
+}
+
+impl MaintenanceQueue {
+    fn push(&mut self, target: String) {
+        if self.pending.insert(target.clone()) {
+            self.queue.push_back(target);
+        }
+    }
+
+    /// Pops the next queued target, waiting up to `timeout` for one to
+    /// arrive; `None` = nothing queued within the wait (idle tick).
+    fn pop_timeout(mutex: &Mutex<Self>, condvar: &Condvar, timeout: Duration) -> Option<String> {
+        let guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+        let (mut guard, _) = condvar
+            .wait_timeout_while(guard, timeout, |queue: &mut Self| queue.queue.is_empty())
+            .unwrap_or_else(PoisonError::into_inner);
+        guard.queue.pop_front().inspect(|target| {
+            guard.pending.remove(target);
+        })
+    }
+}
+
+/// The queue plus its condition variable, shared between the ingest loop
+/// (producer) and the maintenance worker (consumer).
+type SharedMaintenanceQueue = Arc<(Mutex<MaintenanceQueue>, Condvar)>;
+
+/// Queues one maintenance pass for a target, deduplicated per target.
+fn enqueue_maintenance(queue: &SharedMaintenanceQueue, target: &str) {
+    let (mutex, condvar) = &**queue;
+    let mut guard = mutex.lock().unwrap_or_else(PoisonError::into_inner);
+    guard.push(target.to_string());
+    drop(guard);
+    condvar.notify_one();
 }
 
 /// Deterministic boot jitter for one (target, kind): a stable FNV-1a hash of
@@ -80,13 +140,59 @@ fn boot_jitter(key: &(String, PayloadKind), interval: u64) -> Duration {
     Duration::from_secs(hash % interval.max(1))
 }
 
+/// Seeds every (target, kind)'s first-fire timer with its boot jitter and
+/// logs the schedule so source-side gaps are explainable from the logs
+/// alone: a target that has not fetched yet is queued, not stuck.
+fn seed_first_fire(config: &amtracker_core::config::TrackerConfig, timers: &Mutex<TargetTimers>) {
+    let mut timers = timers.lock().unwrap_or_else(PoisonError::into_inner);
+    for target in &config.targets {
+        for (kind, interval) in [
+            (PayloadKind::Commodities, target.poll.commodities_secs),
+            (PayloadKind::Auctions, target.poll.auctions_secs),
+        ] {
+            let key = (target.id.0.clone(), kind);
+            let offset = boot_jitter(&key, interval);
+            // Stamp "last run" so the first due lands after `offset`:
+            // elapsed is (interval - offset) now and grows. The checked
+            // subtraction cannot underflow (offset < interval), but a
+            // fallback of "due now" stays correct anyway.
+            let seeded = (Instant::now() + offset)
+                .checked_sub(Duration::from_secs(interval))
+                .unwrap_or_else(Instant::now);
+            timers.cycle_run.insert(key.clone(), seeded);
+            timers.backoff_until.remove(&key);
+            tracing::info!(
+                target = %target.id.0,
+                kind = kind.as_str(),
+                first_fetch_in_secs = offset.as_secs(),
+                "first fetch scheduled"
+            );
+        }
+    }
+}
+
+/// Spawns the companion maintenance worker thread and returns its queue.
+/// The handle is dropped (the worker lives for the process like the
+/// scheduler itself; a failure to spawn fails `serve` startup).
+fn spawn_maintenance_worker(state: &Arc<AppState>) -> std::io::Result<SharedMaintenanceQueue> {
+    let queue: SharedMaintenanceQueue =
+        Arc::new((Mutex::new(MaintenanceQueue::default()), Condvar::new()));
+    let worker_state = state.clone();
+    let worker_queue = queue.clone();
+    thread::Builder::new().name("amtracker-maintenance".into()).spawn(move || {
+        maintenance_loop(&worker_state, &worker_queue);
+    })?;
+    Ok(queue)
+}
+
 /// Spawns the background poll loop: ingestion cycles for every configured
-/// target on its configured cadence, raw-listing pruning once per UTC day per
-/// target, feed re-publication per target at most every
-/// `server.feed_publish_secs`, and — when `storage.backup_dir` is configured
-/// with a positive `backup_secs` — a store-wide online backup through `hook`
-/// (retention-pruned to `storage.backup_keep`). Outcomes are emitted via
-/// `tracing` (info on success, warn on failures — the warn path is what
+/// target on its configured cadence, prepared-scan TTL refreshes, and — when
+/// `storage.backup_dir` is configured with a positive `backup_secs` — a
+/// store-wide online backup through `hook` (retention-pruned to
+/// `storage.backup_keep`). Successful cycles hand their side effects (feed
+/// publication, retention pruning, scan refresh, alert evaluation) to the
+/// maintenance worker instead of running them inline. Outcomes are emitted
+/// via `tracing` (info on success, warn on failures — the warn path is what
 /// surfaces in Sentry). A panicking cycle is caught and logged so one bad
 /// fetch can never silently kill ingestion while the web UI keeps serving.
 ///
@@ -94,12 +200,14 @@ fn boot_jitter(key: &(String, PayloadKind), interval: u64) -> Duration {
 /// disables the backup branch (the CLI never schedules backups).
 ///
 /// # Errors
+///
 /// Returns the [`std::io::Error`] from [`thread::Builder::spawn`] when the OS
-/// refuses to start the scheduler thread.
+/// refuses to start one of the threads.
 pub fn spawn(
     state: Arc<AppState>,
     backup: Option<BackupHook>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
+    let maintenance = spawn_maintenance_worker(&state)?;
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
         // Prepare every configured target's opportunity scan before the first
@@ -117,27 +225,7 @@ pub fn spawn(
         let timers = Mutex::new(TargetTimers::default());
         // Stagger the first fire of every (target, kind) across its own
         // interval: without this, startup fires all targets back-to-back.
-        {
-            let mut timers = timers.lock().unwrap_or_else(PoisonError::into_inner);
-            for target in &config.targets {
-                for (kind, interval) in [
-                    (PayloadKind::Commodities, target.poll.commodities_secs),
-                    (PayloadKind::Auctions, target.poll.auctions_secs),
-                ] {
-                    let key = (target.id.0.clone(), kind);
-                    let offset = boot_jitter(&key, interval);
-                    // Stamp "last run" so the first due lands after `offset`:
-                    // elapsed is (interval - offset) now and grows. The checked
-                    // subtraction cannot underflow (offset < interval), but a
-                    // fallback of "due now" stays correct anyway.
-                    let seeded = (Instant::now() + offset)
-                        .checked_sub(Duration::from_secs(interval))
-                        .unwrap_or_else(Instant::now);
-                    timers.cycle_run.insert(key.clone(), seeded);
-                    timers.backoff_until.remove(&key);
-                }
-            }
-        }
+        seed_first_fire(&config, &timers);
         let mut last_backup: Option<Instant> = None;
         loop {
             for target in &config.targets {
@@ -153,6 +241,11 @@ pub fn spawn(
                             .get(&key)
                             .is_some_and(|until| Instant::now() < *until)
                         {
+                            tracing::debug!(
+                                target = %target.id.0,
+                                kind = kind.as_str(),
+                                "cycle skipped: rate-limit backoff active"
+                            );
                             continue;
                         }
                         let due = match locked.cycle_run.get(&key) {
@@ -163,7 +256,7 @@ pub fn spawn(
                             continue;
                         }
                     }
-                    run_cycle_logged(&state, &config, &timers, target, kind);
+                    run_cycle_logged(&state, &timers, &maintenance, target, kind);
                     timers
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner)
@@ -173,7 +266,7 @@ pub fn spawn(
             }
             // Refresh any prepared opportunity scan that outlived its TTL;
             // the debounce window in `refresh` makes overlap with the
-            // post-cycle refresh above harmless.
+            // maintenance pass above harmless.
             for target in &config.targets {
                 let refresh_due = state
                     .opportunities
@@ -283,14 +376,15 @@ fn prune_backups(dir: &Path, keep: u32) {
 }
 
 /// Runs one due ingest cycle under `catch_unwind`, logging the outcome and
-/// recording it in the dashboard's recent-cycles ring, then triggers the
-/// post-cycle side effects on success. Panics never kill the scheduler:
-/// the panic hook logs the detail, the ring shows it on the dashboard, and
-/// the next interval retries (the caller still stamps the run timer).
+/// recording it in the dashboard's recent-cycles ring, then queues the
+/// post-cycle side effects on the maintenance worker on success. Panics never
+/// kill the scheduler: the panic hook logs the detail, the ring shows it on
+/// the dashboard, and the next interval retries (the caller still stamps the
+/// run timer).
 fn run_cycle_logged(
     state: &Arc<AppState>,
-    config: &amtracker_core::config::TrackerConfig,
     timers: &Mutex<TargetTimers>,
+    maintenance: &SharedMaintenanceQueue,
     target: &amtracker_core::config::TargetConfig,
     kind: PayloadKind,
 ) {
@@ -336,9 +430,7 @@ fn run_cycle_logged(
                 credits: report.sale_credits,
                 error: None,
             });
-            survive("after-cycle", &target.id.0, || {
-                after_cycle(state, config, timers, &target.id.0);
-            });
+            enqueue_maintenance(maintenance, &target.id.0);
         }
         Ok(Err(error)) => {
             // Rate limiting is transient and self-describing: park the
@@ -352,6 +444,12 @@ fn run_cycle_logged(
                 timers.lock().unwrap_or_else(PoisonError::into_inner).backoff_until.insert(
                     (target.id.0.clone(), kind),
                     Instant::now() + Duration::from_secs(secs),
+                );
+                tracing::info!(
+                    target = %target.id.0,
+                    kind = kind.as_str(),
+                    parked_for_secs = secs,
+                    "rate limited; cycle parked until backoff expiry"
                 );
             }
             tracing::warn!(
@@ -399,48 +497,79 @@ fn run_cycle_logged(
     }
 }
 
+/// The maintenance worker: drains per-target maintenance requests (retention
+/// pruning, feed publication, opportunity refresh, alert evaluation) off the
+/// ingest loop, and on idle ticks sweeps every target for due prunes so UTC
+/// day rolls never depend on a cycle happening to finish. A pass is best
+/// effort end to end — a panicking step is caught and the worker lives on.
+fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
+    let config = state.config.clone();
+    let mut maintenance = MaintenanceState::default();
+    loop {
+        if let Some(target) =
+            MaintenanceQueue::pop_timeout(&queue.0, &queue.1, MAINTENANCE_IDLE_TICK)
+        {
+            survive("maintenance-pass", &target, || {
+                run_pass(state, &config, &mut maintenance, &target);
+            });
+        }
+        for target in &config.targets {
+            survive("maintenance-sweep", &target.id.0, || {
+                run_prune_if_due(state, &config, &mut maintenance, &target.id.0);
+            });
+        }
+    }
+}
+
 /// Operational side effects after a successful cycle for one target:
 /// once-per-UTC-day retention pruning, throttled feed publication, and a
 /// refresh of the target's prepared opportunity scan (new folds/credits just
 /// landed). All are best effort — a failure is logged and retried on a later
-/// cycle.
-fn after_cycle(
+/// pass.
+fn run_pass(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
-    timers: &Mutex<TargetTimers>,
+    maintenance: &mut MaintenanceState,
     target: &str,
 ) {
-    let now_unix = state.clock.now();
-    let today = utc_day(now_unix);
-    let mut timers = timers.lock().unwrap_or_else(PoisonError::into_inner);
+    run_prune_if_due(state, config, maintenance, target);
 
-    if timers.prune_day.get(target) != Some(&today) {
-        match state.history.prune_raw_before(
-            &amtracker_core::domain::TargetId(target.to_string()),
-            today - i64::from(config.storage.raw_listing_days) + 1,
-        ) {
-            Ok(removed) => {
-                timers.prune_day.insert(target.to_string(), today);
-                tracing::debug!(target, removed, "raw listing retention applied");
-            }
-            Err(error) => {
-                tracing::warn!(target, error = %error, "raw listing retention failed");
-            }
-        }
-    }
-
-    let publish_due = timers
+    let publish_due = maintenance
         .feed_publish
         .get(target)
         .is_none_or(|last| last.elapsed().as_secs() >= config.server.feed_publish_secs);
     if publish_due {
-        timers.feed_publish.insert(target.to_string(), Instant::now());
-        drop(timers);
+        maintenance.feed_publish.insert(target.to_string(), Instant::now());
         publish_feed(state, config, target);
     }
 
     refresh_opportunities(state, &TargetId(target.to_string()));
     evaluate_alerts(state, target);
+}
+
+/// Applies retention pruning when the target has not been pruned today yet.
+fn run_prune_if_due(
+    state: &Arc<AppState>,
+    config: &amtracker_core::config::TrackerConfig,
+    maintenance: &mut MaintenanceState,
+    target: &str,
+) {
+    let today = utc_day(state.clock.now());
+    if maintenance.prune_day.get(target) == Some(&today) {
+        return;
+    }
+    match state.history.prune_raw_before(
+        &TargetId(target.to_string()),
+        today - i64::from(config.storage.raw_listing_days) + 1,
+    ) {
+        Ok(removed) => {
+            maintenance.prune_day.insert(target.to_string(), today);
+            tracing::debug!(target, removed, "raw listing retention applied");
+        }
+        Err(error) => {
+            tracing::warn!(target, error = %error, "raw listing retention failed");
+        }
+    }
 }
 
 /// Runs one alert-evaluation pass for a target (post-cycle and post-manual-
@@ -468,21 +597,31 @@ fn evaluate_alerts(state: &Arc<AppState>, target: &str) {
     }
 }
 
+/// Best-effort panic payload rendering: string payloads print their message,
+/// anything else is reported generically rather than `Any`.
+fn panic_message(payload: &(dyn Any + Send)) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_owned()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "non-string panic payload".to_owned()
+    }
+}
+
 /// Runs the after-cycle side effects for one target right now, without the
-/// scheduler's once-per-day/throttle bookkeeping: retention pruning, feed
-/// publication, and an opportunity scan refresh, exactly as a successful
+/// maintenance worker's once-per-day/throttle bookkeeping: retention pruning,
+/// feed publication, and an opportunity scan refresh, exactly as a successful
 /// scheduled cycle would trigger them.
 /// Used by the manual `/api/fetch` path, whose successful cycles must show
 /// up in `/feed.lua` and the ranking pages immediately instead of waiting
-/// for the scheduler.
+/// for the maintenance worker.
 pub fn after_cycle_now(state: &Arc<AppState>, target: &str) {
-    after_cycle(state, &state.config, &Mutex::new(TargetTimers::default()), target);
+    let config = state.config.clone();
+    run_pass(state, &config, &mut MaintenanceState::default(), target);
 }
 
-/// Runs a best-effort scheduler step under `catch_unwind`, giving the
-/// operational side effects (prune, publish, scan refresh) the same
-/// panic-survival guarantee ingest cycles already have: the panic hook logs
-/// the detail, this keeps the thread alive and names the step.
+/// Runs one step under `catch_unwind`, logging a panic and continuing.
 fn survive(step: &'static str, target: &str, f: impl FnOnce()) {
     if panic::catch_unwind(AssertUnwindSafe(f)).is_err() {
         tracing::error!(step, target, "scheduler step panicked; continuing");
@@ -538,14 +677,44 @@ fn publish_feed(
     }
 }
 
-/// Best-effort panic payload rendering: string payloads print their message,
-/// anything else is reported generically rather than as `Any`.
-fn panic_message(payload: &(dyn Any + Send)) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        (*message).to_owned()
-    } else if let Some(message) = payload.downcast_ref::<String>() {
-        message.clone()
-    } else {
-        "non-string panic payload".to_owned()
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
+    // inputs.
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn maintenance_queue_dedupes_pending_targets() {
+        let mut queue = MaintenanceQueue::default();
+        queue.push("a".into());
+        queue.push("b".into());
+        queue.push("a".into());
+        assert_eq!(queue.queue, VecDeque::from(vec!["a".to_string(), "b".to_string()]));
+    }
+
+    #[test]
+    fn maintenance_queue_pops_fifo_and_releases_the_dedup_guard() {
+        let shared: SharedMaintenanceQueue =
+            Arc::new((Mutex::new(MaintenanceQueue::default()), Condvar::new()));
+        {
+            let (mutex, _) = &*shared;
+            let mut guard = mutex.lock().unwrap();
+            guard.push("a".into());
+            guard.push("b".into());
+            guard.push("a".into());
+        }
+        let (mutex, condvar) = &*shared;
+        assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), Some("a".into()));
+        // Popping releases the guard: "a" may queue again immediately.
+        {
+            let mut guard = mutex.lock().unwrap();
+            guard.push("a".into());
+            assert_eq!(guard.queue.back(), Some(&"a".to_string()));
+        }
+        assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), Some("b".into()));
+        assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), Some("a".into()));
+        assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), None);
     }
 }
