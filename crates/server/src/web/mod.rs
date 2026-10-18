@@ -109,6 +109,10 @@ pub struct AppState {
     /// Recent ingest-cycle outcomes (fed by the scheduler), shown on the
     /// dashboard so `serve` activity is visible without reading logs.
     pub recent_cycles: Arc<RecentCycles>,
+    /// Live fetch-schedule board: per-(target, kind) cycle timers written by
+    /// the scheduler (and manual `/api/fetch`), rendered by the dashboard's
+    /// "next fetch" rows and `/api/schedule`.
+    pub timers: Arc<std::sync::Mutex<crate::scheduler::TargetTimers>>,
 }
 
 /// Builds the full HTTP router (pages, JSON API, feed downloads, token-gated
@@ -195,6 +199,7 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         )
         .route("/api/watchlist/metrics", get(api::api_watchlist_metrics))
         .route("/api/snapshots", get(api::api_snapshots))
+        .route("/api/schedule", get(api::api_schedule))
         .route(
             "/api/alerts",
             get(api::api_alerts_get).post(api::api_alerts_post).delete(api::api_alerts_delete),

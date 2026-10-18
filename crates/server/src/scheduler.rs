@@ -68,14 +68,77 @@ const DEFAULT_BACKOFF_SECS: u64 = 60;
 /// store) so the scheduler — and this crate — never needs the adapter type.
 pub type BackupHook = Arc<dyn Fn(&Path) -> Result<(), StoreError> + Send + Sync>;
 
-/// Per-target ingest-loop state: last cycle run and rate-limit backoff.
-/// Maintenance bookkeeping lives in [`MaintenanceState`] on the worker
-/// thread, so cycle pacing and slow side effects never share a thread.
+/// Per-target ingest-loop state: last cycle run, rate-limit backoff, and
+/// which cycles are in flight. Written by the scheduler (and the manual
+/// `/api/fetch` path), read by the dashboard and `/api/schedule` — shared
+/// through [`crate::web::AppState::timers`].
 #[derive(Default)]
-struct TargetTimers {
-    cycle_run: HashMap<(String, PayloadKind), Instant>,
+pub struct TargetTimers {
+    /// Last cycle run per (target, kind): the next due lands one interval
+    /// later. Seeded with the boot jitter so the first due is spread across
+    /// the interval.
+    pub cycle_run: HashMap<(String, PayloadKind), Instant>,
     /// Until when a (target, kind) is rate-limit-backed off (skipped entirely).
-    backoff_until: HashMap<(String, PayloadKind), Instant>,
+    pub backoff_until: HashMap<(String, PayloadKind), Instant>,
+    /// Cycles currently in flight (scheduler or manual fetch).
+    pub running: HashSet<(String, PayloadKind)>,
+}
+
+/// One (target, kind)'s next-fetch schedule as the dashboard and
+/// `/api/schedule` render it: when the poll becomes due, whether it is
+/// parked by a rate-limit backoff, and whether a cycle is in flight right
+/// now.
+#[derive(Clone, Debug)]
+pub struct ScheduleEntry {
+    /// Target id.
+    pub target: String,
+    /// Payload kind polled on this schedule.
+    pub kind: PayloadKind,
+    /// Configured poll interval for this (target, kind).
+    pub interval_secs: u64,
+    /// Seconds until the cycle becomes due (`0` = due now or overdue).
+    pub next_due_in_secs: u64,
+    /// Seconds remaining of a rate-limit park, when parked.
+    pub backoff_in_secs: Option<u64>,
+    /// Whether a cycle for this (target, kind) is in flight right now.
+    pub running: bool,
+}
+
+/// Snapshots the fetch schedule for every configured (target, kind): a pure
+/// read over the scheduler's timers so the dashboard rows and the JSON
+/// endpoint share one computation. `now` is injected for testability.
+#[must_use]
+pub fn schedule_view(
+    targets: &[amtracker_core::config::TargetConfig],
+    timers: &TargetTimers,
+    now: Instant,
+) -> Vec<ScheduleEntry> {
+    let mut out = Vec::new();
+    for target in targets {
+        for (kind, interval) in [
+            (PayloadKind::Commodities, target.poll.commodities_secs),
+            (PayloadKind::Auctions, target.poll.auctions_secs),
+        ] {
+            let key = (target.id.0.clone(), kind);
+            let next_due_in_secs = timers.cycle_run.get(&key).map_or(0, |last| {
+                let ran = now.checked_duration_since(*last).unwrap_or_default();
+                interval.saturating_sub(ran.as_secs())
+            });
+            let backoff_in_secs = timers
+                .backoff_until
+                .get(&key)
+                .and_then(|until| until.checked_duration_since(now).map(|left| left.as_secs()));
+            out.push(ScheduleEntry {
+                target: target.id.0.clone(),
+                kind,
+                interval_secs: interval,
+                next_due_in_secs,
+                backoff_in_secs,
+                running: timers.running.contains(&key),
+            });
+        }
+    }
+    out
 }
 
 /// Maintenance-worker bookkeeping: last retention-prune day and last feed
@@ -221,11 +284,11 @@ pub fn spawn(
         }
         // The critical sections below only touch the maps, so a poisoned
         // lock can only come from a panic inside this very loop; recover
-        // the guard instead of panicking on poison.
-        let timers = Mutex::new(TargetTimers::default());
+        // the guard instead of panicking on poison. The board is shared
+        // with the web layer, which renders the fetch schedule from it.
         // Stagger the first fire of every (target, kind) across its own
         // interval: without this, startup fires all targets back-to-back.
-        seed_first_fire(&config, &timers);
+        seed_first_fire(&config, &state.timers);
         let mut last_backup: Option<Instant> = None;
         loop {
             for target in &config.targets {
@@ -235,7 +298,8 @@ pub fn spawn(
                 ] {
                     let key = (target.id.0.clone(), kind);
                     {
-                        let locked = timers.lock().unwrap_or_else(PoisonError::into_inner);
+                        let mut locked =
+                            state.timers.lock().unwrap_or_else(PoisonError::into_inner);
                         if locked
                             .backoff_until
                             .get(&key)
@@ -255,13 +319,15 @@ pub fn spawn(
                         if !due {
                             continue;
                         }
+                        locked.running.insert(key.clone());
                     }
-                    run_cycle_logged(&state, &timers, &maintenance, target, kind);
-                    timers
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .cycle_run
-                        .insert(key, Instant::now());
+                    run_cycle_logged(&state, &state.timers, &maintenance, target, kind);
+                    {
+                        let mut locked =
+                            state.timers.lock().unwrap_or_else(PoisonError::into_inner);
+                        locked.running.remove(&key);
+                        locked.cycle_run.insert(key, Instant::now());
+                    }
                 }
             }
             // Refresh any prepared opportunity scan that outlived its TTL;
@@ -684,6 +750,65 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
     use super::*;
+
+    #[test]
+    fn schedule_view_reports_due_running_and_parked_entries() {
+        let target =
+            |id: &str, commodities: u64, auctions: u64| amtracker_core::config::TargetConfig {
+                id: amtracker_core::domain::TargetId(id.into()),
+                kind: amtracker_core::config::TargetKind::StaticUrls {
+                    commodities_url: "http://example.test/c.json".into(),
+                    auctions_url: "http://example.test/a.json".into(),
+                },
+                auth: None,
+                poll: amtracker_core::config::PollConfig {
+                    commodities_secs: commodities,
+                    auctions_secs: auctions,
+                },
+            };
+        let targets = [target("alpha", 3_600, 1_800), target("beta", 600, 300)];
+        let now = std::time::Instant::now();
+        let mut timers = TargetTimers::default();
+        // alpha/commodities: ran 10 min ago of a 60 min interval → 50 min left.
+        timers.cycle_run.insert(
+            ("alpha".into(), PayloadKind::Commodities),
+            now.checked_sub(std::time::Duration::from_secs(600)).expect("uptime"),
+        );
+        // alpha/auctions: overdue by 400 s.
+        timers.cycle_run.insert(
+            ("alpha".into(), PayloadKind::Auctions),
+            now.checked_sub(std::time::Duration::from_secs(2_200)).expect("uptime"),
+        );
+        // beta/commodities: rate-limit parked for 2 min.
+        timers.backoff_until.insert(
+            ("beta".into(), PayloadKind::Commodities),
+            now + std::time::Duration::from_secs(120),
+        );
+        // beta/auctions: cycle in flight.
+        timers.running.insert(("beta".into(), PayloadKind::Auctions));
+
+        let view = schedule_view(&targets, &timers, now);
+        assert_eq!(view.len(), 4);
+        let by_key = |target: &str, kind: PayloadKind| {
+            view.iter().find(|e| e.target == target && e.kind == kind).expect("entry")
+        };
+
+        let alpha_c = by_key("alpha", PayloadKind::Commodities);
+        assert_eq!(alpha_c.next_due_in_secs, 3_000);
+        assert!(!alpha_c.running);
+        assert!(alpha_c.backoff_in_secs.is_none());
+
+        let alpha_a = by_key("alpha", PayloadKind::Auctions);
+        assert_eq!(alpha_a.next_due_in_secs, 0, "overdue clamps to due now");
+
+        let beta_c = by_key("beta", PayloadKind::Commodities);
+        assert_eq!(beta_c.backoff_in_secs, Some(120));
+        assert!(!beta_c.running);
+
+        let beta_a = by_key("beta", PayloadKind::Auctions);
+        assert!(beta_a.running);
+        assert!(beta_a.backoff_in_secs.is_none());
+    }
 
     #[test]
     fn maintenance_queue_dedupes_pending_targets() {

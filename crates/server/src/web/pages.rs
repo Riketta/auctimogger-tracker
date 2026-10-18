@@ -50,6 +50,7 @@ use super::{
         freshness_badge,
         html_escape,
         human_age,
+        human_in,
         human_time,
         item_link,
         money,
@@ -153,6 +154,15 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
     };
     let cycles = state.recent_cycles.snapshot();
     let open = mutations_open(&state.config);
+    // The scheduler's live fetch schedule, keyed per (target, kind) for the
+    // target cards below.
+    let schedule: HashMap<(String, PayloadKind), crate::scheduler::ScheduleEntry> = {
+        let timers = state.timers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::scheduler::schedule_view(&state.config.targets, &timers, std::time::Instant::now())
+            .into_iter()
+            .map(|entry| ((entry.target.clone(), entry.kind), entry))
+            .collect()
+    };
 
     let mut body = String::from("<div class=\"cards\">");
     let _ = write!(
@@ -219,6 +229,18 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
                     "<div class=\"kv\"><span class=\"k\">{}</span><span class=\"v\">{}</span></div>",
                     tip(kind.kind.as_str(), "Payload kind: the commodity auction house dump, or the per-item auction house dump."),
                     freshness_badge(kind.age_seconds, interval)
+                );
+                let schedule_row = schedule.get(&(target.id.0.clone(), kind.kind));
+                let _ = write!(
+                    body,
+                    "<div class=\"kv\"><span class=\"k\">{}</span><span class=\"v\">{}</span></div>",
+                    tip(
+                        "next fetch",
+                        "When the scheduler polls this payload next. The first fetch after a \
+                         restart is jittered across the poll interval; a rate-limited poll \
+                         parks until the source's Retry-After. The page reloads every 30 s."
+                    ),
+                    next_fetch_cell(schedule_row)
                 );
                 if let Some(meta) = &kind.latest {
                     let _ = write!(
@@ -336,6 +358,49 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
     }
 
     page("dashboard", "dashboard", &body, None)
+}
+
+/// The dashboard's "next fetch" cell: a countdown, an in-flight badge, a
+/// rate-limit park notice, or a dash when the scheduler has not seeded the
+/// timer yet (the board fills during startup).
+fn next_fetch_cell(entry: Option<&crate::scheduler::ScheduleEntry>) -> String {
+    let Some(entry) = entry else {
+        return "<span class=\"muted\">—</span>".into();
+    };
+    if entry.running {
+        return format!(
+            "<span class=\"badge ok\" tabindex=\"0\" data-tip=\"{}\">running now</span>",
+            html_escape(
+                "A cycle for this payload is in flight right now (scheduler or manual fetch).",
+            )
+        );
+    }
+    if let Some(parked) = entry.backoff_in_secs {
+        return format!(
+            "<span class=\"badge warn\" tabindex=\"0\" data-tip=\"{}\">parked · retry in {}</span>",
+            html_escape(
+                "The source answered rate-limited (429) with a Retry-After; the poll is \
+                 parked until then, then resumes on its normal cadence.",
+            ),
+            human_in(parked)
+        );
+    }
+    if entry.next_due_in_secs == 0 {
+        return format!(
+            "<span class=\"badge warn\" tabindex=\"0\" data-tip=\"{}\">due now</span>",
+            html_escape(
+                "The poll interval has elapsed; the scheduler runs it on its next 30 s tick.",
+            )
+        );
+    }
+    format!(
+        "<span tabindex=\"0\" data-tip=\"{}\">in {}</span>",
+        html_escape(
+            "Countdown to the next scheduled poll. The page auto-reloads every 30 s, so \
+             this stays current without a manual refresh."
+        ),
+        human_in(entry.next_due_in_secs)
+    )
 }
 
 // ---------------------------------------------------------------- snapshots

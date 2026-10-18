@@ -98,6 +98,25 @@ pub fn human_age(seconds: i64) -> String {
     format!("{days}d {}h", hours % 24)
 }
 
+/// Compact countdown ("45s", "12m", "3h 12m", "6d 3h") — like [`human_age`]
+/// but granular under a minute and phrased for time-until, not time-ago.
+#[must_use]
+pub fn human_in(seconds: u64) -> String {
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    if hours < 48 {
+        return format!("{}h {}m", hours, minutes % 60);
+    }
+    let days = hours / 24;
+    format!("{days}d {}h", hours % 24)
+}
+
 /// Freshness badge for one payload kind: green within 2 poll intervals,
 /// amber within 6, red beyond, red "no data" when nothing was ever fetched.
 #[must_use]

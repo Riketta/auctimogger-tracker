@@ -242,6 +242,9 @@ fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
         item_info,
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         recent_cycles: Arc::new(RecentCycles::new(8)),
+        timers: Arc::new(std::sync::Mutex::new(
+            amtracker_server::scheduler::TargetTimers::default(),
+        )),
     };
     (Arc::new(state), root)
 }

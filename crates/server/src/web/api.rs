@@ -6,6 +6,7 @@
 use std::{
     collections::HashMap,
     sync::Arc,
+    time::Instant,
 };
 
 use amtracker_core::{
@@ -1096,6 +1097,12 @@ pub(crate) async fn api_fetch(
                 }
                 let mut fetched = false;
                 for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
+                    let key = (target.id.0.clone(), kind);
+                    {
+                        let mut timers =
+                            state.timers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        timers.running.insert(key.clone());
+                    }
                     let outcome = {
                         let _guard = state
                             .cycle_lock
@@ -1103,6 +1110,16 @@ pub(crate) async fn api_fetch(
                             .unwrap_or_else(std::sync::PoisonError::into_inner);
                         state.cycle.run_cycle(target, kind)
                     };
+                    {
+                        let mut timers =
+                            state.timers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+                        timers.running.remove(&key);
+                        // A manual cycle counts as a run for the schedule,
+                        // like the scheduler's own post-cycle stamping: the
+                        // next poll lands a full interval later instead of
+                        // re-fetching the same payload right away.
+                        timers.cycle_run.insert(key, std::time::Instant::now());
+                    }
                     match outcome {
                         Ok(report) => {
                             fetched = true;
@@ -1138,6 +1155,32 @@ pub(crate) async fn api_fetch(
         }
     };
     Json(serde_json::json!({ "reports": reports })).into_response()
+}
+
+/// `GET /api/schedule` — the scheduler's live fetch queue: when each
+/// (target, kind) becomes due, whether it is parked by a rate-limit backoff,
+/// and whether a cycle is in flight right now. Same data the dashboard's
+/// "next fetch" rows render, as JSON for scripts and monitors.
+pub(crate) async fn api_schedule(State(state): State<Arc<AppState>>) -> Response {
+    let now_unix = state.clock.now();
+    let entries = {
+        let timers = state.timers.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::scheduler::schedule_view(&state.config.targets, &timers, Instant::now())
+    };
+    let entries: Vec<serde_json::Value> = entries
+        .iter()
+        .map(|entry| {
+            serde_json::json!({
+                "target": entry.target,
+                "kind": entry.kind.as_str(),
+                "intervalSecs": entry.interval_secs,
+                "nextDueInSecs": entry.next_due_in_secs,
+                "backoffInSecs": entry.backoff_in_secs,
+                "running": entry.running,
+            })
+        })
+        .collect();
+    Json(serde_json::json!({ "now": now_unix, "entries": entries })).into_response()
 }
 
 /// Stable wire label for a cycle outcome (`Debug` would drift silently).

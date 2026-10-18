@@ -357,6 +357,11 @@ fn build_app_state(
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         // Dashboard-visible ingest history (bounded ring).
         recent_cycles: Arc::new(amtracker_server::web::RecentCycles::new(24)),
+        // Scheduler-owned fetch timers, rendered by the dashboard's
+        // "next fetch" rows and /api/schedule.
+        timers: Arc::new(std::sync::Mutex::new(
+            amtracker_server::scheduler::TargetTimers::default(),
+        )),
     })
 }
 
