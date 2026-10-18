@@ -6,6 +6,7 @@ use std::path::PathBuf;
 
 use crate::{
     domain::{
+        Flavor,
         Span,
         TargetId,
     },
@@ -26,6 +27,8 @@ pub struct TrackerConfig {
     pub opportunities: OpportunitiesConfig,
     /// Alert evaluation and delivery settings.
     pub alerts: AlertsConfig,
+    /// Item/pet name resolution settings (source chain, locale, pacing).
+    pub catalog: CatalogConfig,
     /// One entry per configured market source.
     pub targets: Vec<TargetConfig>,
 }
@@ -84,6 +87,48 @@ pub struct OpportunitiesConfig {
     pub min_samples: u32,
     /// Relative weights of the four score components.
     pub weights: ScoreWeights,
+}
+
+/// Item/pet name resolution settings: which source chain resolves unknown
+/// ids, in which language, and how eagerly (inline render budget + paced
+/// background warm-up).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CatalogConfig {
+    /// Resolution source: `"chain"` (Wowhead first, Blizzard fallback),
+    /// `"wowhead"` (only the credential-free Wowhead adapter) or
+    /// `"blizzard"` (only the authenticated Blizzard API adapter).
+    pub source: String,
+    /// Locale tag for resolved names (e.g. `"enUS"`), in the game's
+    /// locale-code spelling; adapters map it to their wire formats.
+    pub locale: String,
+    /// How many not-yet-named ids one table render may resolve inline,
+    /// synchronously (the rest keep their id fallback labels until the next
+    /// view). `0` disables inline resolution entirely.
+    pub render_resolve_max: u32,
+    /// How many still-unnamed ids one ingest cycle warms in the background
+    /// (paced, see `idle_pace_ms`). `0` disables background warm-up.
+    pub idle_names_per_cycle: u32,
+    /// Milliseconds the background warmer sleeps between two source lookups
+    /// (politeness pacing for the credential-free adapters).
+    pub idle_pace_ms: u64,
+    /// Explicit Wowhead base override (e.g. a mirror or proxy), used for
+    /// every flavor; `None` selects the per-flavor default bases.
+    pub wowhead_base: Option<String>,
+}
+
+impl Default for CatalogConfig {
+    /// The defaults: chained resolution, English names, a bounded inline
+    /// render budget and a polite background trickle.
+    fn default() -> Self {
+        Self {
+            source: "chain".into(),
+            locale: "enUS".into(),
+            render_resolve_max: 8,
+            idle_names_per_cycle: 25,
+            idle_pace_ms: 500,
+            wowhead_base: None,
+        }
+    }
 }
 
 /// Alert evaluation and delivery settings. Rules are per-target and live in
@@ -224,6 +269,9 @@ pub struct TargetConfig {
     pub auth: Option<AuthConfig>,
     /// Poll intervals for the two payload kinds.
     pub poll: PollConfig,
+    /// Which game flavor this target's items resolve against for catalog
+    /// naming (defaults to retail for targets that omit it).
+    pub flavor: Flavor,
 }
 
 impl TargetConfig {
@@ -247,7 +295,8 @@ impl TrackerConfig {
     }
 
     /// Structural validation: ids unique, polls positive, spans known and
-    /// non-empty, score weights sane, URL/auth references non-empty.
+    /// non-empty, score weights sane, URL/auth references non-empty, catalog
+    /// source/locale/flavors sane.
     ///
     /// # Errors
     ///
@@ -255,7 +304,9 @@ impl TrackerConfig {
     /// id is empty or duplicated, a poll interval is zero, an auth env name
     /// or source URL/region is blank, `connected_realm_id` is not positive,
     /// `[metrics].spans` is empty, a score weight is negative/non-finite or
-    /// the weights sum to zero, or `[opportunities].min_samples` is zero.
+    /// the weights sum to zero, `[opportunities].min_samples` is zero, the
+    /// `[catalog]` `source/locale/wowhead_base` are invalid, or a target
+    /// flavor is empty.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.targets.is_empty() {
             return Err(ConfigError("at least one [[targets]] entry is required".into()));
@@ -348,6 +399,7 @@ impl TrackerConfig {
         if self.opportunities.min_samples == 0 {
             return Err(ConfigError("[opportunities].min_samples must be positive".into()));
         }
+        self.validate_catalog()?;
         if !matches!(self.alerts.delivery.as_str(), "log" | "discord" | "telegram") {
             return Err(ConfigError(format!(
                 "[alerts].delivery must be one of \"log\", \"discord\", \"telegram\" (got '{}')",
@@ -355,6 +407,39 @@ impl TrackerConfig {
             )));
         }
         self.validate_alerts_delivery()
+    }
+
+    /// Catalog-specific checks: the source picker names a known adapter, the
+    /// locale tag and optional Wowhead base are non-empty, and every target
+    /// carries a non-empty game flavor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConfigError` for the first violated rule.
+    fn validate_catalog(&self) -> Result<(), ConfigError> {
+        if !matches!(self.catalog.source.as_str(), "chain" | "wowhead" | "blizzard") {
+            return Err(ConfigError(format!(
+                "[catalog].source must be one of \"chain\", \"wowhead\", \"blizzard\" (got '{}')",
+                self.catalog.source
+            )));
+        }
+        if self.catalog.locale.trim().is_empty() {
+            return Err(ConfigError("[catalog].locale must not be empty".into()));
+        }
+        if let Some(base) = &self.catalog.wowhead_base {
+            if base.trim().is_empty() {
+                return Err(ConfigError("[catalog].wowhead_base must not be empty".into()));
+            }
+        }
+        for target in &self.targets {
+            if target.flavor.as_str().trim().is_empty() {
+                return Err(ConfigError(format!(
+                    "target '{}' flavor must not be empty",
+                    target.id
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// Delivery-specific `[alerts]` checks: the selected adapter's credential

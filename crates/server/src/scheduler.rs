@@ -765,6 +765,7 @@ mod tests {
                     commodities_secs: commodities,
                     auctions_secs: auctions,
                 },
+                flavor: amtracker_core::domain::Flavor::default(),
             };
         let targets = [target("alpha", 3_600, 1_800), target("beta", 600, 300)];
         let now = std::time::Instant::now();

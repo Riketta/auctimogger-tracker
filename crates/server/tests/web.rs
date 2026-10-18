@@ -21,6 +21,7 @@ use std::{
 
 use amtracker_core::{
     config::{
+        CatalogConfig,
         MetricsConfig,
         OpportunitiesConfig,
         PollConfig,
@@ -34,6 +35,7 @@ use amtracker_core::{
     domain::{
         utc_day,
         FetchOutcome,
+        Flavor,
         ItemRef,
         ListingKind,
         NewSnapshot,
@@ -112,6 +114,7 @@ struct NoItemInfo;
 impl ItemInfoPort for NoItemInfo {
     fn describe(
         &self,
+        _flavor: &Flavor,
         _item_id: i64,
     ) -> Result<Option<amtracker_core::domain::NameRecord>, SourceError> {
         Ok(None)
@@ -119,6 +122,7 @@ impl ItemInfoPort for NoItemInfo {
 
     fn describe_pet(
         &self,
+        _flavor: &Flavor,
         _species_id: i64,
     ) -> Result<Option<amtracker_core::domain::PetNameRecord>, SourceError> {
         Ok(None)
@@ -168,11 +172,13 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             token_env: None,
             chat_id_env: None,
         },
+        catalog: CatalogConfig::default(),
         targets: vec![TargetConfig {
             id: TargetId(TARGET.into()),
             kind: TargetKind::BlizzardConnectedRealm { region: "us".into(), connected_realm_id: 4 },
             auth: None,
             poll: PollConfig { commodities_secs: 60, auctions_secs: 60 },
+            flavor: Flavor::default(),
         }],
     }
 }
@@ -194,7 +200,7 @@ fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
         clock: clock.clone(),
         health: Arc::new(HealthService::new(store.clone(), config.clone(), clock.clone())),
         search: Arc::new(SearchService::new(store.clone())),
-        catalog: Arc::new(CatalogService::new(store.clone(), item_info.clone())),
+        catalog: Arc::new(CatalogService::new(store.clone(), item_info.clone(), clock.clone())),
         metrics: metrics.clone(),
         opportunities: Arc::new(OpportunityService::new(
             store.clone(),

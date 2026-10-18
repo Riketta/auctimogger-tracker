@@ -286,6 +286,7 @@ fn build_app_state(
         catalog: Arc::new(amtracker_core::services::catalog::CatalogService::new(
             store.clone(),
             item_info.clone(),
+            clock.clone(),
         )),
         metrics: metrics.clone(),
         opportunities: Arc::new(amtracker_core::services::opportunity::OpportunityService::new(

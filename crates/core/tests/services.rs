@@ -71,6 +71,7 @@ fn target() -> TargetConfig {
         kind: TargetKind::BlizzardConnectedRealm { region: "us".into(), connected_realm_id: 4 },
         auth: None,
         poll: amtracker_core::config::PollConfig { commodities_secs: 3600, auctions_secs: 1800 },
+        flavor: amtracker_core::domain::Flavor::default(),
     }
 }
 
@@ -1151,6 +1152,7 @@ fn opportunity_config() -> TrackerConfig {
             token_env: None,
             chat_id_env: None,
         },
+        catalog: amtracker_core::config::CatalogConfig::default(),
         targets: vec![target()],
     }
 }

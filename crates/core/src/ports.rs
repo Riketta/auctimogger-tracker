@@ -10,6 +10,7 @@ use crate::{
         FeedFormat,
         FeedSnapshot,
         FetchOutcome,
+        Flavor,
         ItemRef,
         MetricBlock,
         NameRecord,
@@ -60,24 +61,30 @@ pub trait AuctionSourcePort: Send + Sync {
     ) -> Result<FetchOutcome, SourceError>;
 }
 
-/// Outbound: item/pet name lookups (cache-aside handled by callers).
+/// Outbound: item/pet name lookups (cache-aside handled by callers). Sources
+/// are flavor-aware: the same numeric id may resolve against different game
+/// versions' endpoints and yield different names.
 pub trait ItemInfoPort: Send + Sync {
-    /// Looks up one item in the source item API; `None` when the item does
-    /// not exist there.
+    /// Looks up one item in the source item API for the given flavor; `None`
+    /// when the item does not exist there.
     ///
     /// # Errors
     ///
     /// Returns `SourceError::Http` on transport failures and
     /// `SourceError::Parse` when the response cannot be decoded.
-    fn describe(&self, item_id: i64) -> Result<Option<NameRecord>, SourceError>;
-    /// Looks up one battle-pet species in the source pet API; `None` when
-    /// the species does not exist there.
+    fn describe(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, SourceError>;
+    /// Looks up one battle-pet species in the source pet API for the given
+    /// flavor; `None` when the species does not exist there.
     ///
     /// # Errors
     ///
     /// Returns `SourceError::Http` on transport failures and
     /// `SourceError::Parse` when the response cannot be decoded.
-    fn describe_pet(&self, species_id: i64) -> Result<Option<PetNameRecord>, SourceError>;
+    fn describe_pet(
+        &self,
+        flavor: &Flavor,
+        species_id: i64,
+    ) -> Result<Option<PetNameRecord>, SourceError>;
 }
 
 /// Outbound: snapshot metadata, raw payload archival, and the raw listing
@@ -409,19 +416,21 @@ pub trait MetricsCacheRepository: Send + Sync {
 }
 
 /// Outbound: item/pet name catalog backing search + completions + browsing.
+/// Rows are keyed per [`Flavor`] (see `domain::Flavor`); the read-only
+/// search/browse surface spans all flavors and dedupes by identity.
 pub trait ItemCatalogRepository: Send + Sync {
-    /// Inserts or updates the given catalog records.
+    /// Inserts or updates the given catalog records for one flavor.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when records cannot be written.
-    fn upsert(&self, records: &[NameRecord]) -> Result<(), StoreError>;
-    /// Inserts or updates the given pet-species records.
+    fn upsert(&self, flavor: &Flavor, records: &[NameRecord]) -> Result<(), StoreError>;
+    /// Inserts or updates the given pet-species records for one flavor.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when records cannot be written.
-    fn upsert_pets(&self, records: &[PetNameRecord]) -> Result<(), StoreError>;
+    fn upsert_pets(&self, flavor: &Flavor, records: &[PetNameRecord]) -> Result<(), StoreError>;
     /// Kind-aware substring search over known names, at most `limit` hits
     /// starting at `offset` (prefix matches first, then alphabetical). The
     /// paging pair for completion boxes and browse pages alike.
@@ -435,18 +444,22 @@ pub trait ItemCatalogRepository: Send + Sync {
         limit: usize,
         offset: usize,
     ) -> Result<Vec<SearchHit>, StoreError>;
-    /// The catalog record for one item id, if known.
+    /// The catalog record for one item id in one flavor, if known.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
-    fn by_id(&self, item_id: i64) -> Result<Option<NameRecord>, StoreError>;
-    /// The catalog record for one pet species id, if known.
+    fn by_id(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, StoreError>;
+    /// The catalog record for one pet species id in one flavor, if known.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
-    fn pet_by_species(&self, species_id: i64) -> Result<Option<PetNameRecord>, StoreError>;
+    fn pet_by_species(
+        &self,
+        flavor: &Flavor,
+        species_id: i64,
+    ) -> Result<Option<PetNameRecord>, StoreError>;
     /// Alphabetical catalog browsing, keyset-paginated: rows strictly after
     /// the `after` cursor (name, kind, id — `None` = from the top), at most
     /// `limit` rows. `has_more` tells the UI whether a next page exists.

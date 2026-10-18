@@ -51,6 +51,18 @@ weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 # token_env = "AMT_TELEGRAM_TOKEN"      # required when delivery = "telegram"
 # chat_id_env = "AMT_TELEGRAM_CHAT"
 
+# Item/pet name resolution for the dashboard (the item catalog). Unknown ids
+# resolve through Wowhead's credential-free tooltip endpoints first, with the
+# authenticated Blizzard item API as fallback ("chain"). Resolved names are
+# cached in the database forever per game flavor — each id is fetched once.
+# [catalog]
+# source = "chain"           # "chain" | "wowhead" | "blizzard"
+# locale = "enUS"            # name language, game locale-code spelling
+# render_resolve_max = 8     # inline lookups a table render may wait for (0 = off)
+# idle_names_per_cycle = 25  # ids each ingest cycle warms in the background (0 = off)
+# idle_pace_ms = 500         # sleep between two background lookups
+# wowhead_base = "https://www.wowhead.com" # explicit base override (e.g. a mirror)
+
 # Optional: persistent file logging. Startup-only: the subscriber is
 # installed once at boot, changes require a restart. Remove the section
 # to log to stdout only (systemd's journald usually suffices; otherwise
@@ -94,6 +106,10 @@ poll = { commodities_secs = 3600, auctions_secs = 1800 }
 [[targets]]
 id = "wowforever-main" # future: any conforming endpoint, world-wide
 kind = "static-urls"
+# Game flavor for catalog naming: "retail" (default), "classic-era",
+# "classic", "mop-classic", or a custom key for retail-compatible private
+# servers (custom keys resolve through the retail endpoints).
+flavor = "forever"
 commodities_url = "https://example.org/api/commodities.json"
 auctions_url = "https://example.org/api/auctions.json"
 # auth = { type = "bearer", env = "AMT_WF_TOKEN" } # optional

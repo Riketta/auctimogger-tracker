@@ -25,6 +25,32 @@ impl fmt::Display for TargetId {
     }
 }
 
+/// Game-flavor scope for catalog data: which game version's item ids the
+/// catalog entries describe. Two targets may share one database while
+/// tracking different game versions, and the same numeric id can carry a
+/// different name per version — so catalog rows are keyed per flavor.
+/// Flavors the adapters have no dedicated endpoint preset for (private
+/// servers, beta keys) resolve through the retail-compatible endpoints.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub struct Flavor(pub String);
+
+impl Flavor {
+    /// The default flavor: current retail data.
+    pub const RETAIL: &'static str = "retail";
+
+    /// The flavor key, borrowed.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Flavor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// Canonical item identity. Equipment/_consumables roll up to their base
 /// `item_id` (variant data cannot map onto the in-game item key); pets are
 /// first-class with their full identity.
@@ -477,8 +503,35 @@ pub struct NameRecord {
     pub name: String,
     /// Item class label (e.g. "Consumable"), when the API reports one.
     pub item_class: Option<String>,
+    /// Item subclass label within the class (e.g. "Cloth"), when the API
+    /// reports one.
+    pub item_subclass: Option<String>,
+    /// Equipment slot label (e.g. "Two-Hand"), when the API reports one.
+    pub inventory_slot: Option<String>,
     /// Quality label (e.g. "epic"), when the API reports one.
     pub quality: Option<String>,
+    /// Icon slug (e.g. `inv_sword_1h_04`), renderable through the game's icon
+    /// CDN; when the API reports one.
+    pub icon: Option<String>,
+    /// Vendor sell price in copper, when the API reports one.
+    pub sell_price: Option<i64>,
+    /// Unix seconds of the last successful source fetch (enrichment window
+    /// bookkeeping; `0` for search/browse hits, which do not carry it).
+    pub fetched_at: i64,
+}
+
+impl NameRecord {
+    /// Whether the record predates the enriched catalog columns and carries
+    /// none of the newer fields. Sparse rows are re-fetched once their fetch
+    /// time leaves the enrichment window so old rows gain the richer fields
+    /// without a mass re-fetch.
+    #[must_use]
+    pub fn is_sparse(&self) -> bool {
+        self.item_subclass.is_none()
+            && self.inventory_slot.is_none()
+            && self.icon.is_none()
+            && self.sell_price.is_none()
+    }
 }
 
 /// Human-readable catalog record for one battle-pet species (variant-free:

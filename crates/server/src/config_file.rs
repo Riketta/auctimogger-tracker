@@ -10,6 +10,7 @@ use amtracker_core::{
     config::{
         AlertsConfig,
         AuthConfig,
+        CatalogConfig,
         MetricsConfig,
         OpportunitiesConfig,
         PollConfig,
@@ -64,6 +65,10 @@ pub struct FileConfig {
     /// enabled with `log` delivery (events surface in the UI/API only).
     #[serde(default)]
     pub alerts: FileAlerts,
+    /// `[catalog]` section: item/pet name resolution knobs. Absent = chained
+    /// Wowhead→Blizzard resolution with English names and polite pacing.
+    #[serde(default)]
+    pub catalog: FileCatalog,
     /// `[[targets]]` array: one entry per polled market source.
     pub targets: Vec<FileTarget>,
     /// Optional `[logging]` section: persistent file logging. Absent = stdout
@@ -376,6 +381,39 @@ pub struct FileTarget {
     pub auth: Option<FileAuth>,
     /// Poll cadence per payload kind.
     pub poll: FilePoll,
+    /// Game flavor this target's items resolve against for catalog naming
+    /// (`retail`, `classic-era`, `classic`, `mop-classic`, or a custom key
+    /// for retail-compatible private servers). Absent = `retail`.
+    #[serde(default)]
+    pub flavor: Option<String>,
+}
+
+/// File shape of the optional `[catalog]` section: which chain resolves
+/// unknown item/pet ids, in which language, and how eagerly.
+#[derive(Deserialize, Default)]
+pub struct FileCatalog {
+    /// `"chain"` (Wowhead first, Blizzard fallback), `"wowhead"` or
+    /// `"blizzard"`. Defaults to `"chain"`.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Locale tag for resolved names (e.g. `"enUS"`). Defaults to `"enUS"`.
+    #[serde(default)]
+    pub locale: Option<String>,
+    /// Inline item-name budget per table render; `0` disables inline
+    /// resolution. Defaults to 8.
+    #[serde(default)]
+    pub render_resolve_max: Option<u32>,
+    /// Ids one ingest cycle warms in the background; `0` disables warm-up.
+    /// Defaults to 25.
+    #[serde(default)]
+    pub idle_names_per_cycle: Option<u32>,
+    /// Milliseconds between two background lookups. Defaults to 500.
+    #[serde(default)]
+    pub idle_pace_ms: Option<u64>,
+    /// Explicit Wowhead base override for every flavor. Absent = per-flavor
+    /// defaults.
+    #[serde(default)]
+    pub wowhead_base: Option<String>,
 }
 
 // ------------------------------------------------------------- mapping
@@ -452,6 +490,9 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
                 commodities_secs: target.poll.commodities_secs,
                 auctions_secs: target.poll.auctions_secs,
             },
+            flavor: amtracker_core::domain::Flavor(
+                target.flavor.unwrap_or_else(|| amtracker_core::domain::Flavor::RETAIL.into()),
+            ),
         });
     }
     let mut spans = Vec::with_capacity(file.metrics.spans.len());
@@ -494,6 +535,23 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             token_env: file.alerts.token_env,
             chat_id_env: file.alerts.chat_id_env,
         },
+        catalog: CatalogConfig {
+            source: file.catalog.source.unwrap_or_else(|| CatalogConfig::default().source),
+            locale: file.catalog.locale.unwrap_or_else(|| CatalogConfig::default().locale),
+            render_resolve_max: file
+                .catalog
+                .render_resolve_max
+                .unwrap_or(CatalogConfig::default().render_resolve_max),
+            idle_names_per_cycle: file
+                .catalog
+                .idle_names_per_cycle
+                .unwrap_or(CatalogConfig::default().idle_names_per_cycle),
+            idle_pace_ms: file
+                .catalog
+                .idle_pace_ms
+                .unwrap_or(CatalogConfig::default().idle_pace_ms),
+            wowhead_base: file.catalog.wowhead_base,
+        },
         targets,
     })
 }
@@ -506,6 +564,7 @@ const TOP_KEYS: &[&str] = &[
     "metrics",
     "opportunities",
     "alerts",
+    "catalog",
     "targets",
     "logging",
     "sentry",
@@ -560,6 +619,21 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
             );
         }
     }
+    if let Some(catalog) = section(root, "catalog") {
+        collect_unknown(
+            catalog,
+            "catalog",
+            &[
+                "source",
+                "locale",
+                "render_resolve_max",
+                "idle_names_per_cycle",
+                "idle_pace_ms",
+                "wowhead_base",
+            ],
+            &mut unknown,
+        );
+    }
     if let Some(alerts) = section(root, "alerts") {
         collect_unknown(
             alerts,
@@ -580,47 +654,54 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
         );
     }
     if let Some(targets) = root.get("targets").and_then(toml::Value::as_array) {
-        for (index, target) in targets.iter().enumerate() {
-            let Some(target) = target.as_table() else { continue };
-            let path = format!("targets[{index}]");
-            collect_unknown(
-                target,
-                &path,
-                &[
-                    "id",
-                    "kind",
-                    "auth",
-                    "poll",
-                    "region",
-                    "connected_realm_id",
-                    "commodities_url",
-                    "auctions_url",
-                ],
-                &mut unknown,
-            );
-            if let Some(poll) = target.get("poll").and_then(toml::Value::as_table) {
-                collect_unknown(
-                    poll,
-                    &format!("{path}.poll"),
-                    &["commodities_secs", "auctions_secs"],
-                    &mut unknown,
-                );
-            }
-            if let Some(auth) = target.get("auth").and_then(toml::Value::as_table) {
-                collect_unknown(
-                    auth,
-                    &format!("{path}.auth"),
-                    &["type", "env", "client_id_env", "client_secret_env"],
-                    &mut unknown,
-                );
-            }
-        }
+        check_target_keys(targets, &mut unknown);
     }
 
     if unknown.is_empty() {
         Ok(())
     } else {
         Err(ConfigLoadError::UnknownKeys(unknown.join(", ")))
+    }
+}
+
+/// Keys the `[[targets]]` array entries accept, including the flattened
+/// `kind` variants and the nested `poll`/`auth` tables.
+fn check_target_keys(targets: &[toml::Value], unknown: &mut Vec<String>) {
+    for (index, target) in targets.iter().enumerate() {
+        let Some(target) = target.as_table() else { continue };
+        let path = format!("targets[{index}]");
+        collect_unknown(
+            target,
+            &path,
+            &[
+                "id",
+                "kind",
+                "auth",
+                "poll",
+                "flavor",
+                "region",
+                "connected_realm_id",
+                "commodities_url",
+                "auctions_url",
+            ],
+            unknown,
+        );
+        if let Some(poll) = target.get("poll").and_then(toml::Value::as_table) {
+            collect_unknown(
+                poll,
+                &format!("{path}.poll"),
+                &["commodities_secs", "auctions_secs"],
+                unknown,
+            );
+        }
+        if let Some(auth) = target.get("auth").and_then(toml::Value::as_table) {
+            collect_unknown(
+                auth,
+                &format!("{path}.auth"),
+                &["type", "env", "client_id_env", "client_secret_env"],
+                unknown,
+            );
+        }
     }
 }
 

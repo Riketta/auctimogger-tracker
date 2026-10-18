@@ -859,6 +859,7 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
         domain::{
             BrowseCursor,
             CatalogCounts,
+            Flavor,
             NameRecord,
             PetNameRecord,
             SearchHit,
@@ -868,26 +869,38 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
 
     let dir = temp_dir("pet-catalog");
     let store = open_store(&dir, 1_000_000);
+    let flavor = Flavor::default();
 
     store
-        .upsert(&[NameRecord {
-            item_id: 2589,
-            name: "Linen Cloth".into(),
-            item_class: Some("Cloth".into()),
-            quality: Some("Common".into()),
-        }])
+        .upsert(
+            &flavor,
+            &[NameRecord {
+                item_id: 2589,
+                name: "Linen Cloth".into(),
+                item_class: Some("Cloth".into()),
+                item_subclass: None,
+                inventory_slot: None,
+                quality: Some("Common".into()),
+                icon: None,
+                sell_price: None,
+                fetched_at: 0,
+            }],
+        )
         .expect("upsert item");
     store
-        .upsert_pets(&[
-            PetNameRecord { species_id: 264, name: "Mechanical Squirrel Box".into() },
-            PetNameRecord { species_id: 42, name: "Linen-labeled Pet".into() },
-        ])
+        .upsert_pets(
+            &flavor,
+            &[
+                PetNameRecord { species_id: 264, name: "Mechanical Squirrel Box".into() },
+                PetNameRecord { species_id: 42, name: "Linen-labeled Pet".into() },
+            ],
+        )
         .expect("upsert pets");
 
     // by-species reads.
-    let pet = store.pet_by_species(264).expect("by_species").expect("named");
+    let pet = store.pet_by_species(&flavor, 264).expect("by_species").expect("named");
     assert_eq!(pet.name, "Mechanical Squirrel Box");
-    assert!(store.pet_by_species(999_999).expect("by_species").is_none());
+    assert!(store.pet_by_species(&flavor, 999_999).expect("by_species").is_none());
 
     // Kind-aware search: both pets share the substring with the item.
     let hits = store.search("linen", 10, 0).expect("search");
@@ -931,28 +944,35 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
 #[test]
 fn search_offset_pages_through_hits() {
     use amtracker_core::{
-        domain::NameRecord,
+        domain::{
+            Flavor,
+            NameRecord,
+        },
         ports::ItemCatalogRepository,
     };
 
     let dir = temp_dir("search-offset");
     let store = open_store(&dir, 1_000_000);
+    let record = |id: i64, name: &str| NameRecord {
+        item_id: id,
+        name: name.into(),
+        item_class: None,
+        item_subclass: None,
+        inventory_slot: None,
+        quality: None,
+        icon: None,
+        sell_price: None,
+        fetched_at: 0,
+    };
     store
-        .upsert(&[
-            NameRecord { item_id: 1, name: "Linen Cloth".into(), item_class: None, quality: None },
-            NameRecord {
-                item_id: 2,
-                name: "Bolts of Linen Cloth".into(),
-                item_class: None,
-                quality: None,
-            },
-            NameRecord {
-                item_id: 3,
-                name: "Heavy Linen Glove".into(),
-                item_class: None,
-                quality: None,
-            },
-        ])
+        .upsert(
+            &Flavor::default(),
+            &[
+                record(1, "Linen Cloth"),
+                record(2, "Bolts of Linen Cloth"),
+                record(3, "Heavy Linen Glove"),
+            ],
+        )
         .expect("upsert");
 
     let page1 = store.search("linen", 2, 0).expect("page 1");
@@ -969,6 +989,53 @@ fn search_offset_pages_through_hits() {
     };
     assert_eq!(id(&page1), vec![1, 2], "prefix match first, then alphabetical");
     assert_eq!(id(&page2), vec![3]);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Catalog rows are scoped per flavor: the same numeric id can exist in two
+/// game versions with different names, while the search/browse surfaces stay
+/// identity-deduplicated and counts stay per-identity.
+#[test]
+fn catalog_rows_are_scoped_per_flavor() {
+    use amtracker_core::{
+        domain::{
+            Flavor,
+            NameRecord,
+        },
+        ports::ItemCatalogRepository,
+    };
+
+    let dir = temp_dir("catalog-flavors");
+    let store = open_store(&dir, 1_000_000);
+    let retail = Flavor("retail".into());
+    let forever = Flavor("forever".into());
+    let record = |id: i64, name: &str| NameRecord {
+        item_id: id,
+        name: name.into(),
+        item_class: None,
+        item_subclass: None,
+        inventory_slot: None,
+        quality: None,
+        icon: None,
+        sell_price: None,
+        fetched_at: 0,
+    };
+
+    store.upsert(&retail, &[record(7, "Retail Name")]).expect("upsert retail");
+    store.upsert(&forever, &[record(7, "Forever Name")]).expect("upsert forever");
+
+    let retail_row = store.by_id(&retail, 7).expect("by id").expect("named");
+    assert_eq!(retail_row.name, "Retail Name");
+    let forever_row = store.by_id(&forever, 7).expect("by id").expect("named");
+    assert_eq!(forever_row.name, "Forever Name");
+    assert!(store.by_id(&retail, 8).expect("by id").is_none());
+
+    // Search and counts stay per-identity, not per-flavor.
+    let hits = store.search("name", 10, 0).expect("search");
+    assert_eq!(hits.len(), 1, "one hit per identity, not per flavor");
+    let counts = store.counts().expect("counts");
+    assert_eq!(counts.items, 1, "flavor twins count once");
 
     std::fs::remove_dir_all(&dir).ok();
 }

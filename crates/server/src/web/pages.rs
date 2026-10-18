@@ -21,6 +21,7 @@ use std::{
 use amtracker_core::{
     domain::{
         utc_day,
+        Flavor,
         ItemRef,
         MetricBlock,
         PayloadKind,
@@ -701,7 +702,8 @@ pub(crate) async fn item_page(
         Err(response) => return *response,
     };
     let item = ItemRef::Item { item_id };
-    let name = resolve_item_name(&state, item_id).await;
+    let name =
+        resolve_item_name(&state, &super::target_flavor(&state.config, &target), item_id).await;
     item_detail_page(state, target, item, name, item_id.to_string(), String::new()).await
 }
 
@@ -724,7 +726,8 @@ pub(crate) async fn pet_page(
         && !params.contains_key("quality")
         && !params.contains_key("breed");
     let item = ItemRef::Pet { species: species_id, level, quality, breed };
-    let name = resolve_pet_name(&state, species_id).await;
+    let name =
+        resolve_pet_name(&state, &super::target_flavor(&state.config, &target), species_id).await;
     let note = if defaulted {
         format!(
             "<p class=\"muted\">showing the canonical variant ({}); links from watchlists or rankings carry the exact variant</p>",
@@ -736,11 +739,13 @@ pub(crate) async fn pet_page(
     item_detail_page(state, target, item, name, format!("pet {species_id}"), note).await
 }
 
-/// Resolves an item's display name (catalog first, then the item API).
-/// The name is auxiliary: failures degrade to a placeholder.
-async fn resolve_item_name(state: &Arc<AppState>, item_id: i64) -> Option<String> {
+/// Resolves an item's display name (catalog first, then the item API) for
+/// the target's game flavor. The name is auxiliary: failures degrade to a
+/// placeholder.
+async fn resolve_item_name(state: &Arc<AppState>, flavor: &Flavor, item_id: i64) -> Option<String> {
     let state2 = Arc::clone(state);
-    let lookup = tokio::task::spawn_blocking(move || state2.catalog.ensure(item_id));
+    let flavor2 = flavor.clone();
+    let lookup = tokio::task::spawn_blocking(move || state2.catalog.ensure(&flavor2, item_id));
     match lookup.await {
         Ok(Ok(record)) => record.map(|r| r.name),
         Ok(Err(error)) => {
@@ -755,9 +760,15 @@ async fn resolve_item_name(state: &Arc<AppState>, item_id: i64) -> Option<String
 }
 
 /// Resolves a pet species' display name (same degradation policy as items).
-async fn resolve_pet_name(state: &Arc<AppState>, species_id: i64) -> Option<String> {
+async fn resolve_pet_name(
+    state: &Arc<AppState>,
+    flavor: &Flavor,
+    species_id: i64,
+) -> Option<String> {
     let state2 = Arc::clone(state);
-    let lookup = tokio::task::spawn_blocking(move || state2.catalog.ensure_pet(species_id));
+    let flavor2 = flavor.clone();
+    let lookup =
+        tokio::task::spawn_blocking(move || state2.catalog.ensure_pet(&flavor2, species_id));
     match lookup.await {
         Ok(Ok(record)) => record.map(|r| r.name),
         Ok(Err(error)) => {

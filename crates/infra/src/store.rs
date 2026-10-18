@@ -18,6 +18,7 @@ use amtracker_core::{
         utc_day,
         BrowseCursor,
         CatalogCounts,
+        Flavor,
         ItemDayRow,
         ItemRef,
         MetricBlock,
@@ -56,7 +57,55 @@ use rusqlite::Connection;
 /// cannot be migrated faithfully (old rows carry no kind) and are refused.
 /// Version 3 added the `pet_catalog` table (a fresh `CREATE TABLE IF NOT
 /// EXISTS`, so v2 files upgrade in place without a data migration).
-const SCHEMA_VERSION: i64 = 5;
+/// Version 5 added the per-reason drop breakdown column (nullable ALTER).
+/// Version 6 re-keyed the catalog tables per game flavor and added the
+/// enriched name fields; pre-v6 rows carry over as `retail` with NULL
+/// enrichment and are upgraded lazily (see `CatalogService`).
+const SCHEMA_VERSION: i64 = 6;
+
+/// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
+/// primary keys to `(flavor, id)` keys and gain the enrichment columns.
+/// Pre-v6 rows carry over as `retail` with NULL enrichment; enrichment
+/// happens lazily on later lookups (see `CatalogService`'s sparse-row
+/// refresh). Wrapped in an explicit transaction: a half-rebuilt catalog
+/// would lose rows.
+const CATALOG_V6_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+CREATE TABLE item_catalog_v6 (
+    flavor TEXT NOT NULL DEFAULT 'retail',
+    item_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    item_class TEXT,
+    item_subclass TEXT,
+    inventory_slot TEXT,
+    quality TEXT,
+    icon TEXT,
+    sell_price INTEGER,
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (flavor, item_id)
+);
+INSERT INTO item_catalog_v6
+    (flavor, item_id, name, item_class, item_subclass, inventory_slot, quality, icon, sell_price, fetched_at)
+    SELECT 'retail', item_id, name, item_class, NULL, NULL, quality, NULL, NULL, fetched_at
+    FROM item_catalog;
+DROP TABLE item_catalog;
+ALTER TABLE item_catalog_v6 RENAME TO item_catalog;
+CREATE INDEX IF NOT EXISTS idx_item_catalog_name ON item_catalog(name);
+
+CREATE TABLE pet_catalog_v6 (
+    flavor TEXT NOT NULL DEFAULT 'retail',
+    species_id INTEGER NOT NULL,
+    name TEXT NOT NULL,
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (flavor, species_id)
+);
+INSERT INTO pet_catalog_v6 (flavor, species_id, name, fetched_at)
+    SELECT 'retail', species_id, name, fetched_at FROM pet_catalog;
+DROP TABLE pet_catalog;
+ALTER TABLE pet_catalog_v6 RENAME TO pet_catalog;
+CREATE INDEX IF NOT EXISTS idx_pet_catalog_name ON pet_catalog(name);
+COMMIT;
+";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS snapshots (
@@ -127,18 +176,26 @@ CREATE TABLE IF NOT EXISTS watchlist (
 );
 
 CREATE TABLE IF NOT EXISTS item_catalog (
-    item_id INTEGER PRIMARY KEY,
+    flavor TEXT NOT NULL DEFAULT 'retail',
+    item_id INTEGER NOT NULL,
     name TEXT NOT NULL,
     item_class TEXT,
+    item_subclass TEXT,
+    inventory_slot TEXT,
     quality TEXT,
-    fetched_at INTEGER NOT NULL
+    icon TEXT,
+    sell_price INTEGER,
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (flavor, item_id)
 );
 CREATE INDEX IF NOT EXISTS idx_item_catalog_name ON item_catalog(name);
 
 CREATE TABLE IF NOT EXISTS pet_catalog (
-    species_id INTEGER PRIMARY KEY,
+    flavor TEXT NOT NULL DEFAULT 'retail',
+    species_id INTEGER NOT NULL,
     name TEXT NOT NULL,
-    fetched_at INTEGER NOT NULL
+    fetched_at INTEGER NOT NULL,
+    PRIMARY KEY (flavor, species_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pet_catalog_name ON pet_catalog(name);
 
@@ -270,6 +327,23 @@ impl SqliteStore {
             if !has_column {
                 conn.execute_batch("ALTER TABLE snapshots ADD COLUMN drop_reasons TEXT")
                     .map_err(|e| backend("migrate drop_reasons", e))?;
+            }
+            // v6 re-keyed the catalog tables per game flavor (composite
+            // `(flavor, id)` primary keys, new enrichment columns). A PK
+            // change cannot ALTER in place, so both tables are rebuilt in one
+            // transaction and pre-v6 rows carry over as `retail` with NULL
+            // enrichment (upgraded lazily by the catalog service).
+            let catalog_has_flavor = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('item_catalog') WHERE name = 'flavor')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|flag| flag == 1)
+                .map_err(|e| backend("inspect item_catalog schema", e))?;
+            if !catalog_has_flavor {
+                conn.execute_batch(CATALOG_V6_MIGRATION)
+                    .map_err(|e| backend("migrate catalog to flavor keys", e))?;
             }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
@@ -1580,17 +1654,33 @@ impl AlertEventRepository for SqliteStore {
 }
 
 impl ItemCatalogRepository for SqliteStore {
-    fn upsert(&self, records: &[NameRecord]) -> Result<(), StoreError> {
+    fn upsert(&self, flavor: &Flavor, records: &[NameRecord]) -> Result<(), StoreError> {
         let conn = self.open_transaction();
         for record in records {
             conn.execute(
-                "INSERT INTO item_catalog (item_id, name, item_class, quality, fetched_at) VALUES (?1, ?2, ?3, ?4, ?5)
-                 ON CONFLICT (item_id) DO UPDATE SET name = excluded.name, item_class = excluded.item_class, quality = excluded.quality, fetched_at = excluded.fetched_at",
+                "INSERT INTO item_catalog
+                     (flavor, item_id, name, item_class, item_subclass, inventory_slot,
+                      quality, icon, sell_price, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                 ON CONFLICT (flavor, item_id) DO UPDATE SET
+                     name = excluded.name,
+                     item_class = COALESCE(excluded.item_class, item_class),
+                     item_subclass = COALESCE(excluded.item_subclass, item_subclass),
+                     inventory_slot = COALESCE(excluded.inventory_slot, inventory_slot),
+                     quality = COALESCE(excluded.quality, quality),
+                     icon = COALESCE(excluded.icon, icon),
+                     sell_price = COALESCE(excluded.sell_price, sell_price),
+                     fetched_at = excluded.fetched_at",
                 rusqlite::params![
+                    flavor.as_str(),
                     record.item_id,
                     record.name,
                     record.item_class,
+                    record.item_subclass,
+                    record.inventory_slot,
                     record.quality,
+                    record.icon,
+                    record.sell_price,
                     self.clock.now(),
                 ],
             )
@@ -1599,13 +1689,19 @@ impl ItemCatalogRepository for SqliteStore {
         Ok(())
     }
 
-    fn upsert_pets(&self, records: &[PetNameRecord]) -> Result<(), StoreError> {
+    fn upsert_pets(&self, flavor: &Flavor, records: &[PetNameRecord]) -> Result<(), StoreError> {
         let conn = self.open_transaction();
         for record in records {
             conn.execute(
-                "INSERT INTO pet_catalog (species_id, name, fetched_at) VALUES (?1, ?2, ?3)
-                 ON CONFLICT (species_id) DO UPDATE SET name = excluded.name, fetched_at = excluded.fetched_at",
-                rusqlite::params![record.species_id, record.name, self.clock.now()],
+                "INSERT INTO pet_catalog (flavor, species_id, name, fetched_at) VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT (flavor, species_id) DO UPDATE SET
+                     name = excluded.name, fetched_at = excluded.fetched_at",
+                rusqlite::params![
+                    flavor.as_str(),
+                    record.species_id,
+                    record.name,
+                    self.clock.now(),
+                ],
             )
             .map_err(|e| backend("pet catalog upsert", e))?;
         }
@@ -1624,13 +1720,21 @@ impl ItemCatalogRepository for SqliteStore {
         let prefix = format!("{sanitized}%");
         let mut statement = conn
             .prepare(
+                // One row per identity: the same (kind, id) may exist under
+                // several flavors, and search/browse surfaces dedupe to the
+                // lexicographically-first flavor's name.
                 "SELECT id, name, kind, item_class, quality FROM (
-                     SELECT item_id AS id, name, 'item' AS kind, item_class, quality FROM item_catalog
-                     WHERE name LIKE ?1 COLLATE NOCASE
-                     UNION ALL
-                     SELECT species_id AS id, name, 'pet' AS kind, NULL AS item_class, NULL AS quality FROM pet_catalog
-                     WHERE name LIKE ?1 COLLATE NOCASE
+                     SELECT id, name, kind, item_class, quality,
+                            ROW_NUMBER() OVER (PARTITION BY kind, id ORDER BY flavor) AS rn
+                     FROM (
+                         SELECT item_id AS id, name, 'item' AS kind, item_class, quality, flavor
+                         FROM item_catalog WHERE name LIKE ?1 COLLATE NOCASE
+                         UNION ALL
+                         SELECT species_id AS id, name, 'pet' AS kind, NULL, NULL, flavor
+                         FROM pet_catalog WHERE name LIKE ?1 COLLATE NOCASE
+                     )
                  )
+                 WHERE rn = 1
                  ORDER BY (name LIKE ?2 COLLATE NOCASE) DESC, name
                  LIMIT ?3 OFFSET ?4",
             )
@@ -1650,18 +1754,25 @@ impl ItemCatalogRepository for SqliteStore {
         Ok(out)
     }
 
-    fn by_id(&self, item_id: i64) -> Result<Option<NameRecord>, StoreError> {
+    fn by_id(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, StoreError> {
         let conn = self.open_transaction();
         let row = conn
             .query_row(
-                "SELECT item_id, name, item_class, quality FROM item_catalog WHERE item_id = ?1",
-                rusqlite::params![item_id],
+                "SELECT item_id, name, item_class, item_subclass, inventory_slot, quality,
+                        icon, sell_price, fetched_at
+                 FROM item_catalog WHERE flavor = ?1 AND item_id = ?2",
+                rusqlite::params![flavor.as_str(), item_id],
                 |row| {
                     Ok(NameRecord {
                         item_id: row.get(0)?,
                         name: row.get(1)?,
                         item_class: row.get(2)?,
-                        quality: row.get(3)?,
+                        item_subclass: row.get(3)?,
+                        inventory_slot: row.get(4)?,
+                        quality: row.get(5)?,
+                        icon: row.get(6)?,
+                        sell_price: row.get(7)?,
+                        fetched_at: row.get(8)?,
                     })
                 },
             )
@@ -1673,12 +1784,16 @@ impl ItemCatalogRepository for SqliteStore {
         Ok(row)
     }
 
-    fn pet_by_species(&self, species_id: i64) -> Result<Option<PetNameRecord>, StoreError> {
+    fn pet_by_species(
+        &self,
+        flavor: &Flavor,
+        species_id: i64,
+    ) -> Result<Option<PetNameRecord>, StoreError> {
         let conn = self.open_transaction();
         let row = conn
             .query_row(
-                "SELECT species_id, name FROM pet_catalog WHERE species_id = ?1",
-                rusqlite::params![species_id],
+                "SELECT species_id, name FROM pet_catalog WHERE flavor = ?1 AND species_id = ?2",
+                rusqlite::params![flavor.as_str(), species_id],
                 |row| Ok(PetNameRecord { species_id: row.get(0)?, name: row.get(1)? }),
             )
             .map(Some)
@@ -1702,11 +1817,17 @@ impl ItemCatalogRepository for SqliteStore {
             Some(_cursor) => conn
                 .prepare(
                     "SELECT id, name, kind, item_class, quality FROM (
-                         SELECT name, 'item' AS kind, item_id AS id, item_class, quality FROM item_catalog
-                         UNION ALL
-                         SELECT name, 'pet' AS kind, species_id AS id, NULL AS item_class, NULL AS quality FROM pet_catalog
+                         SELECT id, name, kind, item_class, quality,
+                                ROW_NUMBER() OVER (PARTITION BY kind, id ORDER BY flavor) AS rn
+                         FROM (
+                             SELECT name, 'item' AS kind, item_id AS id, item_class, quality, flavor
+                             FROM item_catalog
+                             UNION ALL
+                             SELECT name, 'pet' AS kind, species_id AS id, NULL, NULL, flavor
+                             FROM pet_catalog
+                         )
                      )
-                     WHERE (name, kind, id) > (?1, ?2, ?3)
+                     WHERE rn = 1 AND (name, kind, id) > (?1, ?2, ?3)
                      ORDER BY name, kind, id
                      LIMIT ?4",
                 )
@@ -1714,10 +1835,17 @@ impl ItemCatalogRepository for SqliteStore {
             None => conn
                 .prepare(
                     "SELECT id, name, kind, item_class, quality FROM (
-                         SELECT name, 'item' AS kind, item_id AS id, item_class, quality FROM item_catalog
-                         UNION ALL
-                         SELECT name, 'pet' AS kind, species_id AS id, NULL AS item_class, NULL AS quality FROM pet_catalog
+                         SELECT id, name, kind, item_class, quality,
+                                ROW_NUMBER() OVER (PARTITION BY kind, id ORDER BY flavor) AS rn
+                         FROM (
+                             SELECT name, 'item' AS kind, item_id AS id, item_class, quality, flavor
+                             FROM item_catalog
+                             UNION ALL
+                             SELECT name, 'pet' AS kind, species_id AS id, NULL, NULL, flavor
+                             FROM pet_catalog
+                         )
                      )
+                     WHERE rn = 1
                      ORDER BY name, kind, id
                      LIMIT ?1",
                 )
@@ -1746,10 +1874,10 @@ impl ItemCatalogRepository for SqliteStore {
     fn counts(&self) -> Result<CatalogCounts, StoreError> {
         let conn = self.open_transaction();
         let items: i64 = conn
-            .query_row("SELECT COUNT(*) FROM item_catalog", [], |row| row.get(0))
+            .query_row("SELECT COUNT(DISTINCT item_id) FROM item_catalog", [], |row| row.get(0))
             .map_err(|e| backend("catalog count items", e))?;
         let pets: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pet_catalog", [], |row| row.get(0))
+            .query_row("SELECT COUNT(DISTINCT species_id) FROM pet_catalog", [], |row| row.get(0))
             .map_err(|e| backend("catalog count pets", e))?;
         Ok(CatalogCounts {
             items: u64::try_from(items).unwrap_or(0),
@@ -1769,7 +1897,12 @@ fn catalog_hit_from_row(row: &rusqlite::Row<'_>) -> Result<SearchHit, StoreError
             item_id: row.get(0).map_err(|e| backend("catalog hit id", e))?,
             name: row.get(1).map_err(|e| backend("catalog hit name", e))?,
             item_class: row.get(3).map_err(|e| backend("catalog hit class", e))?,
+            item_subclass: None,
+            inventory_slot: None,
             quality: row.get(4).map_err(|e| backend("catalog hit quality", e))?,
+            icon: None,
+            sell_price: None,
+            fetched_at: 0,
         })),
         "pet" => Ok(SearchHit::Pet(PetNameRecord {
             species_id: row.get(0).map_err(|e| backend("catalog hit id", e))?,

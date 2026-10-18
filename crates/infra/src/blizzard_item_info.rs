@@ -14,6 +14,7 @@ use amtracker_core::{
         TrackerConfig,
     },
     domain::{
+        Flavor,
         NameRecord,
         PetNameRecord,
     },
@@ -85,7 +86,7 @@ pub struct BlizzardItemInfo {
 impl BlizzardItemInfo {
     /// Derives region and credentials from the config's first Blizzard
     /// target; falls back to `us` with the default Blizzard client-credential
-    /// env names.
+    /// env names. The name locale comes from the `[catalog]` config.
     #[must_use]
     pub fn from_config(config: &TrackerConfig) -> Self {
         let agent = ureq::AgentBuilder::new()
@@ -113,21 +114,42 @@ impl BlizzardItemInfo {
                 )))
             }
         };
-        Self { agent, region, locale: "en_US".into(), credential }
+        Self { agent, region, locale: blizzard_locale(&config.catalog.locale), credential }
     }
 
-    fn item_url(&self, item_id: i64) -> String {
+    fn item_url(&self, flavor: &Flavor, item_id: i64) -> String {
         format!(
-            "https://{}.api.blizzard.com/data/wow/item/{}?namespace=static-{}&locale={}",
-            self.region, item_id, self.region, self.locale
+            "https://{}.api.blizzard.com/data/wow/item/{}?namespace={}&locale={}",
+            self.region,
+            item_id,
+            self.flavor_namespace(flavor),
+            self.locale
         )
     }
 
-    fn pet_url(&self, species_id: i64) -> String {
+    fn pet_url(&self, flavor: &Flavor, species_id: i64) -> String {
         format!(
-            "https://{}.api.blizzard.com/data/wow/pet/{}?namespace=static-{}&locale={}",
-            self.region, species_id, self.region, self.locale
+            "https://{}.api.blizzard.com/data/wow/pet/{}?namespace={}&locale={}",
+            self.region,
+            species_id,
+            self.flavor_namespace(flavor),
+            self.locale
         )
+    }
+
+    /// The Blizzard static namespace for one game flavor. Only flavors with
+    /// known namespace slugs map off retail; unknown flavors (private
+    /// servers with retail-compatible ids, beta keys) resolve through the
+    /// retail namespace. The classic slugs follow Blizzard's namespace
+    /// naming; they should be verified against the live API the first time a
+    /// classic flavor is actually deployed.
+    fn flavor_namespace(&self, flavor: &Flavor) -> String {
+        match flavor.as_str() {
+            "classic-era" => format!("static-classic-era-{}", self.region),
+            "classic" => format!("static-classic-{}", self.region),
+            "mop-classic" => format!("static-mop-classic-{}", self.region),
+            _ => format!("static-{}", self.region),
+        }
     }
 
     /// One authorized GET through the 401 refresh-retry helper: a 401 on the
@@ -214,6 +236,12 @@ struct WireItem {
     quality: Option<WireNamed>,
     #[serde(default)]
     item_class: Option<WireNamed>,
+    #[serde(default)]
+    item_subclass: Option<WireNamed>,
+    #[serde(default)]
+    inventory_type: Option<WireNamed>,
+    #[serde(default)]
+    sell_price: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -229,8 +257,8 @@ struct WireNamed {
 }
 
 impl ItemInfoPort for BlizzardItemInfo {
-    fn describe(&self, item_id: i64) -> Result<Option<NameRecord>, SourceError> {
-        let response = self.authorized_get(&self.item_url(item_id))?;
+    fn describe(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, SourceError> {
+        let response = self.authorized_get(&self.item_url(flavor, item_id))?;
         let status = response.status();
         if status == 404 {
             return Ok(None);
@@ -246,8 +274,12 @@ impl ItemInfoPort for BlizzardItemInfo {
         parse_item(item_id, &bytes)
     }
 
-    fn describe_pet(&self, species_id: i64) -> Result<Option<PetNameRecord>, SourceError> {
-        let response = self.authorized_get(&self.pet_url(species_id))?;
+    fn describe_pet(
+        &self,
+        flavor: &Flavor,
+        species_id: i64,
+    ) -> Result<Option<PetNameRecord>, SourceError> {
+        let response = self.authorized_get(&self.pet_url(flavor, species_id))?;
         let status = response.status();
         if status == 404 {
             return Ok(None);
@@ -277,7 +309,15 @@ fn parse_item(item_id: i64, bytes: &[u8]) -> Result<Option<NameRecord>, SourceEr
         item_id,
         name,
         item_class: wire.item_class.and_then(|c| c.name.and_then(|n| n.en_us)),
+        item_subclass: wire.item_subclass.and_then(|c| c.name.and_then(|n| n.en_us)),
+        inventory_slot: wire.inventory_type.and_then(|t| t.name.and_then(|n| n.en_us)),
         quality: wire.quality.and_then(|q| q.name.and_then(|n| n.en_us)),
+        // Blizzard keeps icons behind a second `/media` call; the chain's
+        // Wowhead leg carries them in the first response, so this leg stays
+        // one-request and leaves icons empty.
+        icon: None,
+        sell_price: wire.sell_price,
+        fetched_at: 0,
     }))
 }
 
@@ -291,6 +331,20 @@ fn parse_pet(species_id: i64, bytes: &[u8]) -> Result<Option<PetNameRecord>, Sou
         .and_then(|n| n.en_us)
         .ok_or_else(|| SourceError::Parse(format!("pet {species_id} has no name")))?;
     Ok(Some(PetNameRecord { species_id, name }))
+}
+
+/// Maps a config locale tag (`enUS`, the game's spelling) to the Blizzard
+/// API's `en_US` wire spelling (an underscore after the language code);
+/// tags already carrying the separator pass through unchanged.
+fn blizzard_locale(tag: &str) -> String {
+    let mut out = String::with_capacity(tag.len() + 1);
+    for (index, ch) in tag.chars().enumerate() {
+        if index == 2 && ch != '_' {
+            out.push('_');
+        }
+        out.push(ch);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -313,12 +367,19 @@ mod tests {
             "name": "Linen Cloth",
             "quality": {"type": "COMMON", "name": "Common"},
             "item_class": {"key": {"href": "https://us.api.blizzard.com/data/wow/item-class/9"}, "name": "Cloth", "id": 9},
-            "inventory_type": {"type": "NON_EQUIP", "name": "Generic"}
+            "item_subclass": {"key": {"href": "https://us.api.blizzard.com/data/wow/item-subclass/9/0"}, "name": "Cloth", "id": 0},
+            "inventory_type": {"type": "NON_EQUIP", "name": "Generic"},
+            "purchase_price": 5,
+            "sell_price": 1
         }"#;
         let record = parse_item(2589, payload).expect("parses").expect("named");
         assert_eq!(record.name, "Linen Cloth");
         assert_eq!(record.quality.as_deref(), Some("Common"));
         assert_eq!(record.item_class.as_deref(), Some("Cloth"));
+        assert_eq!(record.item_subclass.as_deref(), Some("Cloth"));
+        assert_eq!(record.inventory_slot.as_deref(), Some("Generic"));
+        assert_eq!(record.sell_price, Some(1));
+        assert!(!record.is_sparse(), "blizzard records carry enrichment");
     }
 
     #[test]
@@ -377,5 +438,15 @@ mod tests {
         let payload = br#"{"id": 264}"#;
         let error = parse_pet(264, payload).expect_err("no name");
         assert!(error.to_string().contains("has no name"));
+    }
+
+    #[test]
+    fn locale_tags_map_to_blizzard_spelling() {
+        assert_eq!(blizzard_locale("enUS"), "en_US");
+        assert_eq!(blizzard_locale("deDE"), "de_DE");
+        assert_eq!(blizzard_locale("ruRU"), "ru_RU");
+        // Already-spelled tags pass through unchanged.
+        assert_eq!(blizzard_locale("en_US"), "en_US");
+        assert_eq!(blizzard_locale("es"), "es");
     }
 }

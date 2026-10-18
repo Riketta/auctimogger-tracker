@@ -762,6 +762,7 @@ mod tests {
             kind,
             auth: None,
             poll: amtracker_core::config::PollConfig { commodities_secs: 1, auctions_secs: 1 },
+            flavor: amtracker_core::domain::Flavor::default(),
         }
     }
 }

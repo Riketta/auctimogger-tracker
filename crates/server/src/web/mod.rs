@@ -28,7 +28,10 @@ use std::{
 
 use amtracker_core::{
     config::TrackerConfig,
-    domain::TargetId,
+    domain::{
+        Flavor,
+        TargetId,
+    },
     error::StoreError,
     ports::{
         ClockPort,
@@ -331,6 +334,12 @@ pub(crate) fn required_target(
     }
 }
 
+/// The catalog flavor configured for one target; unknown targets default to
+/// retail (they are rejected by `known_target` on the render paths anyway).
+pub(crate) fn target_flavor(config: &TrackerConfig, target: &TargetId) -> Flavor {
+    config.find_target(target.as_str()).map_or_else(Flavor::default, |target| target.flavor.clone())
+}
+
 /// Maps a raw target slug to a configured [`TargetId`], rejecting unknown
 /// ids with a 400 that names the valid options.
 pub(crate) fn known_target(config: &TrackerConfig, id: &str) -> Result<TargetId, Box<Response>> {
@@ -423,6 +432,7 @@ mod tests {
                 token_env: None,
                 chat_id_env: None,
             },
+            catalog: amtracker_core::config::CatalogConfig::default(),
             targets: vec![amtracker_core::config::TargetConfig {
                 id: TargetId("us-4".into()),
                 kind: amtracker_core::config::TargetKind::BlizzardConnectedRealm {
@@ -431,6 +441,7 @@ mod tests {
                 },
                 auth: None,
                 poll: PollConfig { commodities_secs: 60, auctions_secs: 60 },
+                flavor: amtracker_core::domain::Flavor::default(),
             }],
         }
     }
