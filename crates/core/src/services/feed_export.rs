@@ -20,6 +20,7 @@ use crate::{
         FeedEntry,
         FeedSnapshot,
         ItemRef,
+        MetricBlock,
         PayloadKind,
         Span,
         TargetId,
@@ -70,6 +71,10 @@ impl FeedExportService {
     /// to publish time when unknown), so the addon's 24-hour freshness gate
     /// reflects actual data age, not export time.
     ///
+    /// All metric blocks are computed through the bulk paths — one cache /
+    /// fold / sale-rate pass per span chunk — so a whole-market publish costs
+    /// a handful of chunked queries instead of per-item-per-day round trips.
+    ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when snapshot metadata, the watchlist
@@ -91,41 +96,61 @@ impl FeedExportService {
 
         // Group pet variants by species so the exported feed matches the
         // addon's species-level grain; plain items stay per-id.
-        let mut groups: BTreeMap<PetGroupKey, Vec<ItemRef>> = BTreeMap::new();
-        for item in items {
-            let key = match &item {
-                ItemRef::Item { item_id } => PetGroupKey::Item(*item_id),
-                ItemRef::Pet { species, .. } => PetGroupKey::PetSpecies(*species),
-            };
-            groups.entry(key).or_default().push(item);
+        let groups = group_by_feed_grain(items);
+
+        // Split by computation path, preserving group order: single-member
+        // groups go through the cached per-item bulk path, multi-member
+        // populations through the merged bulk path (folds live under the
+        // original variant identity, not the canonical grain).
+        let mut singles: Vec<ItemRef> = Vec::new();
+        let mut populations: Vec<Vec<ItemRef>> = Vec::new();
+        for members in groups.values() {
+            match members.first() {
+                Some(only) if members.len() == 1 => singles.push(only.clone()),
+                _ => populations.push(members.clone()),
+            }
         }
 
+        // Per-span block matrices, row-aligned with `singles` / `populations`.
+        let single_blocks = options
+            .spans
+            .iter()
+            .map(|span| self.metrics.blocks(target, &singles, *span))
+            .collect::<Result<Vec<_>, _>>()?;
+        let population_refs: Vec<&[ItemRef]> = populations.iter().map(Vec::as_slice).collect();
+        let merged_blocks = options
+            .spans
+            .iter()
+            .map(|span| self.metrics.blocks_merged(target, &population_refs, *span))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        // Stitch: walk the groups in the same order the split ran, pulling
+        // each group's rows off the matching cursor. The cursors can only
+        // under-run when `spans` is empty (no rows at all), which yields an
+        // empty row and therefore entry-less output — the degenerate config.
+        let empty_row: Vec<Option<MetricBlock>> = Vec::new();
+        let mut single_rows = single_blocks.iter();
+        let mut merged_rows = merged_blocks.iter();
         let mut entries = Vec::new();
-        for (_, members) in groups {
-            // Groups are built by pushing at least one member, so indexing is
-            // in bounds by construction; a `.get()` fallback would produce an
-            // entry-less feed row instead of failing loudly.
-            #[allow(clippy::indexing_slicing)]
-            let (identity, single) = (canonical_item(&members[0]), members.len() == 1);
+        for members in groups.into_values() {
+            let first = members
+                .first()
+                .ok_or_else(|| StoreError::Backend("feed group lost its members".into()))?;
+            let rows = if members.len() == 1 {
+                single_rows.next().unwrap_or(&empty_row)
+            } else {
+                merged_rows.next().unwrap_or(&empty_row)
+            };
             let mut metrics = BTreeMap::new();
-            for span in &options.spans {
-                // Singles keep the per-item cached path (folds live under the
-                // original variant identity, not the canonical grain); merged
-                // populations go through block_merged.
-                #[allow(clippy::indexing_slicing)]
-                let block = if single {
-                    self.metrics.block(target, &members[0], *span)?
-                } else {
-                    self.metrics.block_merged(target, &members, *span)?
-                };
+            for (span, block) in options.spans.iter().zip(rows) {
                 if let Some(block) = block {
-                    metrics.insert(*span, block);
+                    metrics.insert(*span, block.clone());
                 }
             }
             // Entries without any valid span would be rejected by the addon's
             // strict ingestor — omit them.
             if !metrics.is_empty() {
-                entries.push(FeedEntry { item: identity, metrics });
+                entries.push(FeedEntry { item: canonical_item(first), metrics });
             }
         }
         entries.sort_by(|a, b| a.item.cmp(&b.item));
@@ -147,6 +172,21 @@ impl FeedExportService {
             Ok(newest)
         }
     }
+}
+
+/// Groups flat identities by feed grain: plain items per id, all pet
+/// variants of a species together (the addon resolves every pet entry onto
+/// the cage-species key).
+fn group_by_feed_grain(items: Vec<ItemRef>) -> BTreeMap<PetGroupKey, Vec<ItemRef>> {
+    let mut groups: BTreeMap<PetGroupKey, Vec<ItemRef>> = BTreeMap::new();
+    for item in items {
+        let key = match &item {
+            ItemRef::Item { item_id } => PetGroupKey::Item(*item_id),
+            ItemRef::Pet { species, .. } => PetGroupKey::PetSpecies(*species),
+        };
+        groups.entry(key).or_default().push(item);
+    }
+    groups
 }
 
 /// Feed-grain grouping key: plain items per id, all pet variants of a species

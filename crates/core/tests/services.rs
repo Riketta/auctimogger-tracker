@@ -1335,3 +1335,148 @@ fn requests_self_heal_once_a_snapshot_passes_the_backstop() {
     assert_eq!(sales.sale_rate_each_calls(), 2);
     assert_eq!(service.snapshot_age_secs(&target), Some(0), "the backstop seeds a fresh scan");
 }
+
+/// Builds one fold with a single auction for the given item on no particular
+/// day; callers pick the storage day via `save_fold`.
+fn fold_with(item: &ItemRef, price: i64, qty: i64) -> DayFold {
+    let mut fold = DayFold::new(item.clone());
+    fold.apply(&[listing(1, item, price, qty)]);
+    fold
+}
+
+#[test]
+fn bulk_block_paths_match_the_per_item_paths() {
+    let today = 1_000_000; // utc day 11
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let item2 = item(2);
+    let variant_a = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
+    let variant_b = ItemRef::Pet { species: 2546, level: 7, quality: 3, breed: 5 };
+
+    let history = Arc::new(FakeHistory::default());
+    // item1: three days at two price points; item2: one day.
+    for offset in 0..3 {
+        let mut fold = DayFold::new(item1.clone());
+        fold.apply(&[listing(offset, &item1, 100, 1), listing(1_000 + offset, &item1, 120, 2)]);
+        history.save_fold(&target, &item1, utc_day(today) - offset, &fold).expect("save fold");
+    }
+    history
+        .save_fold(&target, &item2, utc_day(today), &fold_with(&item2, 90, 4))
+        .expect("save fold");
+    // Pet variants: each contributes to the shared species population, one
+    // of them on a previous day.
+    history
+        .save_fold(&target, &variant_a, utc_day(today), &fold_with(&variant_a, 200, 1))
+        .expect("save fold");
+    history
+        .save_fold(&target, &variant_b, utc_day(today) - 1, &fold_with(&variant_b, 220, 3))
+        .expect("save fold");
+
+    let sales = Arc::new(FakeSales::default());
+    sales.rates.lock().unwrap().insert(item1.clone(), 0.25);
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history,
+        Arc::new(FakeCache::default()),
+        sales,
+        Arc::new(FixedClock(today)),
+    ));
+
+    for span in [Span::D1, Span::D7, Span::D30] {
+        let singles = vec![item1.clone(), item2.clone()];
+        let bulk = metrics.blocks(&target, &singles, span).expect("bulk blocks");
+        assert_eq!(
+            bulk.first().cloned().flatten(),
+            metrics.block(&target, &item1, span).expect("block 1")
+        );
+        assert_eq!(
+            bulk.get(1).cloned().flatten(),
+            metrics.block(&target, &item2, span).expect("block 2")
+        );
+
+        let group = vec![variant_a.clone(), variant_b.clone()];
+        let merged_bulk =
+            metrics.blocks_merged(&target, &[group.as_slice()], span).expect("bulk merged");
+        let merged_one = metrics.block_merged(&target, &group, span).expect("merged");
+        assert_eq!(merged_bulk.first().cloned().flatten(), merged_one);
+    }
+
+    // The merged pet population pools both variants: d7 folds two auctions
+    // at 200×1 and 220×3, so the nearest-rank median is 220.
+    let d7 = metrics
+        .block_merged(&target, &[variant_a.clone(), variant_b.clone()], Span::D7)
+        .expect("merged d7")
+        .expect("pet population has data");
+    assert_eq!(d7.n, 2);
+    assert_eq!(d7.median, 210);
+}
+
+#[test]
+fn feed_export_builds_canonical_entries_through_the_bulk_paths() {
+    let today = 1_000_000; // utc day 11
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let variant_a = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
+    let variant_b = ItemRef::Pet { species: 2546, level: 7, quality: 3, breed: 5 };
+
+    let watchlist = Arc::new(FakeWatchlist::default());
+    for watched in [&item1, &variant_a, &variant_b] {
+        watchlist
+            .add(&NewWatchlistEntry { target: target.clone(), item: watched.clone(), note: None })
+            .expect("add watch");
+    }
+
+    let history = Arc::new(FakeHistory::default());
+    let mut fold1 = DayFold::new(item1.clone());
+    fold1.apply(&[listing(1, &item1, 100, 1), listing(2, &item1, 100, 2)]);
+    history.save_fold(&target, &item1, utc_day(today), &fold1).expect("save fold");
+    history
+        .save_fold(&target, &variant_a, utc_day(today), &fold_with(&variant_a, 200, 1))
+        .expect("save fold");
+    history
+        .save_fold(&target, &variant_b, utc_day(today), &fold_with(&variant_b, 220, 3))
+        .expect("save fold");
+
+    let sales = Arc::new(FakeSales::default());
+    sales.rates.lock().unwrap().insert(item1.clone(), 0.5);
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history.clone(),
+        Arc::new(FakeCache::default()),
+        sales,
+        Arc::new(FixedClock(today)),
+    ));
+    let feed = amtracker_core::services::feed_export::FeedExportService::new(
+        Arc::new(FakeSnapshots::new()),
+        history,
+        watchlist,
+        metrics,
+        Arc::new(FixedClock(today)),
+    )
+    .build_feed(
+        &target,
+        &amtracker_core::services::feed_export::ExportOptions {
+            spans: vec![Span::D1],
+            watchlist_only: true,
+        },
+    )
+    .expect("feed");
+
+    assert_eq!(feed.entries.len(), 2, "one item entry + one species-grain pet entry");
+    let pet_entry = feed
+        .entries
+        .iter()
+        .find(|entry| matches!(entry.item, ItemRef::Pet { species: 2546, .. }))
+        .expect("pet entry");
+    assert_eq!(
+        pet_entry.item,
+        ItemRef::Pet { species: 2546, level: 0, quality: 0, breed: 0 },
+        "variants export under the canonical species grain"
+    );
+    let pet_block = pet_entry.metrics.get(&Span::D1).expect("pet d1 block");
+    assert_eq!(pet_block.n, 2, "both variants pooled into one population");
+    assert_eq!(pet_block.median, 210);
+
+    let item_entry = feed.entries.iter().find(|entry| entry.item == item1).expect("item entry");
+    let item_block = item_entry.metrics.get(&Span::D1).expect("item d1 block");
+    assert_eq!(item_block.n, 2);
+    assert_eq!(item_block.median, 100);
+}

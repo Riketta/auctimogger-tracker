@@ -817,31 +817,9 @@ impl SalesRepository for SqliteStore {
         days: i64,
     ) -> Result<Vec<Option<f64>>, StoreError> {
         let conn = self.open_transaction();
-        // One pass resolves identities in order (None = unknown item), so the
-        // result stays positionally aligned with `items`. One prepared
-        // statement is reused for the whole market scan: full-market scans
-        // cover thousands of items, and a prepare per item would dominate the
-        // mutex hold. Same SQL as `lookup_item_ref`.
-        let mut ids: Vec<Option<i64>> = Vec::with_capacity(items.len());
-        {
-            let mut statement = conn
-                .prepare(
-                    "SELECT id FROM item_ref WHERE kind = ?1 AND item_id = ?2 AND pet_species = ?3
-                     AND pet_level = ?4 AND pet_quality = ?5 AND pet_breed = ?6",
-                )
-                .map_err(|e| backend("prepare item_ref", e))?;
-            for item in items {
-                let (kind, item_id, species, level, quality, breed) = split_item_ref(item);
-                let mut rows = statement
-                    .query(rusqlite::params![kind, item_id, species, level, quality, breed])
-                    .map_err(|e| backend("query item_ref", e))?;
-                let id = match rows.next().map_err(|e| backend("item_ref row", e))? {
-                    Some(row) => Some(row.get(0).map_err(|e| backend("item_ref id", e))?),
-                    None => None,
-                };
-                ids.push(id);
-            }
-        }
+        // Positional resolution (None = unknown item), so the result stays
+        // aligned with `items`.
+        let ids = item_ids_in_order(&conn, items)?;
         let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
         if known.is_empty() {
             return Ok(vec![None; items.len()]);
@@ -934,6 +912,35 @@ fn resolve_item_ids(conn: &Connection, items: &[ItemRef]) -> Result<Vec<i64>, St
         if let Some(id) = lookup_item_ref(conn, item)? {
             ids.push(id);
         }
+    }
+    Ok(ids)
+}
+
+/// Positional identity resolution: `ids[i]` is the `item_ref` row id of
+/// `items[i]`, or `None` when the identity is unknown. One prepared
+/// statement serves the whole batch — full-market scans cover thousands of
+/// items, and a prepare per item would dominate the mutex hold. Same SQL as
+/// [`lookup_item_ref`].
+fn item_ids_in_order(conn: &Connection, items: &[ItemRef]) -> Result<Vec<Option<i64>>, StoreError> {
+    let mut ids = Vec::with_capacity(items.len());
+    let mut statement = conn
+        .prepare(
+            "SELECT id FROM item_ref WHERE kind = ?1 AND item_id = ?2 AND pet_species = ?3
+             AND pet_level = ?4 AND pet_quality = ?5 AND pet_breed = ?6",
+        )
+        .map_err(|e| backend("prepare item_ref", e))?;
+    for item in items {
+        let (kind, item_id, species, level, quality, breed) = split_item_ref(item);
+        let id = statement
+            .query_row(rusqlite::params![kind, item_id, species, level, quality, breed], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(backend("query item_ref", other)),
+            })?;
+        ids.push(id);
     }
     Ok(ids)
 }
@@ -1253,6 +1260,36 @@ impl MetricsCacheRepository for SqliteStore {
             }
         }
         Ok(ids.into_iter().map(|id| id.and_then(|id| by_id.remove(&id))).collect())
+    }
+
+    fn put_many(
+        &self,
+        target: &TargetId,
+        span: Span,
+        items: &[ItemRef],
+        blocks: &[Option<amtracker_core::domain::MetricBlock>],
+        computed_at: i64,
+    ) -> Result<(), StoreError> {
+        let conn = self.open_transaction();
+        // One transaction for the whole batch: a market-scale recomputation
+        // writes tens of thousands of rows, and per-row commits would dominate
+        // the publish.
+        let tx =
+            conn.unchecked_transaction().map_err(|e| backend("begin metrics cache put_many", e))?;
+        for (item, block) in items.iter().zip(blocks.iter()) {
+            let Some(block) = block else { continue };
+            let item_ref_id = get_or_create_item_ref(&tx, item)?;
+            let json = serde_json::to_string(&SerMetricBlock::from(block))
+                .map_err(|e| backend("serialize block", e))?;
+            tx.execute(
+                "INSERT OR REPLACE INTO metrics_cache (target_id, item_ref_id, span, computed_at, block_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![target.as_str(), item_ref_id, span.name(), computed_at, json],
+            )
+            .map_err(|e| backend("metrics cache put_many", e))?;
+        }
+        tx.commit().map_err(|e| backend("commit metrics cache put_many", e))?;
+        Ok(())
     }
 }
 
@@ -1771,6 +1808,55 @@ impl PriceHistoryRepository for SqliteStore {
             .map(|ser| ser.map(DayFold::from))
     }
 
+    fn load_folds(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        first_day: i64,
+        last_day: i64,
+    ) -> Result<Vec<Vec<(i64, DayFold)>>, StoreError> {
+        /// Ids per query — mirrors `sale_rates_by_id`'s chunking: one
+        /// market-scale read stays a handful of selects, far under the
+        /// driver's bound-parameter ceiling.
+        const FOLD_CHUNK: usize = 500;
+        let conn = self.open_transaction();
+        // Positional resolution (None = unknown identity has no fold rows),
+        // so the result stays aligned with `items`.
+        let ids = item_ids_in_order(&conn, items)?;
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        let mut by_id: HashMap<i64, Vec<(i64, DayFold)>> = HashMap::new();
+        for chunk in known.chunks(FOLD_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            let sql = format!(
+                "SELECT item_ref_id, day, fold_json FROM item_day
+                 WHERE target_id = ? AND day >= ? AND day <= ? AND item_ref_id IN ({placeholders})"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
+            params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+            params.push(rusqlite::types::Value::Integer(first_day));
+            params.push(rusqlite::types::Value::Integer(last_day));
+            for id in chunk {
+                params.push(rusqlite::types::Value::Integer(*id));
+            }
+            let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare load_folds", e))?;
+            let rows = statement
+                .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+                })
+                .map_err(|e| backend("query load_folds", e))?;
+            for row in rows {
+                let (id, day, json) = row.map_err(|e| backend("load_folds row", e))?;
+                let ser: SerDayFold =
+                    serde_json::from_str(&json).map_err(|e| backend("deserialize fold", e))?;
+                by_id.entry(id).or_default().push((day, DayFold::from(ser)));
+            }
+        }
+        Ok(ids
+            .into_iter()
+            .map(|id| id.and_then(|id| by_id.remove(&id)).unwrap_or_default())
+            .collect())
+    }
+
     fn save_fold(
         &self,
         target: &TargetId,
@@ -1791,13 +1877,30 @@ impl PriceHistoryRepository for SqliteStore {
     }
 
     fn prune_raw_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
+        /// Rows deleted per statement: batching keeps every delete short so
+        /// the store mutex is released between statements and concurrent
+        /// readers interleave, instead of one multi-million-row transaction
+        /// stalling every query for the batch's whole runtime.
+        const PRUNE_BATCH: usize = 50_000;
+        /// `i64` mirror of `PRUNE_BATCH` for the LIMIT bind parameter.
+        const PRUNE_BATCH_I64: i64 = 50_000;
+        let mut removed = 0usize;
+        loop {
+            let conn = self.open_transaction();
+            let batch = conn
+                .execute(
+                    "DELETE FROM listing WHERE rowid IN (
+                         SELECT rowid FROM listing WHERE target_id = ?1 AND day < ?2 LIMIT ?3)",
+                    rusqlite::params![target.as_str(), day, PRUNE_BATCH_I64],
+                )
+                .map_err(|e| backend("prune listings", e))?;
+            drop(conn);
+            removed += batch;
+            if batch < PRUNE_BATCH {
+                break;
+            }
+        }
         let conn = self.open_transaction();
-        let removed = conn
-            .execute(
-                "DELETE FROM listing WHERE target_id = ?1 AND day < ?2",
-                rusqlite::params![target.as_str(), day],
-            )
-            .map_err(|e| backend("prune listings", e))? as u64;
         // Best-effort archive cleanup: payload files of old snapshots. The
         // row's path is cleared alongside the file so a re-run neither
         // re-reads a dangling reference nor re-deletes (files may also be
@@ -1841,7 +1944,7 @@ impl PriceHistoryRepository for SqliteStore {
                 rusqlite::params![target.as_str(), path],
             );
         }
-        Ok(removed)
+        Ok(removed as u64)
     }
 
     fn items_with_data(
@@ -2221,9 +2324,9 @@ impl TryFrom<SerAlertCondition> for amtracker_core::domain::AlertCondition {
 
 #[cfg(test)]
 mod tests {
-    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
-    // inputs (the SecOutfall precedent).
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    // Test assertions may unwrap/expect/panic and fixture setup may index:
+    // fixed synthetic inputs, not hostile data (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
     use super::*;
 
@@ -2243,6 +2346,140 @@ mod tests {
         let enforced: i64 = conn.query_row("PRAGMA foreign_keys", [], |row| row.get(0)).unwrap();
         assert_eq!(enforced, 1, "child-table REFERENCES clauses must be live");
 
+        drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    fn test_store(name: &str) -> (std::path::PathBuf, SqliteStore) {
+        let dir = std::env::temp_dir().join(format!(
+            "amtracker-{name}-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let store = SqliteStore::open(
+            &dir.join("test.db"),
+            &dir.join("raw"),
+            std::sync::Arc::new(crate::clock::SystemClock) as std::sync::Arc<dyn ClockPort>,
+        )
+        .expect("open");
+        (dir, store)
+    }
+
+    /// A minimal listing row for fold construction.
+    fn fold_listing(
+        item: &ItemRef,
+        price: i64,
+        qty: i64,
+    ) -> amtracker_core::domain::NormalizedListing {
+        amtracker_core::domain::NormalizedListing {
+            auction_id: 1,
+            item_ref: item.clone(),
+            kind: amtracker_core::domain::ListingKind::Commodity,
+            quantity: qty,
+            unit_price: price,
+            bid: None,
+            time_left: amtracker_core::domain::TimeLeftBand::VeryLong,
+            context: None,
+            bonus_lists: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn load_folds_stays_aligned_across_chunks_windows_and_unknowns() {
+        let (dir, store) = test_store("folds");
+        let target = TargetId("eu-1602".into());
+        // 600 known identities (crossing the 500-id query chunk) plus an
+        // unknown one mid-list.
+        let items: Vec<ItemRef> = (0..601).map(|id| ItemRef::Item { item_id: id }).collect();
+        for (index, item) in items.iter().enumerate() {
+            let mut fold = DayFold::new(item.clone());
+            fold.apply(&[fold_listing(item, 100 + i64::try_from(index).unwrap_or(0), 1)]);
+            // Even indexes store a fold at `day 50`, odd ones at `day 40` so
+            // the window filter can be asserted per item.
+            let day = if index % 2 == 0 { 50 } else { 40 };
+            store.save_fold(&target, item, day, &fold).expect("save fold");
+        }
+        let query: Vec<ItemRef> = vec![
+            items[0].clone(),                  // known, in window
+            ItemRef::Item { item_id: 99_999 }, // unknown
+            items[1].clone(),                  // known, fold below the window
+            items[600].clone(),                // known, last chunk entry
+        ];
+
+        let folds = store.load_folds(&target, &query, 45, 50).expect("load folds");
+        assert_eq!(folds.len(), 4, "positional alignment");
+        assert_eq!(folds[0].len(), 1, "in-window fold loaded");
+        assert_eq!(folds[0][0].0, 50);
+        assert!(folds[1].is_empty(), "unknown identity loads empty");
+        assert!(folds[2].is_empty(), "out-of-window fold filtered");
+        assert_eq!(folds[3].len(), 1, "last chunk entry loaded");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn put_many_round_trips_through_get_many_and_skips_none() {
+        let (dir, store) = test_store("cache");
+        let target = TargetId("eu-1602".into());
+        let items: Vec<ItemRef> = (0..3).map(|id| ItemRef::Item { item_id: id }).collect();
+        let histogram = amtracker_core::domain::ItemDayHistogram {
+            buckets: std::collections::BTreeMap::from([(
+                100,
+                amtracker_core::domain::PriceBucket { listings: 2, qty: 5 },
+            )]),
+            listing_count: 2,
+            qty_sum: 5,
+        };
+        let block = amtracker_core::metrics::block_from_histograms(
+            std::slice::from_ref(&histogram),
+            Some(0.5),
+        )
+        .expect("block from non-empty histogram");
+        let blocks = [Some(block.clone()), None, Some(block)];
+        store.put_many(&target, Span::D7, &items, &blocks, 1_000).expect("put many");
+
+        let cached = store.get_many(&target, Span::D7, &items).expect("get many");
+        assert!(cached[0].is_some(), "Some block cached");
+        assert!(cached[1].is_none(), "None never cached");
+        assert!(cached[2].is_some(), "third block cached");
+        assert_eq!(cached[0].as_ref().expect("cached block").computed_at, 1_000);
+
+        // A different span must not see the rows.
+        let other = store.get_many(&target, Span::D1, &items).expect("get other span");
+        assert!(other.iter().all(Option::is_none));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn prune_removes_only_the_target_rows_before_the_day() {
+        let (dir, store) = test_store("prune");
+        let stale = TargetId("eu-1602".into());
+        let fresh = TargetId("eu-1615".into());
+        let item = ItemRef::Item { item_id: 7 };
+        {
+            let conn = store.open_transaction();
+            let item_ref_id = get_or_create_item_ref(&conn, &item).expect("item ref");
+            for (target_id, day, count) in
+                [(stale.as_str(), 100, 30), (stale.as_str(), 105, 20), (fresh.as_str(), 100, 10)]
+            {
+                for auction in 0..count {
+                    conn.execute(
+                        "INSERT INTO listing (snapshot_id, target_id, day, auction_id, item_ref_id,
+                                              quantity, unit_price, bid, time_left, context, bonus_lists)
+                         VALUES (1, ?1, ?2, ?3, ?4, 1, 100, NULL, 'VERY_LONG', NULL, '[]')",
+                        rusqlite::params![target_id, day, auction, item_ref_id],
+                    )
+                    .expect("insert listing");
+                }
+            }
+        }
+        let removed = store.prune_raw_before(&stale, 105).expect("prune");
+        assert_eq!(removed, 30, "only the stale target's old rows");
+
+        let conn = store.open_transaction();
+        let remaining: i64 =
+            conn.query_row("SELECT COUNT(*) FROM listing", [], |row| row.get(0)).expect("count");
+        assert_eq!(remaining, 30, "stale target's fresh rows + the other target survive");
         drop(conn);
         std::fs::remove_dir_all(&dir).ok();
     }

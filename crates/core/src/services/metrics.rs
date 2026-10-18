@@ -34,6 +34,11 @@ const MAX_CACHE_AGE_SECONDS: i64 = 300;
 /// Window for the sell-through rate attached to every block.
 const SALE_RATE_WINDOW_DAYS: i64 = 14;
 
+/// Identities per bulk fold/sale pass. Bounds the fold state one batch
+/// materializes (500 items × up to 30 day-folds) while keeping a market-scale
+/// recomputation at a handful of chunked queries per span.
+const BLOCK_CHUNK: usize = 500;
+
 /// Serves per-span metric blocks with cache-aside recomputation.
 pub struct MetricsService {
     history: Arc<dyn PriceHistoryRepository>,
@@ -66,30 +71,7 @@ impl MetricsService {
         item: &ItemRef,
         span: Span,
     ) -> Result<Option<MetricBlock>, StoreError> {
-        let now = self.clock.now();
-        if let Some(cached) = self.cache.get(target, item, span)? {
-            if now - cached.computed_at <= MAX_CACHE_AGE_SECONDS {
-                return Ok(Some(cached.block));
-            }
-        }
-
-        let today = utc_day(now);
-        let mut histograms = Vec::new();
-        for offset in 0..span.days() {
-            let day = today - offset;
-            if let Some(fold) = self.history.load_fold(target, item, day)? {
-                let histogram = fold.histogram();
-                if histogram.listing_count > 0 {
-                    histograms.push(histogram);
-                }
-            }
-        }
-        let sale_rate = self.sales.sale_rate(target, item, SALE_RATE_WINDOW_DAYS)?;
-        let block = block_from_histograms(&histograms, sale_rate);
-        if let Some(block) = &block {
-            self.cache.put(target, item, span, block, now)?;
-        }
-        Ok(block)
+        Ok(self.blocks(target, std::slice::from_ref(item), span)?.into_iter().next().flatten())
     }
 
     /// Computes the metric block for several item identities merged into one
@@ -111,42 +93,18 @@ impl MetricsService {
         if items.is_empty() {
             return Ok(None);
         }
-        let today = utc_day(self.clock.now());
-        let mut merged =
-            ItemDayHistogram { buckets: BTreeMap::new(), listing_count: 0, qty_sum: 0 };
-        for item in items {
-            for offset in 0..span.days() {
-                let day = today - offset;
-                if let Some(fold) = self.history.load_fold(target, item, day)? {
-                    let histogram = fold.histogram();
-                    if histogram.listing_count == 0 {
-                        continue;
-                    }
-                    for (price, bucket) in histogram.buckets {
-                        let merged_bucket = merged
-                            .buckets
-                            .entry(price)
-                            .or_insert(PriceBucket { listings: 0, qty: 0 });
-                        merged_bucket.listings += bucket.listings;
-                        merged_bucket.qty += bucket.qty;
-                    }
-                    merged.listing_count += histogram.listing_count;
-                    merged.qty_sum += histogram.qty_sum;
-                }
-            }
-        }
-        if merged.listing_count == 0 {
-            return Ok(None);
-        }
-        let sale_rate = self.sales.sale_rate_multi(target, items, SALE_RATE_WINDOW_DAYS)?;
-        Ok(block_from_histograms(std::slice::from_ref(&merged), sale_rate))
+        Ok(self
+            .blocks_merged(target, std::slice::from_ref(&items), span)?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
     /// Cached-first metric blocks for several identities of one span,
     /// positionally aligned with `items`; missing or expired entries are
-    /// recomputed (and re-cached) through [`MetricsService::block`]. Batched
-    /// fuel for whole-watchlist views: one bulk cache read, then per-item
-    /// work only for the cold entries.
+    /// recomputed in bounded batches — one bulk fold read and one bulk sale
+    /// rate read per chunk instead of per-item-per-day queries — and
+    /// re-cached through one bulk write.
     ///
     /// # Errors
     ///
@@ -160,14 +118,147 @@ impl MetricsService {
     ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
         let now = self.clock.now();
         let mut out = Vec::with_capacity(items.len());
-        for (item, cached) in items.iter().zip(self.cache.get_many(target, span, items)?) {
-            if let Some(cached) = cached {
-                if now - cached.computed_at <= MAX_CACHE_AGE_SECONDS {
-                    out.push(Some(cached.block));
-                    continue;
+        let pairs: Vec<(ItemRef, Option<crate::domain::CachedBlock>)> =
+            items.iter().cloned().zip(self.cache.get_many(target, span, items)?).collect();
+        for chunk in pairs.chunks(BLOCK_CHUNK) {
+            let mut row = Vec::with_capacity(chunk.len());
+            let mut cold = Vec::new();
+            for (item, cached) in chunk {
+                if cached
+                    .as_ref()
+                    .is_some_and(|cached| now - cached.computed_at <= MAX_CACHE_AGE_SECONDS)
+                {
+                    row.push(cached.as_ref().map(|cached| cached.block.clone()));
+                } else {
+                    row.push(None);
+                    cold.push(item.clone());
                 }
             }
-            out.push(self.block(target, item, span)?);
+            if !cold.is_empty() {
+                let computed = self.compute_blocks(target, &cold, span, now)?;
+                let mut computed_iter = computed.into_iter();
+                for slot in &mut row {
+                    if slot.is_none() {
+                        *slot = computed_iter.next().flatten();
+                    }
+                }
+            }
+            out.extend(row);
+        }
+        Ok(out)
+    }
+
+    /// Merged-population metric blocks for several groups of one span,
+    /// positionally aligned with `groups`; each group's members are folded
+    /// into one histogram population and their sale credits pooled. Bulk
+    /// twin of [`MetricsService::block_merged`]: fold state is loaded in
+    /// bounded batches across all groups instead of per member per day.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when folds or sale rates cannot be read.
+    pub fn blocks_merged(
+        &self,
+        target: &TargetId,
+        groups: &[&[ItemRef]],
+        span: Span,
+    ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
+        let now = self.clock.now();
+        let mut out = Vec::with_capacity(groups.len());
+        let mut batch: Vec<&[ItemRef]> = Vec::new();
+        let mut batch_members = 0usize;
+        for group in groups {
+            batch.push(group);
+            batch_members += group.len();
+            if batch_members >= BLOCK_CHUNK {
+                out.extend(self.compute_merged_batch(target, &batch, span, now)?);
+                batch.clear();
+                batch_members = 0;
+            }
+        }
+        if !batch.is_empty() {
+            out.extend(self.compute_merged_batch(target, &batch, span, now)?);
+        }
+        Ok(out)
+    }
+
+    /// Recomputes one chunk of cold identities: bulk folds in the span
+    /// window, per-identity sale rates, then the (parity-frozen) summarizer;
+    /// non-empty results are written back through one bulk cache put.
+    fn compute_blocks(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        span: Span,
+        now: i64,
+    ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
+        let today = utc_day(now);
+        let folds = self.history.load_folds(target, items, today - span.days() + 1, today)?;
+        let rates = self.sales.sale_rate_each(target, items, SALE_RATE_WINDOW_DAYS)?;
+        let mut blocks = Vec::with_capacity(items.len());
+        for (per_item, rate) in folds.into_iter().zip(rates) {
+            let mut histograms = Vec::new();
+            for (_, fold) in per_item {
+                let histogram = fold.histogram();
+                if histogram.listing_count > 0 {
+                    histograms.push(histogram);
+                }
+            }
+            blocks.push(block_from_histograms(&histograms, rate));
+        }
+        self.cache.put_many(target, span, items, &blocks, now)?;
+        Ok(blocks)
+    }
+
+    /// Merges one bounded batch of groups: the batch's members share a single
+    /// bulk fold read; each group's population is then summed in memory and
+    /// its sale rate pooled exactly as [`MetricsService::block_merged`] does.
+    fn compute_merged_batch(
+        &self,
+        target: &TargetId,
+        groups: &[&[ItemRef]],
+        span: Span,
+        now: i64,
+    ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
+        let today = utc_day(now);
+        let flat: Vec<ItemRef> = groups.iter().flat_map(|group| group.iter()).cloned().collect();
+        if flat.is_empty() {
+            return Ok(vec![None; groups.len()]);
+        }
+        let folds = self.history.load_folds(target, &flat, today - span.days() + 1, today)?;
+        let mut per_member = folds.into_iter();
+        let mut out = Vec::with_capacity(groups.len());
+        for group in groups {
+            let mut merged =
+                ItemDayHistogram { buckets: BTreeMap::new(), listing_count: 0, qty_sum: 0 };
+            // One fold batch per member: `per_member` is positionally
+            // aligned with the flattened group members.
+            for _ in 0..group.len() {
+                if let Some(per_day) = per_member.next() {
+                    for (_, fold) in per_day {
+                        let histogram = fold.histogram();
+                        if histogram.listing_count == 0 {
+                            continue;
+                        }
+                        for (price, bucket) in histogram.buckets {
+                            let merged_bucket = merged
+                                .buckets
+                                .entry(price)
+                                .or_insert(PriceBucket { listings: 0, qty: 0 });
+                            merged_bucket.listings += bucket.listings;
+                            merged_bucket.qty += bucket.qty;
+                        }
+                        merged.listing_count += histogram.listing_count;
+                        merged.qty_sum += histogram.qty_sum;
+                    }
+                }
+            }
+            if merged.listing_count == 0 {
+                out.push(None);
+                continue;
+            }
+            let sale_rate = self.sales.sale_rate_multi(target, group, SALE_RATE_WINDOW_DAYS)?;
+            out.push(block_from_histograms(std::slice::from_ref(&merged), sale_rate));
         }
         Ok(out)
     }

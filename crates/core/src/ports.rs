@@ -135,6 +135,38 @@ pub trait PriceHistoryRepository: Send + Sync {
         item: &ItemRef,
         day: i64,
     ) -> Result<Option<DayFold>, StoreError>;
+    /// Day folds for many identities at once, positionally aligned:
+    /// `folds[i]` holds the `(day, fold)` pairs stored for `items[i]` within
+    /// the inclusive `[first_day, last_day]` window (pairs may arrive in any
+    /// order; empty when the item has no folds in the window). Batched fuel
+    /// for feed builds: one chunked query replaces per-item-per-day loads.
+    ///
+    /// The default falls back to per-item [`PriceHistoryRepository::load_fold`]
+    /// reads — correct for any adapter, just less efficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when folds cannot be read or
+    /// deserialized.
+    fn load_folds(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        first_day: i64,
+        last_day: i64,
+    ) -> Result<Vec<Vec<(i64, DayFold)>>, StoreError> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            let mut per_item = Vec::new();
+            for day in first_day..=last_day {
+                if let Some(fold) = self.load_fold(target, item, day)? {
+                    per_item.push((day, fold));
+                }
+            }
+            out.push(per_item);
+        }
+        Ok(out)
+    }
     /// Persists the fold for one (target, item, day), replacing any previous
     /// state for that day.
     ///
@@ -347,6 +379,32 @@ pub trait MetricsCacheRepository: Send + Sync {
             out.push(self.get(target, item, span)?);
         }
         Ok(out)
+    }
+    /// Stores freshly computed blocks for several identities of one
+    /// target/span, positionally aligned (`blocks[i]` belongs to `items[i]`;
+    /// `None` entries are skipped — empty blocks are never cached). Batched
+    /// tail of whole-feed recomputation.
+    ///
+    /// The default falls back to per-item [`MetricsCacheRepository::put`]
+    /// writes — correct for any adapter, just less efficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when a block cannot be written.
+    fn put_many(
+        &self,
+        target: &TargetId,
+        span: Span,
+        items: &[ItemRef],
+        blocks: &[Option<MetricBlock>],
+        computed_at: i64,
+    ) -> Result<(), StoreError> {
+        for (item, block) in items.iter().zip(blocks.iter()) {
+            if let Some(block) = block {
+                self.put(target, item, span, block, computed_at)?;
+            }
+        }
+        Ok(())
     }
 }
 
