@@ -876,3 +876,97 @@ async fn warm_up_names_pets_through_the_pet_table() {
     );
     std::fs::remove_dir_all(&root).ok();
 }
+
+// --------------------------------------------------------- api discovery
+
+/// The API must be agent-discoverable end to end: `GET /api` is a directory,
+/// `/api/openapi.json` documents every route (drift guard: a new route
+/// without a spec entry fails here), and `/api/docs` renders the same
+/// document as HTML with the units spelled out.
+#[tokio::test]
+async fn api_is_agent_discoverable_index_openapi_and_docs() {
+    let (state, root) = test_state_with_info(None, Arc::new(NoItemInfo));
+    let router = build_router_arc(state);
+
+    let (status, body) = get(router.clone(), "/api").await;
+    assert_eq!(status, StatusCode::OK);
+    let index: Value = serde_json::from_str(&body).expect("index json");
+    assert_eq!(index["service"], "auctimogger-tracker");
+    assert_eq!(index["openapi"], "/api/openapi.json");
+    let paths: Vec<&str> = index["endpoints"]
+        .as_array()
+        .expect("endpoints array")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    assert!(paths.contains(&"/api/opportunities"));
+    assert!(paths.contains(&"/api/history"));
+
+    let (status, body) = get(router.clone(), "/api/openapi.json").await;
+    assert_eq!(status, StatusCode::OK);
+    let spec: Value = serde_json::from_str(&body).expect("spec json");
+    assert_eq!(spec["openapi"], "3.1.0");
+    for path in [
+        "/api",
+        "/api/health",
+        "/api/search",
+        "/api/opportunities",
+        "/api/overview",
+        "/api/history",
+        "/api/items/{target_id}/{item_id}/metrics",
+        "/api/items/{target_id}/pet/{species_id}/metrics",
+        "/api/feed.json",
+        "/api/watchlist",
+        "/api/watchlist/metrics",
+        "/api/snapshots",
+        "/api/schedule",
+        "/api/alerts",
+        "/api/alerts/evaluate",
+        "/api/fetch",
+        "/api/openapi.json",
+        "/api/docs",
+        "/feed.lua",
+        "/feed-slim.lua",
+    ] {
+        assert!(spec["paths"].get(path).is_some(), "undocumented route: {path}");
+    }
+    // Mutations declare bearer auth; reads stay open.
+    assert!(spec["paths"]["/api/fetch"]["post"]["security"].is_array());
+    assert!(spec["paths"]["/api/opportunities"]["get"]["security"].is_null());
+
+    let (status, body) = get(router, "/api/docs").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("/api/opportunities"), "docs must list endpoints");
+    assert!(body.contains("copper"), "docs must state the units");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The bulk analysis endpoint: one call returns every item/pet day aggregate
+/// in the window, and the window clamps so a typo cannot pull unbounded data.
+#[tokio::test]
+async fn api_history_returns_bulk_day_rows() {
+    let (state, root) = test_state_with_info(None, Arc::new(NoItemInfo));
+    seed_pet_history(&state);
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/history?target=t1&days=7").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("history json");
+    assert_eq!(json["target"], TARGET);
+    let rows = json["rows"].as_array().expect("rows array");
+    assert!(!rows.is_empty(), "seeded folds surface as rows");
+    let row = &rows[0];
+    assert_eq!(row["item"]["type"], "pet");
+    assert_eq!(row["item"]["speciesID"], 264);
+    assert!(row["p05"].is_i64(), "p05 ships for robust-floor analysis");
+    assert!(
+        rows.iter().any(|r| r["median"] == 400),
+        "the newest day's fold (4 listings at 400) is inside the window"
+    );
+
+    let (status, body) = get(build_router_arc(state), "/api/history?target=t1&days=999").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("history json");
+    assert_eq!(json["days"], 30, "the window clamps to 30 days");
+    std::fs::remove_dir_all(&root).ok();
+}

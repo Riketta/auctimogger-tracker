@@ -184,9 +184,12 @@ switcher in the top bar works on every target-scoped page.
 
 | Endpoint | Purpose |
 |---|---|
+| `GET /api` | machine-readable endpoint directory: every route with its summary, plus links to the OpenAPI document, docs page and feeds — the entry point for agents/scripts |
+| `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
 | `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics (overview rows 1–50, default 15) |
+| `GET /api/history?target=&days=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers); one call covers the whole market, `days` clamps to 1–30 (default 7) |
 | `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
 | `GET /api/snapshots?target=&kind=&limit=` | snapshot metadata rows, newest first (`kind=commodities\|auctions`) |
@@ -198,6 +201,15 @@ switcher in the top bar works on every target-scoped page.
 | `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
+
+The API is designed to be driven by agents and scripts: `GET /api` is a
+discoverable index, `/api/openapi.json` serves the OpenAPI 3.1 contract
+(hand-authored next to the handlers and pinned by a drift test), and all
+reads are unauthenticated with no rate limiting. A typical analysis pass is
+two calls — `GET /api/opportunities?limit=1000` for the ranking, then
+`GET /api/history?days=7` for the whole market's day-level price history —
+followed by per-item `/metrics` for the interesting ids; the Python
+quickstart on `/api/docs` shows exactly that.
 
 Mutation buttons are rendered only in open mode (no usable API token): with a
 token configured, the browser never holds the secret, and watchlist/fetch

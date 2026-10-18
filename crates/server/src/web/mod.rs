@@ -12,6 +12,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod openapi;
 pub mod pages;
 pub mod render;
 
@@ -186,6 +187,10 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/feed.lua", get(api::feed_lua))
         .route("/feed-slim.lua", get(api::feed_slim_lua))
         .route("/api/health", get(api::api_health))
+        .route("/api", get(api::api_index))
+        .route("/api/openapi.json", get(api::api_openapi))
+        .route("/api/docs", get(openapi::docs_page))
+        .route("/api/history", get(api::api_history))
         .route("/api/search", get(api::api_search))
         .route("/api/opportunities", get(api::api_opportunities))
         .route("/api/overview", get(api::api_overview))

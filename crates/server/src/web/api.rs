@@ -294,6 +294,89 @@ pub(crate) async fn api_search(
     }
 }
 
+/// `GET /api` — machine-readable directory: every endpoint with its summary,
+/// plus links to the `OpenAPI` document and the rendered docs page. An agent
+/// (or curl) can discover the whole surface starting from here.
+pub(crate) async fn api_index() -> Response {
+    let spec = super::openapi::spec();
+    let mut endpoints = Vec::new();
+    if let Some(paths) = spec["paths"].as_object() {
+        for (path, operations) in paths {
+            let mut methods = Vec::new();
+            for method in ["get", "post", "delete"] {
+                if let Some(op) = operations.get(method) {
+                    methods.push(serde_json::json!({
+                        "method": method.to_uppercase(),
+                        "summary": op["summary"].as_str().unwrap_or_default(),
+                    }));
+                }
+            }
+            endpoints.push(serde_json::json!({ "path": path, "operations": methods }));
+        }
+    }
+    Json(serde_json::json!({
+        "service": "auctimogger-tracker",
+        "version": env!("CARGO_PKG_VERSION"),
+        "description": "Local market-memory API over WoW auction data. Prices are integers in copper (10,000 copper = 1 gold); day values are UTC day numbers.",
+        "openapi": "/api/openapi.json",
+        "docs": "/api/docs",
+        "feeds": ["/feed.lua", "/feed-slim.lua", "/api/feed.json"],
+        "endpoints": endpoints,
+    }))
+    .into_response()
+}
+
+/// `GET /api/openapi.json` — the `OpenAPI` 3.1 document describing the whole
+/// HTTP surface; the same value the docs page renders.
+pub(crate) async fn api_openapi() -> Response {
+    Json(super::openapi::spec().clone()).into_response()
+}
+
+/// `GET /api/history?target=&days=` — bulk per-item-per-day aggregates for
+/// every item/pet with fold data in the window: the analysis-grade payload
+/// for scripts (one call covers the whole market; every price field is
+/// integer copper, days are UTC day numbers).
+pub(crate) async fn api_history(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let days = params.get("days").and_then(|v| v.parse::<i64>().ok()).map_or(7, |v| v.clamp(1, 30));
+    let computed = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || -> Result<(i64, Vec<amtracker_core::domain::ItemDayRow>), StoreError> {
+            let today = amtracker_core::domain::utc_day(state.clock.now());
+            let since_day = today.saturating_sub(days - 1);
+            let rows = state.history.item_day_rows(&target, since_day)?;
+            Ok((since_day, rows))
+        }
+    });
+    match computed.await {
+        Ok(Ok((since_day, rows))) => Json(serde_json::json!({
+            "target": target.as_str(),
+            "days": days,
+            "sinceDay": since_day,
+            "rows": rows.iter().map(|row| serde_json::json!({
+                "item": item_json(&row.item),
+                "day": row.day,
+                "listingCount": row.listing_count,
+                "qtySum": row.qty_sum,
+                "min": row.min,
+                "p05": row.p05,
+                "median": row.median,
+                "mad": row.mad,
+            })).collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("history", &error),
+        Err(error) => internal_error("history-join", &error),
+    }
+}
+
 /// `GET /api/opportunities?target=&min_churn=&limit=`
 pub(crate) async fn api_opportunities(
     State(state): State<Arc<AppState>>,
