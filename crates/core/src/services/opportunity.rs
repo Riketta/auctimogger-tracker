@@ -62,7 +62,8 @@ pub struct Opportunity {
     pub median7: i64,
     /// Cheapest unit price of the newest day in the window (copper).
     pub floor_now: i64,
-    /// `1 - floor_now / median7`, clamped to [0, 1] for scoring.
+    /// `1 - p05(newest day) / median7`, clamped to [0, 1] for scoring — the
+    /// robust floor keeps one outlier listing from faking a deep discount.
     pub discount: f64,
     /// 14-day sale rate: share of vanished listings credited as sold.
     pub reliability: f64,
@@ -133,6 +134,8 @@ struct ItemScan {
     samples7: i64,
     churn_per_day: f64,
     floor_now: i64,
+    /// Newest day's p05 — the floor discount is scored against.
+    floor_p05: i64,
     median_now: i64,
     median7: f64,
     mad7: f64,
@@ -369,7 +372,8 @@ impl OpportunityService {
         weighted.sort_by_key(|(median, _)| *median);
         let median7 = weighted_median(&weighted);
         let mad7 = if mad_weight_sum > 0 { mad_weighted / mad_weight_sum as f64 } else { 0.0 };
-        let (floor_now, median_now) = newest.map_or((0, 0), |row| (row.min, row.median));
+        let (floor_now, floor_p05, median_now) =
+            newest.map_or((0, 0, 0), |row| (row.min, row.p05, row.median));
         // Window-denominator churn: days without a fold count as zero, so a
         // single busy day reads as that day's count spread over the window,
         // not as sustained per-day volume (the docs and the `min_churn`
@@ -381,6 +385,7 @@ impl OpportunityService {
             samples7,
             churn_per_day,
             floor_now,
+            floor_p05,
             median_now,
             median7,
             mad7,
@@ -396,9 +401,12 @@ impl OpportunityService {
         if scan.median7 <= 0.0 || scan.floor_now <= 0 {
             return None;
         }
-        // Discount is rounded to 3 decimals for feed/UI stability.
+        // Discount is rounded to 3 decimals for feed/UI stability. Scored
+        // against the newest day's p05, not the raw min: one outlier listing
+        // cannot fake a deep discount, while days with ≤ 20 listings
+        // degenerate p05 → min and keep full snipe sensitivity.
         #[allow(clippy::cast_precision_loss)]
-        let discount = ((1.0 - scan.floor_now as f64 / scan.median7).clamp(0.0, 1.0) * 1000.0)
+        let discount = ((1.0 - scan.floor_p05 as f64 / scan.median7).clamp(0.0, 1.0) * 1000.0)
             .round()
             / 1000.0;
         let churn_score = (scan.churn_per_day / CHURN_ANCHOR).min(1.0);
@@ -495,6 +503,7 @@ mod tests {
                 listing_count: 900,
                 qty_sum: 9_000,
                 min: 45_000,
+                p05: 45_000,
                 median: 90_000,
                 mad: 500,
             },
@@ -504,12 +513,14 @@ mod tests {
                 listing_count: 1_100,
                 qty_sum: 11_000,
                 min: 55_000,
+                p05: 55_000,
                 median: 110_000,
                 mad: 600,
             },
         ];
         let scan = OpportunityService::scan_item(&item(1), &rows);
         assert_eq!(scan.floor_now, 55_000);
+        assert_eq!(scan.floor_p05, 55_000);
         assert_eq!(scan.samples7, 2_000);
         // Window denominator: 2 000 listings across a 7-day window, even
         // though only two of those days have folds.
@@ -526,6 +537,7 @@ mod tests {
             listing_count: 50,
             qty_sum: 50,
             min: 100,
+            p05: 100,
             median: 100,
             mad: 0,
         }];

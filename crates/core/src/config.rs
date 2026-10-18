@@ -183,7 +183,8 @@ pub enum AlertDelivery {
 /// ranking; the absolute scale is free.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoreWeights {
-    /// Weight of the discount component (`1 - floor_now / median7`).
+    /// Weight of the discount component (`1 - p05(newest day) / median7`; the
+    /// robust floor keeps one outlier listing from dominating the score).
     pub discount: f64,
     /// Weight of the sell-through (reliability) component.
     pub sale: f64,

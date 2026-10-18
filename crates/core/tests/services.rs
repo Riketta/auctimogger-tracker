@@ -678,6 +678,7 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
             listing_count: 1,
             qty_sum: 1,
             min: 90,
+            p05: 90,
             median: 100,
             mad: 0,
         },
@@ -687,6 +688,7 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
             listing_count: 1,
             qty_sum: 1,
             min: 500,
+            p05: 500,
             median: 500,
             mad: 0,
         },
@@ -1158,7 +1160,16 @@ fn opportunity_config() -> TrackerConfig {
 }
 
 fn day_row(item_id: i64, day: i64, listing_count: u64, min: i64, median: i64) -> ItemDayRow {
-    ItemDayRow { item: item(item_id), day, listing_count, qty_sum: 0, min, median, mad: 500 }
+    ItemDayRow {
+        item: item(item_id),
+        day,
+        listing_count,
+        qty_sum: 0,
+        min,
+        p05: min,
+        median,
+        mad: 500,
+    }
 }
 
 /// Two ranked items: item 1 with a steep discount and sales evidence, item 2
@@ -1232,6 +1243,35 @@ fn prepared_ranking_matches_the_inline_semantics() {
     );
     assert_eq!(history.item_day_rows_calls(), 1);
     assert_eq!(sales.sale_rate_each_calls(), 1);
+}
+
+#[test]
+fn a_single_troll_floor_cannot_fake_a_deep_discount() {
+    // One 1-copper listing among a busy day: the displayed floor keeps the
+    // true min, but discount scores against the day's p05 so the outlier
+    // cannot top the ranking with a fake ~100% discount.
+    let target = TargetId("us-4".into());
+    let today = amtracker_core::domain::utc_day(1_000_000);
+    let rows = vec![ItemDayRow {
+        item: item(1),
+        day: today,
+        listing_count: 1_000,
+        qty_sum: 1_000,
+        min: 1,
+        p05: 90_000,
+        median: 100_000,
+        mad: 5_000,
+    }];
+    let history = Arc::new(CountingHistory::new(rows));
+    let sales = Arc::new(CountingSales::default());
+    let clock = MutableClock::new(1_000_000);
+    let service = OpportunityService::new(history, sales, clock, &opportunity_config());
+
+    let ranked = service.opportunities(&target, 0.0, 50).expect("ranked");
+    let top = ranked.first().expect("rankable");
+    assert_eq!(top.floor_now, 1, "the displayed floor stays the true min");
+    assert_eq!(top.median7, 100_000);
+    assert_eq!(top.discount, 0.1, "discount reads p05, not the troll min");
 }
 
 #[test]

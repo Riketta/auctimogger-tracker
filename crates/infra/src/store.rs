@@ -965,13 +965,14 @@ fn day_rows_from_stored(rows: Vec<StoredDayRow>) -> Result<Vec<ItemDayRow>, Stor
                 std::iter::repeat_n(*price, usize::try_from(bucket.listings).unwrap_or(0))
             })
             .collect();
-        let (min, median, mad) = price_stats_sorted(&prices);
+        let (min, p05, median, mad) = price_stats_sorted(&prices);
         out.push(ItemDayRow {
             item: join_item_ref(&kind, item_id, species, level, quality, breed),
             day,
             listing_count: histogram.listing_count,
             qty_sum: histogram.qty_sum,
             min,
+            p05,
             median,
             mad,
         });
@@ -2175,14 +2176,18 @@ impl PriceHistoryRepository for SqliteStore {
 /// Prices must be sorted ascending.
 ///
 /// Direct indexing is safe here: `n > 0` is ensured by the early return and
-/// `mid` lies in `1..=n`, so `mid - 1` and `0` are always valid indices — a
+/// `mid` and the p05 rank lie in `1..=n`, so every index is valid — a
 /// `.get()` fallback would silently corrupt the statistics.
 #[allow(clippy::indexing_slicing)]
-fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64) {
+fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64, i64) {
     let n = prices.len();
     if n == 0 {
-        return (0, 0, 0);
+        return (0, 0, 0, 0);
     }
+    // Nearest-rank p05, same rule as the metrics engine: ceil(0.05·n)
+    // clamped to [1, n]; `div_ceil(20)` is that rank in integer math and for
+    // n ≥ 1 always lands in [1, n] (≤ 20 listings degenerate p05 → min).
+    let p05 = prices[n.div_ceil(20) - 1];
     let mid = n.div_ceil(2);
     let median = prices[mid - 1];
     let mad = {
@@ -2190,7 +2195,7 @@ fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64) {
         deviations.sort_unstable();
         deviations[mid - 1]
     };
-    (prices[0], median, mad)
+    (prices[0], p05, median, mad)
 }
 
 // ------------------------------------------------------------------ helpers

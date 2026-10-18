@@ -331,7 +331,7 @@ pub struct PriceBucket {
 }
 
 /// Per-item-day aggregate used by ranking/overview views (derived from the
-/// day fold; median/min are listing-level nearest-rank over that day).
+/// day fold; min/p05/median are listing-level nearest-rank over that day).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemDayRow {
     /// The item the row aggregates.
@@ -344,6 +344,10 @@ pub struct ItemDayRow {
     pub qty_sum: i64,
     /// Cheapest listing of the day (copper per unit).
     pub min: i64,
+    /// 5th-percentile unit price of the day (nearest rank) — the robust
+    /// floor behind discount scoring; equals `min` on days with ≤ 20
+    /// listings.
+    pub p05: i64,
     /// Listing-level nearest-rank median (copper per unit).
     pub median: i64,
     /// Median absolute deviation of the day's unit prices.
