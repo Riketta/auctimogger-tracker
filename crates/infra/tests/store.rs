@@ -18,6 +18,7 @@ use std::{
 
 use amtracker_core::{
     domain::{
+        Flavor,
         ItemRef,
         ListingKind,
         NewSnapshot,
@@ -32,6 +33,7 @@ use amtracker_core::{
     fold::DayFold,
     ports::{
         ClockPort,
+        ItemCatalogRepository,
         MetricsCacheRepository,
         PriceHistoryRepository,
         SalesRepository,
@@ -1314,6 +1316,56 @@ fn reopening_a_migrated_store_keeps_drop_reasons_readable() {
     let store = open_store(&dir, 1_000_000);
     let latest = store.latest(&target, PayloadKind::Commodities).expect("latest").expect("row");
     assert_eq!(latest.dropped_reasons.get("missing-price"), Some(&1));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// v5 → v6: hand-built pre-flavor catalog tables (bare-id primary keys, no
+/// enrichment columns) carry over as `retail` rows with NULL enrichment and
+/// preserved stamps. This is the schema's one data-destroying migration —
+/// pinned against row loss, stamp loss and flavor-key drift.
+#[test]
+fn v5_catalog_rows_carry_over_as_retail_through_the_v6_rebuild() {
+    let dir = temp_dir("catalog-v6-rebuild");
+    let db = dir.join("db.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&db).expect("open v5 file");
+        connection
+            .execute_batch(
+                "CREATE TABLE item_catalog (
+                    item_id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    item_class TEXT,
+                    quality TEXT,
+                    fetched_at INTEGER NOT NULL
+                );
+                CREATE TABLE pet_catalog (
+                    species_id INTEGER PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    fetched_at INTEGER NOT NULL
+                );
+                INSERT INTO item_catalog VALUES (2589, 'Linen Cloth', 'Cloth', 'common', 1000000);
+                INSERT INTO pet_catalog VALUES (264, 'Crawling Claw', 999000);
+                PRAGMA user_version = 5;",
+            )
+            .expect("seed v5 catalog");
+    }
+    let store = open_store(&dir, 1_000_001);
+    let retail = Flavor("retail".into());
+
+    let item = store.by_id(&retail, 2589).expect("read item").expect("item carried over");
+    assert_eq!(item.name, "Linen Cloth");
+    assert_eq!(item.item_class.as_deref(), Some("Cloth"), "carried columns survive");
+    assert_eq!(item.quality.as_deref(), Some("common"));
+    assert_eq!(item.fetched_at, 1_000_000, "the stamp survives for sparse scheduling");
+    assert!(item.is_sparse(), "carried rows are NULL-enriched and re-fetched lazily");
+    assert!(
+        store.by_id(&Flavor("forever".into()), 2589).expect("read").is_none(),
+        "carried rows are scoped to retail only"
+    );
+
+    let pet = store.pet_by_species(&retail, 264).expect("read pet").expect("pet carried over");
+    assert_eq!(pet.name, "Crawling Claw");
 
     std::fs::remove_dir_all(&dir).ok();
 }

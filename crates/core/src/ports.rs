@@ -70,16 +70,18 @@ pub trait ItemInfoPort: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `SourceError::Http` on transport failures and
-    /// `SourceError::Parse` when the response cannot be decoded.
+    /// Returns `SourceError::Http` (or `SourceError::RateLimited` when the
+    /// source said 429) on transport failures and `SourceError::Parse` when
+    /// the response cannot be decoded.
     fn describe(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, SourceError>;
-    /// Looks up one battle-pet species in the source pet API for the given
+    /// Looks up one battle-pet species in the source pet API for the
     /// flavor; `None` when the species does not exist there.
     ///
     /// # Errors
     ///
-    /// Returns `SourceError::Http` on transport failures and
-    /// `SourceError::Parse` when the response cannot be decoded.
+    /// Returns `SourceError::Http` (or `SourceError::RateLimited` when the
+    /// source said 429) on transport failures and `SourceError::Parse` when
+    /// the response cannot be decoded.
     fn describe_pet(
         &self,
         flavor: &Flavor,

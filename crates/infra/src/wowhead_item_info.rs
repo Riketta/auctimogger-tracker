@@ -51,16 +51,26 @@ fn flavor_prefix(flavor: &Flavor) -> &'static str {
     }
 }
 
-/// Maps the config's locale tag (`enUS`, the game's spelling) onto Wowhead's
-/// locale path prefix (`/ru`, `/cn`, ...). English stays unprefixed.
+/// Maps the config's locale tag onto Wowhead's locale path prefix (`/ru`,
+/// `/cn`, ...). English stays unprefixed. Both spellings of a tag (the
+/// game's `xxXX` and the wire's `xx_XX`) normalize onto one prefix; config
+/// validation keeps unknown tags out, and the two-letter fallback covers
+/// future locales defensively.
 fn locale_prefix(locale: &str) -> String {
-    let lowered = locale.to_ascii_lowercase();
+    let lowered: String =
+        locale.chars().filter(|ch| *ch != '_').collect::<String>().to_ascii_lowercase();
     match lowered.as_str() {
-        "" | "enus" | "engb" => String::new(),
+        "enus" | "engb" => String::new(),
         "zhcn" => "/cn".into(),
         "zhtw" => "/tw".into(),
         "esmx" => "/mx".into(),
         "ptbr" => "/pt".into(),
+        "dede" => "/de".into(),
+        "eses" => "/es".into(),
+        "frfr" => "/fr".into(),
+        "itit" => "/it".into(),
+        "ruru" => "/ru".into(),
+        "kokr" => "/ko".into(),
         other => {
             format!("/{}", other.get(..2).unwrap_or(other))
         }
@@ -102,12 +112,21 @@ impl WowheadItemInfo {
     }
 
     /// One tooltip GET: 404 (`{"error": ...}` or a missing entity) is the
-    /// "does not exist there" answer; anything else non-200 is transport
-    /// trouble the chain may fall through on.
+    /// "does not exist there" answer; 429 keeps its rate-limit semantics so
+    /// log lines say "rate-limited" instead of a generic transport error;
+    /// anything else non-200 is transport trouble the chain may fall
+    /// through on.
     fn get_json(&self, url: &str) -> Result<Option<Vec<u8>>, SourceError> {
         let response = match self.agent.get(url).call() {
             Ok(response) => response,
             Err(ureq::Error::Status(404, _)) => return Ok(None),
+            Err(ureq::Error::Status(429, response)) => {
+                return Err(SourceError::RateLimited {
+                    retry_after: response
+                        .header("retry-after")
+                        .and_then(|hint| hint.trim().parse::<u64>().ok()),
+                });
+            }
             Err(error) => return Err(SourceError::Http(error.to_string())),
         };
         if response.status() != 200 {
@@ -366,8 +385,13 @@ mod tests {
         assert_eq!(flavor_prefix(&Flavor("mop-classic".into())), "/mop-classic");
         assert_eq!(flavor_prefix(&Flavor("some-emu".into())), "", "custom flavors ride retail");
         assert_eq!(locale_prefix("enUS"), "");
+        assert_eq!(locale_prefix("en_US"), "", "the wire spelling normalizes too");
         assert_eq!(locale_prefix("ruRU"), "/ru");
+        assert_eq!(locale_prefix("ru_RU"), "/ru");
         assert_eq!(locale_prefix("zhCN"), "/cn");
+        assert_eq!(locale_prefix("zh_TW"), "/tw");
         assert_eq!(locale_prefix("ptBR"), "/pt");
+        assert_eq!(locale_prefix("deDE"), "/de");
+        assert_eq!(locale_prefix("koKR"), "/ko");
     }
 }

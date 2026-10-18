@@ -409,9 +409,36 @@ impl TrackerConfig {
         self.validate_alerts_delivery()
     }
 
+    /// The locale tags `[catalog].locale` accepts, normalized (lowercased,
+    /// separator-stripped): the game's `xxXX` spellings and the wire `xx_XX`
+    /// spellings normalize onto the same tag. Each tag has a Wowhead database
+    /// prefix and a Blizzard API wire form; anything else would 404 every
+    /// lookup and negative-cache real item names.
+    const KNOWN_LOCALE_TAGS: [&str; 12] = [
+        "enus", "engb", "dede", "eses", "esmx", "frfr", "itit", "ptbr", "ruru", "kokr", "zhcn",
+        "zhtw",
+    ];
+
+    /// The credential config for Blizzard item/community endpoints: the
+    /// first Blizzard-connected target's auth, or the default
+    /// client-credential env names when no such target exists. Shared by the
+    /// source adapters and the binary's credential probe so the two can
+    /// never disagree about which credentials the name chain would use.
+    #[must_use]
+    pub fn blizzard_auth(&self) -> AuthConfig {
+        self.targets
+            .iter()
+            .find_map(|target| match &target.kind {
+                TargetKind::BlizzardConnectedRealm { .. } => Some(target.auth.clone()),
+                TargetKind::StaticUrls { .. } => None,
+            })
+            .flatten()
+            .unwrap_or_else(AuthConfig::default_blizzard)
+    }
+
     /// Catalog-specific checks: the source picker names a known adapter, the
-    /// locale tag and optional Wowhead base are non-empty, and every target
-    /// carries a non-empty game flavor.
+    /// locale tag is a supported game locale and the optional Wowhead base
+    /// is non-empty, and every target carries a non-empty game flavor.
     ///
     /// # Errors
     ///
@@ -423,8 +450,19 @@ impl TrackerConfig {
                 self.catalog.source
             )));
         }
-        if self.catalog.locale.trim().is_empty() {
-            return Err(ConfigError("[catalog].locale must not be empty".into()));
+        let tag: String = self
+            .catalog
+            .locale
+            .chars()
+            .filter(|ch| *ch != '_')
+            .collect::<String>()
+            .to_ascii_lowercase();
+        if !Self::KNOWN_LOCALE_TAGS.contains(&tag.as_str()) {
+            return Err(ConfigError(format!(
+                "[catalog].locale must be a supported game locale tag such as \"enUS\" or \
+                 \"deDE\" (got '{}')",
+                self.catalog.locale
+            )));
         }
         if let Some(base) = &self.catalog.wowhead_base {
             if base.trim().is_empty() {

@@ -53,7 +53,7 @@ use super::{
         human_age,
         human_in,
         human_time,
-        item_link,
+        item_cell,
         money,
         outcome_badge,
         page,
@@ -526,7 +526,7 @@ pub(crate) async fn items_page(
          placeholder=\"search item or pet name…\" autocomplete=\"off\" \
          data-search-endpoint=\"/api/search\" data-search-target=\"{}\" /></div>\
          <p class=\"muted\">type at least 2 characters — completions cover named items and pet species \
-         (names resolve through the Blizzard item/pet APIs as items are seen or visited)</p>",
+         (names resolve through the Wowhead-first source chain as items are seen or visited)</p>",
         html_escape(target.as_str())
     );
 
@@ -782,6 +782,12 @@ async fn resolve_pet_name(
     }
 }
 
+/// Wall-clock cap for the render lane's inline lookups: page latency stays
+/// bounded even during a source outage. Timed-out lookups keep running on
+/// their blocking threads and land in the catalog whenever they finish, so
+/// the next view (or the background warm-up) finds them cached.
+const RENDER_RESOLVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The render lane's bounded name resolution for one table page: the first
 /// `[catalog].render_resolve_max` distinct ids/species of `items` resolve
 /// concurrently off the async runtime — cached ids cost one local read,
@@ -834,8 +840,8 @@ async fn resolve_names(
         .collect::<Vec<_>>();
     let mut failures = 0usize;
     for lookup in lookups {
-        match lookup.await {
-            Ok(Ok(Some((item, name)))) => match &item {
+        match tokio::time::timeout(RENDER_RESOLVE_DEADLINE, lookup).await {
+            Ok(Ok(Ok(Some((item, name))))) => match &item {
                 ItemRef::Item { item_id } => {
                     names.items.insert(*item_id, name);
                 }
@@ -843,8 +849,8 @@ async fn resolve_names(
                     names.pets.insert(*species, name);
                 }
             },
-            Ok(Ok(None)) => {}
-            Ok(Err(_)) | Err(_) => failures += 1,
+            Ok(Ok(Ok(None))) => {}
+            Ok(Ok(Err(_)) | Err(_)) | Err(_) => failures += 1,
         }
     }
     if failures > 0 {
@@ -1244,8 +1250,8 @@ pub(crate) async fn opportunities_page(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
-                 <td>{}</td></tr>",
-                item_link(&target, &o.item, &names),
+                 {}</tr>",
+                item_cell(&target, &o.item, &names),
                 o.score,
                 o.score,
                 o.confidence,
@@ -1303,11 +1309,11 @@ fn mover_table(
             let change_class = if m.change >= 0.0 { "up" } else { "down" };
             let _ = write!(
                 out,
-                "<tr><td>{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+                "<tr>{}<td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"{change_class}\" data-v=\"{:.4}\">{:+.1}%</td>\
                  <td class=\"num\" data-v=\"{:.2}\">{:.1}</td><td>{trend}</td></tr>",
-                item_link(target, &m.item, names),
+                item_cell(target, &m.item, names),
                 m.median_now,
                 money(m.median_now),
                 m.median_prev,
@@ -1528,10 +1534,10 @@ pub(crate) async fn watchlist_page(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
-                 <td>{}</td>\
+                 {}\
                  <td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td><td>{}</td></tr>",
-                item_link(&target, &row.entry.item, &names),
+                item_cell(&target, &row.entry.item, &names),
                 now.map_or(String::new(), |v| v.to_string()),
                 now.map_or("—".to_string(), money),
                 week.map_or(String::new(), |w| w.median.to_string()),
@@ -1652,10 +1658,10 @@ pub(crate) async fn alerts_page(
         for rule in &rules {
             let _ = write!(
                 body,
-                "<tr><td>{}</td><td>{}</td><td class=\"muted\">{}</td>\
+                "<tr>{}<td>{}</td><td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td>\
                  <td>{}</td><td>{}</td></tr>",
-                item_link(&target, &rule.item, &names),
+                item_cell(&target, &rule.item, &names),
                 condition_label(&rule.condition),
                 html_escape(rule.note.as_deref().unwrap_or("")),
                 html_escape(&human_time(rule.created_at)),

@@ -61,7 +61,7 @@ weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 # render_resolve_max = 8     # inline lookups a table render may wait for (0 = off)
 # idle_names_per_cycle = 25  # ids each ingest cycle warms in the background (0 = off)
 # idle_pace_ms = 500         # sleep between two background lookups
-# wowhead_base = "https://www.wowhead.com" # explicit base override (e.g. a mirror)
+# wowhead_base = "https://nether.wowhead.com" # explicit base override (this is the default; point at a mirror/proxy if needed — the public www site blocks non-browser traffic)
 
 # Optional: persistent file logging. Startup-only: the subscriber is
 # installed once at boot, changes require a restart. Remove the section

@@ -201,9 +201,10 @@ switcher in the top bar works on every target-scoped page.
 
 Mutation buttons are rendered only in open mode (no usable API token): with a
 token configured, the browser never holds the secret, and watchlist/fetch
-actions stay API-only. Pet names resolve through the Blizzard pet API and are
-cached permanently in a `pet_catalog` table (schema v3, upgraded in place);
-static-URL deployments without Blizzard credentials simply have unnamed pets.
+actions stay API-only. Item and pet names resolve through Wowhead's
+credential-free endpoints first (`[catalog]`, optional Blizzard fallback)
+and are cached permanently in the per-flavor `item_catalog`/`pet_catalog`
+tables — no credentials needed, every id is fetched once.
 
 Opportunities and overview are served from scans the scheduler prepares in
 the background: once right after startup, after each successful ingest cycle
@@ -247,8 +248,8 @@ Hexagonal (ports & adapters), compile-enforced:
   (D13); async exists only at the HTTP edge.
 - **`crates/infra`** — driven adapters: `ureq` Blizzard source (conditional
   GET, strict parse), `rusqlite` (bundled) repositories, feed codec +
-  atomic publisher, `BlizzardItemInfo` (item + pet name lookups),
-  `SystemClock`.
+  atomic publisher, `WowheadItemInfo` + `BlizzardItemInfo` behind the
+  `ChainedItemInfo` name-resolution chain, `SystemClock`.
 - **`crates/server`** — driving adapters: axum web (split into `pages`,
   `api`, `render` and embedded `assets` modules) + DTOs, TOML config ACL,
   poll-loop scheduler thread (which also feeds the dashboard's recent-cycles

@@ -243,6 +243,27 @@ pub fn item_link(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String
     format!("<a href=\"{}\"{tip_attr}>{}</a>", html_escape(&href), html_escape(&label))
 }
 
+/// Table cell for an item reference: [`item_link`] wrapped in the `<td>`
+/// the table builders emit, plus a `data-export` attribute carrying the raw
+/// identity when a catalog name resolved — the CSV exporter reads ids (what
+/// traders quote in-game), not display names.
+#[must_use]
+pub fn item_cell(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String {
+    let identity = match item {
+        ItemRef::Item { item_id } if names.items.contains_key(item_id) => format!("item {item_id}"),
+        ItemRef::Pet { species, .. } if names.pets.contains_key(species) => {
+            format!("pet {species}")
+        }
+        _ => String::new(),
+    };
+    let export = if identity.is_empty() {
+        String::new()
+    } else {
+        format!(" data-export=\"{}\"", html_escape(&identity))
+    };
+    format!("<td{export}>{}</td>", item_link(target, item, names))
+}
+
 /// The shared page shell: topbar, nav (active marker), optional target
 /// switcher, footer. `title` is escaped here — callers pass RAW titles; only
 /// `body` is fully-rendered HTML.

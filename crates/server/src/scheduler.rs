@@ -577,7 +577,7 @@ fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
             MaintenanceQueue::pop_timeout(&queue.0, &queue.1, MAINTENANCE_IDLE_TICK)
         {
             survive("maintenance-pass", &target, || {
-                run_pass(state, &config, &mut maintenance, &target);
+                run_pass(state, &config, &mut maintenance, &target, true);
             });
         }
         for target in &config.targets {
@@ -598,6 +598,7 @@ fn run_pass(
     config: &amtracker_core::config::TrackerConfig,
     maintenance: &mut MaintenanceState,
     target: &str,
+    warm_names: bool,
 ) {
     run_prune_if_due(state, config, maintenance, target);
 
@@ -613,8 +614,11 @@ fn run_pass(
     refresh_opportunities(state, &TargetId(target.to_string()));
     evaluate_alerts(state, target);
     // Last, so the (pacing-sleeping) name warm-up never delays the critical
-    // maintenance work above it.
-    warm_item_names(state, config, target);
+    // maintenance work above it. The manual /api/fetch path skips it: an
+    // HTTP response must not wait out the pacing sleeps.
+    if warm_names {
+        warm_item_names(state, config, target);
+    }
 }
 
 /// Background name warm-up for one target after a successful cycle: the
@@ -646,16 +650,21 @@ fn warm_item_names(
             break;
         }
         // Only ids the catalog has never seen cost a request; known ones are
-        // a single local read away, and the negative cache makes junk ids
-        // free after the first sight.
+        // a single local read away (the pet check MUST consult the pet
+        // table — species ids are their own namespace). Ids remembered as
+        // missing or recently failed are skipped outright: re-asking would
+        // burn the budget and the pacing sleep without new information, and
+        // both windows expire, so those ids get their turn again later.
         let outcome = match &item {
             ItemRef::Item { item_id }
-                if !matches!(state.catalog.known(flavor, *item_id), Ok(true)) =>
+                if !matches!(state.catalog.known(flavor, *item_id), Ok(true))
+                    && !state.catalog.deferred(flavor, *item_id) =>
             {
                 state.catalog.ensure(flavor, *item_id).map(|_| ())
             }
             ItemRef::Pet { species, .. }
-                if !matches!(state.catalog.known(flavor, *species), Ok(true)) =>
+                if !matches!(state.catalog.known_pet(flavor, *species), Ok(true))
+                    && !state.catalog.deferred_pet(flavor, *species) =>
             {
                 state.catalog.ensure_pet(flavor, *species).map(|_| ())
             }
@@ -747,10 +756,12 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// scheduled cycle would trigger them.
 /// Used by the manual `/api/fetch` path, whose successful cycles must show
 /// up in `/feed.lua` and the ranking pages immediately instead of waiting
-/// for the maintenance worker.
-pub fn after_cycle_now(state: &Arc<AppState>, target: &str) {
+/// for the maintenance worker. That path passes `warm_names = false` — the
+/// name warm-up's pacing sleeps belong on the maintenance worker, not
+/// inside an HTTP response.
+pub fn after_cycle_now(state: &Arc<AppState>, target: &str, warm_names: bool) {
     let config = state.config.clone();
-    run_pass(state, &config, &mut MaintenanceState::default(), target);
+    run_pass(state, &config, &mut MaintenanceState::default(), target, warm_names);
 }
 
 /// Runs one step under `catch_unwind`, logging a panic and continuing.

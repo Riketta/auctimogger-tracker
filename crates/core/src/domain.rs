@@ -31,8 +31,17 @@ impl fmt::Display for TargetId {
 /// different name per version — so catalog rows are keyed per flavor.
 /// Flavors the adapters have no dedicated endpoint preset for (private
 /// servers, beta keys) resolve through the retail-compatible endpoints.
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Flavor(pub String);
+
+impl Default for Flavor {
+    /// The documented default: retail data. Manual because a derived
+    /// `Default` would key catalog rows under an empty string that no
+    /// adapter prefix or lookup ever reads.
+    fn default() -> Self {
+        Self(Self::RETAIL.into())
+    }
+}
 
 impl Flavor {
     /// The default flavor: current retail data.
@@ -516,7 +525,9 @@ pub struct NameRecord {
     /// Vendor sell price in copper, when the API reports one.
     pub sell_price: Option<i64>,
     /// Unix seconds of the last successful source fetch (enrichment window
-    /// bookkeeping; `0` for search/browse hits, which do not carry it).
+    /// bookkeeping), stamped by the store on upsert — the adapters deliver
+    /// records without a clock. `0` for search/browse hits, which do not
+    /// carry it.
     pub fetched_at: i64,
 }
 

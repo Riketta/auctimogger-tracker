@@ -37,7 +37,6 @@ use amtracker_core::{
         ClockPort,
         FeedPublisher,
         FeedRenderer,
-        ItemInfoPort,
         PriceHistoryRepository,
         SnapshotRepository,
     },
@@ -104,8 +103,6 @@ pub struct AppState {
     pub history: Arc<dyn PriceHistoryRepository>,
     /// Snapshot metadata behind the snapshot browser's history view.
     pub snapshots: Arc<dyn SnapshotRepository>,
-    /// Late item/pet-name resolution for ids missing from the catalog.
-    pub item_info: Arc<dyn ItemInfoPort>,
     /// Serializes ingestion cycles (scheduled + manual `/api/fetch`) so the
     /// `observe`/`close_missing` sequences of two cycles never interleave.
     pub cycle_lock: Arc<std::sync::Mutex<()>>,

@@ -12,7 +12,6 @@ use std::{
 use amtracker_core::{
     config::{
         AuthConfig,
-        TargetKind,
         TrackerConfig,
     },
     domain::PayloadKind,
@@ -249,7 +248,7 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
     let item_info = build_item_info(config);
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
-    let state = build_app_state(config, &clock, &store, item_info, metrics);
+    let state = build_app_state(config, &clock, &store, &item_info, metrics);
 
     // Store-backed online-backup writer for the scheduler; the hook keeps the
     // server crate free of the concrete adapter type.
@@ -304,19 +303,12 @@ fn build_item_info(config: &TrackerConfig) -> Arc<dyn ItemInfoPort> {
 }
 
 /// Whether the Blizzard item API is actually reachable with the configured
-/// credentials: the first Blizzard target's auth (or the OAuth default) must
-/// name environment variables that are set and non-empty right now.
+/// credentials: the shared [`TrackerConfig::blizzard_auth`] selection (the
+/// same one the adapter chain uses) must name environment variables that
+/// are set and non-empty right now.
 fn blizzard_credentials_present(config: &TrackerConfig) -> bool {
-    let auth = config
-        .targets
-        .iter()
-        .find_map(|target| match &target.kind {
-            TargetKind::BlizzardConnectedRealm { .. } => target.auth.clone(),
-            TargetKind::StaticUrls { .. } => None,
-        })
-        .unwrap_or_else(AuthConfig::default_blizzard);
     let env_set = |name: &str| std::env::var(name).is_ok_and(|value| !value.trim().is_empty());
-    match auth {
+    match config.blizzard_auth() {
         AuthConfig::Bearer { env } => env_set(&env),
         AuthConfig::ClientCredentials { client_id_env, client_secret_env } => {
             env_set(&client_id_env) && env_set(&client_secret_env)
@@ -330,7 +322,7 @@ fn build_app_state(
     config: &amtracker_core::config::TrackerConfig,
     clock: &Arc<dyn amtracker_core::ports::ClockPort>,
     store: &Arc<SqliteStore>,
-    item_info: Arc<dyn ItemInfoPort>,
+    item_info: &Arc<dyn ItemInfoPort>,
     metrics: Arc<MetricsService>,
 ) -> Arc<AppState> {
     Arc::new(AppState {
@@ -412,7 +404,6 @@ fn build_app_state(
         )),
         history: store.clone(),
         snapshots: store.clone(),
-        item_info,
         // One lock serializes scheduled and manual (`/api/fetch`) cycles.
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         // Dashboard-visible ingest history (bounded ring).

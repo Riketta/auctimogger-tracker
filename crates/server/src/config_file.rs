@@ -490,8 +490,14 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
                 commodities_secs: target.poll.commodities_secs,
                 auctions_secs: target.poll.auctions_secs,
             },
+            // Flavor keys are catalog namespaces: normalize case and
+            // whitespace so "Retail" or "retail " cannot fork the catalog.
             flavor: amtracker_core::domain::Flavor(
-                target.flavor.unwrap_or_else(|| amtracker_core::domain::Flavor::RETAIL.into()),
+                target
+                    .flavor
+                    .unwrap_or_else(|| amtracker_core::domain::Flavor::RETAIL.into())
+                    .trim()
+                    .to_ascii_lowercase(),
             ),
         });
     }

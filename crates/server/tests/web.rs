@@ -219,6 +219,28 @@ impl ItemInfoPort for StaticItemInfo {
     }
 }
 
+/// Catalog source that always errors — the render lane must degrade to raw
+/// labels (200 pages, no hang) when the name source is down.
+struct DownItemInfo;
+
+impl ItemInfoPort for DownItemInfo {
+    fn describe(
+        &self,
+        _flavor: &Flavor,
+        _item_id: i64,
+    ) -> Result<Option<amtracker_core::domain::NameRecord>, SourceError> {
+        Err(SourceError::Http("down in test".into()))
+    }
+
+    fn describe_pet(
+        &self,
+        _flavor: &Flavor,
+        _species_id: i64,
+    ) -> Result<Option<amtracker_core::domain::PetNameRecord>, SourceError> {
+        Err(SourceError::Http("down in test".into()))
+    }
+}
+
 /// Full `AppState` over a real (empty) SQLite store in a temp directory.
 fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
     test_state_with_info(token_env, Arc::new(NoItemInfo))
@@ -229,8 +251,18 @@ fn test_state_with_info(
     token_env: Option<String>,
     item_info: Arc<dyn ItemInfoPort>,
 ) -> (Arc<AppState>, PathBuf) {
+    test_state_with_config(token_env, item_info, |_| {})
+}
+
+/// Same, with a config mutation hook (resolution budget and friends).
+fn test_state_with_config(
+    token_env: Option<String>,
+    item_info: Arc<dyn ItemInfoPort>,
+    mutate: impl FnOnce(&mut TrackerConfig),
+) -> (Arc<AppState>, PathBuf) {
     let root = temp_root("state");
-    let config = config(token_env);
+    let mut config = config(token_env);
+    mutate(&mut config);
     let clock: Arc<dyn ClockPort> = Arc::new(SystemClock);
     let store = Arc::new(
         SqliteStore::open(&root.join("db.sqlite3"), &root.join("raw"), clock.clone())
@@ -243,7 +275,7 @@ fn test_state_with_info(
         clock: clock.clone(),
         health: Arc::new(HealthService::new(store.clone(), config.clone(), clock.clone())),
         search: Arc::new(SearchService::new(store.clone())),
-        catalog: Arc::new(CatalogService::new(store.clone(), item_info.clone(), clock.clone())),
+        catalog: Arc::new(CatalogService::new(store.clone(), item_info, clock.clone())),
         metrics: metrics.clone(),
         opportunities: Arc::new(OpportunityService::new(
             store.clone(),
@@ -288,7 +320,6 @@ fn test_state_with_info(
         )),
         history: store.clone(),
         snapshots: store.clone(),
-        item_info,
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         recent_cycles: Arc::new(RecentCycles::new(8)),
         timers: Arc::new(std::sync::Mutex::new(
@@ -730,6 +761,118 @@ async fn alert_api_adds_evaluates_and_removes_rules() {
         json.get("events").and_then(Value::as_array).map(std::vec::Vec::len),
         Some(1),
         "event history outlives the rule"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------- catalog name lanes
+
+/// Seeds two day folds for pet species 264, so the warm-up and render lanes
+/// see a pet identity, not just items.
+fn seed_pet_history(state: &AppState) {
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 11 };
+    let today = utc_day(state.clock.now());
+    for (offset, price) in [(1_i64, 300_i64), (0, 400)] {
+        let mut fold = DayFold::new(item.clone());
+        let listings: Vec<NormalizedListing> =
+            (0..4).map(|n| listing(5000 + offset * 100 + n, &item, price)).collect();
+        fold.apply(&listings);
+        state.history.save_fold(&target, &item, today - offset, &fold).expect("save fold");
+    }
+}
+
+/// Seeds a second item (2592) with high prices so it ranks below 2589 —
+/// deterministic second place for the resolution-budget test.
+fn seed_second_item(state: &AppState) {
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Item { item_id: 2592 };
+    let today = utc_day(state.clock.now());
+    for (offset, price) in [(1_i64, 1000_i64), (0, 2000)] {
+        let mut fold = DayFold::new(item.clone());
+        let listings: Vec<NormalizedListing> =
+            (0..4).map(|n| listing(6000 + offset * 100 + n, &item, price)).collect();
+        fold.apply(&listings);
+        state.history.save_fold(&target, &item, today - offset, &fold).expect("save fold");
+    }
+}
+
+/// Pet identities flow through the same catalog lane: the detail page
+/// shows the resolved species name.
+#[tokio::test]
+async fn pet_pages_render_catalog_names() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    seed_history(&state);
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/items/t1/pet/264?level=1&quality=3&breed=11")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(">Named Pet 264<"), "the pet detail page shows the resolved name");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A failing name source degrades to raw labels: pages stay 200 and show
+/// the bare id (no hang, no 500, no name substitution).
+#[tokio::test]
+async fn a_failing_name_source_renders_raw_labels() {
+    let (state, root) = test_state_with_info(None, Arc::new(DownItemInfo));
+    seed_history(&state);
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(">item 2589<"), "the raw label stays visible");
+    assert!(!body.contains("Named Item"), "no name substitution happened");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The render lane's budget: only the first `render_resolve_max` distinct
+/// identities resolve inline; the rest keep raw labels, and `0` disables
+/// inline resolution entirely.
+#[tokio::test]
+async fn resolve_budget_limits_inline_name_resolution() {
+    let (state, root) = test_state_with_config(None, Arc::new(StaticItemInfo), |config| {
+        config.catalog.render_resolve_max = 1;
+    });
+    seed_history(&state);
+    seed_second_item(&state);
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(">Named Item 2589<"), "the first identity resolves inline");
+    assert!(!body.contains("Named Item 2592"), "beyond-budget ids keep raw labels");
+    assert!(body.contains(">item 2592<"), "the beyond-budget raw label stays visible");
+    std::fs::remove_dir_all(&root).ok();
+
+    let (state, root) = test_state_with_config(None, Arc::new(StaticItemInfo), |config| {
+        config.catalog.render_resolve_max = 0;
+    });
+    seed_history(&state);
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!body.contains("Named Item"), "budget 0 disables inline resolution");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The background warm-up consults the PET table for pets: a cataloged item
+/// with the same numeric id must not make the pet look known (regression:
+/// pets used to be skipped forever on id collisions).
+#[tokio::test]
+async fn warm_up_names_pets_through_the_pet_table() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    let flavor = Flavor::default();
+    // The collision: item id 264 is already cataloged...
+    state.catalog.ensure(&flavor, 264).expect("catalog item 264");
+    assert_eq!(state.catalog.known(&flavor, 264), Ok(true));
+    // ...while pet species 264 has fold data but no pet-catalog row.
+    seed_pet_history(&state);
+
+    amtracker_server::scheduler::after_cycle_now(&state, TARGET, true);
+
+    assert_eq!(
+        state.catalog.known_pet(&flavor, 264),
+        Ok(true),
+        "the warm-up must consult the pet table for species ids"
     );
     std::fs::remove_dir_all(&root).ok();
 }
