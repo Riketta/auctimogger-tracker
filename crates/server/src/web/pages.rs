@@ -782,6 +782,77 @@ async fn resolve_pet_name(
     }
 }
 
+/// The render lane's bounded name resolution for one table page: the first
+/// `[catalog].render_resolve_max` distinct ids/species of `items` resolve
+/// concurrently off the async runtime — cached ids cost one local read,
+/// uncached ones hit the source once ever (the catalog caches). Ids beyond
+/// the budget keep their raw labels until a later view; `0` disables inline
+/// resolution (the background warm-up still fills the catalog over time).
+async fn resolve_names(
+    state: &Arc<AppState>,
+    flavor: &Flavor,
+    items: &[ItemRef],
+) -> render::ItemNames {
+    let mut names = render::ItemNames::default();
+    let budget = usize::try_from(state.config.catalog.render_resolve_max).unwrap_or(0);
+    if budget == 0 {
+        return names;
+    }
+    // Distinct identities in first-appearance order (the table's top rows
+    // are the ones worth the inline wait), capped at the budget.
+    let mut seen_items = HashSet::new();
+    let mut seen_pets = HashSet::new();
+    let mut pending: Vec<ItemRef> = Vec::new();
+    for item in items {
+        let fresh = match item {
+            ItemRef::Item { item_id } => seen_items.insert(*item_id),
+            ItemRef::Pet { species, .. } => seen_pets.insert(*species),
+        };
+        if fresh {
+            pending.push(item.clone());
+            if pending.len() >= budget {
+                break;
+            }
+        }
+    }
+    let lookups = pending
+        .into_iter()
+        .map(|item| {
+            let state = Arc::clone(state);
+            let flavor = flavor.clone();
+            tokio::task::spawn_blocking(move || match &item {
+                ItemRef::Item { item_id } => state
+                    .catalog
+                    .ensure(&flavor, *item_id)
+                    .map(|record| record.map(|r| (item, r.name))),
+                ItemRef::Pet { species, .. } => state
+                    .catalog
+                    .ensure_pet(&flavor, *species)
+                    .map(|record| record.map(|r| (item, r.name))),
+            })
+        })
+        .collect::<Vec<_>>();
+    let mut failures = 0usize;
+    for lookup in lookups {
+        match lookup.await {
+            Ok(Ok(Some((item, name)))) => match &item {
+                ItemRef::Item { item_id } => {
+                    names.items.insert(*item_id, name);
+                }
+                ItemRef::Pet { species, .. } => {
+                    names.pets.insert(*species, name);
+                }
+            },
+            Ok(Ok(None)) => {}
+            Ok(Err(_)) | Err(_) => failures += 1,
+        }
+    }
+    if failures > 0 {
+        tracing::warn!(failures, "some item names failed to resolve; rendering placeholders");
+    }
+    names
+}
+
 /// The shared item/pet detail renderer: name header, 30-day band chart
 /// (JSON island + server SVG fallback), today's price distribution, the
 /// per-span metric blocks and the watch action.
@@ -1098,6 +1169,12 @@ pub(crate) async fn opportunities_page(
         }
     };
     let watched = watched_keys(&state, &target).await;
+    let names = resolve_names(
+        &state,
+        &super::target_flavor(&state.config, &target),
+        &data.iter().map(|o| o.item.clone()).collect::<Vec<_>>(),
+    )
+    .await;
 
     let min_churn_text = format!("{min_churn}");
     let limit_text = format!("{limit}");
@@ -1168,7 +1245,7 @@ pub(crate) async fn opportunities_page(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td></tr>",
-                item_link(&target, &o.item),
+                item_link(&target, &o.item, &names),
                 o.score,
                 o.score,
                 o.confidence,
@@ -1207,6 +1284,7 @@ fn mover_table(
     rows: &[amtracker_core::services::opportunity::MoverRow],
     target: &TargetId,
     series: &HashMap<String, Vec<i64>>,
+    names: &render::ItemNames,
     table_id: &str,
 ) -> String {
     // Display-only conversion: the f64 median feeds the i64 `money` +
@@ -1216,6 +1294,7 @@ fn mover_table(
         rows: &[amtracker_core::services::opportunity::MoverRow],
         target: &TargetId,
         series: &HashMap<String, Vec<i64>>,
+        names: &render::ItemNames,
     ) -> String {
         let mut out = String::new();
         for m in rows {
@@ -1228,7 +1307,7 @@ fn mover_table(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"{change_class}\" data-v=\"{:.4}\">{:+.1}%</td>\
                  <td class=\"num\" data-v=\"{:.2}\">{:.1}</td><td>{trend}</td></tr>",
-                item_link(target, &m.item),
+                item_link(target, &m.item, names),
                 m.median_now,
                 money(m.median_now),
                 m.median_prev,
@@ -1251,7 +1330,7 @@ fn mover_table(
         tip("churn/day", "Average unique listings per day."),
         tip("30d", "Actual 30-day median series (real data, not a two-point sketch).")
     );
-    out.push_str(&body_rows(rows, target, series));
+    out.push_str(&body_rows(rows, target, series, names));
     out.push_str("</tbody></table></div>");
     out
 }
@@ -1310,6 +1389,7 @@ pub(crate) async fn overview_page(
             return render::store_error_page(StoreError::Backend(error.to_string())).await
         }
     };
+    let names = resolve_names(&state, &super::target_flavor(&state.config, &target), &refs).await;
 
     let switcher = target_switcher(&state.config, "/overview", &target, &[]);
 
@@ -1318,19 +1398,19 @@ pub(crate) async fn overview_page(
     if data.movers_up.is_empty() {
         body.push_str("<div class=\"empty\">no rising movers yet</div>");
     } else {
-        body.push_str(&mover_table(&data.movers_up, &target, &series, "rising"));
+        body.push_str(&mover_table(&data.movers_up, &target, &series, &names, "rising"));
     }
     body.push_str("<h2>falling</h2>");
     if data.movers_down.is_empty() {
         body.push_str("<div class=\"empty\">no falling movers yet</div>");
     } else {
-        body.push_str(&mover_table(&data.movers_down, &target, &series, "falling"));
+        body.push_str(&mover_table(&data.movers_down, &target, &series, &names, "falling"));
     }
     body.push_str("<h2>most active</h2>");
     if data.most_active.is_empty() {
         body.push_str("<div class=\"empty\">no churn data yet</div>");
     } else {
-        body.push_str(&mover_table(&data.most_active, &target, &series, "active"));
+        body.push_str(&mover_table(&data.most_active, &target, &series, &names, "active"));
     }
     page("market overview", "overview", &body, Some(switcher))
 }
@@ -1358,6 +1438,12 @@ pub(crate) async fn watchlist_page(
             return render::store_error_page(StoreError::Backend(error.to_string())).await
         }
     };
+    let names = resolve_names(
+        &state,
+        &super::target_flavor(&state.config, &target),
+        &report.iter().map(|row| row.entry.item.clone()).collect::<Vec<_>>(),
+    )
+    .await;
     let switcher = target_switcher(&state.config, "/watchlist", &target, &[]);
     let open = mutations_open(&state.config);
 
@@ -1445,7 +1531,7 @@ pub(crate) async fn watchlist_page(
                  <td>{}</td>\
                  <td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td><td>{}</td></tr>",
-                item_link(&target, &row.entry.item),
+                item_link(&target, &row.entry.item, &names),
                 now.map_or(String::new(), |v| v.to_string()),
                 now.map_or("—".to_string(), money),
                 week.map_or(String::new(), |w| w.median.to_string()),
@@ -1516,6 +1602,12 @@ pub(crate) async fn alerts_page(
             return render::store_error_page(StoreError::Backend(error.to_string())).await
         }
     };
+    let names = resolve_names(
+        &state,
+        &super::target_flavor(&state.config, &target),
+        &rules.iter().map(|rule| rule.item.clone()).collect::<Vec<_>>(),
+    )
+    .await;
     let switcher = target_switcher(&state.config, "/alerts", &target, &[]);
     let open = mutations_open(&state.config);
 
@@ -1563,7 +1655,7 @@ pub(crate) async fn alerts_page(
                 "<tr><td>{}</td><td>{}</td><td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td>\
                  <td>{}</td><td>{}</td></tr>",
-                item_link(&target, &rule.item),
+                item_link(&target, &rule.item, &names),
                 condition_label(&rule.condition),
                 html_escape(rule.note.as_deref().unwrap_or("")),
                 html_escape(&human_time(rule.created_at)),

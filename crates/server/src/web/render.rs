@@ -4,7 +4,10 @@
 //! touch markup.
 
 use std::{
-    collections::BTreeMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     fmt::Write as _,
 };
 
@@ -194,24 +197,50 @@ pub fn item_label(item: &ItemRef) -> String {
     }
 }
 
+/// Resolved display names for one page render: items by id, pets by species.
+/// Ids without a resolved name keep their raw `item 12345` labels — the maps
+/// simply miss. An empty `ItemNames` renders exactly the old raw-id view.
+#[derive(Default)]
+pub struct ItemNames {
+    /// Item id → catalog display name.
+    pub items: HashMap<i64, String>,
+    /// Pet species id → catalog display name.
+    pub pets: HashMap<i64, String>,
+}
+
 /// Detail-page link for an item reference. Pets carry their full variant
 /// identity through query parameters so the metrics engine sees the exact
-/// tuple (species alone is not an identity).
+/// tuple (species alone is not an identity). When a catalog name resolved
+/// for this page it becomes the link text, and the raw identity moves into a
+/// `data-tip` so the floating tooltip layer can show the id traders quote
+/// in-game — without JS the label simply stays the name.
 #[must_use]
-pub fn item_link(target: &TargetId, item: &ItemRef) -> String {
-    let (href, label) = match item {
+pub fn item_link(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String {
+    let href = match item {
         ItemRef::Item { item_id } => {
-            (format!("/items/{}/{}", target.as_str(), item_id), item_label(item))
+            format!("/items/{}/{}", target.as_str(), item_id)
         }
-        ItemRef::Pet { species, level, quality, breed } => (
-            format!(
-                "/items/{t}/pet/{species}?level={level}&quality={quality}&breed={breed}",
-                t = target.as_str()
-            ),
-            item_label(item),
+        ItemRef::Pet { species, level, quality, breed } => format!(
+            "/items/{t}/pet/{species}?level={level}&quality={quality}&breed={breed}",
+            t = target.as_str()
         ),
     };
-    format!("<a href=\"{}\">{}</a>", html_escape(&href), html_escape(&label))
+    let (label, identity) = match item {
+        ItemRef::Item { item_id } => match names.items.get(item_id) {
+            Some(name) => (name.clone(), format!("item {item_id}")),
+            None => (item_label(item), String::new()),
+        },
+        ItemRef::Pet { species, level, .. } => match names.pets.get(species) {
+            Some(name) => (format!("{name} (lvl {level})"), format!("pet {species}")),
+            None => (item_label(item), String::new()),
+        },
+    };
+    let tip_attr = if identity.is_empty() {
+        String::new()
+    } else {
+        format!(" data-tip=\"{}\"", html_escape(&identity))
+    };
+    format!("<a href=\"{}\"{tip_attr}>{}</a>", html_escape(&href), html_escape(&label))
 }
 
 /// The shared page shell: topbar, nav (active marker), optional target

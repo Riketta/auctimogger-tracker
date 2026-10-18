@@ -183,8 +183,52 @@ fn config(token_env: Option<String>) -> TrackerConfig {
     }
 }
 
+/// Catalog source that resolves every item/pet to one fixed name — enough
+/// to prove the render path substitutes names over the real cache-aside
+/// flow (ensure → upsert → label).
+struct StaticItemInfo;
+
+impl ItemInfoPort for StaticItemInfo {
+    fn describe(
+        &self,
+        _flavor: &Flavor,
+        item_id: i64,
+    ) -> Result<Option<amtracker_core::domain::NameRecord>, SourceError> {
+        Ok(Some(amtracker_core::domain::NameRecord {
+            item_id,
+            name: format!("Named Item {item_id}"),
+            item_class: None,
+            item_subclass: None,
+            inventory_slot: None,
+            quality: Some("common".into()),
+            icon: None,
+            sell_price: None,
+            fetched_at: 0,
+        }))
+    }
+
+    fn describe_pet(
+        &self,
+        _flavor: &Flavor,
+        species_id: i64,
+    ) -> Result<Option<amtracker_core::domain::PetNameRecord>, SourceError> {
+        Ok(Some(amtracker_core::domain::PetNameRecord {
+            species_id,
+            name: format!("Named Pet {species_id}"),
+        }))
+    }
+}
+
 /// Full `AppState` over a real (empty) SQLite store in a temp directory.
 fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
+    test_state_with_info(token_env, Arc::new(NoItemInfo))
+}
+
+/// Same, with a caller-chosen item-info source (name-resolution tests).
+fn test_state_with_info(
+    token_env: Option<String>,
+    item_info: Arc<dyn ItemInfoPort>,
+) -> (Arc<AppState>, PathBuf) {
     let root = temp_root("state");
     let config = config(token_env);
     let clock: Arc<dyn ClockPort> = Arc::new(SystemClock);
@@ -192,7 +236,6 @@ fn test_state(token_env: Option<String>) -> (Arc<AppState>, PathBuf) {
         SqliteStore::open(&root.join("db.sqlite3"), &root.join("raw"), clock.clone())
             .expect("open store"),
     );
-    let item_info: Arc<dyn ItemInfoPort> = Arc::new(NoItemInfo);
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
     let state = AppState {
@@ -380,6 +423,29 @@ async fn advertised_tables_render_sortable_headers() {
         let (status, body) = get(router.clone(), uri).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
         assert!(body.contains("<th data-sortable>"), "GET {uri} renders no sortable headers");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Tables link resolved catalog names (the raw id rides in the data-tip for
+/// the floating tooltip layer) instead of the bare `item {id}` label.
+#[tokio::test]
+async fn tables_render_catalog_names_with_identity_tooltips() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    seed_history(&state);
+    let router = build_router_arc(Arc::clone(&state));
+    for uri in ["/opportunities?target=t1", "/overview?target=t1"] {
+        let (status, body) = get(router.clone(), uri).await;
+        assert_eq!(status, StatusCode::OK, "GET {uri}");
+        assert!(
+            body.contains(">Named Item 2589<"),
+            "GET {uri} should link the resolved catalog name"
+        );
+        assert!(
+            body.contains("data-tip=\"item 2589\""),
+            "GET {uri} should carry the raw-id tooltip on the named link"
+        );
+        assert!(!body.contains(">item 2589<"), "GET {uri} should not show the raw label");
     }
     std::fs::remove_dir_all(&root).ok();
 }
