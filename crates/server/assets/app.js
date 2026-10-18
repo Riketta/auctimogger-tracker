@@ -6,6 +6,11 @@
 "use strict";
 
 (function () {
+  // Signals CSS that scripting is active: the pure-CSS tooltip bubbles are
+  // disabled (they get clipped by .scroll-x tables) in favor of the floating
+  // layer below.
+  document.documentElement.classList.add("js");
+
   // ------------------------------------------------------------- helpers
   function $(sel, root) { return (root || document).querySelector(sel); }
   function $all(sel, root) { return Array.prototype.slice.call((root || document).querySelectorAll(sel)); }
@@ -363,6 +368,44 @@
       link.remove();
     });
   });
+
+  // -------------------------------------------------------------- tooltips
+  // One shared floating layer for every [data-tip] element. The CSS-only
+  // bubble is clipped inside .scroll-x tables (overflow cuts everything
+  // above the header row), so this positions a single fixed node near the
+  // hovered/focused element, clamped to the viewport.
+  var tip_node = null;
+  function tip_show(target) {
+    if (!tip_node) {
+      tip_node = document.createElement("div");
+      tip_node.id = "tooltip";
+      tip_node.setAttribute("role", "tooltip");
+      document.body.appendChild(tip_node);
+    }
+    tip_node.textContent = target.getAttribute("data-tip") || "";
+    tip_node.style.display = "block";
+    var rect = target.getBoundingClientRect();
+    var width = tip_node.offsetWidth;
+    var height = tip_node.offsetHeight;
+    var left = rect.left + rect.width / 2 - width / 2;
+    left = Math.max(8, Math.min(left, window.innerWidth - width - 8));
+    var top = rect.top - height - 8;
+    if (top < 8) top = rect.bottom + 8;
+    tip_node.style.left = Math.round(left) + "px";
+    tip_node.style.top = Math.round(top) + "px";
+  }
+  function tip_hide() { if (tip_node) tip_node.style.display = "none"; }
+  function tip_target(node) { return node && node.closest ? node.closest("[data-tip]") : null; }
+  document.addEventListener("mouseover", function (e) {
+    var target = tip_target(e.target);
+    if (target) tip_show(target); else tip_hide();
+  });
+  document.addEventListener("focusin", function (e) {
+    var target = tip_target(e.target);
+    if (target) tip_show(target);
+  });
+  document.addEventListener("focusout", tip_hide);
+  document.addEventListener("mouseleave", tip_hide);
 
   // ---------------------------------------------------------- dashboard refresh
   // The dashboard only reloads while nothing is in the way: not while the

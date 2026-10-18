@@ -58,14 +58,16 @@ pub fn money(copper: i64) -> String {
     }
 }
 
-/// A term with an explanation tooltip (hover/focus, CSS-only, plain text —
-/// `attr()` content is never parsed as markup).
+/// A term with an explanation tooltip (hover/focus, plain text — the
+/// explanation is never parsed as markup). An empty term renders a bare
+/// "?" marker so icon-only columns stay hoverable and discoverable.
 #[must_use]
 pub fn tip(term: &str, explanation: &str) -> String {
+    let label = if term.trim().is_empty() { "?" } else { term };
     format!(
         "<span class=\"tip\" tabindex=\"0\" data-tip=\"{}\">{}</span>",
         html_escape(explanation),
-        html_escape(term)
+        html_escape(label)
     )
 }
 
@@ -385,4 +387,24 @@ pub fn component_bar(label: &str, value: f64) -> String {
         value * 60.0,
         value
     )
+}
+
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
+    // inputs (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn tip_marks_empty_terms_and_escapes_both_sides() {
+        let icon = tip("", "Watchlist action (open mode only).");
+        assert!(icon.contains(">?</span>"), "empty term renders the ? marker: {icon}");
+        assert!(icon.contains("data-tip=\"Watchlist action (open mode only).\""));
+
+        let quoted = tip("Δ vs d7", "can't be \"tricked\"");
+        assert!(quoted.contains(">Δ vs d7</span>"));
+        assert!(quoted.contains("can&#39;t be &quot;tricked&quot;"), "quotes escape: {quoted}");
+    }
 }

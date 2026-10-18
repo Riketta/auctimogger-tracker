@@ -321,7 +321,6 @@ input:focus-visible, select:focus-visible, .btn:focus-visible {
 }
 .tip:hover, .tip:focus-visible {
   color: var(--text);
-  background: var(--accent-soft);
   border-bottom-color: var(--muted);
 }
 .tip::after {
@@ -352,6 +351,32 @@ input:focus-visible, select:focus-visible, .btn:focus-visible {
   pointer-events: none;
 }
 .tip:hover::after, .tip:focus-visible::after { opacity: 1; visibility: visible; }
+/* With scripting active, the shared floating #tooltip layer takes over:
+   the CSS bubble is clipped by .scroll-x tables (it extends above the
+   header row), which read as a bright band instead of a tooltip. */
+html.js .tip::after { display: none; }
+html.js .tip:hover, html.js .tip:focus-visible { background: transparent; }
+
+/* Shared floating tooltip (created by app.js, positioned in viewport
+   coordinates so table scroll containers can never clip it). */
+#tooltip {
+  position: fixed;
+  display: none;
+  max-width: min(21rem, 90vw);
+  white-space: normal;
+  background: var(--surface-3);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  box-shadow: var(--shadow);
+  padding: .45rem .65rem;
+  font-size: .8rem;
+  font-weight: 400;
+  line-height: 1.45;
+  text-align: left;
+  z-index: 90;
+  pointer-events: none;
+}
 
 /* ----------------------------------------------------------------- chart */
 
