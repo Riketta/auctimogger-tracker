@@ -72,6 +72,7 @@ use amtracker_infra::{
     store::SqliteStore,
 };
 use amtracker_server::web::{
+    api_routes,
     build_router_arc,
     AppState,
     RecentCycles,
@@ -879,10 +880,24 @@ async fn warm_up_names_pets_through_the_pet_table() {
 
 // --------------------------------------------------------- api discovery
 
-/// The API must be agent-discoverable end to end: `GET /api` is a directory,
-/// `/api/openapi.json` documents every route (drift guard: a new route
-/// without a spec entry fails here), and `/api/docs` renders the same
-/// document as HTML with the units spelled out.
+/// Fires one method at a concrete path and returns the status. Registration
+/// probe: an existing path answers 405 for methods it does not serve, while a
+/// missing path falls through to the fallback's 404.
+async fn probe_status(router: &Router, method: &str, path: &str) -> StatusCode {
+    let response = router
+        .clone()
+        .oneshot(Request::builder().method(method).uri(path).body(Body::empty()).expect("request"))
+        .await
+        .expect("response");
+    response.status()
+}
+
+/// The API must be agent-discoverable end to end: `GET /api` is a directory
+/// whose path set equals the spec's, the spec equals the router's route table
+/// in BOTH directions (paths and methods), and the table is what the router
+/// actually serves — a new route without a spec entry, a phantom spec path,
+/// or a missing method all fail here. `/api/docs` renders the same document
+/// as HTML with the units spelled out.
 #[tokio::test]
 async fn api_is_agent_discoverable_index_openapi_and_docs() {
     let (state, root) = test_state_with_info(None, Arc::new(NoItemInfo));
@@ -893,43 +908,61 @@ async fn api_is_agent_discoverable_index_openapi_and_docs() {
     let index: Value = serde_json::from_str(&body).expect("index json");
     assert_eq!(index["service"], "auctimogger-tracker");
     assert_eq!(index["openapi"], "/api/openapi.json");
-    let paths: Vec<&str> = index["endpoints"]
-        .as_array()
-        .expect("endpoints array")
-        .iter()
-        .filter_map(|entry| entry["path"].as_str())
-        .collect();
-    assert!(paths.contains(&"/api/opportunities"));
-    assert!(paths.contains(&"/api/history"));
 
     let (status, body) = get(router.clone(), "/api/openapi.json").await;
     assert_eq!(status, StatusCode::OK);
     let spec: Value = serde_json::from_str(&body).expect("spec json");
     assert_eq!(spec["openapi"], "3.1.0");
-    for path in [
-        "/api",
-        "/api/health",
-        "/api/search",
-        "/api/opportunities",
-        "/api/overview",
-        "/api/history",
-        "/api/items/{target_id}/{item_id}/metrics",
-        "/api/items/{target_id}/pet/{species_id}/metrics",
-        "/api/feed.json",
-        "/api/watchlist",
-        "/api/watchlist/metrics",
-        "/api/snapshots",
-        "/api/schedule",
-        "/api/alerts",
-        "/api/alerts/evaluate",
-        "/api/fetch",
-        "/api/openapi.json",
-        "/api/docs",
-        "/feed.lua",
-        "/feed-slim.lua",
-    ] {
-        assert!(spec["paths"].get(path).is_some(), "undocumented route: {path}");
+
+    // The index directory and the spec agree on the exact path set.
+    let mut index_paths: Vec<&str> = index["endpoints"]
+        .as_array()
+        .expect("endpoints array")
+        .iter()
+        .filter_map(|entry| entry["path"].as_str())
+        .collect();
+    index_paths.sort_unstable();
+    let mut spec_paths: Vec<&str> =
+        spec["paths"].as_object().expect("spec paths").keys().map(String::as_str).collect();
+    spec_paths.sort_unstable();
+    assert_eq!(index_paths, spec_paths, "/api must list exactly the spec's paths");
+
+    // The spec matches the router's route table in both directions: same
+    // path set, same methods per path.
+    let table = api_routes();
+    let mut table_paths: Vec<&str> = table.iter().map(|(path, _, _)| *path).collect();
+    table_paths.sort_unstable();
+    assert_eq!(spec_paths, table_paths, "spec paths must equal the router table");
+    for (path, methods, _) in &table {
+        let ops = &spec["paths"][*path];
+        assert!(ops.is_object(), "undocumented route: {path}");
+        let spec_methods: Vec<&str> =
+            ops.as_object().expect("path operations").keys().map(String::as_str).collect();
+        assert_eq!(spec_methods, *methods, "method drift on {path}");
     }
+
+    // And the table is what the router serves: a listed method never answers
+    // 405, an unlisted method always does (a missing route would fall through
+    // to the fallback's 404 instead).
+    for (path, methods, _) in &table {
+        let concrete = path
+            .replace("{target_id}", TARGET)
+            .replace("{item_id}", "2589")
+            .replace("{species_id}", "264");
+        for method in ["GET", "POST", "DELETE"] {
+            let status = probe_status(&router, method, &concrete).await;
+            if methods.contains(&method.to_lowercase().as_str()) {
+                assert_ne!(status, StatusCode::METHOD_NOT_ALLOWED, "{method} {path}");
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::METHOD_NOT_ALLOWED,
+                    "{method} {path}: unexpected registration"
+                );
+            }
+        }
+    }
+
     // Mutations declare bearer auth; reads stay open.
     assert!(spec["paths"]["/api/fetch"]["post"]["security"].is_array());
     assert!(spec["paths"]["/api/opportunities"]["get"]["security"].is_null());
@@ -942,10 +975,12 @@ async fn api_is_agent_discoverable_index_openapi_and_docs() {
 }
 
 /// The bulk analysis endpoint: one call returns every item/pet day aggregate
-/// in the window, and the window clamps so a typo cannot pull unbounded data.
+/// in the window in a documented deterministic order, the window clamps on
+/// both ends, and the target is mandatory (no silent default market).
 #[tokio::test]
 async fn api_history_returns_bulk_day_rows() {
     let (state, root) = test_state_with_info(None, Arc::new(NoItemInfo));
+    seed_history(&state);
     seed_pet_history(&state);
 
     let (status, body) =
@@ -954,14 +989,33 @@ async fn api_history_returns_bulk_day_rows() {
     let json: Value = serde_json::from_str(&body).expect("history json");
     assert_eq!(json["target"], TARGET);
     let rows = json["rows"].as_array().expect("rows array");
-    assert!(!rows.is_empty(), "seeded folds surface as rows");
-    let row = &rows[0];
-    assert_eq!(row["item"]["type"], "pet");
-    assert_eq!(row["item"]["speciesID"], 264);
-    assert!(row["p05"].is_i64(), "p05 ships for robust-floor analysis");
+    assert_eq!(rows.len(), 4, "two days times two identities (item + pet)");
+    let days: Vec<i64> = rows.iter().filter_map(|row| row["day"].as_i64()).collect();
+    let mut sorted_days = days.clone();
+    sorted_days.sort_unstable();
+    assert_eq!(days, sorted_days, "rows are ordered by day");
+    assert_eq!(rows[0]["item"]["type"], "item", "items order before pets within a day");
+    assert_eq!(rows[0]["item"]["itemID"], 2589);
     assert!(
-        rows.iter().any(|r| r["median"] == 400),
-        "the newest day's fold (4 listings at 400) is inside the window"
+        rows.iter().any(|row| row["item"]["type"] == "pet" && row["item"]["speciesID"] == 264),
+        "pet identities surface as rows"
+    );
+    assert!(rows.iter().any(|row| row["p05"].is_i64()), "p05 ships for robust-floor analysis");
+
+    // The target is mandatory: no silent fallback to the first market.
+    let (status, _) = get(build_router_arc(Arc::clone(&state)), "/api/history?days=7").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "missing target is a 400");
+
+    // The window clamps on both ends; one day means only the newest folds.
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/history?target=t1&days=0").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("history json");
+    assert_eq!(json["days"], 1, "the window clamps up to one day");
+    assert_eq!(
+        json["rows"].as_array().expect("rows array").len(),
+        2,
+        "the one-day window keeps only the newest fold per identity"
     );
 
     let (status, body) = get(build_router_arc(state), "/api/history?target=t1&days=999").await;

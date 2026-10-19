@@ -62,6 +62,7 @@ use axum::{
     routing::{
         get,
         post,
+        MethodRouter,
     },
     Router,
 };
@@ -166,11 +167,63 @@ async fn shutdown_signal() {
     tracing::info!("shutdown signal received");
 }
 
+/// One mounted API route: the spec/router path, its methods, its handlers.
+type ApiRoute = (&'static str, &'static [&'static str], MethodRouter<Arc<AppState>>);
+
+/// The canonical API surface: every JSON/feed route with its methods, in one
+/// table. `build_router_arc` mounts exactly this table, and the drift test
+/// (`tests/web.rs`) asserts the `OpenAPI` document matches it in both
+/// directions — so a route cannot exist without a spec entry, and a spec
+/// entry cannot exist without a route. Paths use axum 0.8 `{param}` syntax,
+/// which is also the `OpenAPI` path syntax, so the strings are shared
+/// verbatim.
+pub fn api_routes() -> Vec<ApiRoute> {
+    vec![
+        ("/api", &["get"], get(api::api_index)),
+        ("/api/health", &["get"], get(api::api_health)),
+        ("/api/openapi.json", &["get"], get(api::api_openapi)),
+        ("/api/docs", &["get"], get(openapi::docs_page)),
+        ("/api/history", &["get"], get(api::api_history)),
+        ("/api/search", &["get"], get(api::api_search)),
+        ("/api/opportunities", &["get"], get(api::api_opportunities)),
+        ("/api/overview", &["get"], get(api::api_overview)),
+        ("/api/items/{target_id}/{item_id}/metrics", &["get"], get(api::api_item_metrics)),
+        (
+            "/api/items/{target_id}/pet/{species_id}/metrics",
+            &["get"],
+            get(api::api_item_pet_metrics),
+        ),
+        ("/api/feed.json", &["get"], get(api::api_feed_json)),
+        (
+            "/api/watchlist",
+            // Alphabetical: serde_json maps serialize keys sorted, and the
+            // drift test compares the table against the spec verbatim.
+            &["delete", "get", "post"],
+            get(api::api_watchlist_get)
+                .post(api::api_watchlist_post)
+                .delete(api::api_watchlist_delete),
+        ),
+        ("/api/watchlist/metrics", &["get"], get(api::api_watchlist_metrics)),
+        ("/api/snapshots", &["get"], get(api::api_snapshots)),
+        ("/api/schedule", &["get"], get(api::api_schedule)),
+        (
+            "/api/alerts",
+            &["delete", "get", "post"],
+            get(api::api_alerts_get).post(api::api_alerts_post).delete(api::api_alerts_delete),
+        ),
+        ("/api/alerts/evaluate", &["post"], post(api::api_alerts_evaluate)),
+        ("/api/fetch", &["post"], post(api::api_fetch)),
+        ("/feed.lua", &["get"], get(api::feed_lua)),
+        ("/feed-slim.lua", &["get"], get(api::feed_slim_lua)),
+    ]
+}
+
 /// Builds the full HTTP router (pages, JSON API, feed downloads, token-gated
 /// mutations) over shared state — the `Arc<AppState>` form `serve` uses, and
-/// the form integration tests drive.
+/// the form integration tests drive. The API surface is mounted from
+/// [`api_routes`], the one table the drift test pins the spec to.
 pub fn build_router_arc(state: Arc<AppState>) -> Router {
-    Router::new()
+    let mut router = Router::new()
         .route("/", get(pages::dashboard))
         .route("/snapshots", get(pages::snapshots_page))
         .route("/items", get(pages::items_page))
@@ -183,37 +236,11 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/help", get(pages::help_page))
         .route("/assets/app.css", get(assets::asset_css))
         .route("/assets/app.js", get(assets::asset_js))
-        .route("/favicon.svg", get(assets::favicon))
-        .route("/feed.lua", get(api::feed_lua))
-        .route("/feed-slim.lua", get(api::feed_slim_lua))
-        .route("/api/health", get(api::api_health))
-        .route("/api", get(api::api_index))
-        .route("/api/openapi.json", get(api::api_openapi))
-        .route("/api/docs", get(openapi::docs_page))
-        .route("/api/history", get(api::api_history))
-        .route("/api/search", get(api::api_search))
-        .route("/api/opportunities", get(api::api_opportunities))
-        .route("/api/overview", get(api::api_overview))
-        .route("/api/items/{target_id}/{item_id}/metrics", get(api::api_item_metrics))
-        .route("/api/feed.json", get(api::api_feed_json))
-        .route(
-            "/api/watchlist",
-            get(api::api_watchlist_get)
-                .post(api::api_watchlist_post)
-                .delete(api::api_watchlist_delete),
-        )
-        .route("/api/watchlist/metrics", get(api::api_watchlist_metrics))
-        .route("/api/snapshots", get(api::api_snapshots))
-        .route("/api/schedule", get(api::api_schedule))
-        .route(
-            "/api/alerts",
-            get(api::api_alerts_get).post(api::api_alerts_post).delete(api::api_alerts_delete),
-        )
-        .route("/api/alerts/evaluate", post(api::api_alerts_evaluate))
-        .route("/api/items/{target_id}/pet/{species_id}/metrics", get(api::api_item_pet_metrics))
-        .route("/api/fetch", post(api::api_fetch))
-        .fallback(not_found)
-        .with_state(state)
+        .route("/favicon.svg", get(assets::favicon));
+    for (path, _, method_router) in api_routes() {
+        router = router.route(path, method_router);
+    }
+    router.fallback(not_found).with_state(state)
 }
 
 async fn not_found() -> Response {

@@ -296,15 +296,18 @@ pub(crate) async fn api_search(
 
 /// `GET /api` — machine-readable directory: every endpoint with its summary,
 /// plus links to the `OpenAPI` document and the rendered docs page. An agent
-/// (or curl) can discover the whole surface starting from here.
+/// (or curl) can discover the whole JSON API + feed surface from here.
 pub(crate) async fn api_index() -> Response {
     let spec = super::openapi::spec();
     let mut endpoints = Vec::new();
     if let Some(paths) = spec["paths"].as_object() {
         for (path, operations) in paths {
+            // Iterate the operations themselves (not a fixed method list) so
+            // a future put/patch cannot be silently dropped; the JSON map is
+            // alphabetically ordered, so the sweep is deterministic.
             let mut methods = Vec::new();
-            for method in ["get", "post", "delete"] {
-                if let Some(op) = operations.get(method) {
+            if let Some(ops) = operations.as_object() {
+                for (method, op) in ops {
                     methods.push(serde_json::json!({
                         "method": method.to_uppercase(),
                         "summary": op["summary"].as_str().unwrap_or_default(),
@@ -327,9 +330,10 @@ pub(crate) async fn api_index() -> Response {
 }
 
 /// `GET /api/openapi.json` — the `OpenAPI` 3.1 document describing the whole
-/// HTTP surface; the same value the docs page renders.
+/// JSON API + feed surface; the same value the docs page renders. The spec is
+/// an immutable `&'static Value`, so it is serialized in place (no clone).
 pub(crate) async fn api_openapi() -> Response {
-    Json(super::openapi::spec().clone()).into_response()
+    Json(super::openapi::spec()).into_response()
 }
 
 /// `GET /api/history?target=&days=` — bulk per-item-per-day aggregates for

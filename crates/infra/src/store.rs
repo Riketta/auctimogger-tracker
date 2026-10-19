@@ -2128,7 +2128,8 @@ impl PriceHistoryRepository for SqliteStore {
             .prepare(
                 "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
                  FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
-                 WHERE d.target_id = ?1 AND d.day >= ?2",
+                 WHERE d.target_id = ?1 AND d.day >= ?2
+                 ORDER BY d.day, r.kind, r.item_id",
             )
             .map_err(|e| backend("prepare item_day_rows", e))?;
         let rows = query_day_rows(&mut statement, rusqlite::params![target.as_str(), since_day])?;
