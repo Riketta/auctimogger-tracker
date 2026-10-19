@@ -3,6 +3,11 @@
 -- "Feed contract (v2)" section).
 -- Usage: lua verify_feed.lua <feed.lua>
 -- Exits non-zero with a message on the first violation.
+--
+-- TRUST: this script executes the feed file as trusted Lua (loadfile +
+-- pcall) — the same trust domain as the tracker itself. Only point it at
+-- feeds you generated with the tracker; it must never be run against
+-- untrusted files.
 
 local path = assert(arg and arg[1], "usage: lua verify_feed.lua <feed.lua>")
 

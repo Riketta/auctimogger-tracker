@@ -206,20 +206,22 @@ impl IngestCycleService {
                 // cycle). The rolling span windows slide at UTC day
                 // boundaries — a change no per-item rule can see — so the
                 // first cycle after a day roll sweeps the whole target cache
-                // instead. A poisoned mutex degrades to one extra sweep.
-                let sweep = {
-                    let mut sweeps = self
-                        .last_sweep_day
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    let sweep = sweeps.get(&target.id) != Some(&day);
-                    if sweep {
-                        sweeps.insert(target.id.clone(), day);
-                    }
-                    sweep
-                };
+                // instead. The sweep marker advances only AFTER the
+                // invalidation succeeds: a failed sweep retries next cycle
+                // rather than trusting a stamp that never did anything. A
+                // poisoned mutex degrades to one extra sweep.
+                let sweep = self
+                    .last_sweep_day
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(&target.id)
+                    != Some(&day);
                 if sweep {
                     self.cache.invalidate(&target.id)?;
+                    self.last_sweep_day
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .insert(target.id.clone(), day);
                 } else {
                     self.cache.invalidate_items(&target.id, &affected)?;
                 }

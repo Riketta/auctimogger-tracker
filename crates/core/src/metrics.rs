@@ -34,6 +34,8 @@ pub fn block_from_histograms(
     sale_rate: Option<f64>,
 ) -> Option<MetricBlock> {
     let mut samples: Vec<i64> = Vec::new();
+    // `qty_sum` saturates like the ranking math: the i128 `value_qty` care
+    // below would be undone by an i64 overflow in the denominator.
     let mut qty_sum = 0i64;
     // `price * qty` overflows i64 on extreme-but-legal inputs (huge quantities
     // at huge prices); the accumulator stays i128 so the floored quotient is
@@ -45,7 +47,7 @@ pub fn block_from_histograms(
             for _ in 0..bucket.listings {
                 samples.push(*price);
             }
-            qty_sum += bucket.qty;
+            qty_sum = qty_sum.saturating_add(bucket.qty);
             value_qty += i128::from(*price) * i128::from(bucket.qty);
         }
     }

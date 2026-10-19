@@ -97,12 +97,21 @@ impl NegativeCache {
     }
 
     /// Remembers `key` until the TTL expires, evicting oldest-first once over
-    /// capacity. Re-remembering an id supersedes its old queue entry, which
-    /// the eviction loop then skips as litter.
+    /// capacity. Re-remembering an id supersedes its old queue entry: stale
+    /// fronts are drained on every remember (even under cap, so a
+    /// re-remembered key cannot grow the queue without bound), and any the
+    /// eviction loop meets further back are skipped as litter.
     fn remember(&mut self, key: (String, i64)) {
         self.seq = self.seq.wrapping_add(1);
         self.entries.insert(key.clone(), (Instant::now(), self.seq));
         self.order.push_back((key, self.seq));
+        while self
+            .order
+            .front()
+            .is_some_and(|(id, seq)| self.entries.get(id).map(|(_, s)| *s) != Some(*seq))
+        {
+            self.order.pop_front();
+        }
         while self.entries.len() > self.cap {
             match self.order.pop_front() {
                 // Only a queue entry matching the live map entry evicts;
@@ -387,6 +396,46 @@ mod tests {
         cache.remember(("retail".to_string(), 42));
         assert!(cache.contains_fresh(&("retail".to_string(), 42)));
         assert!(!cache.contains_fresh(&("forever".to_string(), 42)), "other flavor misses");
+    }
+
+    /// Re-remembering one key must not grow the queue without bound: the
+    /// superseded fronts drain on every remember, leaving exactly one live
+    /// queue entry no matter how often the key is re-remembered.
+    #[test]
+    fn reremembering_one_key_does_not_grow_the_queue() {
+        let key = ("retail".to_string(), 7);
+        let mut cache = NegativeCache::new(10, NEGATIVE_TTL_SECONDS);
+        for _ in 0..100 {
+            cache.remember(key.clone());
+        }
+        assert_eq!(cache.entries.len(), 1, "one live entry");
+        assert_eq!(cache.order.len(), 1, "stale queue fronts drain under cap");
+        assert!(cache.contains_fresh(&key));
+    }
+
+    /// At cap, eviction still sheds the oldest LIVE entries: a re-remembered
+    /// id survives while genuinely older ids evict, and the superseded queue
+    /// entries drain as they reach the front instead of accumulating.
+    #[test]
+    fn eviction_at_cap_still_sheds_reremembered_litter() {
+        let key = |v: i64| ("retail".to_string(), v);
+        let mut cache = NegativeCache::new(3, NEGATIVE_TTL_SECONDS);
+        cache.remember(key(1));
+        cache.remember(key(2));
+        cache.remember(key(3));
+        cache.remember(key(3)); // supersede 3's queue entry
+        cache.remember(key(4)); // over cap: 1 evicts (oldest live), 3 stays
+        cache.remember(key(5)); // over cap: 2 evicts, 3 stays live
+        assert!(!cache.contains_fresh(&key(1)));
+        assert!(!cache.contains_fresh(&key(2)));
+        assert!(cache.contains_fresh(&key(3)), "the re-remembered id stays live");
+        assert!(cache.contains_fresh(&key(4)));
+        assert!(cache.contains_fresh(&key(5)));
+        // The next remember drains 3's stale fronts, so the queue holds
+        // exactly the live set again.
+        cache.remember(key(6));
+        assert!(!cache.contains_fresh(&key(3)), "oldest live entry evicted at cap");
+        assert_eq!(cache.order.len(), cache.entries.len(), "no litter left");
     }
 
     // ------------------------------------------------------------ fakes

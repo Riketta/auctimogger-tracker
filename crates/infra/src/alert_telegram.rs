@@ -3,6 +3,8 @@
 //! configured environment variable on every dispatch, so rotated tokens apply
 //! without a restart.
 
+use std::time::Duration;
+
 use amtracker_core::{
     domain::AlertEvent,
     error::AlertDispatchError,
@@ -23,11 +25,14 @@ impl TelegramAlertDispatcher {
     /// environment variables on every dispatch.
     #[must_use]
     pub fn new(token_env: impl Into<String>, chat_id_env: impl Into<String>) -> Self {
-        Self {
-            agent: ureq::Agent::new(),
-            token_env: token_env.into(),
-            chat_id_env: chat_id_env.into(),
-        }
+        // Same timeouts as the Wowhead agent: dispatches run on the single
+        // maintenance worker, so a hung bot-API call must not stall it
+        // forever.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build();
+        Self { agent, token_env: token_env.into(), chat_id_env: chat_id_env.into() }
     }
 
     fn env_value(name: &str) -> Result<String, AlertDispatchError> {

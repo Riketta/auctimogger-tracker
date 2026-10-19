@@ -288,6 +288,79 @@ impl TargetConfig {
     }
 }
 
+/// Upper bound for every poll-style interval — the per-target poll seconds
+/// and `[server].feed_publish_secs`: 30 days (`2_592_000` s). The scheduler
+/// seeds first-fire timers as `Instant::now() + jitter` with the jitter drawn
+/// from `[0, interval)`, so an unbounded interval could overflow that
+/// addition and panic at startup.
+const MAX_INTERVAL_SECS: u64 = 30 * 24 * 60 * 60;
+
+/// Whether `id` is a valid target id: `[a-z0-9][a-z0-9._-]*`. Target ids are
+/// used as filesystem path segments (`feeds/<id>/`, raw archives), so the
+/// charset is restricted to lowercase ASCII alphanumerics plus `.`, `_`, `-`
+/// after a leading alphanumeric — this excludes `/`, `\`, whitespace and
+/// control characters, the leading-character rule rejects `.`/`..` as ids,
+/// and the `..` contains-check rejects interior empty segments (`a..b`).
+/// Plain char checks, no regex dependency.
+fn is_valid_target_id(id: &str) -> bool {
+    let mut chars = id.chars();
+    let Some(first) = chars.next() else { return false };
+    if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {
+        return false;
+    }
+    if !chars
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || matches!(ch, '.' | '_' | '-'))
+    {
+        return false;
+    }
+    !id.contains("..")
+}
+
+/// Target id rules that do not need cross-target state: non-empty and
+/// restricted to `[a-z0-9][a-z0-9._-]*` (ids become filesystem path
+/// segments — see [`is_valid_target_id`]).
+///
+/// # Errors
+///
+/// Returns a `ConfigError` for the first violated rule.
+fn validate_target_identity(target: &TargetConfig) -> Result<(), ConfigError> {
+    if target.id.0.trim().is_empty() {
+        return Err(ConfigError("target id must not be empty".into()));
+    }
+    if !is_valid_target_id(target.id.as_str()) {
+        return Err(ConfigError(format!(
+            "target id '{}' must match [a-z0-9][a-z0-9._-]* (lowercase ASCII \
+             alphanumerics, then also '.', '_', '-'; no path separators or '..')",
+            target.id
+        )));
+    }
+    Ok(())
+}
+
+/// Per-target poll checks: both intervals positive and under the 30-day cap
+/// ([`MAX_INTERVAL_SECS`]).
+///
+/// # Errors
+///
+/// Returns a `ConfigError` for the first violated rule.
+fn validate_target_poll(target: &TargetConfig) -> Result<(), ConfigError> {
+    if target.poll.commodities_secs == 0 || target.poll.auctions_secs == 0 {
+        return Err(ConfigError(format!("target '{}' poll intervals must be positive", target.id)));
+    }
+    for (name, secs) in [
+        ("poll.commodities_secs", target.poll.commodities_secs),
+        ("poll.auctions_secs", target.poll.auctions_secs),
+    ] {
+        if secs > MAX_INTERVAL_SECS {
+            return Err(ConfigError(format!(
+                "target '{}' {name} must not exceed {MAX_INTERVAL_SECS} (30 days)",
+                target.id
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl TrackerConfig {
     /// The configured target with the given id, if any.
     #[must_use]
@@ -302,7 +375,9 @@ impl TrackerConfig {
     /// # Errors
     ///
     /// Returns a `ConfigError` when no `[[targets]]` entries exist, a target
-    /// id is empty or duplicated, a poll interval is zero, an auth env name
+    /// id is empty, not `[a-z0-9][a-z0-9._-]*`, or duplicated, a poll
+    /// interval is zero or exceeds the 30-day cap (`[server].
+    /// feed_publish_secs` included), an auth env name
     /// or source URL/region is blank, `connected_realm_id` is not positive,
     /// `[metrics].spans` is empty, a score weight is negative/non-finite or
     /// the weights sum to zero, `[opportunities].min_samples` is zero, the
@@ -314,18 +389,11 @@ impl TrackerConfig {
         }
         let mut seen = std::collections::BTreeSet::new();
         for target in &self.targets {
-            if target.id.0.trim().is_empty() {
-                return Err(ConfigError("target id must not be empty".into()));
-            }
+            validate_target_identity(target)?;
             if !seen.insert(target.id.clone()) {
                 return Err(ConfigError(format!("duplicate target id '{}'", target.id)));
             }
-            if target.poll.commodities_secs == 0 || target.poll.auctions_secs == 0 {
-                return Err(ConfigError(format!(
-                    "target '{}' poll intervals must be positive",
-                    target.id
-                )));
-            }
+            validate_target_poll(target)?;
             if let Some(auth) = &target.auth {
                 let empty = match auth {
                     AuthConfig::Bearer { env } if env.trim().is_empty() => {
@@ -374,6 +442,11 @@ impl TrackerConfig {
                     }
                 }
             }
+        }
+        if self.server.feed_publish_secs > MAX_INTERVAL_SECS {
+            return Err(ConfigError(format!(
+                "[server].feed_publish_secs must not exceed {MAX_INTERVAL_SECS} (30 days)"
+            )));
         }
         if self.metrics.spans.is_empty() {
             return Err(ConfigError("[metrics].spans must not be empty".into()));

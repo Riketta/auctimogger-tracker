@@ -64,6 +64,25 @@ const MAINTENANCE_IDLE_TICK: Duration = Duration::from_secs(60);
 /// parseable `Retry-After` hint.
 const DEFAULT_BACKOFF_SECS: u64 = 60;
 
+/// Upper bound for a wire-provided `Retry-After` hint. A hostile or broken
+/// source can send an absurd value (e.g. `u64::MAX`); `Instant::now() +
+/// Duration::from_secs(secs)` panics on overflow, and the backoff insertion
+/// site sits OUTSIDE the cycle's `catch_unwind` — an unclamped hint could
+/// therefore kill the scheduler thread. One day is longer than any sane
+/// rate-limit window.
+const MAX_RETRY_AFTER_SECS: u64 = 24 * 60 * 60;
+
+/// Clamps a parsed `Retry-After` hint to a safe backoff duration: no hint
+/// falls back to [`DEFAULT_BACKOFF_SECS`], any hint is capped at
+/// [`MAX_RETRY_AFTER_SECS`] so the `Instant + Duration` insertion below can
+/// never overflow and panic the scheduler thread.
+fn retry_after_secs(retry_after: Option<u64>) -> u64 {
+    match retry_after {
+        None => DEFAULT_BACKOFF_SECS,
+        Some(secs) => secs.min(MAX_RETRY_AFTER_SECS),
+    }
+}
+
 /// Store-wide online-backup hook: writes a consistent copy of the database to
 /// the given path. Injected by the composition root (which owns the concrete
 /// store) so the scheduler — and this crate — never needs the adapter type.
@@ -507,7 +526,7 @@ fn run_cycle_logged(
                 amtracker_core::error::SourceError::RateLimited { retry_after },
             ) = &error
             {
-                let secs = retry_after.unwrap_or(DEFAULT_BACKOFF_SECS);
+                let secs = retry_after_secs(*retry_after);
                 timers.lock().unwrap_or_else(PoisonError::into_inner).backoff_until.insert(
                     (target.id.0.clone(), kind),
                     Instant::now() + Duration::from_secs(secs),
@@ -645,8 +664,12 @@ fn warm_item_names(
         }
     };
     let mut warmed = 0u32;
-    for item in items {
-        if warmed >= config.catalog.idle_names_per_cycle {
+    for (examined, item) in items.into_iter().enumerate() {
+        // Every examined item counts against the budget, known or not: the
+        // accounting must precede the known/deferred branch, or an all-known
+        // market would scan its entire item list every pass (the break could
+        // never fire) instead of at most `idle_names_per_cycle` items.
+        if examined >= config.catalog.idle_names_per_cycle as usize {
             break;
         }
         // Only ids the catalog has never seen cost a request; known ones are
@@ -919,5 +942,22 @@ mod tests {
         assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), Some("b".into()));
         assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), Some("a".into()));
         assert_eq!(MaintenanceQueue::pop_timeout(mutex, condvar, Duration::ZERO), None);
+    }
+
+    #[test]
+    fn missing_retry_after_uses_the_default_backoff() {
+        assert_eq!(retry_after_secs(None), DEFAULT_BACKOFF_SECS);
+    }
+
+    #[test]
+    fn parseable_retry_after_is_honored() {
+        assert_eq!(retry_after_secs(Some(30)), 30);
+    }
+
+    #[test]
+    fn absurd_retry_after_is_clamped_to_one_day() {
+        // `u64::MAX` would overflow `Instant + Duration` and panic the
+        // scheduler thread (the insertion site is outside `catch_unwind`).
+        assert_eq!(retry_after_secs(Some(u64::MAX)), MAX_RETRY_AFTER_SECS);
     }
 }

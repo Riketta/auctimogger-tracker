@@ -273,6 +273,21 @@ struct WireNamed {
     name: Option<WireLocalized>,
 }
 
+/// Terminal non-200 status handling for the Blizzard item/pet legs: 429 keeps
+/// its rate-limit semantics — the `ItemInfoPort` contract promises
+/// `SourceError::RateLimited` on 429 so the scheduler's backoff parking
+/// applies (mirroring the Wowhead leg) — and anything else is plain transport
+/// trouble the chain may fall through on. The Blizzard endpoints sent no
+/// `Retry-After` hint in practice, so `retry_after` stays `None` (the default
+/// backoff applies).
+fn terminal_status_error(leg: &str, status: u16) -> SourceError {
+    if status == 429 {
+        SourceError::RateLimited { retry_after: None }
+    } else {
+        SourceError::Http(format!("{leg} api status {status}"))
+    }
+}
+
 impl ItemInfoPort for BlizzardItemInfo {
     fn describe(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, SourceError> {
         let response = self.authorized_get(&self.item_url(flavor, item_id))?;
@@ -281,7 +296,7 @@ impl ItemInfoPort for BlizzardItemInfo {
             return Ok(None);
         }
         if status != 200 {
-            return Err(SourceError::Http(format!("item api status {status}")));
+            return Err(terminal_status_error("item", status));
         }
         let bytes = crate::blizzard_source::read_capped(
             response.into_reader(),
@@ -302,7 +317,7 @@ impl ItemInfoPort for BlizzardItemInfo {
             return Ok(None);
         }
         if status != 200 {
-            return Err(SourceError::Http(format!("pet api status {status}")));
+            return Err(terminal_status_error("pet", status));
         }
         let bytes = crate::blizzard_source::read_capped(
             response.into_reader(),
@@ -492,5 +507,27 @@ mod tests {
         assert_eq!(blizzard_locale("en_US"), "en_US");
         assert_eq!(blizzard_locale("ru_RU"), "ru_RU");
         assert_eq!(blizzard_locale("es"), "es");
+    }
+
+    /// 429 must surface as `RateLimited` (the `ItemInfoPort` contract), not
+    /// plain `Http` — otherwise the scheduler never parks the lookup and
+    /// hot-retries into the rate limit.
+    #[test]
+    fn rate_limit_status_keeps_its_semantics() {
+        for leg in ["item", "pet"] {
+            let error = terminal_status_error(leg, 429);
+            assert!(
+                matches!(error, SourceError::RateLimited { retry_after: None }),
+                "{leg} 429 must be RateLimited"
+            );
+        }
+    }
+
+    #[test]
+    fn other_error_statuses_stay_plain_http_errors() {
+        let error = terminal_status_error("item", 500);
+        assert!(matches!(error, SourceError::Http(m) if m == "item api status 500"));
+        let error = terminal_status_error("pet", 503);
+        assert!(matches!(error, SourceError::Http(m) if m == "pet api status 503"));
     }
 }

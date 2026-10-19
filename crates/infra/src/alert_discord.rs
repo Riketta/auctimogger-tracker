@@ -3,6 +3,8 @@
 //! environment variable on every dispatch, so rotated URLs apply without a
 //! restart.
 
+use std::time::Duration;
+
 use amtracker_core::{
     domain::AlertEvent,
     error::AlertDispatchError,
@@ -21,7 +23,13 @@ impl DiscordAlertDispatcher {
     /// environment variable on every dispatch.
     #[must_use]
     pub fn new(webhook_env: impl Into<String>) -> Self {
-        Self { agent: ureq::Agent::new(), webhook_env: webhook_env.into() }
+        // Same timeouts as the Wowhead agent: dispatches run on the single
+        // maintenance worker, so a hung webhook must not stall it forever.
+        let agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(10))
+            .timeout(Duration::from_secs(20))
+            .build();
+        Self { agent, webhook_env: webhook_env.into() }
     }
 
     /// The message body for one event: plain text, target-tagged.

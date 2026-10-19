@@ -36,6 +36,34 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 echo "==> downloading ${ARCHIVE}"
 curl -fL --retry 3 -o "$TMP_DIR/archive.tar.gz" "${BASE_URL}/${ARCHIVE}"
 
+# Checksum verification against the release's SHA256SUMS, when published:
+# a mismatch aborts the install; a missing checksum file is reported as an
+# explicit, skipped verification.
+if curl -fsSL --retry 3 -o "$TMP_DIR/SHA256SUMS" "${BASE_URL}/SHA256SUMS"; then
+    echo "==> verifying archive checksum"
+    EXPECTED="$(grep -E "^[0-9a-fA-F]{64}[[:space:]]+[* ]?${ARCHIVE}\$" \
+        "$TMP_DIR/SHA256SUMS" | head -n 1 | awk '{print $1}')"
+    if [ -z "$EXPECTED" ]; then
+        echo "error: ${ARCHIVE} not listed in the release's SHA256SUMS" >&2
+        exit 1
+    fi
+    if command -v sha256sum >/dev/null 2>&1; then
+        ACTUAL="$(sha256sum "$TMP_DIR/archive.tar.gz" | awk '{print $1}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        ACTUAL="$(shasum -a 256 "$TMP_DIR/archive.tar.gz" | awk '{print $1}')"
+    else
+        echo "error: need sha256sum or shasum to verify SHA256SUMS" >&2
+        exit 1
+    fi
+    if [ "$ACTUAL" != "$EXPECTED" ]; then
+        echo "error: checksum mismatch for ${ARCHIVE} (expected ${EXPECTED}, got ${ACTUAL})" >&2
+        exit 1
+    fi
+    echo "==> checksum ok"
+else
+    echo "==> note: ${TAG} publishes no SHA256SUMS; checksum verification skipped"
+fi
+
 echo "==> unpacking"
 mkdir -p "$TMP_DIR/unpacked"
 tar -xzf "$TMP_DIR/archive.tar.gz" -C "$TMP_DIR/unpacked"

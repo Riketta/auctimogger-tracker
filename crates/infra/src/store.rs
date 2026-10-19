@@ -1264,7 +1264,10 @@ impl MetricsCacheRepository for SqliteStore {
         }
         let conn = self.open_transaction();
         // Unknown identities have no cache rows: `put` resolves the same way.
-        let ids = resolve_item_ids(&conn, items)?;
+        // One prepared statement serves the whole batch (`item_ids_in_order`,
+        // same SQL as `lookup_item_ref`) — a prepare per item would dominate
+        // the mutex hold on market-scale cycles.
+        let ids: Vec<i64> = item_ids_in_order(&conn, items)?.into_iter().flatten().collect();
         for chunk in ids.chunks(CACHE_INVALIDATE_CHUNK) {
             // Placeholders are bound values, never interpolated input.
             let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
@@ -1297,11 +1300,10 @@ impl MetricsCacheRepository for SqliteStore {
         }
         let conn = self.open_transaction();
         // Positional resolution: unknown identities have no cache rows (the
-        // same rule `put` applies), so they read back as `None`.
-        let mut ids: Vec<Option<i64>> = Vec::with_capacity(items.len());
-        for item in items {
-            ids.push(lookup_item_ref(&conn, item)?);
-        }
+        // same rule `put` applies), so they read back as `None`. One prepared
+        // statement serves the whole batch (`item_ids_in_order`) instead of a
+        // prepare per item; the result order matches the input exactly.
+        let ids = item_ids_in_order(&conn, items)?;
         let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
         let mut by_id: HashMap<i64, amtracker_core::domain::CachedBlock> = HashMap::new();
         for chunk in known.chunks(CACHE_GET_CHUNK) {

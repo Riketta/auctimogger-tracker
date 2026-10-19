@@ -157,6 +157,12 @@ permanently out of scope for the frontend.
 
 ### 3.3 API gaps a WASM UI would expose
 
+> **Note (2026-10-19):** the API gaps listed below have since been
+> implemented. The live `/api` index (served by the tracker alongside its
+> OpenAPI document) reflects the current surface, and the OpenAPI drift test
+> in `crates/server/tests/web.rs` pins the document to the router's route
+> table, so this list is kept for the historical record only.
+
 These are the concrete server-side tasks a swap implies (all verified absent today):
 
 1. **Pet-addressable metrics.** `api_item_metrics` always constructs

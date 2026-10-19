@@ -359,10 +359,12 @@ impl OpportunityService {
         let mut newest: Option<&ItemDayRow> = None;
         for row in day_rows {
             let count = i64::try_from(row.listing_count).unwrap_or(i64::MAX);
-            samples7 += count;
+            // Saturating: one absurd listing_count must not overflow the
+            // whole sum (debug builds panic on overflow).
+            samples7 = samples7.saturating_add(count);
             churn_sum += row.listing_count as f64;
             weighted.push((row.median, count));
-            mad_weight_sum += count;
+            mad_weight_sum = mad_weight_sum.saturating_add(count);
             mad_weighted += row.mad as f64 * row.listing_count as f64;
             match newest {
                 Some(latest) if latest.day >= row.day => {}
@@ -460,16 +462,18 @@ impl OpportunityService {
 // Copper prices go into ranking math only; f64 keeps 2^53 integers exact.
 #[allow(clippy::cast_precision_loss)]
 fn weighted_median(pairs: &[(i64, i64)]) -> f64 {
-    let total: i64 = pairs.iter().map(|(_, count)| count).sum();
+    // Saturating fold: corrupt/absurd counts must not overflow the total.
+    let total: i64 =
+        pairs.iter().map(|(_, count)| count).fold(0i64, |acc, count| acc.saturating_add(*count));
     if total == 0 {
         return 0.0;
     }
-    let mid_floor = (total + 1) / 2;
+    let mid_floor = total.saturating_add(1) / 2;
     let mid_ceil = total / 2 + 1;
     let value_at = |rank: i64| -> i64 {
         let mut seen = 0i64;
         for (median, count) in pairs {
-            seen += count;
+            seen = seen.saturating_add(*count);
             if seen >= rank {
                 return *median;
             }
@@ -478,7 +482,9 @@ fn weighted_median(pairs: &[(i64, i64)]) -> f64 {
     };
     let low = value_at(mid_floor);
     let high = value_at(mid_ceil);
-    (low + high) as f64 / 2.0
+    // Sum in i128 first: `low + high` can overflow i64, and the cast keeps
+    // the .5 fraction the old float division produced.
+    ((i128::from(low) + i128::from(high)) as f64) / 2.0
 }
 
 #[cfg(test)]

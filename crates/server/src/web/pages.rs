@@ -1136,7 +1136,10 @@ async fn item_detail_page(
         }
     }
 
-    page(&title, "items", &body, Some(target_switcher(&state.config, "/items", &target, &[])))
+    // `page` escapes its title itself; passing the escaped copy would
+    // double-escape ("&" rendering as "&amp;"). `title` stays the
+    // single-escaped copy for the body <h2> above.
+    page(&title_raw, "items", &body, Some(target_switcher(&state.config, "/items", &target, &[])))
 }
 
 /// Serializes a JSON value for embedding in a `<script type="application/json">`
