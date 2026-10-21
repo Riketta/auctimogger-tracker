@@ -399,7 +399,7 @@ async fn post_json(router: Router, uri: &str, content_type: Option<&str>) -> Sta
 
 // --------------------------------------------------------------- tests
 
-/// M2 contract: the search box must carry the target slug — `app.js` builds
+/// Contract: the search box must carry the target slug — `app.js` builds
 /// completion links from it, and an empty target dead-ends on a 400 page.
 #[tokio::test]
 async fn items_page_carries_the_completion_target() {
@@ -414,7 +414,7 @@ async fn items_page_carries_the_completion_target() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// M1 contract: the chart data island must be a `days`-keyed object — the
+/// Contract: the chart data island must be a `days`-keyed object — the
 /// exact shape `app.js` parses. A bare array makes the interactive chart dead
 /// code.
 #[tokio::test]
@@ -442,7 +442,7 @@ async fn chart_island_matches_the_shape_app_js_parses() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// M3 contract: advertised sortable tables must actually render sortable
+/// Contract: advertised sortable tables must actually render sortable
 /// headers (`data-sortable` is the hook `app.js` binds to). Seeded history
 /// makes the ranking/overview tables render real rows; the seeded cycle
 /// record makes the dashboard's cycles table render.

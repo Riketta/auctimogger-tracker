@@ -1,7 +1,7 @@
 //! SQLite repositories implementing `SnapshotRepository` and
 //! `PriceHistoryRepository` over a single database file (WAL).
 //!
-//! Durability model (plan §3 / D3): snapshot metadata, item-day folds and the
+//! Durability model: snapshot metadata, item-day folds and the
 //! item catalog are permanent; raw listing rows and archived payload files are
 //! a bounded working set (`prune_raw_before`).
 
