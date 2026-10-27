@@ -1,6 +1,6 @@
--- Verifies a generated tracker feed (feed.lua) against the frozen v2
+-- Verifies a generated tracker feed (feed.lua) against the v3
 -- contract the AuctiMogger addon ingests (see the tracker README's
--- "Feed contract (v2)" section).
+-- "Feed contract (v3)" section).
 -- Usage: lua verify_feed.lua <feed.lua>
 -- Exits non-zero with a message on the first violation.
 --
@@ -17,7 +17,7 @@ assert(ok, "feed file errors at runtime")
 -- The contract is a global (the addon reads it the same way).
 local feed = AuctiMoggerTrackerFeed
 assert(type(feed) == "table", "feed must be a table")
-assert(feed.version == 2, "feed.version must be 2")
+assert(feed.version == 3, "feed.version must be 3")
 assert(type(feed.generatedAt) == "number" and feed.generatedAt > 0 and feed.generatedAt % 1 == 0,
 	"feed.generatedAt must be a positive integer epoch")
 assert(type(feed.items) == "table", "feed.items must be a table")
@@ -58,6 +58,8 @@ local function fail(index, message)
 	error(("item %d: %s"):format(index, message), 0)
 end
 
+local CATEGORIES = { "item", "commodity", "pet" }
+
 local count = 0
 for index, entry in ipairs(feed.items) do
 	assert(type(entry) == "table", ("items[%d] must be a table"):format(index))
@@ -65,6 +67,17 @@ for index, entry in ipairs(feed.items) do
 	if not spans then
 		fail(index, "missing metrics table")
 	end
+	-- v3: every entry names its market category (items/commodities/pets are
+	-- separate ledgers; an item trading in both AHs exports once per one).
+	local category = entry.category
+	local knownCategory = false
+	for _, known in ipairs(CATEGORIES) do
+		if category == known then
+			knownCategory = true
+			break
+		end
+	end
+	assert(knownCategory, ("items[%d] needs a category of item|commodity|pet"):format(index))
 	local validSpans = 0
 	for _, name in ipairs(SPANS) do
 		local span = spans[name]
@@ -78,6 +91,7 @@ for index, entry in ipairs(feed.items) do
 	if entry.kind == "pet" then
 		assert(isUInt(entry.speciesID) and entry.speciesID > 0,
 			("items[%d] pet needs a positive speciesID"):format(index))
+		assert(category == "pet", ("items[%d] pet entries must use the pet category"):format(index))
 	else
 		assert(entry.kind == nil and isUInt(entry.itemID) and entry.itemID > 0,
 			("items[%d] needs a positive itemID"):format(index))

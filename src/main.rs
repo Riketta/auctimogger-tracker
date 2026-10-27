@@ -85,7 +85,7 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
-    /// Print the analytics block for one item/span (debug aid).
+    /// Print the analytics block for one item/span/category (debug aid).
     Metrics {
         #[arg(long)]
         config: PathBuf,
@@ -95,6 +95,8 @@ enum Commands {
         item: i64,
         #[arg(long, default_value = "d1")]
         span: String,
+        #[arg(long, default_value = "item")]
+        category: String,
     },
     /// Export the tracker feed for a target (lua + json).
     ExportFeed {
@@ -121,8 +123,10 @@ fn main() {
         Commands::Serve { config } => {
             with_observability(&config, |loaded| run_serve(&loaded.tracker))
         }
-        Commands::Metrics { config, target, item, span } => {
-            with_observability(&config, |loaded| run_metrics(&loaded.tracker, &target, item, &span))
+        Commands::Metrics { config, target, item, span, category } => {
+            with_observability(&config, |loaded| {
+                run_metrics(&loaded.tracker, &target, item, &span, &category)
+            })
         }
         Commands::ExportFeed { config, target, out, slim } => {
             with_observability(&config, |loaded| {
@@ -518,9 +522,14 @@ fn run_metrics(
     target_id: &str,
     item_id: i64,
     span_name: &str,
+    category_name: &str,
 ) -> i32 {
     let Some(span) = amtracker_core::domain::Span::parse(span_name) else {
         eprintln!("error: unknown span '{span_name}' (expected d1|d7|d14|d30)");
+        return 1;
+    };
+    let Some(category) = amtracker_core::domain::Category::parse(category_name) else {
+        eprintln!("error: unknown category '{category_name}' (expected item|commodity|pet)");
         return 1;
     };
     if !config.metrics.spans.contains(&span) {
@@ -546,12 +555,13 @@ fn run_metrics(
         clock,
     );
     let item = amtracker_core::domain::ItemRef::Item { item_id };
-    match metrics.block(&target.id, &item, span) {
+    match metrics.block(&target.id, &item, category, span) {
         Ok(Some(block)) => {
             println!(
-                "{} {} span {} : n={} median={} min={} p05={} p25={} p75={} p95={} max={} mad={} vwap={} qty={} sale_rate={}",
+                "{} {} {} span {} : n={} median={} min={} p05={} p25={} p75={} p95={} max={} mad={} vwap={} qty={} sale_rate={}",
                 target_id,
                 item_id,
+                category.as_str(),
                 span.name(),
                 block.n,
                 block.median,

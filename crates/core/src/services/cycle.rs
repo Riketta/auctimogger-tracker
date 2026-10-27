@@ -15,15 +15,20 @@ use crate::{
     config::TargetConfig,
     domain::{
         utc_day,
+        Category,
         FetchOutcome,
         ItemRef,
+        ListingKind,
         NewSnapshot,
         PayloadKind,
         SaleCredit,
         SnapshotStatus,
         TargetId,
     },
-    error::CycleError,
+    error::{
+        CycleError,
+        StoreError,
+    },
     fold::{
         group_by_item,
         DayFold,
@@ -182,15 +187,23 @@ impl IngestCycleService {
                     &payload.raw,
                 )?;
                 let grouped = group_by_item(&payload.listings);
-                let mut affected: Vec<ItemRef> = Vec::with_capacity(grouped.len());
+                // The payload kind fixes the auction house; the identity
+                // shape splits the item-AH payload's rows into item and pet
+                // categories, so one batch can touch two categories.
+                let listing_kind = match kind {
+                    PayloadKind::Commodities => ListingKind::Commodity,
+                    PayloadKind::Auctions => ListingKind::Item,
+                };
+                let mut affected: Vec<(ItemRef, Category)> = Vec::with_capacity(grouped.len());
                 for (item_ref, listings) in &grouped {
+                    let category = Category::derive(listing_kind, item_ref);
                     let mut fold = self
                         .history
-                        .load_fold(&target.id, item_ref, day)?
+                        .load_fold(&target.id, item_ref, day, category)?
                         .unwrap_or_else(|| DayFold::new(item_ref.clone()));
                     fold.apply(listings);
-                    self.history.save_fold(&target.id, item_ref, day, &fold)?;
-                    affected.push(item_ref.clone());
+                    self.history.save_fold(&target.id, item_ref, day, category, &fold)?;
+                    affected.push((item_ref.clone(), category));
                 }
 
                 // Sell-through bookkeeping: register sightings, then close
@@ -198,7 +211,9 @@ impl IngestCycleService {
                 self.sales.observe(&target.id, kind, &payload.listings, snapshot_id, now)?;
                 let credits: Vec<SaleCredit> =
                     self.sales.close_missing(&target.id, kind, snapshot_id, now)?;
-                affected.extend(credits.iter().map(|credit| credit.item.clone()));
+                affected.extend(credits.iter().map(|credit| {
+                    (credit.item.clone(), Category::derive(listing_kind, &credit.item))
+                }));
 
                 // Fold + sale state changed for the affected items only:
                 // drop just their memoized blocks (cache is an optimization —
@@ -210,21 +225,7 @@ impl IngestCycleService {
                 // invalidation succeeds: a failed sweep retries next cycle
                 // rather than trusting a stamp that never did anything. A
                 // poisoned mutex degrades to one extra sweep.
-                let sweep = self
-                    .last_sweep_day
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .get(&target.id)
-                    != Some(&day);
-                if sweep {
-                    self.cache.invalidate(&target.id)?;
-                    self.last_sweep_day
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .insert(target.id.clone(), day);
-                } else {
-                    self.cache.invalidate_items(&target.id, &affected)?;
-                }
+                self.invalidate_after_cycle(&target.id, day, &affected)?;
 
                 Ok(CycleReport {
                     target: target.id.clone(),
@@ -238,5 +239,45 @@ impl IngestCycleService {
                 })
             }
         }
+    }
+
+    /// Drops the memoized metric blocks a cycle made stale. Cache rows are
+    /// keyed per category, so the affected items are grouped and invalidated
+    /// per category (one or two groups in practice: an item-AH payload can
+    /// carry item and pet rows, a commodities payload only one). The rolling
+    /// span windows slide at UTC day boundaries — a change no per-item rule
+    /// can see — so the first cycle after a day roll sweeps the whole target
+    /// cache instead. The sweep marker advances only AFTER the invalidation
+    /// succeeds: a failed sweep retries next cycle rather than trusting a
+    /// stamp that never did anything. A poisoned mutex degrades to one extra
+    /// sweep.
+    fn invalidate_after_cycle(
+        &self,
+        target: &TargetId,
+        day: i64,
+        affected: &[(ItemRef, Category)],
+    ) -> Result<(), StoreError> {
+        let sweep = self
+            .last_sweep_day
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(target)
+            != Some(&day);
+        if sweep {
+            self.cache.invalidate(target)?;
+            self.last_sweep_day
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(target.clone(), day);
+            return Ok(());
+        }
+        let mut by_category: HashMap<Category, Vec<ItemRef>> = HashMap::new();
+        for (item, category) in affected {
+            by_category.entry(*category).or_default().push(item.clone());
+        }
+        for (category, items) in &by_category {
+            self.cache.invalidate_items(target, *category, items)?;
+        }
+        Ok(())
     }
 }

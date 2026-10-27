@@ -34,6 +34,7 @@ use amtracker_core::{
     },
     domain::{
         utc_day,
+        Category,
         FetchOutcome,
         Flavor,
         ItemRef,
@@ -357,7 +358,10 @@ fn seed_history(state: &AppState) {
         let listings: Vec<NormalizedListing> =
             (0..4).map(|n| listing(1000 + offset * 100 + n, &item, price)).collect();
         fold.apply(&listings);
-        state.history.save_fold(&target, &item, today - offset, &fold).expect("save fold");
+        state
+            .history
+            .save_fold(&target, &item, today - offset, Category::Commodity, &fold)
+            .expect("save fold");
     }
     // A finished cycle record so the dashboard's recent-cycles table renders.
     state.recent_cycles.push(crate_recent_cycle());
@@ -421,7 +425,8 @@ async fn items_page_carries_the_completion_target() {
 async fn chart_island_matches_the_shape_app_js_parses() {
     let (state, root) = test_state(None);
     seed_history(&state);
-    let (status, body) = get(build_router_arc(Arc::clone(&state)), "/items/t1/2589").await;
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/items/t1/2589?category=commodity").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(r#"id="chart-data""#), "island missing despite seeded folds");
 
@@ -451,7 +456,11 @@ async fn advertised_tables_render_sortable_headers() {
     let (state, root) = test_state(None);
     seed_history(&state);
     let router = build_router_arc(Arc::clone(&state));
-    for uri in ["/opportunities?target=t1", "/overview?target=t1", "/"] {
+    for uri in [
+        "/opportunities?target=t1&category=commodity",
+        "/overview?target=t1&category=commodity",
+        "/",
+    ] {
         let (status, body) = get(router.clone(), uri).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
         assert!(body.contains("<th data-sortable>"), "GET {uri} renders no sortable headers");
@@ -466,7 +475,9 @@ async fn tables_render_catalog_names_with_identity_tooltips() {
     let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
     seed_history(&state);
     let router = build_router_arc(Arc::clone(&state));
-    for uri in ["/opportunities?target=t1", "/overview?target=t1"] {
+    for uri in
+        ["/opportunities?target=t1&category=commodity", "/overview?target=t1&category=commodity"]
+    {
         let (status, body) = get(router.clone(), uri).await;
         assert_eq!(status, StatusCode::OK, "GET {uri}");
         assert!(
@@ -558,9 +569,11 @@ async fn watchlist_metrics_api_joins_entries_to_market_numbers() {
         .add(&target, ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 11 }, None)
         .expect("watch pet");
 
-    let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/api/watchlist/metrics?target=t1&span=d1,d7")
-            .await;
+    let (status, body) = get(
+        build_router_arc(Arc::clone(&state)),
+        "/api/watchlist/metrics?target=t1&category=commodity&span=d1,d7",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     let json: Value = serde_json::from_str(&body).expect("json");
     let entries = json.get("entries").and_then(Value::as_array).expect("entries array");
@@ -779,7 +792,10 @@ fn seed_pet_history(state: &AppState) {
         let listings: Vec<NormalizedListing> =
             (0..4).map(|n| listing(5000 + offset * 100 + n, &item, price)).collect();
         fold.apply(&listings);
-        state.history.save_fold(&target, &item, today - offset, &fold).expect("save fold");
+        state
+            .history
+            .save_fold(&target, &item, today - offset, Category::Commodity, &fold)
+            .expect("save fold");
     }
 }
 
@@ -794,7 +810,10 @@ fn seed_second_item(state: &AppState) {
         let listings: Vec<NormalizedListing> =
             (0..4).map(|n| listing(6000 + offset * 100 + n, &item, price)).collect();
         fold.apply(&listings);
-        state.history.save_fold(&target, &item, today - offset, &fold).expect("save fold");
+        state
+            .history
+            .save_fold(&target, &item, today - offset, Category::Commodity, &fold)
+            .expect("save fold");
     }
 }
 
@@ -804,9 +823,11 @@ fn seed_second_item(state: &AppState) {
 async fn pet_pages_render_catalog_names() {
     let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
     seed_history(&state);
-    let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/items/t1/pet/264?level=1&quality=3&breed=11")
-            .await;
+    let (status, body) = get(
+        build_router_arc(Arc::clone(&state)),
+        "/items/t1/pet/264?level=1&quality=3&breed=11&category=commodity",
+    )
+    .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(">Named Pet 264<"), "the pet detail page shows the resolved name");
     std::fs::remove_dir_all(&root).ok();
@@ -819,7 +840,8 @@ async fn a_failing_name_source_renders_raw_labels() {
     let (state, root) = test_state_with_info(None, Arc::new(DownItemInfo));
     seed_history(&state);
     let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1").await;
+        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1&category=commodity")
+            .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(">item 2589<"), "the raw label stays visible");
     assert!(!body.contains("Named Item"), "no name substitution happened");
@@ -837,7 +859,8 @@ async fn resolve_budget_limits_inline_name_resolution() {
     seed_history(&state);
     seed_second_item(&state);
     let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1").await;
+        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1&category=commodity")
+            .await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(">Named Item 2589<"), "the first identity resolves inline");
     assert!(!body.contains("Named Item 2592"), "beyond-budget ids keep raw labels");
@@ -849,7 +872,8 @@ async fn resolve_budget_limits_inline_name_resolution() {
     });
     seed_history(&state);
     let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1").await;
+        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1&category=commodity")
+            .await;
     assert_eq!(status, StatusCode::OK);
     assert!(!body.contains("Named Item"), "budget 0 disables inline resolution");
     std::fs::remove_dir_all(&root).ok();

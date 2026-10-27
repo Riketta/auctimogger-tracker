@@ -17,6 +17,8 @@ use std::{
 
 use amtracker_core::{
     domain::{
+        Category,
+        ListingKind,
         NewSnapshot,
         NormalizedListing,
         PayloadKind,
@@ -124,9 +126,14 @@ fn real_sample_sightings_close_and_credit() {
     assert!(credits.iter().all(|c| c.at == t1));
 
     // sale_rate for an item whose rows closed: credited / total listings seen.
+    // Everything here came from the auctions payload, so the category derives
+    // from the credited item's identity shape.
     let first = &credits[0];
-    let rate =
-        store.sale_rate(&target, &first.item, 14).expect("sale_rate").expect("sales rows exist");
+    let category = Category::derive(ListingKind::Item, &first.item);
+    let rate = store
+        .sale_rate(&target, &first.item, 14, category)
+        .expect("sale_rate")
+        .expect("sales rows exist");
     assert!(rate > 0.0 && rate <= 1.0);
 
     std::fs::remove_dir_all(&dir).ok();

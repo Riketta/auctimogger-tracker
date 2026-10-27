@@ -19,6 +19,7 @@ use std::{
 
 use amtracker_core::{
     domain::{
+        Category,
         FeedFormat,
         ItemRef,
         ListingKind,
@@ -106,6 +107,7 @@ fn pet_variants_export_as_one_species_entry_with_merged_metrics() {
             &target,
             &low,
             100,
+            Category::Pet,
             &pet_fold(&low, &[listing(1, &low, 100), listing(2, &low, 120)]),
         )
         .expect("save low fold");
@@ -114,6 +116,7 @@ fn pet_variants_export_as_one_species_entry_with_merged_metrics() {
             &target,
             &high,
             100,
+            Category::Pet,
             &pet_fold(
                 &high,
                 &[listing(3, &high, 200), listing(4, &high, 220), listing(5, &high, 240)],
@@ -122,7 +125,7 @@ fn pet_variants_export_as_one_species_entry_with_merged_metrics() {
         .expect("save high fold");
     // species 42: a single variant — still exports under the canonical grain.
     store
-        .save_fold(&target, &solo, 100, &pet_fold(&solo, &[listing(6, &solo, 300)]))
+        .save_fold(&target, &solo, 100, Category::Pet, &pet_fold(&solo, &[listing(6, &solo, 300)]))
         .expect("save solo fold");
 
     let clock = Arc::new(FixedClock(now));

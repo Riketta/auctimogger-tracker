@@ -11,6 +11,7 @@ use std::{
 
 use amtracker_core::{
     domain::{
+        Category,
         FeedFormat,
         PayloadKind,
         Span,
@@ -41,6 +42,7 @@ use axum::{
 use serde::Deserialize;
 
 use super::{
+    category_option,
     expected_api_token,
     known_target,
     log_failure,
@@ -336,16 +338,22 @@ pub(crate) async fn api_openapi() -> Response {
     Json(super::openapi::spec()).into_response()
 }
 
-/// `GET /api/history?target=&days=` — bulk per-item-per-day aggregates for
-/// every item/pet with fold data in the window: the analysis-grade payload
-/// for scripts (one call covers the whole market; every price field is
-/// integer copper, days are UTC day numbers).
+/// `GET /api/history?target=&category=&days=` — bulk per-item-per-day
+/// aggregates for every item/pet with fold data in the window: the
+/// analysis-grade payload for scripts (one call covers the whole market;
+/// every price field is integer copper, days are UTC day numbers). Without
+/// `category`, rows of all three categories are concatenated (each row names
+/// its `category`); with it, only that category's rows.
 pub(crate) async fn api_history(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let target = match required_target(&params, &state.config) {
         Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let category = match category_option(&params) {
+        Ok(category) => category,
         Err(response) => return *response,
     };
     let days = params.get("days").and_then(|v| v.parse::<i64>().ok()).map_or(7, |v| v.clamp(1, 30));
@@ -355,17 +363,28 @@ pub(crate) async fn api_history(
         move || -> Result<(i64, Vec<amtracker_core::domain::ItemDayRow>), StoreError> {
             let today = amtracker_core::domain::utc_day(state.clock.now());
             let since_day = today.saturating_sub(days - 1);
-            let rows = state.history.item_day_rows(&target, since_day)?;
+            let rows = match category {
+                Some(category) => state.history.item_day_rows(&target, since_day, category)?,
+                None => Category::ALL
+                    .iter()
+                    .map(|category| state.history.item_day_rows(&target, since_day, *category))
+                    .collect::<Result<Vec<Vec<_>>, _>>()?
+                    .into_iter()
+                    .flatten()
+                    .collect(),
+            };
             Ok((since_day, rows))
         }
     });
     match computed.await {
         Ok(Ok((since_day, rows))) => Json(serde_json::json!({
             "target": target.as_str(),
+            "category": category.map_or_else(|| "all".to_string(), |c| c.as_str().to_string()),
             "days": days,
             "sinceDay": since_day,
             "rows": rows.iter().map(|row| serde_json::json!({
                 "item": item_json(&row.item),
+                "category": row.category.as_str(),
                 "day": row.day,
                 "listingCount": row.listing_count,
                 "qtySum": row.qty_sum,
@@ -381,7 +400,9 @@ pub(crate) async fn api_history(
     }
 }
 
-/// `GET /api/opportunities?target=&min_churn=&limit=`
+/// `GET /api/opportunities?target=&category=&min_churn=&limit=` — without
+/// `category`, one response keyed by all three categories; with it, the bare
+/// single-category shape. Every row names its category.
 pub(crate) async fn api_opportunities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -390,35 +411,73 @@ pub(crate) async fn api_opportunities(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_option(&params) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let min_churn = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let list = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.opportunities(&target, min_churn, limit)
+        move || -> Result<Vec<(Category, Vec<_>)>, StoreError> {
+            let categories: Vec<Category> = match category {
+                Some(category) => vec![category],
+                None => Category::ALL.to_vec(),
+            };
+            categories
+                .iter()
+                .map(|category| {
+                    state
+                        .opportunities
+                        .opportunities(&target, *category, min_churn, limit)
+                        .map(|rows| (*category, rows))
+                })
+                .collect()
+        }
     });
     match list.await {
-        Ok(Ok(list)) => Json(serde_json::json!({
-            "opportunities": list.iter().map(|o| serde_json::json!({
-                "item": item_json(&o.item),
-                "median7": o.median7,
-                "floorNow": o.floor_now,
-                "discount": o.discount,
-                "reliability": o.reliability,
-                "churnPerDay": o.churn_per_day,
-                "stability": o.stability,
-                "samples7": o.samples7,
-                "confidence": o.confidence,
-                "score": o.score,
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response(),
+        Ok(Ok(list)) => {
+            let ranked = |rows: &[amtracker_core::services::opportunity::Opportunity]| {
+                rows.iter()
+                    .map(|o| {
+                        serde_json::json!({
+                            "item": item_json(&o.item),
+                            "category": o.category.as_str(),
+                            "median7": o.median7,
+                            "floorNow": o.floor_now,
+                            "discount": o.discount,
+                            "reliability": o.reliability,
+                            "churnPerDay": o.churn_per_day,
+                            "stability": o.stability,
+                            "samples7": o.samples7,
+                            "confidence": o.confidence,
+                            "score": o.score,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            match category {
+                Some(category) => Json(serde_json::json!({
+                    "category": category.as_str(),
+                    "opportunities": list.into_iter().next().map(|(_, rows)| ranked(&rows)).unwrap_or_default(),
+                }))
+                .into_response(),
+                None => Json(serde_json::json!(
+                    list.into_iter()
+                        .map(|(category, rows)| (category.as_str().to_string(), serde_json::json!(ranked(&rows))))
+                        .collect::<serde_json::Map<String, serde_json::Value>>()
+                ))
+                .into_response(),
+            }
+        }
         Ok(Err(error)) => internal_error("opportunities", &error),
         Err(error) => internal_error("opportunities-join", &error),
     }
 }
 
-/// `GET /api/overview?target=&limit=`
+/// `GET /api/overview?target=&category=&limit=` — without `category`, one
+/// response keyed by all three categories; with it, the bare shape.
 pub(crate) async fn api_overview(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -427,30 +486,68 @@ pub(crate) async fn api_overview(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_option(&params) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let limit =
         params.get("limit").and_then(|v| v.parse::<usize>().ok()).map_or(15, |v| v.clamp(1, 50));
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.overview(&target, limit)
+        move || -> Result<Vec<(Category, _)>, StoreError> {
+            let categories: Vec<Category> = match category {
+                Some(category) => vec![category],
+                None => Category::ALL.to_vec(),
+            };
+            categories
+                .iter()
+                .map(|category| {
+                    state
+                        .opportunities
+                        .overview(&target, *category, limit)
+                        .map(|data| (*category, data))
+                })
+                .collect()
+        }
     });
     match data.await {
-        Ok(Ok(data)) => {
+        Ok(Ok(list)) => {
             let mover = |m: &amtracker_core::services::opportunity::MoverRow| {
                 serde_json::json!({
                     "item": item_json(&m.item),
+                    "category": m.category.as_str(),
                     "medianNow": m.median_now,
                     "medianPrev": m.median_prev,
                     "change": m.change,
                     "churnPerDay": m.churn_per_day,
                 })
             };
-            Json(serde_json::json!({
-                "moversUp": data.movers_up.iter().map(&mover).collect::<Vec<_>>(),
-                "moversDown": data.movers_down.iter().map(&mover).collect::<Vec<_>>(),
-                "mostActive": data.most_active.iter().map(&mover).collect::<Vec<_>>(),
-            }))
-            .into_response()
+            let overview_json = |data: &amtracker_core::services::opportunity::OverviewData| {
+                serde_json::json!({
+                    "moversUp": data.movers_up.iter().map(&mover).collect::<Vec<_>>(),
+                    "moversDown": data.movers_down.iter().map(&mover).collect::<Vec<_>>(),
+                    "mostActive": data.most_active.iter().map(&mover).collect::<Vec<_>>(),
+                })
+            };
+            match category {
+                Some(category) => {
+                    let data = list.into_iter().next().map(|(_, data)| data);
+                    let mut base = match data {
+                        Some(data) => overview_json(&data),
+                        None => serde_json::json!({}),
+                    };
+                    if let Some(object) = base.as_object_mut() {
+                        object.insert("category".into(), serde_json::json!(category.as_str()));
+                    }
+                    Json(base).into_response()
+                }
+                None => Json(serde_json::json!(list
+                    .iter()
+                    .map(|(category, data)| (category.as_str().to_string(), overview_json(data)))
+                    .collect::<serde_json::Map<String, serde_json::Value>>()))
+                .into_response(),
+            }
         }
         Ok(Err(error)) => internal_error("overview", &error),
         Err(error) => internal_error("overview-join", &error),
@@ -474,24 +571,27 @@ fn spans_param(params: &HashMap<String, String>, default: Span) -> Vec<Span> {
         .map_or_else(|| vec![default], |s| s.split(',').filter_map(Span::parse).collect())
 }
 
-/// Blocking read of one item identity's blocks across `spans`; the shared
-/// body of the item and pet metrics handlers.
+/// Blocking read of one item identity's category's blocks across `spans`;
+/// the shared body of the item and pet metrics handlers.
 type SpanBlocks = Vec<(Span, Option<amtracker_core::domain::MetricBlock>)>;
 fn fetch_span_blocks(
     state: &Arc<AppState>,
     target: &amtracker_core::domain::TargetId,
     item: &amtracker_core::domain::ItemRef,
+    category: Category,
     spans: Vec<Span>,
 ) -> Result<SpanBlocks, StoreError> {
     let mut out = Vec::with_capacity(spans.len());
     for span in spans {
-        out.push((span, state.metrics.block(target, item, span)?));
+        out.push((span, state.metrics.block(target, item, category, span)?));
     }
     Ok(out)
 }
 
-/// `GET /api/items/{target_id}/{item_id}/metrics?span=d7,d30` — the same
-/// blocks the item page shows, JSON-shaped.
+/// `GET /api/items/{target_id}/{item_id}/metrics?category=&span=d7,d30` —
+/// the same blocks the item page shows, JSON-shaped. Without `category`, one
+/// object keyed by category (each holding the span map); with it, the bare
+/// span map.
 pub(crate) async fn api_item_metrics(
     State(state): State<Arc<AppState>>,
     Path((target_id, item_id)): Path<(String, i64)>,
@@ -501,14 +601,43 @@ pub(crate) async fn api_item_metrics(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_option(&params) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let spans = spans_param(&params, Span::D1);
     let item = amtracker_core::domain::ItemRef::Item { item_id };
     let computed = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || fetch_span_blocks(&state, &target, &item, spans)
+        move || -> Result<serde_json::Value, StoreError> {
+            let categories: Vec<Category> = match category {
+                Some(category) => vec![category],
+                None => Category::ALL.to_vec(),
+            };
+            let mut out = serde_json::Map::new();
+            for category in &categories {
+                let mut spans_json = serde_json::Map::new();
+                for (span, block) in
+                    fetch_span_blocks(&state, &target, &item, *category, spans.clone())?
+                {
+                    if let Some(block) = block {
+                        spans_json.insert(span.name().to_string(), metric_block_json(&block));
+                    }
+                }
+                if categories.len() == 1 {
+                    return Ok(serde_json::Value::Object(spans_json));
+                }
+                out.insert(category.as_str().to_string(), serde_json::Value::Object(spans_json));
+            }
+            Ok(serde_json::Value::Object(out))
+        }
     });
-    blocks_response(computed.await)
+    match computed.await {
+        Ok(Ok(json)) => Json(json).into_response(),
+        Ok(Err(error)) => internal_error("item-metrics", &error),
+        Err(error) => internal_error("item-metrics-join", &error),
+    }
 }
 
 /// `GET /api/items/{target_id}/pet/{species_id}/metrics?level=&quality=&breed=&span=…`
@@ -529,10 +658,12 @@ pub(crate) async fn api_item_pet_metrics(
         Err(response) => return *response,
     };
     let spans = spans_param(&params, Span::D1);
+    // Pets only ever trade in the item AH: the pet identity's category is
+    // always `pet` (the commodity payload never carries pets).
     let computed = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || fetch_span_blocks(&state, &target, &item, spans)
+        move || fetch_span_blocks(&state, &target, &item, Category::Pet, spans)
     });
     blocks_response(computed.await)
 }
@@ -679,16 +810,21 @@ pub(crate) async fn api_snapshots(
     }
 }
 
-/// `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` — every
-/// watchlist entry joined to its current market numbers in one batched read:
-/// metric blocks per requested span, trailing sale rate and per-day trend
-/// rows. The machine contract behind the live watchlist page.
+/// `GET /api/watchlist/metrics?target=&category=&span=&sale_days=&trend_days=`
+/// — every watchlist entry joined to its current market numbers in one
+/// batched read: metric blocks per requested span, trailing sale rate and
+/// per-day trend rows. Without `category`, one response keyed by all three
+/// categories; with it, the bare entry-list shape.
 pub(crate) async fn api_watchlist_metrics(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let target = match required_target(&params, &state.config) {
         Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let category = match category_option(&params) {
+        Ok(category) => category,
         Err(response) => return *response,
     };
     let spans = spans_param(&params, Span::D7);
@@ -698,40 +834,72 @@ pub(crate) async fn api_watchlist_metrics(
         let state = Arc::clone(&state);
         let target = target.clone();
         let spans = spans.clone();
-        move || state.watchlist_report.report(&target, &spans, sale_days, trend_days)
+        move || -> Result<Vec<(Category, Vec<_>)>, StoreError> {
+            let categories: Vec<Category> = match category {
+                Some(category) => vec![category],
+                None => Category::ALL.to_vec(),
+            };
+            categories
+                .iter()
+                .map(|category| {
+                    state
+                        .watchlist_report
+                        .report(&target, *category, &spans, sale_days, trend_days)
+                        .map(|entries| (*category, entries))
+                })
+                .collect()
+        }
     });
     let span_names: Vec<&'static str> = spans.iter().map(Span::name).collect();
     match report.await {
-        Ok(Ok(entries)) => Json(serde_json::json!({
-            "target": target.as_str(),
-            "spans": span_names,
-            "saleDays": sale_days,
-            "trendDays": trend_days,
-            "entries": entries.iter().map(|entry| serde_json::json!({
-                "item": item_json(&entry.entry.item),
-                "note": entry.entry.note,
-                "addedAt": entry.entry.added_at,
-                "metrics": entry
-                    .blocks
-                    .iter()
-                    .zip(spans.iter())
-                    .filter_map(|(block, span)| block.as_ref().map(|b| (span.name(), b)))
-                    .map(|(name, block)| (name.to_string(), metric_block_json(block)))
-                    .collect::<serde_json::Map<String, serde_json::Value>>(),
-                "saleRate": entry.sale_rate,
-                "trend": entry.trend.iter().map(|row| serde_json::json!({
-                    "day": row.day,
-                    "listingCount": row.listing_count,
-                    "qtySum": row.qty_sum,
-                    "min": row.min,
-                    "median": row.median,
-                    "mad": row.mad,
+        Ok(Ok(list)) => {
+            let entries_json =
+                |entries: &[amtracker_core::services::watchlist_report::WatchlistReportEntry]| {
+                    entries.iter().map(|entry| serde_json::json!({
+                    "item": item_json(&entry.entry.item),
+                    "note": entry.entry.note,
+                    "addedAt": entry.entry.added_at,
+                    "metrics": entry
+                        .blocks
+                        .iter()
+                        .zip(spans.iter())
+                        .filter_map(|(block, span)| block.as_ref().map(|b| (span.name(), b)))
+                        .map(|(name, block)| (name.to_string(), metric_block_json(block)))
+                        .collect::<serde_json::Map<String, serde_json::Value>>(),
+                    "saleRate": entry.sale_rate,
+                    "trend": entry.trend.iter().map(|row| serde_json::json!({
+                        "day": row.day,
+                        "listingCount": row.listing_count,
+                        "qtySum": row.qty_sum,
+                        "min": row.min,
+                        "median": row.median,
+                        "mad": row.mad,
+                    }))
+                    .collect::<Vec<_>>(),
                 }))
-                .collect::<Vec<_>>(),
-            }))
-            .collect::<Vec<_>>(),
-        }))
-        .into_response(),
+                .collect::<Vec<_>>()
+                };
+            match category {
+                Some(category) => Json(serde_json::json!({
+                    "target": target.as_str(),
+                    "category": category.as_str(),
+                    "spans": span_names,
+                    "saleDays": sale_days,
+                    "trendDays": trend_days,
+                    "entries": list.into_iter().next().map(|(_, entries)| entries_json(&entries)).unwrap_or_default(),
+                }))
+                .into_response(),
+                None => Json(serde_json::json!(
+                    list.iter()
+                        .map(|(category, entries)| (
+                            category.as_str().to_string(),
+                            serde_json::json!(entries_json(entries))
+                        ))
+                        .collect::<serde_json::Map<String, serde_json::Value>>()
+                ))
+                .into_response(),
+            }
+        }
         Ok(Err(error)) => internal_error("watchlist-metrics", &error),
         Err(error) => internal_error("watchlist-metrics-join", &error),
     }

@@ -64,6 +64,17 @@ fn days_param(name: &str, default: i64, max: i64, description: &str) -> Value {
     })
 }
 
+/// The optional `?category=` query parameter shared by every market view.
+fn category_param() -> Value {
+    json!({
+        "name": "category",
+        "in": "query",
+        "required": false,
+        "description": "item|commodity|pet. Narrows the view to one market category; absent, the response covers all three, keyed by category. Each category is a separate evidence pool: an item trading in both auction houses appears independently in each.",
+        "schema": { "type": "string", "enum": ["item", "commodity", "pet"] }
+    })
+}
+
 // JSON document builders: `json!` only borrows its interpolations, so the
 // linter's pass-by-value preference would force `&&&` noise at every call
 // site. By-value reads keep the call sites readable.
@@ -248,8 +259,9 @@ fn spec_paths_market(target: &Value) -> Value {
                 "Snipe candidates sorted by score descending: discount (robust p05 floor vs 7-day median), 14-day sale-rate reliability, churn and stability. limit is uncapped enough for whole-ranking pulls (scores are ranking-only; deal gates use exact metric blocks).",
                 vec![
                     target.clone(),
-                    json!({ "name": "min_churn", "in": "query", "required": false, "description": "Only items with at least this many unique listings churning per day rank.", "schema": { "type": "number", "default": 1.0 } }),
-                    json!({ "name": "limit", "in": "query", "required": false, "description": "Maximum rows; 0 is treated as 1.", "schema": { "type": "integer", "default": 50 } }),
+                    category_param(),
+                    json!({ "name": "min_churn", "in": "query", "required": false, "description": "Only items with at least this many unique listings churning per day rank (per category).", "schema": { "type": "number", "default": 1.0 } }),
+                    json!({ "name": "limit", "in": "query", "required": false, "description": "Maximum rows per category; 0 is treated as 1.", "schema": { "type": "integer", "default": 50 } }),
                 ],
                 ok_json_ref("OpportunitiesResponse"),
             ),
@@ -265,6 +277,7 @@ fn spec_paths_market(target: &Value) -> Value {
                 ),
                 vec![
                     target.clone(),
+                    category_param(),
                     days_param("days", 7, 30, "Window length in days ending today (UTC). Out-of-range values are clamped to 1..=30; unparseable values default to 7."),
                 ],
                 ok_json_ref("HistoryResponse"),
@@ -273,10 +286,11 @@ fn spec_paths_market(target: &Value) -> Value {
         "/api/overview": {
             "get": get_op(
                 "Market overview",
-                "Movers up/down by median change and the most active items by churn, computed from the prepared scan.",
+                "Movers up/down by median change and the most active items by churn, computed from the prepared per-category scans.",
                 vec![
                     target.clone(),
-                    json!({ "name": "limit", "in": "query", "required": false, "description": "Rows per list, clamped to 1..=50.", "schema": { "type": "integer", "default": 15, "minimum": 1, "maximum": 50 } }),
+                    category_param(),
+                    json!({ "name": "limit", "in": "query", "required": false, "description": "Rows per list per category, clamped to 1..=50.", "schema": { "type": "integer", "default": 15, "minimum": 1, "maximum": 50 } }),
                 ],
                 ok_json_ref("OverviewResponse"),
             ),
@@ -314,7 +328,8 @@ fn spec_paths_items_and_feeds() -> Value {
                 vec![
                     json!({ "name": "target_id", "in": "path", "required": true, "description": "Target slug.", "schema": { "type": "string" } }),
                     json!({ "name": "item_id", "in": "path", "required": true, "description": "Item id.", "schema": { "type": "integer" } }),
-                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d1.", "schema": { "type": "string" } }),
+                    category_param(),
+                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d1." }),
                 ],
                 ok_json(json!({
                     "type": "object",
@@ -416,6 +431,7 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
                 "Every watchlist entry joined to its current market numbers: metric blocks per span, trailing sale rate and per-day trend rows.",
                 vec![
                     target.clone(),
+                    category_param(),
                     json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d7.", "schema": { "type": "string" } }),
                     days_param("sale_days", 14, 90, "Trailing sale-rate window (sale_days)."),
                     json!({ "name": "trend_days", "in": "query", "required": false, "description": "Trend window, clamped to 1..=90.", "schema": { "type": "integer", "default": 30, "minimum": 1, "maximum": 90 } }),
@@ -518,6 +534,7 @@ fn spec_schemas_market() -> Value {
             "type": "object",
             "properties": {
                 "item": { "$ref": "#/components/schemas/ItemRef" },
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"], "description": "The market this row ranks in." },
                 "median7": { "type": "integer", "description": "Count-weighted 7-day median unit price (copper)." },
                 "floorNow": { "type": "integer", "description": "Cheapest listing of the newest day (copper)." },
                 "discount": { "type": "number", "description": "1 - p05(newest day)/median7, clamped to [0,1] — robust against single outlier listings." },
@@ -530,16 +547,20 @@ fn spec_schemas_market() -> Value {
             }
         },
         "OpportunitiesResponse": {
+            "description": concat!("With ?category=, the bare shape below (plus a category echo). ",
+                                   "Without it, an object keyed by category: {\"item\": {…}, \"commodity\": {…}, \"pet\": {…}}."),
             "type": "object",
             "properties": {
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
                 "opportunities": { "type": "array", "items": { "$ref": "#/components/schemas/Opportunity" } }
             }
         },
         "HistoryRow": {
-            "description": "One item's aggregate over one UTC day: listing-level nearest-rank stats in copper.",
+            "description": "One item's aggregate over one UTC day in one category: listing-level nearest-rank stats in copper.",
             "type": "object",
             "properties": {
                 "item": { "$ref": "#/components/schemas/ItemRef" },
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
                 "day": { "type": "integer", "description": "UTC day number (days since epoch)." },
                 "listingCount": { "type": "integer", "description": "Unique auctions that day." },
                 "qtySum": { "type": "integer" },
@@ -565,8 +586,11 @@ fn spec_schemas_market() -> Value {
 fn spec_schemas_secondary() -> Value {
     json!({
         "OverviewResponse": {
+            "description": concat!("With ?category=, the bare shape below (plus a category echo). ",
+                                   "Without it, an object keyed by category: {\"item\": {…}, \"commodity\": {…}, \"pet\": {…}}."),
             "type": "object",
             "properties": {
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
                 "moversUp": { "type": "array", "items": { "$ref": "#/components/schemas/MoverRow" } },
                 "moversDown": { "type": "array", "items": { "$ref": "#/components/schemas/MoverRow" } },
                 "mostActive": { "type": "array", "items": { "$ref": "#/components/schemas/MoverRow" } }
@@ -576,6 +600,7 @@ fn spec_schemas_secondary() -> Value {
             "type": "object",
             "properties": {
                 "item": { "$ref": "#/components/schemas/ItemRef" },
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
                 "medianNow": { "type": "integer" },
                 "medianPrev": { "type": "number", "description": "7-day weighted median (copper)." },
                 "change": { "type": "number", "description": "medianNow/medianPrev - 1." },
@@ -681,16 +706,19 @@ fn build_docs_body() -> String {
             "# what can I ask?\n",
             "print(requests.get(f\"{BASE}/api\").json())\n",
             "\n",
-            "# ranked deals, whole ranking\n",
+            "# ranked deals, whole ranking for one market category\n",
+            "# (omit category to get all three, keyed by category)\n",
             "deals = requests.get(f\"{BASE}/api/opportunities\",\n",
-            "                     params={\"target\": TARGET, \"limit\": 1000}).json()[\"opportunities\"]\n",
+            "                     params={\"target\": TARGET, \"category\": \"commodity\",\n",
+            "                             \"limit\": 1000}).json()[\"opportunities\"]\n",
             "\n",
-            "# bulk day-level history for the whole market\n",
+            "# bulk day-level history for the whole market (all categories)\n",
             "rows = requests.get(f\"{BASE}/api/history\",\n",
             "                    params={\"target\": TARGET, \"days\": 7}).json()[\"rows\"]\n",
             "\n",
             "# exact metric blocks for the most interesting deal (pets use the pet twin)\n",
             "top = deals[0][\"item\"]\n",
+            "top_category = deals[0][\"category\"]\n",
             "if top[\"type\"] == \"pet\":\n",
             "    blocks = requests.get(\n",
             "        f\"{BASE}/api/items/{TARGET}/pet/{top['speciesID']}/metrics\",\n",
@@ -698,7 +726,8 @@ fn build_docs_body() -> String {
             "                \"breed\": top[\"breedID\"], \"span\": \"d1,d7,d30\"}).json()\n",
             "else:\n",
             "    blocks = requests.get(f\"{BASE}/api/items/{TARGET}/{top['itemID']}/metrics\",\n",
-            "                          params={\"span\": \"d1,d7,d30\"}).json()"
+            "                          params={\"category\": top_category,\n",
+            "                                  \"span\": \"d1,d7,d30\"}).json()"
         ))
     );
     body.push_str(

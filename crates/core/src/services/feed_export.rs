@@ -17,6 +17,7 @@ use std::{
 use crate::{
     domain::{
         utc_day,
+        Category,
         FeedEntry,
         FeedSnapshot,
         ItemRef,
@@ -71,9 +72,12 @@ impl FeedExportService {
     /// to publish time when unknown), so the addon's 24-hour freshness gate
     /// reflects actual data age, not export time.
     ///
-    /// All metric blocks are computed through the bulk paths — one cache /
-    /// fold / sale-rate pass per span chunk — so a whole-market publish costs
-    /// a handful of chunked queries instead of per-item-per-day round trips.
+    /// Entries are per (category, feed grain): an item trading in both
+    /// auction houses exports twice, once per category, each on its own
+    /// evidence. All metric blocks are computed through the bulk paths — one
+    /// cache / fold / sale-rate pass per span chunk per category — so a
+    /// whole-market publish costs a handful of chunked queries instead of
+    /// per-item-per-day round trips.
     ///
     /// # Errors
     ///
@@ -87,73 +91,83 @@ impl FeedExportService {
         let generated_at = self.freshness(target)?;
         let today = utc_day(self.clock.now());
         let window_days = options.spans.iter().map(Span::days).max().unwrap_or(1);
-
-        let items: Vec<ItemRef> = if options.watchlist_only {
-            self.watchlist.list(target)?.into_iter().map(|entry| entry.item).collect()
+        let watchlist_items: Option<Vec<ItemRef>> = if options.watchlist_only {
+            Some(self.watchlist.list(target)?.into_iter().map(|entry| entry.item).collect())
         } else {
-            self.history.items_with_data(target, today - window_days + 1)?
+            None
         };
 
-        // Group pet variants by species so the exported feed matches the
-        // addon's species-level grain; plain items stay per-id.
-        let groups = group_by_feed_grain(items);
-
-        // Split by computation path, preserving group order: single-member
-        // groups go through the cached per-item bulk path, multi-member
-        // populations through the merged bulk path (folds live under the
-        // original variant identity, not the canonical grain).
-        let mut singles: Vec<ItemRef> = Vec::new();
-        let mut populations: Vec<Vec<ItemRef>> = Vec::new();
-        for members in groups.values() {
-            match members.first() {
-                Some(only) if members.len() == 1 => singles.push(only.clone()),
-                _ => populations.push(members.clone()),
-            }
-        }
-
-        // Per-span block matrices, row-aligned with `singles` / `populations`.
-        let single_blocks = options
-            .spans
-            .iter()
-            .map(|span| self.metrics.blocks(target, &singles, *span))
-            .collect::<Result<Vec<_>, _>>()?;
-        let population_refs: Vec<&[ItemRef]> = populations.iter().map(Vec::as_slice).collect();
-        let merged_blocks = options
-            .spans
-            .iter()
-            .map(|span| self.metrics.blocks_merged(target, &population_refs, *span))
-            .collect::<Result<Vec<_>, _>>()?;
-
-        // Stitch: walk the groups in the same order the split ran, pulling
-        // each group's rows off the matching cursor. The cursors can only
-        // under-run when `spans` is empty (no rows at all), which yields an
-        // empty row and therefore entry-less output — the degenerate config.
-        let empty_row: Vec<Option<MetricBlock>> = Vec::new();
-        let mut single_rows = single_blocks.iter();
-        let mut merged_rows = merged_blocks.iter();
         let mut entries = Vec::new();
-        for members in groups.into_values() {
-            let first = members
-                .first()
-                .ok_or_else(|| StoreError::Backend("feed group lost its members".into()))?;
-            let rows = if members.len() == 1 {
-                single_rows.next().unwrap_or(&empty_row)
-            } else {
-                merged_rows.next().unwrap_or(&empty_row)
+        for category in Category::ALL {
+            let items: Vec<ItemRef> = match &watchlist_items {
+                Some(items) => items.clone(),
+                None => self.history.items_with_data(target, today - window_days + 1, category)?,
             };
-            let mut metrics = BTreeMap::new();
-            for (span, block) in options.spans.iter().zip(rows) {
-                if let Some(block) = block {
-                    metrics.insert(*span, block.clone());
+            if items.is_empty() {
+                continue;
+            }
+            // Group pet variants by species so the exported feed matches the
+            // addon's species-level grain; plain items stay per-id. The
+            // grouping runs per category: the merged (species-population)
+            // path pools only variants of the same category.
+            let groups = group_by_feed_grain(items);
+
+            // Split by computation path, preserving group order: single-member
+            // groups go through the cached per-item bulk path, multi-member
+            // populations through the merged bulk path (folds live under the
+            // original variant identity, not the canonical grain).
+            let mut singles: Vec<ItemRef> = Vec::new();
+            let mut populations: Vec<Vec<ItemRef>> = Vec::new();
+            for members in groups.values() {
+                match members.first() {
+                    Some(only) if members.len() == 1 => singles.push(only.clone()),
+                    _ => populations.push(members.clone()),
                 }
             }
-            // Entries without any valid span would be rejected by the addon's
-            // strict ingestor — omit them.
-            if !metrics.is_empty() {
-                entries.push(FeedEntry { item: canonical_item(first), metrics });
+
+            // Per-span block matrices, row-aligned with `singles` / `populations`.
+            let single_blocks = options
+                .spans
+                .iter()
+                .map(|span| self.metrics.blocks(target, &singles, category, *span))
+                .collect::<Result<Vec<_>, _>>()?;
+            let population_refs: Vec<&[ItemRef]> = populations.iter().map(Vec::as_slice).collect();
+            let merged_blocks = options
+                .spans
+                .iter()
+                .map(|span| self.metrics.blocks_merged(target, &population_refs, category, *span))
+                .collect::<Result<Vec<_>, _>>()?;
+
+            // Stitch: walk the groups in the same order the split ran, pulling
+            // each group's rows off the matching cursor. The cursors can only
+            // under-run when `spans` is empty (no rows at all), which yields an
+            // empty row and therefore entry-less output — the degenerate config.
+            let empty_row: Vec<Option<MetricBlock>> = Vec::new();
+            let mut single_rows = single_blocks.iter();
+            let mut merged_rows = merged_blocks.iter();
+            for members in groups.into_values() {
+                let first = members
+                    .first()
+                    .ok_or_else(|| StoreError::Backend("feed group lost its members".into()))?;
+                let rows = if members.len() == 1 {
+                    single_rows.next().unwrap_or(&empty_row)
+                } else {
+                    merged_rows.next().unwrap_or(&empty_row)
+                };
+                let mut metrics = BTreeMap::new();
+                for (span, block) in options.spans.iter().zip(rows) {
+                    if let Some(block) = block {
+                        metrics.insert(*span, block.clone());
+                    }
+                }
+                // Entries without any valid span would be rejected by the
+                // addon's strict ingestor — omit them.
+                if !metrics.is_empty() {
+                    entries.push(FeedEntry { item: canonical_item(first), category, metrics });
+                }
             }
         }
-        entries.sort_by(|a, b| a.item.cmp(&b.item));
+        entries.sort_by(|a, b| a.item.cmp(&b.item).then_with(|| a.category.cmp(&b.category)));
         Ok(FeedSnapshot { target: target.clone(), generated_at, entries })
     }
 

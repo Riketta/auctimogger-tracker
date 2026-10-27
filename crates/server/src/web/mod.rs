@@ -30,6 +30,7 @@ use std::{
 use amtracker_core::{
     config::TrackerConfig,
     domain::{
+        Category,
         Flavor,
         TargetId,
     },
@@ -360,6 +361,46 @@ pub(crate) fn required_target(
     match params.get("target") {
         Some(t) => known_target(config, t),
         None => Err(Box::new((StatusCode::BAD_REQUEST, "missing ?target=").into_response())),
+    }
+}
+
+/// Parses the optional `?category=` query parameter. Absent → the given
+/// default (pages default to `item`); unknown values are rejected with a 400
+/// that names the valid options.
+pub(crate) fn category_param(
+    params: &HashMap<String, String>,
+    default: Category,
+) -> Result<Category, Box<Response>> {
+    match params.get("category") {
+        None => Ok(default),
+        Some(value) => Category::parse(value).ok_or_else(|| {
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown category '{value}' (expected item, commodity or pet)"),
+                )
+                    .into_response(),
+            )
+        }),
+    }
+}
+
+/// Like [`category_param`], but absent → `None` (the JSON API's
+/// all-categories keyed response shape).
+pub(crate) fn category_option(
+    params: &HashMap<String, String>,
+) -> Result<Option<Category>, Box<Response>> {
+    match params.get("category") {
+        None => Ok(None),
+        Some(value) => Ok(Some(Category::parse(value).ok_or_else(|| {
+            Box::new(
+                (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown category '{value}' (expected item, commodity or pet)"),
+                )
+                    .into_response(),
+            )
+        })?)),
     }
 }
 

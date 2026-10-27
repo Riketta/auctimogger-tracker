@@ -18,9 +18,11 @@ use amtracker_core::{
         utc_day,
         BrowseCursor,
         CatalogCounts,
+        Category,
         Flavor,
         ItemDayRow,
         ItemRef,
+        ListingKind,
         MetricBlock,
         NameRecord,
         NewSnapshot,
@@ -37,7 +39,10 @@ use amtracker_core::{
         WatchlistEntry,
     },
     error::StoreError,
-    fold::DayFold,
+    fold::{
+        DayEntry,
+        DayFold,
+    },
     ports::{
         AlertEventRepository,
         AlertRuleRepository,
@@ -61,7 +66,12 @@ use rusqlite::Connection;
 /// Version 6 re-keyed the catalog tables per game flavor and added the
 /// enriched name fields; pre-v6 rows carry over as `retail` with NULL
 /// enrichment and are upgraded lazily (see `CatalogService`).
-const SCHEMA_VERSION: i64 = 6;
+/// Version 7 keyed day folds, sale aggregates and the metrics cache per
+/// market category (item / commodity / pet). Pre-v7 merged aggregates cannot
+/// be split faithfully (a merged fold row carries no category), so they are
+/// dropped and the day folds are rebuilt exactly from the retained raw
+/// listings (see `rebuild_category_folds`); sale and cache rows re-accumulate.
+const SCHEMA_VERSION: i64 = 7;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
 /// primary keys to `(flavor, id)` keys and gain the enrichment columns.
@@ -104,6 +114,52 @@ INSERT INTO pet_catalog_v6 (flavor, species_id, name, fetched_at)
 DROP TABLE pet_catalog;
 ALTER TABLE pet_catalog_v6 RENAME TO pet_catalog;
 CREATE INDEX IF NOT EXISTS idx_pet_catalog_name ON pet_catalog(name);
+COMMIT;
+";
+
+/// One-shot pre-v7 category rebuild: the aggregate tables move from merged
+/// per-item rows to per-category rows. A PK change cannot ALTER in place, and
+/// a merged fold row cannot be split faithfully (it carries no category), so
+/// the aggregate tables are recreated empty and the day folds are re-derived
+/// from the retained raw listings (still inside raw retention) by replaying
+/// them in snapshot order — the same last-observation-wins semantics live
+/// ingest applies. Sale aggregates and metric-cache rows are dropped, not
+/// rebuilt: sale rates re-accumulate over their rolling window and metric
+/// blocks recompute on demand. Re-running the whole pass is safe — it reads
+/// only `listing`/`snapshots`/`item_ref`, which it never modifies.
+const CATEGORY_V7_MIGRATION: &str = "
+BEGIN IMMEDIATE;
+DROP TABLE IF EXISTS metrics_cache;
+DROP TABLE IF EXISTS sales;
+DROP TABLE IF EXISTS item_day;
+CREATE TABLE item_day (
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    day INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    fold_json TEXT NOT NULL,
+    PRIMARY KEY (target_id, item_ref_id, day, category)
+);
+CREATE TABLE metrics_cache (
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    category TEXT NOT NULL,
+    span TEXT NOT NULL,
+    computed_at INTEGER NOT NULL,
+    block_json TEXT NOT NULL,
+    PRIMARY KEY (target_id, item_ref_id, category, span)
+);
+CREATE TABLE sales (
+    target_id TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    day INTEGER NOT NULL,
+    category TEXT NOT NULL,
+    listings INTEGER NOT NULL DEFAULT 0,
+    closed INTEGER NOT NULL DEFAULT 0,
+    credited INTEGER NOT NULL DEFAULT 0,
+    qty_sold INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (target_id, item_ref_id, day, category)
+);
 COMMIT;
 ";
 
@@ -154,17 +210,19 @@ CREATE TABLE IF NOT EXISTS item_day (
     target_id TEXT NOT NULL,
     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
     day INTEGER NOT NULL,
+    category TEXT NOT NULL,
     fold_json TEXT NOT NULL,
-    PRIMARY KEY (target_id, item_ref_id, day)
+    PRIMARY KEY (target_id, item_ref_id, day, category)
 );
 
 CREATE TABLE IF NOT EXISTS metrics_cache (
     target_id TEXT NOT NULL,
     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    category TEXT NOT NULL,
     span TEXT NOT NULL,
     computed_at INTEGER NOT NULL,
     block_json TEXT NOT NULL,
-    PRIMARY KEY (target_id, item_ref_id, span)
+    PRIMARY KEY (target_id, item_ref_id, category, span)
 );
 
 CREATE TABLE IF NOT EXISTS watchlist (
@@ -220,11 +278,12 @@ CREATE TABLE IF NOT EXISTS sales (
     target_id TEXT NOT NULL,
     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
     day INTEGER NOT NULL,
+    category TEXT NOT NULL,
     listings INTEGER NOT NULL DEFAULT 0,
     closed INTEGER NOT NULL DEFAULT 0,
     credited INTEGER NOT NULL DEFAULT 0,
     qty_sold INTEGER NOT NULL DEFAULT 0,
-    PRIMARY KEY (target_id, item_ref_id, day)
+    PRIMARY KEY (target_id, item_ref_id, day, category)
 );
 
 CREATE TABLE IF NOT EXISTS alert_rule (
@@ -345,6 +404,16 @@ impl SqliteStore {
                 conn.execute_batch(CATALOG_V6_MIGRATION)
                     .map_err(|e| backend("migrate catalog to flavor keys", e))?;
             }
+            // v7 keyed the aggregate tables per market category. Pre-v7 rows
+            // are merged across categories and cannot be split, so the tables
+            // are recreated and day folds rebuild from the retained raw
+            // listings. Runs unguarded on every pre-v7 open — the pass is
+            // idempotent (fresh files replay an empty listing table), and a
+            // crash before the version stamp below must re-run it rather than
+            // silently skip a half-populated rebuild.
+            conn.execute_batch(CATEGORY_V7_MIGRATION)
+                .map_err(|e| backend("migrate aggregates to category keys", e))?;
+            Self::rebuild_category_folds(&conn)?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
         }
@@ -439,6 +508,111 @@ impl SqliteStore {
         // the path is inlined as a quoted SQL string (single quotes doubled).
         let sql = format!("VACUUM INTO '{}'", path.to_string_lossy().replace('\'', "''"));
         self.open_transaction().execute_batch(&sql).map_err(|e| backend("backup", e))?;
+        Ok(())
+    }
+
+    /// One-shot pre-v7 day-fold rebuild (see `CATEGORY_V7_MIGRATION`): the
+    /// aggregate tables were just recreated empty; this replays the retained
+    /// raw listings in snapshot order into per-category folds — the exact
+    /// last-observation-wins semantics live ingest applies — and writes one
+    /// `item_day` row per (target, item, day, category). Streams one group at
+    /// a time over the ordered scan, so memory stays bounded regardless of
+    /// market size. Sale and cache tables stay empty: they re-accumulate.
+    fn rebuild_category_folds(conn: &Connection) -> Result<(), StoreError> {
+        /// One group's accumulation: per category, the item identity and the
+        /// last-observation-wins entry map that becomes the day's fold.
+        type Group = HashMap<Category, (ItemRef, std::collections::HashMap<i64, DayEntry>)>;
+        let tx = conn.unchecked_transaction().map_err(|e| backend("begin category rebuild", e))?;
+        {
+            let mut select = tx
+                .prepare(
+                    "SELECT l.target_id, l.item_ref_id, l.day, l.snapshot_id, l.auction_id,
+                        l.quantity, l.unit_price, s.kind, r.kind, r.item_id, r.pet_species,
+                        r.pet_level, r.pet_quality, r.pet_breed
+                    FROM listing l
+                    JOIN snapshots s ON s.id = l.snapshot_id
+                    JOIN item_ref r ON r.id = l.item_ref_id
+                    ORDER BY l.target_id, l.item_ref_id, l.day, l.snapshot_id",
+                )
+                .map_err(|e| backend("prepare category rebuild", e))?;
+            let rows =
+                select.query([]).map_err(|e| backend("query category rebuild", e))?.mapped(|row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, i64>(9)?,
+                        row.get::<_, i64>(10)?,
+                        row.get::<_, i64>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                    ))
+                });
+            let mut save = tx
+                .prepare(
+                    "INSERT OR REPLACE INTO item_day (target_id, item_ref_id, day, category, fold_json)
+                    VALUES (?1, ?2, ?3, ?4, ?5)",
+                )
+                .map_err(|e| backend("prepare category rebuild save", e))?;
+
+            let mut current: Option<((String, i64, i64), Group)> = None;
+            for row in rows {
+                let (
+                    target,
+                    item_ref_id,
+                    day,
+                    _snapshot_id,
+                    auction_id,
+                    quantity,
+                    unit_price,
+                    payload_kind,
+                    ref_kind,
+                    item_id,
+                    species,
+                    level,
+                    quality,
+                    breed,
+                ) = row.map_err(|e| backend("category rebuild row", e))?;
+                // Contiguous groups in the ordered scan: a key change flushes
+                // the finished group exactly once.
+                let same_group = matches!(
+                    &current,
+                    Some(((key_target, key_ref, key_day), _))
+                        if key_target.as_str() == target.as_str()
+                            && *key_ref == item_ref_id
+                            && *key_day == day
+                );
+                if !same_group {
+                    if let Some(((key_target, key_ref, key_day), group)) = current.take() {
+                        save_rebuilt_group(&mut save, &key_target, key_ref, key_day, group)?;
+                    }
+                    current = Some(((target, item_ref_id, day), Group::new()));
+                }
+                let item = join_item_ref(&ref_kind, item_id, species, level, quality, breed);
+                let listing_kind = if payload_kind == "commodities" {
+                    ListingKind::Commodity
+                } else {
+                    ListingKind::Item
+                };
+                let category = Category::derive(listing_kind, &item);
+                if let Some((_, group)) = &mut current {
+                    let (_, entries) = group
+                        .entry(category)
+                        .or_insert_with(|| (item, std::collections::HashMap::new()));
+                    entries.insert(auction_id, DayEntry { price: unit_price, qty: quantity });
+                }
+            }
+            if let Some(((key_target, key_ref, key_day), group)) = current.take() {
+                save_rebuilt_group(&mut save, &key_target, key_ref, key_day, group)?;
+            }
+        }
+        tx.commit().map_err(|e| backend("commit category rebuild", e))?;
         Ok(())
     }
 }
@@ -661,7 +835,7 @@ impl SalesRepository for SqliteStore {
             )
             .map_err(|e| backend("prepare observe reopen", e))?;
         let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
-        let mut new_sights: HashMap<i64, i64> = HashMap::new(); // item_ref_id -> count
+        let mut new_sights: HashMap<(i64, Category), i64> = HashMap::new(); // (ref, category) -> count
         for listing in listings {
             let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
                 *id
@@ -670,6 +844,9 @@ impl SalesRepository for SqliteStore {
                 item_ref_ids.insert(listing.item_ref.clone(), id);
                 id
             };
+            // The payload kind fixes the category for every listing in this
+            // batch; the identity shape splits item-AH rows into item/pet.
+            let category = Category::derive(listing.kind, &listing.item_ref);
             // A listing sighted in a previous kind cycle must never match
             // here: commodity and item auction ids are separate namespaces.
             let updated = update_open
@@ -697,19 +874,21 @@ impl SalesRepository for SqliteStore {
                     kind,
                     listing,
                     item_ref_id,
+                    category,
                     snapshot_id,
                     at,
                 )? {
-                    *new_sights.entry(item_ref_id).or_insert(0) += 1;
+                    *new_sights.entry((item_ref_id, category)).or_insert(0) += 1;
                 }
             }
         }
-        for (item_ref_id, count) in new_sights {
+        for ((item_ref_id, category), count) in new_sights {
             bump_sales_row(
                 &tx,
                 target,
                 item_ref_id,
                 utc_day(at),
+                category,
                 &SalesDelta { listings: count, closed: 0, credited: 0, qty_sold: 0 },
             )?;
         }
@@ -780,6 +959,23 @@ impl SalesRepository for SqliteStore {
         {
             let band = amtracker_core::domain::TimeLeftBand::parse(&band);
             let credited = band.credits_sale(last_seen_at, at);
+            // The payload kind fixes this close's category; the identity
+            // shape splits item-AH sightings into item/pet sale rows.
+            let item = join_item_ref(
+                &ref_kind,
+                ref_item_id,
+                pet_species,
+                pet_level,
+                pet_quality,
+                pet_breed,
+            );
+            let category = Category::derive(
+                match kind {
+                    PayloadKind::Commodities => ListingKind::Commodity,
+                    PayloadKind::Auctions => ListingKind::Item,
+                },
+                &item,
+            );
             // The kind predicate is load-bearing: commodity and item auction
             // ids are separate namespaces, so a close for one kind must never
             // touch the other kind's sight with the same numeric id.
@@ -800,6 +996,7 @@ impl SalesRepository for SqliteStore {
                 target,
                 item_ref_id,
                 utc_day(at),
+                category,
                 &SalesDelta {
                     listings: 0,
                     closed: 1,
@@ -808,19 +1005,7 @@ impl SalesRepository for SqliteStore {
                 },
             )?;
             if credited {
-                credits.push(SaleCredit {
-                    auction_id,
-                    item: join_item_ref(
-                        &ref_kind,
-                        ref_item_id,
-                        pet_species,
-                        pet_level,
-                        pet_quality,
-                        pet_breed,
-                    ),
-                    quantity,
-                    at,
-                });
+                credits.push(SaleCredit { auction_id, item, quantity, at });
             }
         }
         tx.commit().map_err(|e| backend("commit close", e))?;
@@ -832,6 +1017,7 @@ impl SalesRepository for SqliteStore {
         target: &TargetId,
         item: &ItemRef,
         days: i64,
+        category: Category,
     ) -> Result<Option<f64>, StoreError> {
         let conn = self.open_transaction();
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
@@ -842,8 +1028,8 @@ impl SalesRepository for SqliteStore {
         let (credited, listings): (i64, i64) = conn
             .query_row(
                 "SELECT COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
-                 WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3",
-                rusqlite::params![target.as_str(), item_ref_id, cutoff_day],
+                 WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3 AND category = ?4",
+                rusqlite::params![target.as_str(), item_ref_id, cutoff_day, category.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| backend("sale_rate", e))?;
@@ -862,6 +1048,7 @@ impl SalesRepository for SqliteStore {
         target: &TargetId,
         items: &[ItemRef],
         days: i64,
+        category: Category,
     ) -> Result<Option<f64>, StoreError> {
         let conn = self.open_transaction();
         let ids = resolve_item_ids(&conn, items)?;
@@ -869,7 +1056,7 @@ impl SalesRepository for SqliteStore {
             return Ok(None);
         }
         let now_day = utc_day(self.clock.now());
-        let rates = sale_rates_by_id(&conn, target, &ids, now_day - days + 1)?;
+        let rates = sale_rates_by_id(&conn, target, &ids, now_day - days + 1, category)?;
         let mut credited = 0i64;
         let mut listings = 0i64;
         for (c, l) in rates.values() {
@@ -889,6 +1076,7 @@ impl SalesRepository for SqliteStore {
         target: &TargetId,
         items: &[ItemRef],
         days: i64,
+        category: Category,
     ) -> Result<Vec<Option<f64>>, StoreError> {
         let conn = self.open_transaction();
         // Positional resolution (None = unknown item), so the result stays
@@ -899,7 +1087,7 @@ impl SalesRepository for SqliteStore {
             return Ok(vec![None; items.len()]);
         }
         let now_day = utc_day(self.clock.now());
-        let rates = sale_rates_by_id(&conn, target, &known, now_day - days + 1)?;
+        let rates = sale_rates_by_id(&conn, target, &known, now_day - days + 1, category)?;
         Ok(ids
             .iter()
             .map(|id| {
@@ -946,7 +1134,12 @@ fn query_day_rows(
 }
 
 /// Expands stored day rows (fold JSON + identity) into [`ItemDayRow`]s.
-fn day_rows_from_stored(rows: Vec<StoredDayRow>) -> Result<Vec<ItemDayRow>, StoreError> {
+/// `category` is the query's scope: every stored row it covered belongs to
+/// that one category.
+fn day_rows_from_stored(
+    rows: Vec<StoredDayRow>,
+    category: Category,
+) -> Result<Vec<ItemDayRow>, StoreError> {
     let mut out = Vec::with_capacity(rows.len());
     for (fold_json, day, kind, item_id, species, level, quality, breed) in rows {
         let ser: SerDayFold =
@@ -968,6 +1161,7 @@ fn day_rows_from_stored(rows: Vec<StoredDayRow>) -> Result<Vec<ItemDayRow>, Stor
         let (min, p05, median, mad) = price_stats_sorted(&prices);
         out.push(ItemDayRow {
             item: join_item_ref(&kind, item_id, species, level, quality, breed),
+            category,
             day,
             listing_count: histogram.listing_count,
             qty_sum: histogram.qty_sum,
@@ -1033,6 +1227,7 @@ fn sale_rates_by_id(
     target: &TargetId,
     ids: &[i64],
     cutoff_day: i64,
+    category: Category,
 ) -> Result<HashMap<i64, (i64, i64)>, StoreError> {
     /// Ids per query — 500 keeps one market-scale scan at a handful of
     /// grouped queries while sitting 60× under the driver's bound ceiling.
@@ -1042,15 +1237,16 @@ fn sale_rates_by_id(
         let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
         let sql = format!(
             "SELECT item_ref_id, COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
-             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ?
+             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ? AND category = ?
              GROUP BY item_ref_id"
         );
-        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
         params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
         for id in chunk {
             params.push(rusqlite::types::Value::Integer(*id));
         }
         params.push(rusqlite::types::Value::Integer(cutoff_day));
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
         let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare sale_rates", e))?;
         let rows = statement
             .query(rusqlite::params_from_iter(params.iter()))
@@ -1063,7 +1259,29 @@ fn sale_rates_by_id(
     Ok(out)
 }
 
-/// Sales-aggregate deltas for one (target, item, day) row.
+/// Persists one rebuilt (target, item, day) group: one fold row per category
+/// that accumulated entries, serialized exactly like live writes.
+fn save_rebuilt_group(
+    save: &mut rusqlite::Statement<'_>,
+    target: &str,
+    item_ref_id: i64,
+    day: i64,
+    group: HashMap<Category, (ItemRef, HashMap<i64, DayEntry>)>,
+) -> Result<(), StoreError> {
+    for (category, (item, entries)) in group {
+        if entries.is_empty() {
+            continue;
+        }
+        let fold = DayFold::from_parts(item, entries);
+        let ser = SerDayFold::from(&fold);
+        let json = serde_json::to_string(&ser).map_err(|e| backend("serialize rebuilt fold", e))?;
+        save.execute(rusqlite::params![target, item_ref_id, day, category.as_str(), json])
+            .map_err(|e| backend("save rebuilt fold", e))?;
+    }
+    Ok(())
+}
+
+/// Sales-aggregate deltas for one (target, item, day, category) row.
 struct SalesDelta {
     listings: i64,
     closed: i64,
@@ -1078,20 +1296,22 @@ fn bump_sales_row(
     target: &TargetId,
     item_ref_id: i64,
     day: i64,
+    category: Category,
     delta: &SalesDelta,
 ) -> Result<(), StoreError> {
     tx.execute(
-        "INSERT INTO sales (target_id, item_ref_id, day, listings, closed, credited, qty_sold)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT (target_id, item_ref_id, day) DO UPDATE SET
-           listings = listings + ?4,
-           closed = closed + ?5,
-           credited = credited + ?6,
-           qty_sold = qty_sold + ?7",
+        "INSERT INTO sales (target_id, item_ref_id, day, category, listings, closed, credited, qty_sold)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         ON CONFLICT (target_id, item_ref_id, day, category) DO UPDATE SET
+           listings = listings + ?5,
+           closed = closed + ?6,
+           credited = credited + ?7,
+           qty_sold = qty_sold + ?8",
         rusqlite::params![
             target.as_str(),
             item_ref_id,
             day,
+            category.as_str(),
             delta.listings,
             delta.closed,
             delta.credited,
@@ -1118,6 +1338,7 @@ fn observe_new_or_reopen(
     kind: PayloadKind,
     listing: &NormalizedListing,
     item_ref_id: i64,
+    category: Category,
     snapshot_id: i64,
     at: i64,
 ) -> Result<bool, StoreError> {
@@ -1152,6 +1373,7 @@ fn observe_new_or_reopen(
             target,
             item_ref_id,
             utc_day(closed_at),
+            category,
             &SalesDelta { listings: 0, closed: -1, credited: d_credited, qty_sold: d_qty },
         )?;
     }
@@ -1197,6 +1419,7 @@ impl MetricsCacheRepository for SqliteStore {
         &self,
         target: &TargetId,
         item: &ItemRef,
+        category: Category,
         span: Span,
     ) -> Result<Option<amtracker_core::domain::CachedBlock>, StoreError> {
         let conn = self.open_transaction();
@@ -1206,8 +1429,8 @@ impl MetricsCacheRepository for SqliteStore {
         let row = conn
             .query_row(
                 "SELECT computed_at, block_json FROM metrics_cache
-                 WHERE target_id = ?1 AND item_ref_id = ?2 AND span = ?3",
-                rusqlite::params![target.as_str(), item_ref_id, span.name()],
+                 WHERE target_id = ?1 AND item_ref_id = ?2 AND category = ?3 AND span = ?4",
+                rusqlite::params![target.as_str(), item_ref_id, category.as_str(), span.name()],
                 |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
             )
             .map(Some)
@@ -1227,6 +1450,7 @@ impl MetricsCacheRepository for SqliteStore {
         &self,
         target: &TargetId,
         item: &ItemRef,
+        category: Category,
         span: Span,
         block: &MetricBlock,
         computed_at: i64,
@@ -1236,9 +1460,16 @@ impl MetricsCacheRepository for SqliteStore {
         let json = serde_json::to_string(&SerMetricBlock::from(block))
             .map_err(|e| backend("serialize block", e))?;
         conn.execute(
-            "INSERT OR REPLACE INTO metrics_cache (target_id, item_ref_id, span, computed_at, block_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![target.as_str(), item_ref_id, span.name(), computed_at, json],
+            "INSERT OR REPLACE INTO metrics_cache (target_id, item_ref_id, category, span, computed_at, block_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                target.as_str(),
+                item_ref_id,
+                category.as_str(),
+                span.name(),
+                computed_at,
+                json
+            ],
         )
         .map_err(|e| backend("metrics cache put", e))?;
         Ok(())
@@ -1254,7 +1485,12 @@ impl MetricsCacheRepository for SqliteStore {
         Ok(())
     }
 
-    fn invalidate_items(&self, target: &TargetId, items: &[ItemRef]) -> Result<(), StoreError> {
+    fn invalidate_items(
+        &self,
+        target: &TargetId,
+        category: Category,
+        items: &[ItemRef],
+    ) -> Result<(), StoreError> {
         /// Ids per statement — mirrors `sale_rates_by_id`'s chunking: one
         /// market-scale cycle stays a handful of deletes, far under the
         /// driver's bound-parameter ceiling.
@@ -1272,10 +1508,12 @@ impl MetricsCacheRepository for SqliteStore {
             // Placeholders are bound values, never interpolated input.
             let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
             let sql = format!(
-                "DELETE FROM metrics_cache WHERE target_id = ? AND item_ref_id IN ({placeholders})"
+                "DELETE FROM metrics_cache
+                 WHERE target_id = ? AND category = ? AND item_ref_id IN ({placeholders})"
             );
-            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
             params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+            params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
             for id in chunk {
                 params.push(rusqlite::types::Value::Integer(*id));
             }
@@ -1288,6 +1526,7 @@ impl MetricsCacheRepository for SqliteStore {
     fn get_many(
         &self,
         target: &TargetId,
+        category: Category,
         span: Span,
         items: &[ItemRef],
     ) -> Result<Vec<Option<amtracker_core::domain::CachedBlock>>, StoreError> {
@@ -1310,10 +1549,11 @@ impl MetricsCacheRepository for SqliteStore {
             let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
             let sql = format!(
                 "SELECT item_ref_id, computed_at, block_json FROM metrics_cache
-                 WHERE target_id = ? AND span = ? AND item_ref_id IN ({placeholders})"
+                 WHERE target_id = ? AND category = ? AND span = ? AND item_ref_id IN ({placeholders})"
             );
-            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
             params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+            params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
             params.push(rusqlite::types::Value::Text(span.name().to_string()));
             for id in chunk {
                 params.push(rusqlite::types::Value::Integer(*id));
@@ -1342,6 +1582,7 @@ impl MetricsCacheRepository for SqliteStore {
     fn put_many(
         &self,
         target: &TargetId,
+        category: Category,
         span: Span,
         items: &[ItemRef],
         blocks: &[Option<amtracker_core::domain::MetricBlock>],
@@ -1359,9 +1600,16 @@ impl MetricsCacheRepository for SqliteStore {
             let json = serde_json::to_string(&SerMetricBlock::from(block))
                 .map_err(|e| backend("serialize block", e))?;
             tx.execute(
-                "INSERT OR REPLACE INTO metrics_cache (target_id, item_ref_id, span, computed_at, block_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                rusqlite::params![target.as_str(), item_ref_id, span.name(), computed_at, json],
+                "INSERT OR REPLACE INTO metrics_cache (target_id, item_ref_id, category, span, computed_at, block_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    target.as_str(),
+                    item_ref_id,
+                    category.as_str(),
+                    span.name(),
+                    computed_at,
+                    json
+                ],
             )
             .map_err(|e| backend("metrics cache put_many", e))?;
         }
@@ -1921,6 +2169,7 @@ impl PriceHistoryRepository for SqliteStore {
         target: &TargetId,
         item: &ItemRef,
         day: i64,
+        category: Category,
     ) -> Result<Option<DayFold>, StoreError> {
         let conn = self.open_transaction();
         let item_ref_id = lookup_item_ref(&conn, item)?;
@@ -1929,8 +2178,9 @@ impl PriceHistoryRepository for SqliteStore {
         };
         let json: Option<String> = conn
             .query_row(
-                "SELECT fold_json FROM item_day WHERE target_id = ?1 AND item_ref_id = ?2 AND day = ?3",
-                rusqlite::params![target.as_str(), item_ref_id, day],
+                "SELECT fold_json FROM item_day
+                 WHERE target_id = ?1 AND item_ref_id = ?2 AND day = ?3 AND category = ?4",
+                rusqlite::params![target.as_str(), item_ref_id, day, category.as_str()],
                 |row| row.get(0),
             )
             .map(Some)
@@ -1950,6 +2200,7 @@ impl PriceHistoryRepository for SqliteStore {
         items: &[ItemRef],
         first_day: i64,
         last_day: i64,
+        category: Category,
     ) -> Result<Vec<Vec<(i64, DayFold)>>, StoreError> {
         /// Ids per query — mirrors `sale_rates_by_id`'s chunking: one
         /// market-scale read stays a handful of selects, far under the
@@ -1965,12 +2216,14 @@ impl PriceHistoryRepository for SqliteStore {
             let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
             let sql = format!(
                 "SELECT item_ref_id, day, fold_json FROM item_day
-                 WHERE target_id = ? AND day >= ? AND day <= ? AND item_ref_id IN ({placeholders})"
+                 WHERE target_id = ? AND day >= ? AND day <= ? AND category = ?
+                   AND item_ref_id IN ({placeholders})"
             );
-            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 4);
             params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
             params.push(rusqlite::types::Value::Integer(first_day));
             params.push(rusqlite::types::Value::Integer(last_day));
+            params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
             for id in chunk {
                 params.push(rusqlite::types::Value::Integer(*id));
             }
@@ -1998,6 +2251,7 @@ impl PriceHistoryRepository for SqliteStore {
         target: &TargetId,
         item: &ItemRef,
         day: i64,
+        category: Category,
         fold: &DayFold,
     ) -> Result<(), StoreError> {
         let conn = self.open_transaction();
@@ -2005,8 +2259,9 @@ impl PriceHistoryRepository for SqliteStore {
         let ser = SerDayFold::from(fold);
         let json = serde_json::to_string(&ser).map_err(|e| backend("serialize fold", e))?;
         conn.execute(
-            "INSERT OR REPLACE INTO item_day (target_id, item_ref_id, day, fold_json) VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![target.as_str(), item_ref_id, day, json],
+            "INSERT OR REPLACE INTO item_day (target_id, item_ref_id, day, category, fold_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![target.as_str(), item_ref_id, day, category.as_str(), json],
         )
         .map_err(|e| backend("save fold", e))?;
         Ok(())
@@ -2087,18 +2342,19 @@ impl PriceHistoryRepository for SqliteStore {
         &self,
         target: &TargetId,
         since_day: i64,
+        category: Category,
     ) -> Result<Vec<ItemRef>, StoreError> {
         let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT DISTINCT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
                  FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
-                 WHERE d.target_id = ?1 AND d.day >= ?2
+                 WHERE d.target_id = ?1 AND d.day >= ?2 AND d.category = ?3
                  ORDER BY r.kind, r.item_id, r.pet_species",
             )
             .map_err(|e| backend("prepare items_with_data", e))?;
         let rows = statement
-            .query(rusqlite::params![target.as_str(), since_day])
+            .query(rusqlite::params![target.as_str(), since_day, category.as_str()])
             .map_err(|e| backend("query items_with_data", e))?
             .mapped(|row| {
                 Ok((
@@ -2124,18 +2380,22 @@ impl PriceHistoryRepository for SqliteStore {
         &self,
         target: &TargetId,
         since_day: i64,
+        category: Category,
     ) -> Result<Vec<ItemDayRow>, StoreError> {
         let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
                  FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
-                 WHERE d.target_id = ?1 AND d.day >= ?2
+                 WHERE d.target_id = ?1 AND d.day >= ?2 AND d.category = ?3
                  ORDER BY d.day, r.kind, r.item_id",
             )
             .map_err(|e| backend("prepare item_day_rows", e))?;
-        let rows = query_day_rows(&mut statement, rusqlite::params![target.as_str(), since_day])?;
-        day_rows_from_stored(rows)
+        let rows = query_day_rows(
+            &mut statement,
+            rusqlite::params![target.as_str(), since_day, category.as_str()],
+        )?;
+        day_rows_from_stored(rows, category)
     }
 
     fn item_day_rows_for_item(
@@ -2143,15 +2403,16 @@ impl PriceHistoryRepository for SqliteStore {
         target: &TargetId,
         item: &ItemRef,
         since_day: i64,
+        category: Category,
     ) -> Result<Vec<ItemDayRow>, StoreError> {
         let conn = self.open_transaction();
         let mut statement = conn
             .prepare(
                 "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
                  FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
-                 WHERE d.target_id = ?1 AND d.day >= ?2
-                   AND r.kind = ?3 AND r.item_id = ?4 AND r.pet_species = ?5
-                   AND r.pet_level = ?6 AND r.pet_quality = ?7 AND r.pet_breed = ?8",
+                 WHERE d.target_id = ?1 AND d.day >= ?2 AND d.category = ?3
+                   AND r.kind = ?4 AND r.item_id = ?5 AND r.pet_species = ?6
+                   AND r.pet_level = ?7 AND r.pet_quality = ?8 AND r.pet_breed = ?9",
             )
             .map_err(|e| backend("prepare item_day_rows_for_item", e))?;
         // The identity tuple is the canonical `item_ref` shape (see
@@ -2163,6 +2424,7 @@ impl PriceHistoryRepository for SqliteStore {
             rusqlite::params![
                 target.as_str(),
                 since_day,
+                category.as_str(),
                 kind,
                 item_id,
                 species,
@@ -2171,7 +2433,7 @@ impl PriceHistoryRepository for SqliteStore {
                 breed
             ],
         )?;
-        day_rows_from_stored(rows)
+        day_rows_from_stored(rows, category)
     }
 }
 
@@ -2539,7 +2801,9 @@ mod tests {
             // Even indexes store a fold at `day 50`, odd ones at `day 40` so
             // the window filter can be asserted per item.
             let day = if index % 2 == 0 { 50 } else { 40 };
-            store.save_fold(&target, item, day, &fold).expect("save fold");
+            store
+                .save_fold(&target, item, day, amtracker_core::domain::Category::Commodity, &fold)
+                .expect("save fold");
         }
         let query: Vec<ItemRef> = vec![
             items[0].clone(),                  // known, in window
@@ -2548,7 +2812,9 @@ mod tests {
             items[600].clone(),                // known, last chunk entry
         ];
 
-        let folds = store.load_folds(&target, &query, 45, 50).expect("load folds");
+        let folds = store
+            .load_folds(&target, &query, 45, 50, amtracker_core::domain::Category::Commodity)
+            .expect("load folds");
         assert_eq!(folds.len(), 4, "positional alignment");
         assert_eq!(folds[0].len(), 1, "in-window fold loaded");
         assert_eq!(folds[0][0].0, 50);
@@ -2577,16 +2843,29 @@ mod tests {
         )
         .expect("block from non-empty histogram");
         let blocks = [Some(block.clone()), None, Some(block)];
-        store.put_many(&target, Span::D7, &items, &blocks, 1_000).expect("put many");
+        store
+            .put_many(
+                &target,
+                amtracker_core::domain::Category::Commodity,
+                Span::D7,
+                &items,
+                &blocks,
+                1_000,
+            )
+            .expect("put many");
 
-        let cached = store.get_many(&target, Span::D7, &items).expect("get many");
+        let cached = store
+            .get_many(&target, amtracker_core::domain::Category::Commodity, Span::D7, &items)
+            .expect("get many");
         assert!(cached[0].is_some(), "Some block cached");
         assert!(cached[1].is_none(), "None never cached");
         assert!(cached[2].is_some(), "third block cached");
         assert_eq!(cached[0].as_ref().expect("cached block").computed_at, 1_000);
 
         // A different span must not see the rows.
-        let other = store.get_many(&target, Span::D1, &items).expect("get other span");
+        let other = store
+            .get_many(&target, amtracker_core::domain::Category::Commodity, Span::D1, &items)
+            .expect("get other span");
         assert!(other.iter().all(Option::is_none));
         std::fs::remove_dir_all(&dir).ok();
     }

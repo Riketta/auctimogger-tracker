@@ -16,7 +16,7 @@ normal for this item, and how do I know this deal is real?"*.
 - [Configuration](#configuration)
 - [CLI reference](#cli-reference)
 - [Web UI & JSON API](#web-ui--json-api)
-- [Feed contract (v2)](#feed-contract-v2)
+- [Feed contract (v3)](#feed-contract-v3)
 - [For developers](#for-developers)
   - [Architecture](#architecture)
   - [Project structure](#project-structure)
@@ -63,7 +63,8 @@ normal for this item, and how do I know this deal is real?"*.
   once per UTC day at its last observed price (hourly snapshots don't inflate
   samples).
 - **Opportunity ranking** — transparent weighted score (discount, sale-rate
-  reliability, churn, stability + confidence) over the stored history.
+  reliability, churn, stability + confidence) over the stored history,
+  ranked per market category (items, commodities, pets).
 - **Tracker feed v2** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
@@ -120,7 +121,7 @@ only — never put secrets in this file.
 | `storage.backup_secs` | `0` | minimum seconds between scheduled backups (`0` = off) |
 | `storage.backup_keep` | `7` | recent backups kept (oldest pruned after each backup) |
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
-| `opportunities.min_samples` | `30` | samples before an item is scored |
+| `opportunities.min_samples` | `30` | samples before an item is scored (per category) |
 | `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | score mix, tunable without code changes |
 | `[logging]` | absent | optional file logging: `dir` (created at boot, failure aborts), `rotation` = `daily`\|`never`, independent `level` (EnvFilter directives) |
 | `[sentry]` | absent | optional Sentry/GlitchTip reporting: `dsn` (empty = off), `environment`, `traces_sample_rate` (0.0..=1.0; absent = error-only) |
@@ -188,9 +189,9 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole JSON API + feed surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
-| `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics (overview rows 1–50, default 15) |
-| `GET /api/history?target=&days=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
-| `GET /api/items/{target}/{item}/metrics` | span blocks for one item |
+| `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15) |
+| `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
+| `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
 | `GET /api/snapshots?target=&kind=&limit=` | snapshot metadata rows, newest first (`kind=commodities\|auctions`) |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
@@ -208,11 +209,13 @@ discoverable index, `/api/openapi.json` serves the OpenAPI 3.1 contract
 that asserts paths and methods match in both directions), and all reads are
 unauthenticated with no rate limiting. Every target-scoped read requires
 `?target=<id>` (unknown ids answer 400; only the feed downloads default to
-the first configured target). A typical analysis pass is two calls —
-`GET /api/opportunities?target=<id>&limit=1000` for the ranking, then
-`GET /api/history?target=<id>&days=7` for the whole market's day-level price
-history — followed by per-item `/metrics` for the interesting ids; the
-Python quickstart on `/api/docs` shows exactly that.
+the first configured target). Market views are per category — `item`,
+`commodity` and `pet` are separate evidence pools, and every row names its
+`category`. A typical analysis pass is two calls —
+`GET /api/opportunities?target=<id>&category=commodity&limit=1000` for the
+ranking, then `GET /api/history?target=<id>&days=7` for the whole market's
+day-level price history — followed by per-item `/metrics` for the
+interesting ids; the Python quickstart on `/api/docs` shows exactly that.
 
 Mutation buttons are rendered only in open mode (no usable API token): with a
 token configured, the browser never holds the secret, and watchlist/fetch
@@ -231,25 +234,31 @@ completely cold cache (e.g. the very first request before the scheduler's
 initial refresh lands) and, as a self-heal backstop, any scan that ages past
 six scan TTLs (which would take a dead or persistently failing scheduler).
 
-## Feed contract (v2)
+## Feed contract (v3)
 
 ```lua
 AuctiMoggerTrackerFeed = {
-  version = 2,
+  version = 3,
   generatedAt = 1760000000,                 -- newest source Last-Modified (unix secs)
   items = {
-    { itemID = 194784, metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200,
+    { itemID = 194784, category = "commodity", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200,
       median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366,
       qtySum = 150, listingCount = 5, saleRate = 0.2500 } } },
     { kind = "pet", speciesID = 2546, level = 1, qualityID = 3, breedID = 11,
+      category = "pet",
       metrics = { /* same block shape */ } },
   },
 }
 ```
 
-Entries without metrics are omitted; the in-game addon's ingestor parses this
-strictly. The executable source of truth: `crates/infra/src/feed.rs`,
-`scripts/verify_feed.lua`, and the addon's `spec/metrics_parity_spec.lua`.
+v3 added `category` to every entry (`item`, `commodity` or `pet`). The three
+categories are separate evidence pools — items and commodities split the
+auction houses, pets split off the item-AH rows by identity — so an item
+trading in both auction houses exports once per category, each entry carrying
+only its own market's metrics. Entries without metrics are omitted; the
+in-game addon's ingestor parses this strictly. The executable source of truth:
+`crates/infra/src/feed.rs`, `scripts/verify_feed.lua`, and the addon's
+`spec/metrics_parity_spec.lua`.
 
 ## For developers
 

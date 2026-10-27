@@ -94,6 +94,63 @@ pub enum ListingKind {
     Item,
 }
 
+/// Market category of an aggregate: which auction house a listing came from
+/// and what shape of good it is. Derived per listing (see
+/// [`Category::derive`]), never read off the wire: the commodities payload is
+/// all `Commodity`, while the auctions payload splits into `Item` and `Pet`
+/// by identity shape. The split dimension for storage, ranking, metrics,
+/// feeds, API and UI — an item trading in both auction houses is two
+/// categories' worth of evidence, never one merged population.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Category {
+    /// Plain items traded in the item auction house.
+    Item,
+    /// Stackable commodities traded in the commodity auction house.
+    Commodity,
+    /// Battle pets (all variants) traded in the item auction house.
+    Pet,
+}
+
+impl Category {
+    /// Every category, in canonical (`as_str`) order. The all-categories API
+    /// responses and the scheduler's refresh loop walk this list.
+    pub const ALL: [Category; 3] = [Category::Item, Category::Commodity, Category::Pet];
+
+    /// Derives the category of one listing from its auction house and its
+    /// identity shape. Total: every listing maps to exactly one category.
+    #[must_use]
+    pub fn derive(kind: ListingKind, item: &ItemRef) -> Category {
+        match kind {
+            ListingKind::Commodity => Category::Commodity,
+            ListingKind::Item => match item {
+                ItemRef::Pet { .. } => Category::Pet,
+                ItemRef::Item { .. } => Category::Item,
+            },
+        }
+    }
+
+    /// Lowercase wire/storage spelling (storage column, API parameter).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Category::Item => "item",
+            Category::Commodity => "commodity",
+            Category::Pet => "pet",
+        }
+    }
+
+    /// Parses the lowercase wire/storage spelling (see [`Category::as_str`]).
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "item" => Some(Category::Item),
+            "commodity" => Some(Category::Commodity),
+            "pet" => Some(Category::Pet),
+            _ => None,
+        }
+    }
+}
+
 /// Server `time_left` bands with their lower bounds (seconds). A listing that
 /// vanishes earlier than the lower bound must have sold, not expired.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -336,6 +393,9 @@ pub struct PriceBucket {
 pub struct ItemDayRow {
     /// The item the row aggregates.
     pub item: ItemRef,
+    /// Market category the row aggregates (which auction house the fold's
+    /// listings came from; pets split off the item-AH rows).
+    pub category: Category,
     /// UTC day number the row aggregates (see `utc_day`).
     pub day: i64,
     /// Unique auctions of the day.
@@ -478,8 +538,11 @@ pub enum FeedFormat {
 /// per-span metric blocks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedEntry {
-    /// The tracked item or pet identity.
+    /// The tracked item or pet identity (canonical grain).
     pub item: ItemRef,
+    /// Which market the entry's metrics describe: an item trading in both
+    /// auction houses exports one entry per category.
+    pub category: Category,
     /// Metric block per span; spans without data are absent.
     pub metrics: BTreeMap<Span, MetricBlock>,
 }
@@ -789,5 +852,31 @@ mod tests {
         // VERY_LONG (>= 12 h).
         assert!(TimeLeftBand::VeryLong.credits_sale(t0, t0 + 11 * 3_600));
         assert!(!TimeLeftBand::VeryLong.credits_sale(t0, t0 + 12 * 3_600));
+    }
+
+    #[test]
+    fn category_derivation_covers_every_payload_and_identity_shape() {
+        let item = ItemRef::Item { item_id: 7909 };
+        let pet = ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 4 };
+        // The commodities payload is all commodity, regardless of identity
+        // shape (pets never arrive there, and the mapping must stay total
+        // even if an emulator ever sent one).
+        assert_eq!(Category::derive(ListingKind::Commodity, &item), Category::Commodity);
+        assert_eq!(Category::derive(ListingKind::Commodity, &pet), Category::Commodity);
+        // The auctions payload splits by identity shape.
+        assert_eq!(Category::derive(ListingKind::Item, &item), Category::Item);
+        assert_eq!(Category::derive(ListingKind::Item, &pet), Category::Pet);
+    }
+
+    #[test]
+    fn category_wire_spelling_round_trips_and_rejects_unknowns() {
+        for category in Category::ALL {
+            assert_eq!(Category::parse(category.as_str()), Some(category));
+        }
+        // Canonical order matches the wire spellings' documented order.
+        assert_eq!(Category::ALL.map(|c| c.as_str()), ["item", "commodity", "pet"]);
+        assert_eq!(Category::parse("commodities"), None);
+        assert_eq!(Category::parse("auctions"), None);
+        assert_eq!(Category::parse(""), None);
     }
 }

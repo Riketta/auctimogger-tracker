@@ -34,7 +34,13 @@ archive_dir = "./data/raw"
 spans = ["d1", "d7", "d14", "d30"]
 
 [opportunities]
+# Evidence floor and component weights, applied PER CATEGORY: every market
+# (items, commodities, pets) ranks on its own 7-day evidence, so an item
+# trading in both auction houses needs the sample count in each.
 min_samples = 30
+# Note: the churn component saturates at 50 unique listings/day (per
+# category). Commodity markets reach that long before item/pet markets do —
+# tune `weights` first if commodity rows all read as churn-capped.
 weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 
 # Alert rules (per target, managed on the /alerts page or via the API) are

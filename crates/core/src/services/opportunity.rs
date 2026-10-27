@@ -19,6 +19,7 @@ use crate::{
     config::TrackerConfig,
     domain::{
         utc_day,
+        Category,
         ItemDayRow,
         ItemRef,
         TargetId,
@@ -53,11 +54,15 @@ const SCAN_REFRESH_DEBOUNCE_SECONDS: i64 = 30;
 const CHURN_ANCHOR: f64 = 50.0;
 
 /// One ranked snipe candidate. All components are 0..1-normalized except the
-/// raw price fields; `score` is ranking-only and never gates deals.
+/// raw price fields; `score` is ranking-only and never gates deals. Rows are
+/// per market category: an item trading in both auction houses ranks
+/// independently in each, on that category's evidence alone.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Opportunity {
     /// The ranked item or pet.
     pub item: ItemRef,
+    /// Which market the row ranks in.
+    pub category: Category,
     /// Count-weighted median unit price over the window (copper).
     pub median7: i64,
     /// Cheapest unit price of the newest day in the window (copper).
@@ -84,11 +89,14 @@ pub struct Opportunity {
     pub score: f64,
 }
 
-/// One overview row: an item's current median vs its window median.
+/// One overview row: an item's current median vs its window median, within
+/// one market category.
 #[derive(Clone, Debug, PartialEq)]
 pub struct MoverRow {
     /// The item or pet that moved.
     pub item: ItemRef,
+    /// Which market the row belongs to.
+    pub category: Category,
     /// Median unit price of the newest day in the window (copper).
     pub median_now: i64,
     /// Count-weighted median unit price over the window (copper).
@@ -141,9 +149,10 @@ struct ItemScan {
     mad7: f64,
 }
 
-/// Cached scan per target: computed-at stamp plus the shared snapshot.
-/// Keyed by target so alternating requests don't evict each other.
-type ScanCache = HashMap<TargetId, (i64, Arc<ScanSnapshot>)>;
+/// Cached scan per (target, category): computed-at stamp plus the shared
+/// snapshot. Keyed by both so alternating requests and categories don't
+/// evict each other.
+type ScanCache = HashMap<(TargetId, Category), (i64, Arc<ScanSnapshot>)>;
 
 /// Builds ranked opportunities and the market overview from prepared
 /// full-market scans: the scheduler refreshes them in the background and
@@ -189,15 +198,16 @@ impl OpportunityService {
     pub fn opportunities(
         &self,
         target: &TargetId,
+        category: Category,
         min_churn_per_day: f64,
         limit: usize,
     ) -> Result<Vec<Opportunity>, StoreError> {
-        let scan = self.scan(target)?;
+        let scan = self.scan(target, category)?;
         let mut out: Vec<Opportunity> = Vec::new();
         // Sale rates come with the prepared snapshot, positionally aligned
         // with the rows; requests never re-query the sales store.
         for (row, rate) in scan.rows.iter().zip(scan.rates.iter()) {
-            let Some(opportunity) = self.opportunity_for(row, rate.unwrap_or(0.0)) else {
+            let Some(opportunity) = self.opportunity_for(row, rate.unwrap_or(0.0), category) else {
                 continue;
             };
             if opportunity.samples7 >= i64::from(self.min_samples)
@@ -219,12 +229,17 @@ impl OpportunityService {
     ///
     /// Returns `StoreError::Backend` when the cold-start inline scan cannot
     /// read history rows or sale rates, or the scan cache is poisoned.
-    pub fn overview(&self, target: &TargetId, limit: usize) -> Result<OverviewData, StoreError> {
-        let scan = self.scan(target)?;
+    pub fn overview(
+        &self,
+        target: &TargetId,
+        category: Category,
+        limit: usize,
+    ) -> Result<OverviewData, StoreError> {
+        let scan = self.scan(target, category)?;
         let mut movers: Vec<MoverRow> = scan
             .rows
             .iter()
-            .filter_map(|row| Self::mover_for(row, target))
+            .filter_map(|row| Self::mover_for(row, category))
             .filter(|m| m.churn_per_day >= 1.0 && m.median_prev > 0.0)
             .collect();
         movers.sort_by(|a, b| b.change.partial_cmp(&a.change).unwrap_or(std::cmp::Ordering::Equal));
@@ -255,28 +270,29 @@ impl OpportunityService {
     ///
     /// Returns `StoreError::Backend` when history rows or sale rates cannot be
     /// read, or the scan cache is poisoned.
-    pub fn refresh(&self, target: &TargetId) -> Result<usize, StoreError> {
+    pub fn refresh(&self, target: &TargetId, category: Category) -> Result<usize, StoreError> {
         let now = self.clock.now();
         {
             let cache = self.scan_cache()?;
-            if let Some((at, snapshot)) = cache.get(target) {
+            if let Some((at, snapshot)) = cache.get(&(target.clone(), category)) {
                 if now - at <= SCAN_REFRESH_DEBOUNCE_SECONDS {
                     return Ok(snapshot.items);
                 }
             }
         }
-        let snapshot = Arc::new(self.compute_scan(target)?);
+        let snapshot = Arc::new(self.compute_scan(target, category)?);
         let covered = snapshot.items;
-        self.scan_cache()?.insert(target.clone(), (snapshot.computed_at, Arc::clone(&snapshot)));
+        self.scan_cache()?
+            .insert((target.clone(), category), (snapshot.computed_at, Arc::clone(&snapshot)));
         Ok(covered)
     }
 
     /// Age of the prepared snapshot in seconds (via the injected clock);
-    /// `None` when nothing has been prepared for the target yet.
+    /// `None` when nothing has been prepared for the target's category yet.
     #[must_use]
-    pub fn snapshot_age_secs(&self, target: &TargetId) -> Option<i64> {
+    pub fn snapshot_age_secs(&self, target: &TargetId, category: Category) -> Option<i64> {
         let cache = self.scan_cache().ok()?;
-        let (computed_at, _) = cache.get(target)?;
+        let (computed_at, _) = cache.get(&(target.clone(), category))?;
         Some(self.clock.now() - computed_at)
     }
 
@@ -288,18 +304,19 @@ impl OpportunityService {
     /// startup, before the scheduler's initial refresh) or a snapshot past
     /// the hard backstop (the scheduler is dead or persistently failing)
     /// computes inline as a fallback.
-    fn scan(&self, target: &TargetId) -> Result<Arc<ScanSnapshot>, StoreError> {
+    fn scan(&self, target: &TargetId, category: Category) -> Result<Arc<ScanSnapshot>, StoreError> {
         let now = self.clock.now();
         {
             let cache = self.scan_cache()?;
-            if let Some((at, snapshot)) = cache.get(target) {
+            if let Some((at, snapshot)) = cache.get(&(target.clone(), category)) {
                 if now - at <= SCAN_MAX_STALENESS_SECONDS {
                     return Ok(Arc::clone(snapshot));
                 }
             }
         }
-        let snapshot = Arc::new(self.compute_scan(target)?);
-        self.scan_cache()?.insert(target.clone(), (snapshot.computed_at, Arc::clone(&snapshot)));
+        let snapshot = Arc::new(self.compute_scan(target, category)?);
+        self.scan_cache()?
+            .insert((target.clone(), category), (snapshot.computed_at, Arc::clone(&snapshot)));
         Ok(snapshot)
     }
 
@@ -307,10 +324,14 @@ impl OpportunityService {
     /// per-item aggregation, then one batched sale-rate lookup aligned with
     /// the aggregated rows. This is the whole per-target cost, paid by the
     /// scheduler (or the cold-start fallback) instead of request threads.
-    fn compute_scan(&self, target: &TargetId) -> Result<ScanSnapshot, StoreError> {
+    fn compute_scan(
+        &self,
+        target: &TargetId,
+        category: Category,
+    ) -> Result<ScanSnapshot, StoreError> {
         let now = self.clock.now();
         let today = utc_day(now);
-        let rows = self.history.item_day_rows(target, today - SCAN_WINDOW_DAYS + 1)?;
+        let rows = self.history.item_day_rows(target, today - SCAN_WINDOW_DAYS + 1, category)?;
 
         let mut by_item: BTreeMap<ItemRef, Vec<ItemDayRow>> = BTreeMap::new();
         for row in rows {
@@ -324,7 +345,7 @@ impl OpportunityService {
         // BTreeMap iteration is sorted, so the batched rates line up
         // positionally with the stored rows by construction.
         let items: Vec<ItemRef> = scans.iter().map(|scan| scan.item.clone()).collect();
-        let rates = self.sales.sale_rate_each(target, &items, SALE_RATE_WINDOW_DAYS)?;
+        let rates = self.sales.sale_rate_each(target, &items, SALE_RATE_WINDOW_DAYS, category)?;
         debug_assert_eq!(
             scans.len(),
             rates.len(),
@@ -399,7 +420,12 @@ impl OpportunityService {
     /// prepared with the snapshot; a failing sales store surfaces while the
     /// snapshot is computed (in `refresh` or the cold-start fallback), never
     /// per request.
-    fn opportunity_for(&self, scan: &ItemScan, reliability: f64) -> Option<Opportunity> {
+    fn opportunity_for(
+        &self,
+        scan: &ItemScan,
+        reliability: f64,
+        category: Category,
+    ) -> Option<Opportunity> {
         if scan.median7 <= 0.0 || scan.floor_now <= 0 {
             return None;
         }
@@ -427,6 +453,7 @@ impl OpportunityService {
         let median7 = scan.median7 as i64;
         Some(Opportunity {
             item: scan.item.clone(),
+            category,
             median7,
             floor_now: scan.floor_now,
             discount,
@@ -440,7 +467,7 @@ impl OpportunityService {
         })
     }
 
-    fn mover_for(scan: &ItemScan, _target: &TargetId) -> Option<MoverRow> {
+    fn mover_for(scan: &ItemScan, category: Category) -> Option<MoverRow> {
         if scan.median_now <= 0 || scan.median7 <= 0.0 {
             return None;
         }
@@ -449,6 +476,7 @@ impl OpportunityService {
         let change = scan.median_now as f64 / scan.median7 - 1.0;
         Some(MoverRow {
             item: scan.item.clone(),
+            category,
             median_now: scan.median_now,
             median_prev: scan.median7,
             change,
@@ -504,6 +532,7 @@ mod tests {
     fn scan_item_picks_the_newest_day_for_the_floor() {
         let rows = vec![
             ItemDayRow {
+                category: Category::Commodity,
                 item: item(1),
                 day: 7,
                 listing_count: 900,
@@ -514,6 +543,7 @@ mod tests {
                 mad: 500,
             },
             ItemDayRow {
+                category: Category::Commodity,
                 item: item(1),
                 day: 8,
                 listing_count: 1_100,
@@ -539,6 +569,7 @@ mod tests {
         // per-day volume: 50 listings on one day are 50/7 per day, not 50.
         let rows = vec![ItemDayRow {
             item: item(2),
+            category: Category::Commodity,
             day: 9,
             listing_count: 50,
             qty_sum: 50,

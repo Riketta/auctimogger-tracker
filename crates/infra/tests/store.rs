@@ -18,6 +18,7 @@ use std::{
 
 use amtracker_core::{
     domain::{
+        Category,
         Flavor,
         ItemRef,
         ListingKind,
@@ -136,14 +137,21 @@ fn fold_round_trips_through_storage() {
     let pet = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
     let mut fold = DayFold::new(pet.clone());
     fold.apply(&[listing(7, &pet, 900_000, 1), listing(8, &pet, 900_000, 2)]);
-    store.save_fold(&target, &pet, 11, &fold).expect("save");
+    store.save_fold(&target, &pet, 11, Category::Pet, &fold).expect("save");
 
-    let loaded = store.load_fold(&target, &pet, 11).expect("load").expect("fold present");
+    let loaded =
+        store.load_fold(&target, &pet, 11, Category::Pet).expect("load").expect("fold present");
     assert_eq!(loaded, fold, "fold survives the serialization round-trip");
     assert_eq!(loaded.histogram().listing_count, 2);
 
     // unknown item/day has no fold
-    assert!(store.load_fold(&TargetId("other".into()), &pet, 11).expect("load").is_none());
+    assert!(store
+        .load_fold(&TargetId("other".into()), &pet, 11, Category::Pet)
+        .expect("load")
+        .is_none());
+    // ...and neither does the same identity under a different category (the
+    // pet fold lives in the pet market only).
+    assert!(store.load_fold(&target, &pet, 11, Category::Item).expect("load").is_none());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -198,8 +206,10 @@ fn prune_removes_only_the_raw_working_set() {
 
     // old fold rows are permanent too
     let old_item = item(1);
-    store.save_fold(&target, &old_item, 10, &DayFold::new(old_item.clone())).expect("save");
-    assert!(store.load_fold(&target, &old_item, 10).expect("load").is_some());
+    store
+        .save_fold(&target, &old_item, 10, Category::Commodity, &DayFold::new(old_item.clone()))
+        .expect("save");
+    assert!(store.load_fold(&target, &old_item, 10, Category::Commodity).expect("load").is_some());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -285,11 +295,13 @@ fn sell_through_credits_band_violations_only() {
     store.close_missing(&target, PayloadKind::Commodities, 3, t3).expect("close late");
 
     // sale_rate over the trailing window: item 1 = 2 credited / 2 listings.
-    let rate = store.sale_rate(&target, &item(1), 14).expect("rate").expect("rate");
+    let rate =
+        store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate").expect("rate");
     assert!((rate - 1.0).abs() < 1e-9, "all vanishings credited so far");
 
     // item 2 closed past its band floor: credited stays 0, denominator 1.
-    let rate2 = store.sale_rate(&target, &item(2), 14).expect("rate").expect("rate");
+    let rate2 =
+        store.sale_rate(&target, &item(2), 14, Category::Commodity).expect("rate").expect("rate");
     assert_eq!(rate2, 0.0);
 
     std::fs::remove_dir_all(&dir).ok();
@@ -463,7 +475,7 @@ fn interleaved_kinds_do_not_close_each_others_sights_or_wedge() {
 
     // Sale ledger: 1 listing opened, 1 closed (not credited), reopen undid the
     // close. Nothing credited.
-    let rate = store.sale_rate(&target, &item(1), 14).expect("rate");
+    let rate = store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate");
     assert!(rate.is_none() || rate == Some(0.0), "no phantom sales: got {rate:?}");
 
     // Sales aggregates must never go negative after the close/reopen cycle
@@ -616,7 +628,7 @@ fn metrics_cache_round_trips_and_invalidates() {
     let target = TargetId("us-4".into());
     let item = item(194_784);
 
-    assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
+    assert!(store.get(&target, &item, Category::Commodity, Span::D1).expect("get").is_none());
 
     let block = MetricBlock {
         n: 42,
@@ -633,14 +645,15 @@ fn metrics_cache_round_trips_and_invalidates() {
         listing_count: 42,
         sale_rate: None,
     };
-    store.put(&target, &item, Span::D1, &block, 1234).expect("put");
+    store.put(&target, &item, Category::Commodity, Span::D1, &block, 1234).expect("put");
 
-    let cached = store.get(&target, &item, Span::D1).expect("get").expect("cached");
+    let cached =
+        store.get(&target, &item, Category::Commodity, Span::D1).expect("get").expect("cached");
     assert_eq!(cached.computed_at, 1234);
     assert_eq!(cached.block, block, "block survives the serialization round-trip");
 
     store.invalidate(&target).expect("invalidate");
-    assert!(store.get(&target, &item, Span::D1).expect("get").is_none());
+    assert!(store.get(&target, &item, Category::Commodity, Span::D1).expect("get").is_none());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -673,17 +686,33 @@ fn metrics_cache_invalidation_targets_only_named_items() {
         listing_count: 42,
         sale_rate: None,
     };
-    store.put(&target, &item_a, Span::D1, &block, 1234).expect("put a d1");
-    store.put(&target, &item_b, Span::D1, &block, 1234).expect("put b d1");
-    store.put(&target, &item_a, Span::D7, &block, 1234).expect("put a d7");
+    store.put(&target, &item_a, Category::Commodity, Span::D1, &block, 1234).expect("put a d1");
+    store.put(&target, &item_b, Category::Commodity, Span::D1, &block, 1234).expect("put b d1");
+    store.put(&target, &item_a, Category::Commodity, Span::D7, &block, 1234).expect("put a d7");
 
-    store.invalidate_items(&target, std::slice::from_ref(&item_a)).expect("invalidate a");
-    assert!(store.get(&target, &item_a, Span::D1).expect("get a d1").is_none());
-    assert!(store.get(&target, &item_a, Span::D7).expect("get a d7").is_none());
-    assert!(store.get(&target, &item_b, Span::D1).expect("get b d1").is_some());
+    store
+        .invalidate_items(&target, Category::Commodity, std::slice::from_ref(&item_a))
+        .expect("invalidate a");
+    assert!(store
+        .get(&target, &item_a, Category::Commodity, Span::D1)
+        .expect("get a d1")
+        .is_none());
+    assert!(store
+        .get(&target, &item_a, Category::Commodity, Span::D7)
+        .expect("get a d7")
+        .is_none());
+    assert!(store
+        .get(&target, &item_b, Category::Commodity, Span::D1)
+        .expect("get b d1")
+        .is_some());
 
-    store.invalidate_items(&target, &[item(999_999_999)]).expect("unknown identity");
-    assert!(store.get(&target, &item_b, Span::D1).expect("get b d1").is_some());
+    store
+        .invalidate_items(&target, Category::Commodity, &[item(999_999_999)])
+        .expect("unknown identity");
+    assert!(store
+        .get(&target, &item_b, Category::Commodity, Span::D1)
+        .expect("get b d1")
+        .is_some());
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -726,7 +755,7 @@ fn sale_rates_chunking_merges_results_across_chunk_boundaries() {
     assert_eq!(credits.len(), dropped.len(), "every vanished listing is credited");
 
     let items: Vec<ItemRef> = (0..N).map(&item).collect();
-    let rates = store.sale_rate_each(&target, &items, 14).expect("rates");
+    let rates = store.sale_rate_each(&target, &items, 14, Category::Commodity).expect("rates");
     let expected_len = usize::try_from(N).unwrap();
     assert_eq!(rates.len(), expected_len, "positionally aligned across all chunks");
     for (index, rate) in rates.iter().enumerate() {
@@ -1068,11 +1097,11 @@ fn metrics_cache_get_many_aligns_blocks_with_identities() {
         sale_rate: None,
     };
 
-    store.put(&target, &item1, Span::D7, &block(100), 999).expect("put item1");
-    store.put(&target, &item2, Span::D7, &block(200), 999).expect("put item2");
+    store.put(&target, &item1, Category::Item, Span::D7, &block(100), 999).expect("put item1");
+    store.put(&target, &item2, Category::Item, Span::D7, &block(200), 999).expect("put item2");
 
     let items = vec![item1.clone(), unknown.clone(), item2.clone()];
-    let blocks = store.get_many(&target, Span::D7, &items).expect("get_many");
+    let blocks = store.get_many(&target, Category::Item, Span::D7, &items).expect("get_many");
     assert_eq!(blocks.len(), 3, "one slot per requested identity");
     assert_eq!(blocks[0].as_ref().expect("item1 cached").block.median, 100);
     assert!(blocks[1].is_none(), "unknown identity has no cache rows");
@@ -1080,7 +1109,13 @@ fn metrics_cache_get_many_aligns_blocks_with_identities() {
 
     // Spans partition the cache: the same items read under another span
     // come back empty.
-    let other = store.get_many(&target, Span::D1, &items).expect("get_many d1");
+    let other = store.get_many(&target, Category::Item, Span::D1, &items).expect("get_many d1");
+    assert!(other.iter().all(Option::is_none));
+
+    // Categories partition it too: the same identities under another
+    // category have no rows.
+    let other =
+        store.get_many(&target, Category::Commodity, Span::D7, &items).expect("get_many commodity");
     assert!(other.iter().all(Option::is_none));
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1366,6 +1401,156 @@ fn v5_catalog_rows_carry_over_as_retail_through_the_v6_rebuild() {
 
     let pet = store.pet_by_species(&retail, 264).expect("read pet").expect("pet carried over");
     assert_eq!(pet.name, "Crawling Claw");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// v6 → v7: the merged aggregate tables are recreated per category and the
+/// day folds are rebuilt exactly from the retained raw listings — last
+/// observation per auction wins within its snapshot order, commodity and
+/// item-AH rows land in separate categories, auctions-payload pets split off
+/// into `pet`. The old merged fold row (which cannot be split) is discarded,
+/// sale/cache tables start empty, and `sight` is untouched.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn v7_category_migration_rebuilds_folds_from_retained_listings() {
+    let dir = temp_dir("category-v7-rebuild");
+    let db = dir.join("db.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&db).expect("open v6 file");
+        connection
+            .execute_batch(
+                "CREATE TABLE item_ref (
+                     id INTEGER PRIMARY KEY,
+                     kind TEXT NOT NULL,
+                     item_id INTEGER NOT NULL,
+                     pet_species INTEGER NOT NULL DEFAULT 0,
+                     pet_level INTEGER NOT NULL DEFAULT 0,
+                     pet_quality INTEGER NOT NULL DEFAULT 0,
+                     pet_breed INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE (kind, item_id, pet_species, pet_level, pet_quality, pet_breed)
+                 );
+                 INSERT INTO item_ref VALUES (1, 'item', 2589, 0, 0, 0, 0);
+                 INSERT INTO item_ref VALUES (2, 'pet', 0, 42, 10, 1, 3);
+                 CREATE TABLE snapshots (
+                     id INTEGER PRIMARY KEY,
+                     target_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     source_last_modified INTEGER,
+                     sha256 TEXT NOT NULL,
+                     archive_path TEXT,
+                     entry_count INTEGER NOT NULL,
+                     dropped_count INTEGER NOT NULL,
+                     status TEXT NOT NULL
+                 );
+                 INSERT INTO snapshots VALUES (1, 'us-4', 'commodities', 1_000_000, NULL, 'c', NULL, 3, 0, 'ok');
+                 INSERT INTO snapshots VALUES (2, 'us-4', 'auctions', 1_000_600, NULL, 'a', NULL, 2, 0, 'ok');
+                 CREATE TABLE listing (
+                     snapshot_id INTEGER NOT NULL,
+                     target_id TEXT NOT NULL,
+                     day INTEGER NOT NULL,
+                     auction_id INTEGER NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     quantity INTEGER NOT NULL,
+                     unit_price INTEGER NOT NULL,
+                     bid INTEGER,
+                     time_left TEXT NOT NULL,
+                     context INTEGER,
+                     bonus_lists TEXT NOT NULL DEFAULT '[]'
+                 );
+                 -- commodity AH: auction 100 re-sighted with a shrunken qty.
+                 INSERT INTO listing VALUES (1, 'us-4', 11, 100, 1, 1, 100, NULL, 'VERY_LONG', NULL, '[]');
+                 INSERT INTO listing VALUES (1, 'us-4', 11, 101, 1, 5, 200, NULL, 'VERY_LONG', NULL, '[]');
+                 INSERT INTO listing VALUES (1, 'us-4', 11, 100, 1, 2, 100, NULL, 'VERY_LONG', NULL, '[]');
+                 -- item AH: same item id in the OTHER market, plus a pet.
+                 INSERT INTO listing VALUES (2, 'us-4', 11, 300, 1, 1, 300, 250, 'LONG', NULL, '[]');
+                 INSERT INTO listing VALUES (2, 'us-4', 11, 400, 2, 1, 500, NULL, 'VERY_LONG', NULL, '[]');
+                 CREATE TABLE item_day (
+                     target_id TEXT NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     day INTEGER NOT NULL,
+                     fold_json TEXT NOT NULL,
+                     PRIMARY KEY (target_id, item_ref_id, day)
+                 );
+                 -- Stale merged fold: must be dropped, never read back.
+                 INSERT INTO item_day VALUES ('us-4', 1, 11,
+                     '{\"item\":{\"type\":\"item\",\"item_id\":2589},\"entries\":[[999,1,1]]}');
+                 CREATE TABLE sales (
+                     target_id TEXT NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     day INTEGER NOT NULL,
+                     listings INTEGER NOT NULL DEFAULT 0,
+                     closed INTEGER NOT NULL DEFAULT 0,
+                     credited INTEGER NOT NULL DEFAULT 0,
+                     qty_sold INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (target_id, item_ref_id, day)
+                 );
+                 INSERT INTO sales VALUES ('us-4', 1, 11, 3, 1, 1, 7);
+                 CREATE TABLE metrics_cache (
+                     target_id TEXT NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     span TEXT NOT NULL,
+                     computed_at INTEGER NOT NULL,
+                     block_json TEXT NOT NULL,
+                     PRIMARY KEY (target_id, item_ref_id, span)
+                 );
+                 INSERT INTO metrics_cache VALUES ('us-4', 1, 'd1', 5, '{}');
+                 PRAGMA user_version = 6;",
+            )
+            .expect("seed v6 aggregates");
+    }
+    let store = open_store(&dir, 1_000_001);
+    let target = TargetId("us-4".into());
+    let item1 = item(2589);
+    let pet = ItemRef::Pet { species: 42, level: 10, quality: 1, breed: 3 };
+
+    // The commodity fold: last observation of auction 100 wins (qty 2), 101
+    // intact; the stale merged fold's phantom auction 999 is gone.
+    let commodity = store
+        .load_fold(&target, &item1, 11, Category::Commodity)
+        .expect("load")
+        .expect("commodity fold rebuilt from listings");
+    assert_eq!(commodity.len(), 2);
+    let commodity_entries: std::collections::HashMap<i64, amtracker_core::fold::DayEntry> =
+        commodity.entries().collect();
+    assert_eq!(
+        commodity_entries.get(&100).map(|entry| (entry.price, entry.qty)),
+        Some((100, 2)),
+        "last observation wins inside the rebuild replay"
+    );
+    assert_eq!(commodity_entries.get(&101).map(|entry| (entry.price, entry.qty)), Some((200, 5)));
+
+    // The same item id's item-AH rows live in their own category.
+    let item_ah = store
+        .load_fold(&target, &item1, 11, Category::Item)
+        .expect("load")
+        .expect("item fold rebuilt");
+    assert_eq!(item_ah.len(), 1);
+
+    // The auctions payload's pet rows split off into the pet category.
+    let pet_fold =
+        store.load_fold(&target, &pet, 11, Category::Pet).expect("load").expect("pet fold rebuilt");
+    assert_eq!(pet_fold.len(), 1);
+
+    // ...and nothing crosses categories.
+    assert!(store.load_fold(&target, &item1, 11, Category::Pet).expect("load").is_none());
+    assert!(store.load_fold(&target, &pet, 11, Category::Item).expect("load").is_none());
+
+    // Sale aggregates and the metric cache start empty (re-accumulate);
+    // the version stamp prevents a second rebuild pass.
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect db");
+        for table in ["sales", "metrics_cache"] {
+            let rows: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
+                .expect("count rows");
+            assert_eq!(rows, 0, "{table} starts empty after the migration");
+        }
+        let version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
+        assert_eq!(version, 7, "the file is stamped at the new schema version");
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }

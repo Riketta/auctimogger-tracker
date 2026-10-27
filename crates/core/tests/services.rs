@@ -24,6 +24,7 @@ use amtracker_core::{
     },
     domain::{
         utc_day,
+        Category,
         FetchOutcome,
         ItemDayRow,
         ItemRef,
@@ -109,7 +110,7 @@ fn payload(listings: Vec<amtracker_core::domain::NormalizedListing>) -> FetchOut
     })
 }
 
-type FoldKey = (TargetId, ItemRef, i64);
+type FoldKey = (TargetId, ItemRef, i64, Category);
 
 struct FakeSource {
     outcomes: Mutex<Vec<Result<FetchOutcome, SourceError>>>,
@@ -218,8 +219,9 @@ impl PriceHistoryRepository for FakeHistory {
         target: &TargetId,
         item: &ItemRef,
         day: i64,
+        category: amtracker_core::domain::Category,
     ) -> Result<Option<DayFold>, StoreError> {
-        Ok(self.folds.lock().unwrap().get(&(target.clone(), item.clone(), day)).cloned())
+        Ok(self.folds.lock().unwrap().get(&(target.clone(), item.clone(), day, category)).cloned())
     }
 
     fn save_fold(
@@ -227,9 +229,13 @@ impl PriceHistoryRepository for FakeHistory {
         target: &TargetId,
         item: &ItemRef,
         day: i64,
+        category: amtracker_core::domain::Category,
         fold: &DayFold,
     ) -> Result<(), StoreError> {
-        self.folds.lock().unwrap().insert((target.clone(), item.clone(), day), fold.clone());
+        self.folds
+            .lock()
+            .unwrap()
+            .insert((target.clone(), item.clone(), day, category), fold.clone());
         Ok(())
     }
 
@@ -241,6 +247,7 @@ impl PriceHistoryRepository for FakeHistory {
         &self,
         _target: &TargetId,
         _since_day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<ItemRef>, StoreError> {
         Ok(Vec::new())
     }
@@ -249,6 +256,7 @@ impl PriceHistoryRepository for FakeHistory {
         &self,
         _target: &TargetId,
         _since_day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<amtracker_core::domain::ItemDayRow>, StoreError> {
         Ok(Vec::new())
     }
@@ -258,6 +266,7 @@ impl PriceHistoryRepository for FakeHistory {
         _target: &TargetId,
         item: &ItemRef,
         since_day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<amtracker_core::domain::ItemDayRow>, StoreError> {
         let rows = self.item_rows.lock().unwrap();
         Ok(rows.iter().filter(|row| &row.item == item && row.day >= since_day).cloned().collect())
@@ -281,6 +290,7 @@ impl MetricsCacheRepository for FakeCache {
         &self,
         _target: &TargetId,
         _item: &ItemRef,
+        _category: amtracker_core::domain::Category,
         _span: amtracker_core::domain::Span,
     ) -> Result<Option<amtracker_core::domain::CachedBlock>, StoreError> {
         Ok(None)
@@ -290,6 +300,7 @@ impl MetricsCacheRepository for FakeCache {
         &self,
         _target: &TargetId,
         _item: &ItemRef,
+        _category: amtracker_core::domain::Category,
         _span: amtracker_core::domain::Span,
         _block: &amtracker_core::domain::MetricBlock,
         _computed_at: i64,
@@ -302,7 +313,12 @@ impl MetricsCacheRepository for FakeCache {
         Ok(())
     }
 
-    fn invalidate_items(&self, _target: &TargetId, items: &[ItemRef]) -> Result<(), StoreError> {
+    fn invalidate_items(
+        &self,
+        _target: &TargetId,
+        _category: amtracker_core::domain::Category,
+        items: &[ItemRef],
+    ) -> Result<(), StoreError> {
         self.targeted.lock().unwrap().push(items.to_vec());
         Ok(())
     }
@@ -357,6 +373,7 @@ impl SalesRepository for FakeSales {
         _target: &TargetId,
         item: &ItemRef,
         _days: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Option<f64>, StoreError> {
         Ok(self.rates.lock().unwrap().get(item).copied())
     }
@@ -432,11 +449,13 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
 
     let folds = history.folds.lock().unwrap();
     let day = amtracker_core::domain::utc_day(1_000_000);
-    let item1_fold =
-        folds.get(&(TargetId("us-4".into()), item1.clone(), day)).expect("item 1 fold saved");
+    let item1_fold = folds
+        .get(&(TargetId("us-4".into()), item1.clone(), day, Category::Commodity))
+        .expect("item 1 fold saved");
     assert_eq!(item1_fold.len(), 2, "re-sighted auction folds into one entry");
-    let item2_fold =
-        folds.get(&(TargetId("us-4".into()), item2.clone(), day)).expect("item 2 fold saved");
+    let item2_fold = folds
+        .get(&(TargetId("us-4".into()), item2.clone(), day, Category::Commodity))
+        .expect("item 2 fold saved");
     assert_eq!(item2_fold.len(), 1);
 
     assert_eq!(*cache.invalidations.lock().unwrap(), 1, "fetched data invalidates the cache");
@@ -667,13 +686,20 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
         let mut fold = DayFold::new(item1.clone());
         fold.apply(&[listing(offset, &item1, 100, 1)]);
         history
-            .save_fold(&TargetId("us-4".into()), &item1, utc_day(today) - offset, &fold)
+            .save_fold(
+                &TargetId("us-4".into()),
+                &item1,
+                utc_day(today) - offset,
+                Category::Commodity,
+                &fold,
+            )
             .expect("save fold");
     }
     // Trend rows: one inside the 30-day window, one far outside it.
     *history.item_rows.lock().unwrap() = vec![
         ItemDayRow {
             item: item1.clone(),
+            category: Category::Commodity,
             day: utc_day(today),
             listing_count: 1,
             qty_sum: 1,
@@ -684,6 +710,7 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
         },
         ItemDayRow {
             item: item1.clone(),
+            category: Category::Commodity,
             day: utc_day(today) - 40,
             listing_count: 1,
             qty_sum: 1,
@@ -711,7 +738,7 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
     );
 
     let report = report_service
-        .report(&TargetId("us-4".into()), &[Span::D1, Span::D7], 14, 30)
+        .report(&TargetId("us-4".into()), Category::Commodity, &[Span::D1, Span::D7], 14, 30)
         .expect("report");
     assert_eq!(report.len(), 2);
 
@@ -761,7 +788,9 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
     let history = Arc::new(FakeHistory::default());
     let mut fold = DayFold::new(item1.clone());
     fold.apply(&[listing(1, &item1, 100, 1)]);
-    history.save_fold(&target, &item1, utc_day(today), &fold).expect("save fold");
+    history
+        .save_fold(&target, &item1, utc_day(today), Category::Commodity, &fold)
+        .expect("save fold");
 
     let rules = Arc::new(FakeAlertRules::default());
     let events = Arc::new(FakeAlertEvents::default());
@@ -1009,6 +1038,7 @@ impl PriceHistoryRepository for CountingHistory {
         _target: &TargetId,
         _item: &ItemRef,
         _day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Option<DayFold>, StoreError> {
         Ok(None)
     }
@@ -1018,6 +1048,7 @@ impl PriceHistoryRepository for CountingHistory {
         _target: &TargetId,
         _item: &ItemRef,
         _day: i64,
+        _category: amtracker_core::domain::Category,
         _fold: &DayFold,
     ) -> Result<(), StoreError> {
         Ok(())
@@ -1031,6 +1062,7 @@ impl PriceHistoryRepository for CountingHistory {
         &self,
         _target: &TargetId,
         _since_day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<ItemRef>, StoreError> {
         Ok(Vec::new())
     }
@@ -1039,6 +1071,7 @@ impl PriceHistoryRepository for CountingHistory {
         &self,
         _target: &TargetId,
         _since_day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<ItemDayRow>, StoreError> {
         *self.item_day_rows_calls.lock().unwrap() += 1;
         Ok(self.rows.clone())
@@ -1049,6 +1082,7 @@ impl PriceHistoryRepository for CountingHistory {
         _target: &TargetId,
         _item: &ItemRef,
         _since_day: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<ItemDayRow>, StoreError> {
         Ok(Vec::new())
     }
@@ -1099,6 +1133,7 @@ impl SalesRepository for CountingSales {
         _target: &TargetId,
         _item: &ItemRef,
         _days: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Option<f64>, StoreError> {
         Ok(None)
     }
@@ -1108,6 +1143,7 @@ impl SalesRepository for CountingSales {
         _target: &TargetId,
         items: &[ItemRef],
         _days: i64,
+        _category: amtracker_core::domain::Category,
     ) -> Result<Vec<Option<f64>>, StoreError> {
         *self.sale_rate_each_calls.lock().unwrap() += 1;
         if *self.fail_sale_rate_each.lock().unwrap() {
@@ -1162,6 +1198,7 @@ fn opportunity_config() -> TrackerConfig {
 fn day_row(item_id: i64, day: i64, listing_count: u64, min: i64, median: i64) -> ItemDayRow {
     ItemDayRow {
         item: item(item_id),
+        category: Category::Commodity,
         day,
         listing_count,
         qty_sum: 0,
@@ -1205,13 +1242,13 @@ fn refresh_prepares_the_scan_so_requests_read_nothing() {
     let target = TargetId("us-4".into());
     let (service, history, sales, _clock) = opportunity_fixture(1_000_000);
 
-    let covered = service.refresh(&target).expect("refresh");
+    let covered = service.refresh(&target, Category::Commodity).expect("refresh");
     assert_eq!(covered, 2, "both scanned items are covered");
 
     for _ in 0..3 {
-        let ranked = service.opportunities(&target, 1.0, 50).expect("ranked");
+        let ranked = service.opportunities(&target, Category::Commodity, 1.0, 50).expect("ranked");
         assert_eq!(ranked.len(), 2);
-        let overview = service.overview(&target, 15).expect("overview");
+        let overview = service.overview(&target, Category::Commodity, 15).expect("overview");
         assert_eq!(overview.most_active.len(), 2);
     }
     assert_eq!(history.item_day_rows_calls(), 1, "only the refresh reads history");
@@ -1224,11 +1261,12 @@ fn prepared_ranking_matches_the_inline_semantics() {
     // The same data through the cold inline fallback and through a prepared
     // snapshot must produce identical ranking.
     let (cold, _, _, _) = opportunity_fixture(1_000_000);
-    let inline = cold.opportunities(&target, 1.0, 50).expect("inline ranked");
+    let inline = cold.opportunities(&target, Category::Commodity, 1.0, 50).expect("inline ranked");
 
     let (prepared, history, sales, _clock) = opportunity_fixture(1_000_000);
-    prepared.refresh(&target).expect("refresh");
-    let warmed = prepared.opportunities(&target, 1.0, 50).expect("prepared ranked");
+    prepared.refresh(&target, Category::Commodity).expect("refresh");
+    let warmed =
+        prepared.opportunities(&target, Category::Commodity, 1.0, 50).expect("prepared ranked");
 
     assert_eq!(inline, warmed, "prepared rates must reproduce the inline math");
     assert_eq!(
@@ -1254,6 +1292,7 @@ fn a_single_troll_floor_cannot_fake_a_deep_discount() {
     let today = amtracker_core::domain::utc_day(1_000_000);
     let rows = vec![ItemDayRow {
         item: item(1),
+        category: Category::Commodity,
         day: today,
         listing_count: 1_000,
         qty_sum: 1_000,
@@ -1267,7 +1306,7 @@ fn a_single_troll_floor_cannot_fake_a_deep_discount() {
     let clock = MutableClock::new(1_000_000);
     let service = OpportunityService::new(history, sales, clock, &opportunity_config());
 
-    let ranked = service.opportunities(&target, 0.0, 50).expect("ranked");
+    let ranked = service.opportunities(&target, Category::Commodity, 0.0, 50).expect("ranked");
     let top = ranked.first().expect("rankable");
     assert_eq!(top.floor_now, 1, "the displayed floor stays the true min");
     assert_eq!(top.median7, 100_000);
@@ -1279,16 +1318,18 @@ fn stale_snapshot_is_still_served_without_recompute() {
     let target = TargetId("us-4".into());
     let ttl = amtracker_core::services::opportunity::SCAN_TTL_SECONDS;
     let (service, history, sales, clock) = opportunity_fixture(1_000_000);
-    service.refresh(&target).expect("refresh");
-    assert_eq!(service.snapshot_age_secs(&target), Some(0));
+    service.refresh(&target, Category::Commodity).expect("refresh");
+    assert_eq!(service.snapshot_age_secs(&target, Category::Commodity), Some(0));
 
     // Past the scheduler TTL but far inside the staleness backstop: the
     // stale snapshot keeps serving.
     clock.advance(ttl + 60);
-    assert_eq!(service.snapshot_age_secs(&target), Some(ttl + 60));
+    assert_eq!(service.snapshot_age_secs(&target, Category::Commodity), Some(ttl + 60));
 
-    service.opportunities(&target, 1.0, 50).expect("ranked from the stale snapshot");
-    service.overview(&target, 15).expect("overview from the stale snapshot");
+    service
+        .opportunities(&target, Category::Commodity, 1.0, 50)
+        .expect("ranked from the stale snapshot");
+    service.overview(&target, Category::Commodity, 15).expect("overview from the stale snapshot");
     assert_eq!(history.item_day_rows_calls(), 1, "a stale snapshot must not recompute inline");
     assert_eq!(sales.sale_rate_each_calls(), 1);
 }
@@ -1298,13 +1339,13 @@ fn cold_cache_falls_back_to_inline_compute() {
     let target = TargetId("us-4".into());
     let (service, history, sales, _clock) = opportunity_fixture(1_000_000);
 
-    let ranked = service.opportunities(&target, 1.0, 50).expect("ranked");
+    let ranked = service.opportunities(&target, Category::Commodity, 1.0, 50).expect("ranked");
     assert_eq!(ranked.len(), 2);
     assert_eq!(history.item_day_rows_calls(), 1, "cold cache computes inline");
     assert_eq!(sales.sale_rate_each_calls(), 1);
 
     // The inline compute also seeds the cache: the next request reads nothing.
-    service.overview(&target, 15).expect("overview");
+    service.overview(&target, Category::Commodity, 15).expect("overview");
     assert_eq!(history.item_day_rows_calls(), 1);
     assert_eq!(sales.sale_rate_each_calls(), 1);
 }
@@ -1313,17 +1354,17 @@ fn cold_cache_falls_back_to_inline_compute() {
 fn refresh_debounces_inside_the_window_and_recomputes_outside() {
     let target = TargetId("us-4".into());
     let (service, history, sales, clock) = opportunity_fixture(1_000_000);
-    let covered = service.refresh(&target).expect("first refresh");
+    let covered = service.refresh(&target, Category::Commodity).expect("first refresh");
     assert_eq!(covered, 2);
 
     clock.advance(10);
-    let covered = service.refresh(&target).expect("debounced refresh");
+    let covered = service.refresh(&target, Category::Commodity).expect("debounced refresh");
     assert_eq!(covered, 2, "debounced refresh reports the cached coverage");
     assert_eq!(history.item_day_rows_calls(), 1, "inside the debounce window no work happens");
     assert_eq!(sales.sale_rate_each_calls(), 1);
 
     clock.advance(21); // 31s after the first refresh
-    let covered = service.refresh(&target).expect("post-debounce refresh");
+    let covered = service.refresh(&target, Category::Commodity).expect("post-debounce refresh");
     assert_eq!(covered, 2);
     assert_eq!(history.item_day_rows_calls(), 2, "outside the window the scan recomputes");
     assert_eq!(sales.sale_rate_each_calls(), 2);
@@ -1333,17 +1374,21 @@ fn refresh_debounces_inside_the_window_and_recomputes_outside() {
 fn a_failed_refresh_keeps_the_previous_snapshot_serving() {
     let target = TargetId("us-4".into());
     let (service, history, sales, clock) = opportunity_fixture(1_000_000);
-    service.refresh(&target).expect("first refresh");
+    service.refresh(&target, Category::Commodity).expect("first refresh");
 
     clock.advance(31); // past the debounce, so the next refresh really runs
     sales.set_sale_rate_each_failure(true);
-    assert!(service.refresh(&target).is_err(), "the failed sales lookup surfaces as an Err");
+    assert!(
+        service.refresh(&target, Category::Commodity).is_err(),
+        "the failed sales lookup surfaces as an Err"
+    );
 
     // The failed pass must not evict or poison the cached artifact: ranking
     // and overview keep serving the previous snapshot without store reads.
-    let ranked = service.opportunities(&target, 1.0, 50).expect("stale ranked");
+    let ranked =
+        service.opportunities(&target, Category::Commodity, 1.0, 50).expect("stale ranked");
     assert_eq!(ranked.len(), 2);
-    service.overview(&target, 15).expect("stale overview");
+    service.overview(&target, Category::Commodity, 15).expect("stale overview");
     assert_eq!(
         history.item_day_rows_calls(),
         2,
@@ -1356,9 +1401,13 @@ fn a_failed_refresh_keeps_the_previous_snapshot_serving() {
 fn snapshot_age_is_none_until_a_scan_exists() {
     let target = TargetId("us-4".into());
     let (service, _history, _sales, _clock) = opportunity_fixture(1_000_000);
-    assert_eq!(service.snapshot_age_secs(&target), None, "cold cache has no age");
-    service.refresh(&target).expect("refresh");
-    assert_eq!(service.snapshot_age_secs(&target), Some(0));
+    assert_eq!(
+        service.snapshot_age_secs(&target, Category::Commodity),
+        None,
+        "cold cache has no age"
+    );
+    service.refresh(&target, Category::Commodity).expect("refresh");
+    assert_eq!(service.snapshot_age_secs(&target, Category::Commodity), Some(0));
 }
 
 #[test]
@@ -1366,16 +1415,20 @@ fn requests_self_heal_once_a_snapshot_passes_the_backstop() {
     let target = TargetId("us-4".into());
     let ttl = amtracker_core::services::opportunity::SCAN_TTL_SECONDS;
     let (service, history, sales, clock) = opportunity_fixture(1_000_000);
-    service.refresh(&target).expect("refresh");
+    service.refresh(&target, Category::Commodity).expect("refresh");
 
     // A dead scheduler would leave the snapshot aging forever; past six TTLs
     // the request path recomputes inline instead of serving it.
     clock.advance(ttl * 6 + 1);
-    let ranked = service.opportunities(&target, 1.0, 50).expect("ranked");
+    let ranked = service.opportunities(&target, Category::Commodity, 1.0, 50).expect("ranked");
     assert_eq!(ranked.len(), 2);
     assert_eq!(history.item_day_rows_calls(), 2, "the backstop recomputed inline");
     assert_eq!(sales.sale_rate_each_calls(), 2);
-    assert_eq!(service.snapshot_age_secs(&target), Some(0), "the backstop seeds a fresh scan");
+    assert_eq!(
+        service.snapshot_age_secs(&target, Category::Commodity),
+        Some(0),
+        "the backstop seeds a fresh scan"
+    );
 }
 
 /// Builds one fold with a single auction for the given item on no particular
@@ -1400,18 +1453,32 @@ fn bulk_block_paths_match_the_per_item_paths() {
     for offset in 0..3 {
         let mut fold = DayFold::new(item1.clone());
         fold.apply(&[listing(offset, &item1, 100, 1), listing(1_000 + offset, &item1, 120, 2)]);
-        history.save_fold(&target, &item1, utc_day(today) - offset, &fold).expect("save fold");
+        history
+            .save_fold(&target, &item1, utc_day(today) - offset, Category::Commodity, &fold)
+            .expect("save fold");
     }
     history
-        .save_fold(&target, &item2, utc_day(today), &fold_with(&item2, 90, 4))
+        .save_fold(&target, &item2, utc_day(today), Category::Commodity, &fold_with(&item2, 90, 4))
         .expect("save fold");
     // Pet variants: each contributes to the shared species population, one
     // of them on a previous day.
     history
-        .save_fold(&target, &variant_a, utc_day(today), &fold_with(&variant_a, 200, 1))
+        .save_fold(
+            &target,
+            &variant_a,
+            utc_day(today),
+            Category::Pet,
+            &fold_with(&variant_a, 200, 1),
+        )
         .expect("save fold");
     history
-        .save_fold(&target, &variant_b, utc_day(today) - 1, &fold_with(&variant_b, 220, 3))
+        .save_fold(
+            &target,
+            &variant_b,
+            utc_day(today) - 1,
+            Category::Pet,
+            &fold_with(&variant_b, 220, 3),
+        )
         .expect("save fold");
 
     let sales = Arc::new(FakeSales::default());
@@ -1425,27 +1492,30 @@ fn bulk_block_paths_match_the_per_item_paths() {
 
     for span in [Span::D1, Span::D7, Span::D30] {
         let singles = vec![item1.clone(), item2.clone()];
-        let bulk = metrics.blocks(&target, &singles, span).expect("bulk blocks");
+        let bulk =
+            metrics.blocks(&target, &singles, Category::Commodity, span).expect("bulk blocks");
         assert_eq!(
             bulk.first().cloned().flatten(),
-            metrics.block(&target, &item1, span).expect("block 1")
+            metrics.block(&target, &item1, Category::Commodity, span).expect("block 1")
         );
         assert_eq!(
             bulk.get(1).cloned().flatten(),
-            metrics.block(&target, &item2, span).expect("block 2")
+            metrics.block(&target, &item2, Category::Commodity, span).expect("block 2")
         );
 
         let group = vec![variant_a.clone(), variant_b.clone()];
-        let merged_bulk =
-            metrics.blocks_merged(&target, &[group.as_slice()], span).expect("bulk merged");
-        let merged_one = metrics.block_merged(&target, &group, span).expect("merged");
+        let merged_bulk = metrics
+            .blocks_merged(&target, &[group.as_slice()], Category::Pet, span)
+            .expect("bulk merged");
+        let merged_one =
+            metrics.block_merged(&target, &group, Category::Pet, span).expect("merged");
         assert_eq!(merged_bulk.first().cloned().flatten(), merged_one);
     }
 
     // The merged pet population pools both variants: d7 folds two auctions
     // at 200×1 and 220×3, so the nearest-rank median is 220.
     let d7 = metrics
-        .block_merged(&target, &[variant_a.clone(), variant_b.clone()], Span::D7)
+        .block_merged(&target, &[variant_a.clone(), variant_b.clone()], Category::Pet, Span::D7)
         .expect("merged d7")
         .expect("pet population has data");
     assert_eq!(d7.n, 2);
@@ -1470,12 +1540,26 @@ fn feed_export_builds_canonical_entries_through_the_bulk_paths() {
     let history = Arc::new(FakeHistory::default());
     let mut fold1 = DayFold::new(item1.clone());
     fold1.apply(&[listing(1, &item1, 100, 1), listing(2, &item1, 100, 2)]);
-    history.save_fold(&target, &item1, utc_day(today), &fold1).expect("save fold");
     history
-        .save_fold(&target, &variant_a, utc_day(today), &fold_with(&variant_a, 200, 1))
+        .save_fold(&target, &item1, utc_day(today), Category::Commodity, &fold1)
         .expect("save fold");
     history
-        .save_fold(&target, &variant_b, utc_day(today), &fold_with(&variant_b, 220, 3))
+        .save_fold(
+            &target,
+            &variant_a,
+            utc_day(today),
+            Category::Pet,
+            &fold_with(&variant_a, 200, 1),
+        )
+        .expect("save fold");
+    history
+        .save_fold(
+            &target,
+            &variant_b,
+            utc_day(today),
+            Category::Pet,
+            &fold_with(&variant_b, 220, 3),
+        )
         .expect("save fold");
 
     let sales = Arc::new(FakeSales::default());

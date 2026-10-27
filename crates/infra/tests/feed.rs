@@ -16,6 +16,7 @@ use std::{
 
 use amtracker_core::{
     domain::{
+        Category,
         FeedEntry,
         FeedFormat,
         FeedSnapshot,
@@ -56,9 +57,14 @@ fn sample_feed() -> FeedSnapshot {
         target: TargetId("us-4".into()),
         generated_at: 1_760_000_000,
         entries: vec![
-            FeedEntry { item: ItemRef::Item { item_id: 194_784 }, metrics: item_metrics },
+            FeedEntry {
+                item: ItemRef::Item { item_id: 194_784 },
+                category: Category::Item,
+                metrics: item_metrics,
+            },
             FeedEntry {
                 item: ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 },
+                category: Category::Pet,
                 metrics: pet_metrics,
             },
         ],

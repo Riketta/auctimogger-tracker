@@ -11,6 +11,7 @@ use crate::{
         AlertCondition,
         AlertEvent,
         AlertRule,
+        Category,
         FloorPercentile,
         ItemRef,
         NewAlertEvent,
@@ -137,9 +138,6 @@ impl AlertEvaluationService {
             let Some(observed) = self.observe(&rule)? else {
                 continue;
             };
-            if !observed.fired {
-                continue;
-            }
             let event = NewAlertEvent {
                 rule_id: rule.id,
                 target: rule.target.clone(),
@@ -174,70 +172,93 @@ impl AlertEvaluationService {
         Ok(run)
     }
 
-    /// Observes one rule's condition: `None` = not enough data to decide.
+    /// Observes one rule's condition across the rule's item's market
+    /// categories: each category's block / sale rate is checked in canonical
+    /// order and the first breach fires, its message naming the category.
+    /// `None` = no category breached (or none had enough data to decide).
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the underlying reads fail.
     fn observe(&self, rule: &AlertRule) -> Result<Option<Observation>, StoreError> {
+        for category in Category::ALL {
+            if let Some(observation) = self.observe_category(rule, category)? {
+                return Ok(Some(observation));
+            }
+        }
+        Ok(None)
+    }
+
+    /// One category's observation: `Ok(Some(_))` only when the condition
+    /// held there; no data or a non-breach reads as `Ok(None)` and the next
+    /// category gets its turn.
+    fn observe_category(
+        &self,
+        rule: &AlertRule,
+        category: Category,
+    ) -> Result<Option<Observation>, StoreError> {
+        let label = format!("{} [{}]", item_label(&rule.item), category.as_str());
         match rule.condition {
             AlertCondition::PriceBelow { copper } => {
-                match self.metrics.block(&rule.target, &rule.item, Span::D1)? {
-                    Some(block) => Ok(Some(Observation {
-                        fired: block.median <= copper,
+                match self.metrics.block(&rule.target, &rule.item, category, Span::D1)? {
+                    Some(block) if block.median <= copper => Ok(Some(Observation {
                         value: Some(median_observation(block.median)),
                         message: format!(
-                            "{}: d1 median {} copper (target ≤ {copper})",
-                            item_label(&rule.item),
+                            "{label}: d1 median {} copper (target ≤ {copper})",
                             block.median
                         ),
                     })),
-                    None => Ok(None),
+                    _ => Ok(None),
                 }
             }
             AlertCondition::BelowFloor { span, percentile } => {
-                match self.metrics.block(&rule.target, &rule.item, span)? {
-                    Some(block) => {
-                        let floor = match percentile {
-                            FloorPercentile::P05 => block.p05,
-                            FloorPercentile::P25 => block.p25,
-                        };
+                match self.metrics.block(&rule.target, &rule.item, category, span)? {
+                    Some(block) if block.median <= floor(&block, percentile) => {
                         Ok(Some(Observation {
-                            fired: block.median <= floor,
                             value: Some(median_observation(block.median)),
                             message: format!(
-                                "{}: {} median {} copper at/below {} floor {floor}",
-                                item_label(&rule.item),
+                                "{label}: {} median {} copper at/below {} floor {}",
                                 span.name(),
                                 block.median,
-                                percentile.as_str()
+                                percentile.as_str(),
+                                floor(&block, percentile)
                             ),
                         }))
                     }
-                    None => Ok(None),
+                    _ => Ok(None),
                 }
             }
             AlertCondition::SaleRateAbove { rate } => {
-                match self.sales.sale_rate(&rule.target, &rule.item, SALE_RATE_WINDOW_DAYS)? {
-                    Some(actual) => Ok(Some(Observation {
-                        fired: actual >= rate,
+                match self.sales.sale_rate(
+                    &rule.target,
+                    &rule.item,
+                    SALE_RATE_WINDOW_DAYS,
+                    category,
+                )? {
+                    Some(actual) if actual >= rate => Ok(Some(Observation {
                         value: Some(actual),
-                        message: format!(
-                            "{}: 14d sale rate {actual:.2} (target ≥ {rate:.2})",
-                            item_label(&rule.item)
-                        ),
+                        message: format!("{label}: 14d sale rate {actual:.2} (target ≥ {rate:.2})"),
                     })),
-                    None => Ok(None),
+                    _ => Ok(None),
                 }
             }
         }
     }
 }
 
-/// One rule observation: whether the condition held, the observed number and
-/// the human-readable one-liner for the event row.
+/// The floor percentile a [`AlertCondition::BelowFloor`] rule compares
+/// against.
+fn floor(block: &crate::domain::MetricBlock, percentile: FloorPercentile) -> i64 {
+    match percentile {
+        FloorPercentile::P05 => block.p05,
+        FloorPercentile::P25 => block.p25,
+    }
+}
+
+/// One fired observation: the observed number and the human-readable
+/// one-liner for the event row. `observe` returns `Some` only when a
+/// category's condition held, so there is no separate fired flag.
 struct Observation {
-    fired: bool,
     value: Option<f64>,
     message: String,
 }

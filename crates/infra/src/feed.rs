@@ -1,5 +1,9 @@
-//! Feed rendering (tracker feed v2: Lua + JSON) and publication to the feed
+//! Feed rendering (tracker feed v3: Lua + JSON) and publication to the feed
 //! directory served to the in-game sub-addon.
+//!
+//! v3 added `category` to every entry: an item trading in both auction
+//! houses exports once per category, each entry carrying only its own
+//! market's evidence.
 
 use std::{
     collections::BTreeMap,
@@ -70,7 +74,11 @@ fn entry_lua(entry: &FeedEntry) -> String {
             "kind = \"pet\", speciesID = {species}, level = {level}, qualityID = {quality}, breedID = {breed}"
         ),
     };
-    format!("{{ {identity}, {} }}", metrics_lua(&entry.metrics))
+    format!(
+        "{{ {identity}, category = \"{}\", {} }}",
+        entry.category.as_str(),
+        metrics_lua(&entry.metrics)
+    )
 }
 
 fn render_lua(feed: &FeedSnapshot) -> Vec<u8> {
@@ -81,7 +89,7 @@ fn render_lua(feed: &FeedSnapshot) -> Vec<u8> {
         .map(entry_lua)
         .collect();
     let lua = format!(
-        "AuctiMoggerTrackerFeed = {{\n  version = 2,\n  generatedAt = {},\n  items = {{\n    {}\n  }},\n}}\n",
+        "AuctiMoggerTrackerFeed = {{\n  version = 3,\n  generatedAt = {},\n  items = {{\n    {}\n  }},\n}}\n",
         feed.generated_at,
         items.join(",\n    ")
     );
@@ -126,6 +134,7 @@ fn entry_json(entry: &FeedEntry) -> serde_json::Value {
             object.insert("breedID".into(), serde_json::json!(breed));
         }
     }
+    object.insert("category".into(), serde_json::json!(entry.category.as_str()));
     object.insert("metrics".into(), serde_json::Value::Object(metrics));
     serde_json::Value::Object(object)
 }
@@ -134,7 +143,7 @@ fn render_json(feed: &FeedSnapshot) -> Result<Vec<u8>, RenderError> {
     let items: Vec<serde_json::Value> =
         feed.entries.iter().filter(|entry| !entry.metrics.is_empty()).map(entry_json).collect();
     let value = serde_json::json!({
-        "version": 2,
+        "version": 3,
         "generatedAt": feed.generated_at,
         "items": items,
     });
@@ -245,7 +254,10 @@ mod tests {
     // Test assertions may unwrap: fixture-driven, deterministic inputs.
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
-    use amtracker_core::ports::FeedRenderer;
+    use amtracker_core::{
+        domain::Category,
+        ports::FeedRenderer,
+    };
 
     use super::*;
 
@@ -273,9 +285,14 @@ mod tests {
             target: TargetId("us-4".into()),
             generated_at: 1_760_000_000,
             entries: vec![
-                FeedEntry { item: ItemRef::Item { item_id: 194_784 }, metrics },
+                FeedEntry {
+                    item: ItemRef::Item { item_id: 194_784 },
+                    category: Category::Commodity,
+                    metrics,
+                },
                 FeedEntry {
                     item: ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 },
+                    category: Category::Pet,
                     metrics: pet_metrics,
                 },
             ],
@@ -291,8 +308,8 @@ mod tests {
         let lua = FeedCodec.render(&feed, FeedFormat::Lua).expect("render");
         let text = String::from_utf8(lua).expect("utf-8");
         let expected = "AuctiMoggerTrackerFeed = {\n  \
-            version = 2,\n  generatedAt = 1760000000,\n  items = {\n    \
-            { itemID = 194784, metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500 } } }\n  },\n}\n";
+            version = 3,\n  generatedAt = 1760000000,\n  items = {\n    \
+            { itemID = 194784, category = \"commodity\", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500 } } }\n  },\n}\n";
         assert_eq!(text, expected);
     }
 
@@ -318,12 +335,14 @@ mod tests {
         let feed = sample_feed();
         let bytes = FeedCodec.render(&feed, FeedFormat::Json).expect("render");
         let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
-        assert_eq!(value["version"], 2);
+        assert_eq!(value["version"], 3);
         assert_eq!(value["generatedAt"], 1_760_000_000);
         assert_eq!(value["items"][0]["itemID"], 194_784);
+        assert_eq!(value["items"][0]["category"], "commodity");
         assert_eq!(value["items"][0]["metrics"]["d1"]["median"], 300);
         assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate"], 0.25);
         assert_eq!(value["items"][1]["kind"], "pet");
+        assert_eq!(value["items"][1]["category"], "pet");
         assert_eq!(value["items"][1]["speciesID"], 2546);
     }
 }

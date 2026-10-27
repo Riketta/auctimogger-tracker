@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::{
     domain::{
+        Category,
         ItemDayRow,
         ItemRef,
         MetricBlock,
@@ -61,9 +62,10 @@ impl WatchlistReportService {
     }
 
     /// Joins every entry of a target's watchlist to its metric blocks, sale
-    /// rate and trend rows. `blocks[i]` of each entry corresponds to
-    /// `spans[i]`; trend rows cover the last `trend_days` UTC days inclusive
-    /// of today; the sale rate covers `sale_days`.
+    /// rate and trend rows, all within one market category. `blocks[i]` of
+    /// each entry corresponds to `spans[i]`; trend rows cover the last
+    /// `trend_days` UTC days inclusive of today; the sale rate covers
+    /// `sale_days`.
     ///
     /// # Errors
     ///
@@ -71,6 +73,7 @@ impl WatchlistReportService {
     pub fn report(
         &self,
         target: &TargetId,
+        category: Category,
         spans: &[Span],
         sale_days: i64,
         trend_days: i64,
@@ -86,15 +89,16 @@ impl WatchlistReportService {
         // into per-entry span lists without indexing.
         let per_span = spans
             .iter()
-            .map(|span| self.metrics.blocks(target, &items, *span))
+            .map(|span| self.metrics.blocks(target, &items, category, *span))
             .collect::<Result<Vec<_>, _>>()?;
-        let rates = self.sales.sale_rate_each(target, &items, sale_days)?;
+        let rates = self.sales.sale_rate_each(target, &items, sale_days, category)?;
         let mut out = Vec::with_capacity(entries.len());
         for (i, entry) in entries.into_iter().enumerate() {
             let rate = rates.get(i).copied().flatten();
             let blocks =
                 per_span.iter().map(|spans_items| spans_items.get(i).cloned().flatten()).collect();
-            let trend = self.history.item_day_rows_for_item(target, &entry.item, since_day)?;
+            let trend =
+                self.history.item_day_rows_for_item(target, &entry.item, since_day, category)?;
             out.push(WatchlistReportEntry { entry, blocks, sale_rate: rate, trend });
         }
         Ok(out)

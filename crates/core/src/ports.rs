@@ -7,6 +7,7 @@ use crate::{
     domain::{
         BrowseCursor,
         CatalogCounts,
+        Category,
         FeedFormat,
         FeedSnapshot,
         FetchOutcome,
@@ -131,8 +132,8 @@ pub trait SnapshotRepository: Send + Sync {
 
 /// Outbound: per-day unique-auction fold state (the long-term memory).
 pub trait PriceHistoryRepository: Send + Sync {
-    /// Loads the fold for one (target, item, day); `None` when no fold has
-    /// been saved for that day yet.
+    /// Loads the fold for one (target, item, day, category); `None` when no
+    /// fold has been saved for that day yet.
     ///
     /// # Errors
     ///
@@ -143,12 +144,14 @@ pub trait PriceHistoryRepository: Send + Sync {
         target: &TargetId,
         item: &ItemRef,
         day: i64,
+        category: Category,
     ) -> Result<Option<DayFold>, StoreError>;
     /// Day folds for many identities at once, positionally aligned:
     /// `folds[i]` holds the `(day, fold)` pairs stored for `items[i]` within
     /// the inclusive `[first_day, last_day]` window (pairs may arrive in any
     /// order; empty when the item has no folds in the window). Batched fuel
     /// for feed builds: one chunked query replaces per-item-per-day loads.
+    /// Only folds of the given category are returned.
     ///
     /// The default falls back to per-item [`PriceHistoryRepository::load_fold`]
     /// reads — correct for any adapter, just less efficient.
@@ -163,12 +166,13 @@ pub trait PriceHistoryRepository: Send + Sync {
         items: &[ItemRef],
         first_day: i64,
         last_day: i64,
+        category: Category,
     ) -> Result<Vec<Vec<(i64, DayFold)>>, StoreError> {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
             let mut per_item = Vec::new();
             for day in first_day..=last_day {
-                if let Some(fold) = self.load_fold(target, item, day)? {
+                if let Some(fold) = self.load_fold(target, item, day, category)? {
                     per_item.push((day, fold));
                 }
             }
@@ -176,8 +180,8 @@ pub trait PriceHistoryRepository: Send + Sync {
         }
         Ok(out)
     }
-    /// Persists the fold for one (target, item, day), replacing any previous
-    /// state for that day.
+    /// Persists the fold for one (target, item, day, category), replacing
+    /// any previous state for that day and category.
     ///
     /// # Errors
     ///
@@ -187,6 +191,7 @@ pub trait PriceHistoryRepository: Send + Sync {
         target: &TargetId,
         item: &ItemRef,
         day: i64,
+        category: Category,
         fold: &DayFold,
     ) -> Result<(), StoreError>;
     /// Drops the raw listing working set older than the given UTC day.
@@ -197,7 +202,8 @@ pub trait PriceHistoryRepository: Send + Sync {
     ///
     /// Returns `StoreError::Backend` when the raw rows cannot be deleted.
     fn prune_raw_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError>;
-    /// Distinct items that have fold data on/after the given UTC day.
+    /// Distinct items that have fold data of the given category on/after the
+    /// given UTC day.
     ///
     /// # Errors
     ///
@@ -206,9 +212,10 @@ pub trait PriceHistoryRepository: Send + Sync {
         &self,
         target: &TargetId,
         since_day: i64,
+        category: Category,
     ) -> Result<Vec<ItemRef>, StoreError>;
-    /// Per-item-day aggregate rows on/after the given UTC day (ranking fuel
-    /// for the opportunities/overview views).
+    /// Per-item-day aggregate rows on/after the given UTC day, scoped to one
+    /// category (ranking fuel for the opportunities/overview views).
     ///
     /// # Errors
     ///
@@ -217,11 +224,13 @@ pub trait PriceHistoryRepository: Send + Sync {
         &self,
         target: &TargetId,
         since_day: i64,
+        category: Category,
     ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
     /// Per-item-day aggregate rows on/after `since_day` for exactly one item
-    /// identity (the item detail page): SQL-scoped instead of loading the
-    /// whole market's rows. The identity must match the canonical `item_ref`
-    /// tuple (`kind` + `item_id` + pet fields, see `split_item_ref`).
+    /// identity and category (the item detail page): SQL-scoped instead of
+    /// loading the whole market's rows. The identity must match the canonical
+    /// `item_ref` tuple (`kind` + `item_id` + pet fields, see
+    /// `split_item_ref`).
     ///
     /// # Errors
     ///
@@ -231,6 +240,7 @@ pub trait PriceHistoryRepository: Send + Sync {
         target: &TargetId,
         item: &ItemRef,
         since_day: i64,
+        category: Category,
     ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
 }
 
@@ -267,7 +277,9 @@ pub trait SalesRepository: Send + Sync {
         snapshot_id: i64,
         at: i64,
     ) -> Result<Vec<crate::domain::SaleCredit>, StoreError>;
-    /// Fraction of listings credited as sold within the trailing day window.
+    /// Fraction of listings credited as sold within the trailing day window,
+    /// for one category (commodity and item-AH sale evidence are separate
+    /// ledgers; pets split off the item-AH rows).
     ///
     /// # Errors
     ///
@@ -278,10 +290,11 @@ pub trait SalesRepository: Send + Sync {
         target: &TargetId,
         item: &ItemRef,
         days: i64,
+        category: Category,
     ) -> Result<Option<f64>, StoreError>;
     /// Sale rate summed over several item identities (pet variants of one
-    /// species share their market). `Ok(None)` when none of the items has
-    /// sales rows.
+    /// species share their market) within one category. `Ok(None)` when none
+    /// of the items has sales rows.
     ///
     /// # Errors
     ///
@@ -292,14 +305,15 @@ pub trait SalesRepository: Send + Sync {
         target: &TargetId,
         items: &[ItemRef],
         days: i64,
+        category: Category,
     ) -> Result<Option<f64>, StoreError> {
-        let _ = (target, items, days);
+        let _ = (target, items, days, category);
         Ok(None)
     }
     /// Sale rate for EACH of the given identities, positionally aligned
     /// (`rates[i]` belongs to `items[i]`); `None` entries have no sales rows.
     /// Batched replacement for per-item `sale_rate` loops over candidate
-    /// lists.
+    /// lists. Scoped to one category.
     ///
     /// # Errors
     ///
@@ -310,11 +324,12 @@ pub trait SalesRepository: Send + Sync {
         target: &TargetId,
         items: &[ItemRef],
         days: i64,
+        category: Category,
     ) -> Result<Vec<Option<f64>>, StoreError> {
         // Correct-by-default fallback: one query per identity.
         let mut rates = Vec::with_capacity(items.len());
         for item in items {
-            rates.push(self.sale_rate(target, item, days)?);
+            rates.push(self.sale_rate(target, item, days, category)?);
         }
         Ok(rates)
     }
@@ -322,7 +337,8 @@ pub trait SalesRepository: Send + Sync {
 
 /// Outbound: memoized span metrics (invalidated per item on ingest).
 pub trait MetricsCacheRepository: Send + Sync {
-    /// The cached block for one (target, item, span), if one is stored.
+    /// The cached block for one (target, item, category, span), if one is
+    /// stored.
     ///
     /// # Errors
     ///
@@ -331,6 +347,7 @@ pub trait MetricsCacheRepository: Send + Sync {
         &self,
         target: &TargetId,
         item: &ItemRef,
+        category: Category,
         span: Span,
     ) -> Result<Option<crate::domain::CachedBlock>, StoreError>;
     /// Stores a freshly computed block with its computation timestamp.
@@ -342,21 +359,23 @@ pub trait MetricsCacheRepository: Send + Sync {
         &self,
         target: &TargetId,
         item: &ItemRef,
+        category: Category,
         span: Span,
         block: &MetricBlock,
         computed_at: i64,
     ) -> Result<(), StoreError>;
-    /// Drops all cached blocks for a target. Called when fold state changes
-    /// beyond what a per-item rule can see: the rolling span windows slide at
-    /// UTC day boundaries, so the first cycle after a day roll sweeps all of
-    /// a target's memoized blocks.
+    /// Drops all cached blocks for a target (every category). Called when
+    /// fold state changes beyond what a per-item rule can see: the rolling
+    /// span windows slide at UTC day boundaries, so the first cycle after a
+    /// day roll sweeps all of a target's memoized blocks.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the cache cannot be cleared.
     fn invalidate(&self, target: &TargetId) -> Result<(), StoreError>;
-    /// Drops cached blocks for just the given items of a target (called
-    /// after a cycle that touched only those items' folds or sale state).
+    /// Drops cached blocks for just the given items of a target and category
+    /// (called after a cycle that touched only those items' folds or sale
+    /// state).
     ///
     /// The default falls back to the full sweep — correct for any adapter,
     /// just less precise.
@@ -364,12 +383,17 @@ pub trait MetricsCacheRepository: Send + Sync {
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the cache cannot be cleared.
-    fn invalidate_items(&self, target: &TargetId, _items: &[ItemRef]) -> Result<(), StoreError> {
+    fn invalidate_items(
+        &self,
+        target: &TargetId,
+        _category: Category,
+        _items: &[ItemRef],
+    ) -> Result<(), StoreError> {
         self.invalidate(target)
     }
-    /// Cached blocks for several identities of one target/span, positionally
-    /// aligned (`blocks[i]` belongs to `items[i]`); `None` entries have no
-    /// cached block. Batched fuel for whole-watchlist views.
+    /// Cached blocks for several identities of one target/category/span,
+    /// positionally aligned (`blocks[i]` belongs to `items[i]`); `None`
+    /// entries have no cached block. Batched fuel for whole-watchlist views.
     ///
     /// The default falls back to per-item reads — correct for any adapter,
     /// just less efficient.
@@ -380,19 +404,20 @@ pub trait MetricsCacheRepository: Send + Sync {
     fn get_many(
         &self,
         target: &TargetId,
+        category: Category,
         span: Span,
         items: &[ItemRef],
     ) -> Result<Vec<Option<crate::domain::CachedBlock>>, StoreError> {
         let mut out = Vec::with_capacity(items.len());
         for item in items {
-            out.push(self.get(target, item, span)?);
+            out.push(self.get(target, item, category, span)?);
         }
         Ok(out)
     }
     /// Stores freshly computed blocks for several identities of one
-    /// target/span, positionally aligned (`blocks[i]` belongs to `items[i]`;
-    /// `None` entries are skipped — empty blocks are never cached). Batched
-    /// tail of whole-feed recomputation.
+    /// target/category/span, positionally aligned (`blocks[i]` belongs to
+    /// `items[i]`; `None` entries are skipped — empty blocks are never
+    /// cached). Batched tail of whole-feed recomputation.
     ///
     /// The default falls back to per-item [`MetricsCacheRepository::put`]
     /// writes — correct for any adapter, just less efficient.
@@ -403,6 +428,7 @@ pub trait MetricsCacheRepository: Send + Sync {
     fn put_many(
         &self,
         target: &TargetId,
+        category: Category,
         span: Span,
         items: &[ItemRef],
         blocks: &[Option<MetricBlock>],
@@ -410,7 +436,7 @@ pub trait MetricsCacheRepository: Send + Sync {
     ) -> Result<(), StoreError> {
         for (item, block) in items.iter().zip(blocks.iter()) {
             if let Some(block) = block {
-                self.put(target, item, span, block, computed_at)?;
+                self.put(target, item, category, span, block, computed_at)?;
             }
         }
         Ok(())

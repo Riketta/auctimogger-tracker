@@ -8,6 +8,7 @@ use std::{
 use crate::{
     domain::{
         utc_day,
+        Category,
         ItemDayHistogram,
         ItemRef,
         MetricBlock,
@@ -58,8 +59,8 @@ impl MetricsService {
         Self { history, cache, sales, clock }
     }
 
-    /// Computes (or serves from cache) the metric block for one item/span.
-    /// `None` = no data in the window.
+    /// Computes (or serves from cache) the metric block for one
+    /// item/category/span. `None` = no data in the window.
     ///
     /// # Errors
     ///
@@ -69,17 +70,22 @@ impl MetricsService {
         &self,
         target: &TargetId,
         item: &ItemRef,
+        category: Category,
         span: Span,
     ) -> Result<Option<MetricBlock>, StoreError> {
-        Ok(self.blocks(target, std::slice::from_ref(item), span)?.into_iter().next().flatten())
+        Ok(self
+            .blocks(target, std::slice::from_ref(item), category, span)?
+            .into_iter()
+            .next()
+            .flatten())
     }
 
-    /// Computes the metric block for several item identities merged into one
-    /// population (pet variants of one species share their market). Histogram
-    /// buckets are summed before the (parity-frozen) summarizer runs, and the
-    /// sale rate aggregates credited/listings across all identities. Merged
-    /// blocks bypass the per-item cache: exports run on a slow cadence and
-    /// the cache schema is keyed per item.
+    /// Computes the metric block for several item identities of one category
+    /// merged into one population (pet variants of one species share their
+    /// market). Histogram buckets are summed before the (parity-frozen)
+    /// summarizer runs, and the sale rate aggregates credited/listings across
+    /// all identities. Merged blocks bypass the per-item cache: exports run
+    /// on a slow cadence and the cache schema is keyed per item.
     ///
     /// # Errors
     ///
@@ -88,23 +94,24 @@ impl MetricsService {
         &self,
         target: &TargetId,
         items: &[ItemRef],
+        category: Category,
         span: Span,
     ) -> Result<Option<MetricBlock>, StoreError> {
         if items.is_empty() {
             return Ok(None);
         }
         Ok(self
-            .blocks_merged(target, std::slice::from_ref(&items), span)?
+            .blocks_merged(target, std::slice::from_ref(&items), category, span)?
             .into_iter()
             .next()
             .flatten())
     }
 
-    /// Cached-first metric blocks for several identities of one span,
-    /// positionally aligned with `items`; missing or expired entries are
-    /// recomputed in bounded batches — one bulk fold read and one bulk sale
-    /// rate read per chunk instead of per-item-per-day queries — and
-    /// re-cached through one bulk write.
+    /// Cached-first metric blocks for several identities of one
+    /// target/category/span, positionally aligned with `items`; missing or
+    /// expired entries are recomputed in bounded batches — one bulk fold read
+    /// and one bulk sale rate read per chunk instead of per-item-per-day
+    /// queries — and re-cached through one bulk write.
     ///
     /// # Errors
     ///
@@ -114,12 +121,16 @@ impl MetricsService {
         &self,
         target: &TargetId,
         items: &[ItemRef],
+        category: Category,
         span: Span,
     ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
         let now = self.clock.now();
         let mut out = Vec::with_capacity(items.len());
-        let pairs: Vec<(ItemRef, Option<crate::domain::CachedBlock>)> =
-            items.iter().cloned().zip(self.cache.get_many(target, span, items)?).collect();
+        let pairs: Vec<(ItemRef, Option<crate::domain::CachedBlock>)> = items
+            .iter()
+            .cloned()
+            .zip(self.cache.get_many(target, category, span, items)?)
+            .collect();
         for chunk in pairs.chunks(BLOCK_CHUNK) {
             let mut row = Vec::with_capacity(chunk.len());
             let mut cold = Vec::new();
@@ -135,7 +146,7 @@ impl MetricsService {
                 }
             }
             if !cold.is_empty() {
-                let computed = self.compute_blocks(target, &cold, span, now)?;
+                let computed = self.compute_blocks(target, &cold, category, span, now)?;
                 let mut computed_iter = computed.into_iter();
                 for slot in &mut row {
                     if slot.is_none() {
@@ -148,11 +159,12 @@ impl MetricsService {
         Ok(out)
     }
 
-    /// Merged-population metric blocks for several groups of one span,
-    /// positionally aligned with `groups`; each group's members are folded
-    /// into one histogram population and their sale credits pooled. Bulk
-    /// twin of [`MetricsService::block_merged`]: fold state is loaded in
-    /// bounded batches across all groups instead of per member per day.
+    /// Merged-population metric blocks for several groups of one
+    /// target/category/span, positionally aligned with `groups`; each group's
+    /// members are folded into one histogram population and their sale
+    /// credits pooled. Bulk twin of [`MetricsService::block_merged`]: fold
+    /// state is loaded in bounded batches across all groups instead of per
+    /// member per day.
     ///
     /// # Errors
     ///
@@ -161,6 +173,7 @@ impl MetricsService {
         &self,
         target: &TargetId,
         groups: &[&[ItemRef]],
+        category: Category,
         span: Span,
     ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
         let now = self.clock.now();
@@ -171,13 +184,13 @@ impl MetricsService {
             batch.push(group);
             batch_members += group.len();
             if batch_members >= BLOCK_CHUNK {
-                out.extend(self.compute_merged_batch(target, &batch, span, now)?);
+                out.extend(self.compute_merged_batch(target, &batch, category, span, now)?);
                 batch.clear();
                 batch_members = 0;
             }
         }
         if !batch.is_empty() {
-            out.extend(self.compute_merged_batch(target, &batch, span, now)?);
+            out.extend(self.compute_merged_batch(target, &batch, category, span, now)?);
         }
         Ok(out)
     }
@@ -189,12 +202,14 @@ impl MetricsService {
         &self,
         target: &TargetId,
         items: &[ItemRef],
+        category: Category,
         span: Span,
         now: i64,
     ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
         let today = utc_day(now);
-        let folds = self.history.load_folds(target, items, today - span.days() + 1, today)?;
-        let rates = self.sales.sale_rate_each(target, items, SALE_RATE_WINDOW_DAYS)?;
+        let folds =
+            self.history.load_folds(target, items, today - span.days() + 1, today, category)?;
+        let rates = self.sales.sale_rate_each(target, items, SALE_RATE_WINDOW_DAYS, category)?;
         let mut blocks = Vec::with_capacity(items.len());
         for (per_item, rate) in folds.into_iter().zip(rates) {
             let mut histograms = Vec::new();
@@ -206,7 +221,7 @@ impl MetricsService {
             }
             blocks.push(block_from_histograms(&histograms, rate));
         }
-        self.cache.put_many(target, span, items, &blocks, now)?;
+        self.cache.put_many(target, category, span, items, &blocks, now)?;
         Ok(blocks)
     }
 
@@ -217,6 +232,7 @@ impl MetricsService {
         &self,
         target: &TargetId,
         groups: &[&[ItemRef]],
+        category: Category,
         span: Span,
         now: i64,
     ) -> Result<Vec<Option<MetricBlock>>, StoreError> {
@@ -225,7 +241,8 @@ impl MetricsService {
         if flat.is_empty() {
             return Ok(vec![None; groups.len()]);
         }
-        let folds = self.history.load_folds(target, &flat, today - span.days() + 1, today)?;
+        let folds =
+            self.history.load_folds(target, &flat, today - span.days() + 1, today, category)?;
         let mut per_member = folds.into_iter();
         let mut out = Vec::with_capacity(groups.len());
         for group in groups {
@@ -257,7 +274,8 @@ impl MetricsService {
                 out.push(None);
                 continue;
             }
-            let sale_rate = self.sales.sale_rate_multi(target, group, SALE_RATE_WINDOW_DAYS)?;
+            let sale_rate =
+                self.sales.sale_rate_multi(target, group, SALE_RATE_WINDOW_DAYS, category)?;
             out.push(block_from_histograms(std::slice::from_ref(&merged), sale_rate));
         }
         Ok(out)

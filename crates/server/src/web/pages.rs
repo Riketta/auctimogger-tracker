@@ -21,6 +21,7 @@ use std::{
 use amtracker_core::{
     domain::{
         utc_day,
+        Category,
         Flavor,
         ItemRef,
         MetricBlock,
@@ -42,6 +43,7 @@ use axum::{
 };
 
 use super::{
+    category_param,
     health_blocking,
     mutations_open,
     render::{
@@ -696,15 +698,20 @@ pub(crate) async fn items_page(
 pub(crate) async fn item_page(
     State(state): State<Arc<AppState>>,
     Path((target_id, item_id)): Path<(String, i64)>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let target = match super::known_target(&state.config, &target_id) {
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_param(&params, Category::Item) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let item = ItemRef::Item { item_id };
     let name =
         resolve_item_name(&state, &super::target_flavor(&state.config, &target), item_id).await;
-    item_detail_page(state, target, item, name, item_id.to_string(), String::new()).await
+    item_detail_page(state, target, item, name, item_id.to_string(), String::new(), category).await
 }
 
 /// `GET /items/{target_id}/pet/{species_id}?level=&quality=&breed=` — one
@@ -726,6 +733,10 @@ pub(crate) async fn pet_page(
         && !params.contains_key("quality")
         && !params.contains_key("breed");
     let item = ItemRef::Pet { species: species_id, level, quality, breed };
+    let category = match category_param(&params, Category::Pet) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let name =
         resolve_pet_name(&state, &super::target_flavor(&state.config, &target), species_id).await;
     let note = if defaulted {
@@ -736,7 +747,7 @@ pub(crate) async fn pet_page(
     } else {
         String::new()
     };
-    item_detail_page(state, target, item, name, format!("pet {species_id}"), note).await
+    item_detail_page(state, target, item, name, format!("pet {species_id}"), note, category).await
 }
 
 /// Resolves an item's display name (catalog first, then the item API) for
@@ -861,7 +872,9 @@ async fn resolve_names(
 
 /// The shared item/pet detail renderer: name header, 30-day band chart
 /// (JSON island + server SVG fallback), today's price distribution, the
-/// per-span metric blocks and the watch action.
+/// per-span metric blocks and the watch action — all within one market
+/// category (the tabs switch between them; merged views would mix two
+/// markets' evidence).
 async fn item_detail_page(
     state: Arc<AppState>,
     target: TargetId,
@@ -869,6 +882,7 @@ async fn item_detail_page(
     name: Option<String>,
     id_label: String,
     note: String,
+    category: Category,
 ) -> Response {
     let title_raw = name.unwrap_or_else(|| format!("{} (name unknown)", render::item_label(&item)));
     let title = html_escape(&title_raw);
@@ -886,14 +900,14 @@ async fn item_detail_page(
         let target = target.clone();
         let item = item.clone();
         move || -> Result<ItemPageData, StoreError> {
-            let rows = state.history.item_day_rows_for_item(&target, &item, since)?;
+            let rows = state.history.item_day_rows_for_item(&target, &item, since, category)?;
             let mut days: Vec<i64> = rows.iter().map(|row| row.day).collect();
             days.sort_unstable();
             days.dedup();
             let mut chart_rows = Vec::with_capacity(days.len());
             let mut distribution = std::collections::BTreeMap::new();
             for day in days {
-                let Some(fold) = state.history.load_fold(&target, &item, day)? else {
+                let Some(fold) = state.history.load_fold(&target, &item, day, category)? else {
                     continue;
                 };
                 let histogram = fold.histogram();
@@ -917,13 +931,13 @@ async fn item_detail_page(
             }
             let mut blocks = Vec::with_capacity(4);
             for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
-                blocks.push((span, state.metrics.block(&target, &item, span)?));
+                blocks.push((span, state.metrics.block(&target, &item, category, span)?));
             }
-            // Cross-target comparison: the same identity on every other
-            // configured target (cached d7 blocks — cheap by construction).
+            // Cross-target comparison: the same identity + category on every
+            // other configured target (cached d7 blocks — cheap by design).
             let mut peers = Vec::new();
             for other in state.config.targets.iter().filter(|t| t.id != target) {
-                let block = state.metrics.block(&other.id, &item, Span::D7)?;
+                let block = state.metrics.block(&other.id, &item, category, Span::D7)?;
                 peers.push((other.id.clone(), block));
             }
             Ok((rows, blocks, chart_rows, distribution, peers))
@@ -1138,8 +1152,33 @@ async fn item_detail_page(
 
     // `page` escapes its title itself; passing the escaped copy would
     // double-escape ("&" rendering as "&amp;"). `title` stays the
-    // single-escaped copy for the body <h2> above.
-    page(&title_raw, "items", &body, Some(target_switcher(&state.config, "/items", &target, &[])))
+    // single-escaped copy for the body <h2> above. The category tabs ride
+    // next to the target switcher; a pet's variant tuple is preserved as
+    // hidden fields (a GET form replaces the action's query string).
+    let base_path = match &item {
+        ItemRef::Item { item_id } => format!("/items/{}/{}", target.as_str(), item_id),
+        ItemRef::Pet { species, .. } => {
+            format!("/items/{}/pet/{}", target.as_str(), species)
+        }
+    };
+    let preserve: Vec<(&str, String)> = match &item {
+        ItemRef::Item { .. } => Vec::new(),
+        ItemRef::Pet { level, quality, breed, .. } => {
+            vec![
+                ("level", level.to_string()),
+                ("quality", quality.to_string()),
+                ("breed", breed.to_string()),
+            ]
+        }
+    };
+    let preserve_refs: Vec<(&str, &str)> =
+        preserve.iter().map(|(key, value)| (*key, value.as_str())).collect();
+    let switcher = format!(
+        "{}{}",
+        target_switcher(&state.config, "/items", &target, &[]),
+        render::category_switcher(&base_path, &preserve_refs, category)
+    );
+    page(&title_raw, "items", &body, Some(switcher))
 }
 
 /// Serializes a JSON value for embedding in a `<script type="application/json">`
@@ -1153,8 +1192,26 @@ fn json_island(value: &serde_json::Value) -> String {
 
 // ----------------------------------------------------------- opportunities
 
-/// `GET /opportunities?target=&min_churn=&limit=` — ranked deals with
-/// filters, sortable columns and per-row watch actions.
+/// `<option>` fragment for an inline category select with `current`
+/// preselected (the opportunities toolbar; standalone pages use
+/// `render::category_switcher`'s full form).
+fn category_options(current: Category) -> String {
+    let mut out = String::new();
+    for category in Category::ALL {
+        let selected = if category == current { " selected" } else { "" };
+        let _ = write!(
+            out,
+            "<option value=\"{}\"{selected}>{}</option>",
+            category.as_str(),
+            category.as_str()
+        );
+    }
+    out
+}
+
+/// `GET /opportunities?target=&category=&min_churn=&limit=` — ranked deals
+/// for one market category with filters, sortable columns and per-row watch
+/// actions.
 pub(crate) async fn opportunities_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1163,12 +1220,16 @@ pub(crate) async fn opportunities_page(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_param(&params, Category::Item) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let min_churn: f64 = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
     let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.opportunities(&target, min_churn, limit)
+        move || state.opportunities.opportunities(&target, category, min_churn, limit)
     });
     let data = match data.await {
         Ok(Ok(data)) => data,
@@ -1196,13 +1257,19 @@ pub(crate) async fn opportunities_page(
         &state.config,
         "/opportunities",
         &target,
-        &[("min_churn", &min_churn_text), ("limit", limit_text.as_str())],
+        &[
+            ("category", category.as_str()),
+            ("min_churn", &min_churn_text),
+            ("limit", limit_text.as_str()),
+        ],
     );
 
     let mut body = format!(
-        "<p class=\"muted\">{} target <code>{}</code></p>\
+        "<p class=\"muted\">{} target <code>{}</code> · category <code>{}</code></p>\
          <form class=\"toolbar\" method=\"get\" action=\"/opportunities\">\
          <input type=\"hidden\" name=\"target\" value=\"{}\">\
+         <label for=\"category\">{}</label>\
+         <select id=\"category\" name=\"category\" data-autosubmit>{}</select>\
          <label for=\"min-churn\">{} ≥</label>\
          <input type=\"number\" id=\"min-churn\" name=\"min_churn\" value=\"{min_churn}\" min=\"0\" step=\"0.1\" style=\"width:6rem\">\
          <label for=\"limit\">{}</label>\
@@ -1211,7 +1278,10 @@ pub(crate) async fn opportunities_page(
          </form>",
         tip("score", "score = Σ wᵢ·componentᵢ over discount, reliability, churn and stability (weights from [opportunities] in the config; only ratios matter)."),
         html_escape(target.as_str()),
+        html_escape(category.as_str()),
         html_escape(target.as_str()),
+        tip("category", "Which market the ranking covers: items (item AH), commodities (commodity AH) or pets. Each category ranks on its own evidence — an item trading in both AHs appears independently in each."),
+        category_options(category),
         tip("min churn", "Only items with at least this many listings churning per day rank — filters out thin, un-tradeable markets."),
         tip("rows", "Maximum number of ranked items to show."),
     );
@@ -1344,8 +1414,8 @@ fn mover_table(
     out
 }
 
-/// `GET /overview?target=` — rising / falling / most-active movers with
-/// honest 30-day sparklines.
+/// `GET /overview?target=&category=` — rising / falling / most-active movers
+/// for one market category, with honest 30-day sparklines.
 pub(crate) async fn overview_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1354,10 +1424,14 @@ pub(crate) async fn overview_page(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_param(&params, Category::Item) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.overview(&target, 15)
+        move || state.opportunities.overview(&target, category, 15)
     });
     let data = match data.await {
         Ok(Ok(data)) => data,
@@ -1384,7 +1458,8 @@ pub(crate) async fn overview_page(
             let since = utc_day(state.clock.now()) - 29;
             let mut out = HashMap::new();
             for item in &refs {
-                let mut rows = state.history.item_day_rows_for_item(&target, item, since)?;
+                let mut rows =
+                    state.history.item_day_rows_for_item(&target, item, since, category)?;
                 rows.sort_by_key(|row| row.day);
                 out.insert(item_key(item), rows.iter().map(|row| row.median).collect());
             }
@@ -1400,7 +1475,11 @@ pub(crate) async fn overview_page(
     };
     let names = resolve_names(&state, &super::target_flavor(&state.config, &target), &refs).await;
 
-    let switcher = target_switcher(&state.config, "/overview", &target, &[]);
+    let switcher = format!(
+        "{}{}",
+        target_switcher(&state.config, "/overview", &target, &[("category", category.as_str())]),
+        render::category_switcher("/overview", &[("target", target.as_str())], category)
+    );
 
     let mut body = String::new();
     body.push_str("<h2>rising</h2>");
@@ -1426,7 +1505,8 @@ pub(crate) async fn overview_page(
 
 // --------------------------------------------------------------- watchlist
 
-/// `GET /watchlist?target=` — the curated list driving `feed-slim.lua`.
+/// `GET /watchlist?target=&category=` — the curated list driving
+/// `feed-slim.lua`, joined to one market category's numbers.
 pub(crate) async fn watchlist_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -1435,10 +1515,14 @@ pub(crate) async fn watchlist_page(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    let category = match category_param(&params, Category::Item) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
     let report = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.watchlist_report.report(&target, &[Span::D1, Span::D7], 14, 30)
+        move || state.watchlist_report.report(&target, category, &[Span::D1, Span::D7], 14, 30)
     });
     let report = match report.await {
         Ok(Ok(report)) => report,
@@ -1453,7 +1537,11 @@ pub(crate) async fn watchlist_page(
         &report.iter().map(|row| row.entry.item.clone()).collect::<Vec<_>>(),
     )
     .await;
-    let switcher = target_switcher(&state.config, "/watchlist", &target, &[]);
+    let switcher = format!(
+        "{}{}",
+        target_switcher(&state.config, "/watchlist", &target, &[("category", category.as_str())]),
+        render::category_switcher("/watchlist", &[("target", target.as_str())], category)
+    );
     let open = mutations_open(&state.config);
 
     let mut body = format!(

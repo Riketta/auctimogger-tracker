@@ -39,6 +39,7 @@ use std::{
 use amtracker_core::{
     domain::{
         utc_day,
+        Category,
         FeedFormat,
         ItemRef,
         PayloadKind,
@@ -298,9 +299,11 @@ pub fn spawn(
         // target's scan simply stays cold (the request path falls back to an
         // inline compute), so `serve` never fails startup over it.
         for target in &config.targets {
-            survive("startup-refresh", &target.id.0, || {
-                refresh_opportunities(&state, &target.id);
-            });
+            for category in Category::ALL {
+                survive("startup-refresh", &target.id.0, || {
+                    refresh_opportunities(&state, &target.id, category);
+                });
+            }
         }
         // The critical sections below only touch the maps, so a poisoned
         // lock can only come from a panic inside this very loop; recover
@@ -352,16 +355,19 @@ pub fn spawn(
             }
             // Refresh any prepared opportunity scan that outlived its TTL;
             // the debounce window in `refresh` makes overlap with the
-            // maintenance pass above harmless.
+            // maintenance pass above harmless. Scans are per category, so
+            // each category refreshes on its own cadence.
             for target in &config.targets {
-                let refresh_due = state
-                    .opportunities
-                    .snapshot_age_secs(&target.id)
-                    .is_none_or(|age| age >= SCAN_TTL_SECONDS);
-                if refresh_due {
-                    survive("scan-refresh", &target.id.0, || {
-                        refresh_opportunities(&state, &target.id);
-                    });
+                for category in Category::ALL {
+                    let refresh_due = state
+                        .opportunities
+                        .snapshot_age_secs(&target.id, category)
+                        .is_none_or(|age| age >= SCAN_TTL_SECONDS);
+                    if refresh_due {
+                        survive("scan-refresh", &target.id.0, || {
+                            refresh_opportunities(&state, &target.id, category);
+                        });
+                    }
                 }
             }
             // Store-wide online backup on its own cadence (disabled unless
@@ -630,7 +636,11 @@ fn run_pass(
         publish_feed(state, config, target);
     }
 
-    refresh_opportunities(state, &TargetId(target.to_string()));
+    // New folds/credits just landed for this cycle's payload kind, but
+    // categories are refreshed wholesale (cheap, debounced per category).
+    for category in Category::ALL {
+        refresh_opportunities(state, &TargetId(target.to_string()), category);
+    }
     evaluate_alerts(state, target);
     // Last, so the (pacing-sleeping) name warm-up never delays the critical
     // maintenance work above it. The manual /api/fetch path skips it: an
@@ -656,13 +666,27 @@ fn warm_item_names(
     let flavor = &target_config.flavor;
     let pace = Duration::from_millis(config.catalog.idle_pace_ms);
     let since_day = utc_day(state.clock.now()).saturating_sub(1);
-    let items = match state.history.items_with_data(&TargetId(target.to_string()), since_day) {
-        Ok(items) => items,
-        Err(error) => {
-            tracing::warn!(target, error = %error, "name warm-up listing failed");
-            return;
+    // Distinct identities across all categories: the same item id can have
+    // both commodity and item-AH folds, and the catalog names ids, not
+    // categories.
+    let target_id = TargetId(target.to_string());
+    let mut items: Vec<ItemRef> = Vec::new();
+    let mut seen: HashSet<ItemRef> = HashSet::new();
+    for category in Category::ALL {
+        match state.history.items_with_data(&target_id, since_day, category) {
+            Ok(list) => {
+                for item in list {
+                    if seen.insert(item.clone()) {
+                        items.push(item);
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(target, error = %error, "name warm-up listing failed");
+                return;
+            }
         }
-    };
+    }
     let mut warmed = 0u32;
     for (examined, item) in items.into_iter().enumerate() {
         // Every examined item counts against the budget, known or not: the
@@ -794,15 +818,25 @@ fn survive(step: &'static str, target: &str, f: impl FnOnce()) {
     }
 }
 
-/// Recomputes one target's prepared opportunity scan, best effort: success is
-/// logged at debug with the items covered, failures warn and are swallowed —
-/// ranking data is background hygiene, never worth failing a cycle or the
-/// startup over.
-fn refresh_opportunities(state: &Arc<AppState>, target: &TargetId) {
-    match state.opportunities.refresh(target) {
-        Ok(items) => tracing::debug!(target = %target.0, items, "opportunity scan refreshed"),
+/// Recomputes one target's prepared opportunity scan for one category, best
+/// effort: success is logged at debug with the items covered, failures warn
+/// and are swallowed — ranking data is background hygiene, never worth
+/// failing a cycle or the startup over.
+fn refresh_opportunities(state: &Arc<AppState>, target: &TargetId, category: Category) {
+    match state.opportunities.refresh(target, category) {
+        Ok(items) => tracing::debug!(
+            target = %target.0,
+            category = category.as_str(),
+            items,
+            "opportunity scan refreshed"
+        ),
         Err(error) => {
-            tracing::warn!(target = %target.0, error = %error, "opportunity scan refresh failed");
+            tracing::warn!(
+                target = %target.0,
+                category = category.as_str(),
+                error = %error,
+                "opportunity scan refresh failed"
+            );
         }
     }
 }

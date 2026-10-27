@@ -14,6 +14,7 @@ use std::{
 use amtracker_core::{
     config::TrackerConfig,
     domain::{
+        Category,
         ItemRef,
         PriceBucket,
         TargetId,
@@ -339,6 +340,40 @@ pub fn target_switcher(
         "<form class=\"switcher\" method=\"get\" action=\"{}\">{hidden}\
          <label for=\"target-select\">target</label>\
          <select id=\"target-select\" name=\"target\" data-autosubmit>{options}</select>\
+         <noscript><button class=\"btn btn-sm\" type=\"submit\">go</button></noscript></form>",
+        html_escape(path),
+    )
+}
+
+/// Category switcher: same form mechanics as [`target_switcher`], one option
+/// per market category. Every market view renders one category per request;
+/// the tabs switch between them (items/commodities/pets keep separate
+/// evidence, so a combined view would mix markets).
+#[must_use]
+pub fn category_switcher(path: &str, preserve: &[(&str, &str)], current: Category) -> String {
+    let mut hidden = String::new();
+    for (key, value) in preserve {
+        let _ = write!(
+            hidden,
+            "<input type=\"hidden\" name=\"{}\" value=\"{}\">",
+            html_escape(key),
+            html_escape(value)
+        );
+    }
+    let mut options = String::new();
+    for category in Category::ALL {
+        let selected = if category == current { " selected" } else { "" };
+        let _ = write!(
+            options,
+            "<option value=\"{}\"{selected}>{}</option>",
+            category.as_str(),
+            category.as_str()
+        );
+    }
+    format!(
+        "<form class=\"switcher\" method=\"get\" action=\"{}\">{hidden}\
+         <label for=\"category-select\">category</label>\
+         <select id=\"category-select\" name=\"category\" data-autosubmit>{options}</select>\
          <noscript><button class=\"btn btn-sm\" type=\"submit\">go</button></noscript></form>",
         html_escape(path),
     )
