@@ -12,7 +12,6 @@ use crate::{
         ItemDayRow,
         ItemRef,
         MetricBlock,
-        SaleRecency,
         Span,
         TargetId,
         WatchlistEntry,
@@ -36,9 +35,13 @@ pub struct WatchlistReportEntry {
     pub blocks: Vec<Option<MetricBlock>>,
     /// Trailing-window sale rate; `None` = no sales rows yet.
     pub sale_rate: Option<f64>,
-    /// Ledger recency; `None` = no credited sale ever (the "stopped
-    /// selling" signal behind the watchlist page and metrics API).
-    pub recency: Option<SaleRecency>,
+    /// Whole days since the ledger last credited a sale; `None` = no
+    /// credited sale ever (the "stopped selling" signal behind the
+    /// watchlist page and metrics API).
+    pub days_since_last_sale: Option<i64>,
+    /// Net listings that closed after the last credited sale day; `None`
+    /// alongside `days_since_last_sale`.
+    pub closures_since_last_sale: Option<i64>,
     /// Per-day aggregate rows over the trend window, ordered by day.
     pub trend: Vec<ItemDayRow>,
 }
@@ -87,7 +90,8 @@ impl WatchlistReportService {
             return Ok(Vec::new());
         }
         let items: Vec<ItemRef> = entries.iter().map(|entry| entry.item.clone()).collect();
-        let since_day = crate::domain::utc_day(self.clock.now()) - (trend_days - 1);
+        let today = crate::domain::utc_day(self.clock.now());
+        let since_day = today - (trend_days - 1);
         // One batched read per span, then one sale-rate query for all items.
         // `per_span[s]` is aligned with `items`; the loop below transposes it
         // into per-entry span lists without indexing.
@@ -105,7 +109,14 @@ impl WatchlistReportService {
                 per_span.iter().map(|spans_items| spans_items.get(i).cloned().flatten()).collect();
             let trend =
                 self.history.item_day_rows_for_item(target, &entry.item, since_day, category)?;
-            out.push(WatchlistReportEntry { entry, blocks, sale_rate: rate, recency, trend });
+            out.push(WatchlistReportEntry {
+                entry,
+                blocks,
+                sale_rate: rate,
+                days_since_last_sale: recency.map(|recency| today - recency.last_sale_day),
+                closures_since_last_sale: recency.map(|recency| recency.closures_since),
+                trend,
+            });
         }
         Ok(out)
     }

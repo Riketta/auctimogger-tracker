@@ -410,10 +410,15 @@ pub trait SalesRepository: Send + Sync {
         Ok(recencies)
     }
     /// Ledger recency pooled over several item identities (pet variants of
-    /// one species share their market): the EARLIEST member's last-sale day
-    /// (a variant selling resets the whole species' clock) and the summed
-    /// closures after that day across all members. `Ok(None)` when no member
-    /// ever credited a sale.
+    /// one species share their market): the MOST RECENT member's last-sale
+    /// day — any variant selling resets the species' clock — and the summed
+    /// closures strictly after that day across all members. `Ok(None)` when
+    /// no member ever credited a sale.
+    ///
+    /// The default loop pools the per-identity readings, so its closure sum
+    /// is an approximation: closures that fall between the pooled day and a
+    /// member's own last-sale day are only visible to a pooled backend (the
+    /// SQLite store overrides this with the exact sum).
     ///
     /// # Errors
     ///
@@ -432,7 +437,7 @@ pub trait SalesRepository: Send + Sync {
             let Some(recency) = recency else { continue };
             sold_any = true;
             last_sale_day = Some(match last_sale_day {
-                Some(day) => day.min(recency.last_sale_day),
+                Some(day) => day.max(recency.last_sale_day),
                 None => recency.last_sale_day,
             });
             closures_since += recency.closures_since;

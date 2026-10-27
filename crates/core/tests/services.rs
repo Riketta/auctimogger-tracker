@@ -147,7 +147,9 @@ impl AuctionSourcePort for FakeSource {
 
 #[derive(Default)]
 struct FakeSnapshotsInner {
-    latest: Option<SnapshotMeta>,
+    /// Newest snapshot per (target, kind) — the freshness gate is per kind,
+    /// so the fake must scope its reads the way the real store does.
+    latest: HashMap<(TargetId, PayloadKind), SnapshotMeta>,
     raws: Vec<Vec<u8>>,
     listing_counts: Vec<u64>,
     next_id: i64,
@@ -173,7 +175,7 @@ impl SnapshotRepository for FakeSnapshots {
         let mut inner = self.inner.lock().unwrap();
         inner.next_id += 1;
         let id = inner.next_id;
-        inner.latest = Some(SnapshotMeta {
+        let meta = SnapshotMeta {
             id,
             target: snapshot.target.clone(),
             kind: snapshot.kind,
@@ -183,7 +185,8 @@ impl SnapshotRepository for FakeSnapshots {
             dropped_count: snapshot.dropped_count,
             dropped_reasons: snapshot.dropped_reasons.clone(),
             status: snapshot.status,
-        });
+        };
+        inner.latest.insert((snapshot.target.clone(), snapshot.kind), meta);
         inner.raws.push(raw.to_vec());
         inner.listing_counts.push(listings.len() as u64);
         Ok(id)
@@ -191,10 +194,10 @@ impl SnapshotRepository for FakeSnapshots {
 
     fn latest(
         &self,
-        _target: &TargetId,
-        _kind: PayloadKind,
+        target: &TargetId,
+        kind: PayloadKind,
     ) -> Result<Option<SnapshotMeta>, StoreError> {
-        Ok(self.inner.lock().unwrap().latest.clone())
+        Ok(self.inner.lock().unwrap().latest.get(&(target.clone(), kind)).cloned())
     }
 
     fn list_recent(
@@ -204,7 +207,7 @@ impl SnapshotRepository for FakeSnapshots {
         limit: usize,
     ) -> Result<Vec<SnapshotMeta>, StoreError> {
         let inner = self.inner.lock().unwrap();
-        Ok(inner.latest.iter().take(limit).cloned().collect())
+        Ok(inner.latest.values().take(limit).cloned().collect())
     }
 }
 
@@ -458,7 +461,14 @@ fn ingest_cycle_folds_unique_auctions_and_records_the_snapshot() {
     assert_eq!(*sales.closes.lock().unwrap(), 1);
 
     let stored = snapshots.inner.lock().unwrap();
-    assert_eq!(stored.latest.as_ref().expect("snapshot recorded").entry_count, 4);
+    assert_eq!(
+        stored
+            .latest
+            .get(&(TargetId("us-4".into()), PayloadKind::Commodities))
+            .expect("snapshot recorded")
+            .entry_count,
+        4
+    );
     assert_eq!(stored.raws[0], b"raw-bytes".to_vec());
     assert_eq!(stored.listing_counts[0], 4, "listings persist with the snapshot");
     drop(stored);
@@ -616,7 +626,7 @@ fn ingest_cycle_maps_source_errors_without_touching_storage() {
 
     let error = service.run_cycle(&target(), PayloadKind::Auctions).expect_err("must fail");
     assert!(matches!(error, CycleError::Source(_)));
-    assert!(snapshots.inner.lock().unwrap().latest.is_none(), "failed cycle writes nothing");
+    assert!(snapshots.inner.lock().unwrap().latest.is_empty(), "failed cycle writes nothing");
 }
 
 #[derive(Default)]
@@ -1047,6 +1057,374 @@ fn stale_feed_snapshot_skips_rules_and_counts_them() {
     assert_eq!(run.skipped_stale, 1);
     let recent = events.recent(&target, 10).expect("recent");
     assert_eq!(recent.as_slice(), &[], "stale gate must not record events");
+}
+
+/// Seeds a `PriceBelow` rule plus its Commodity-category fold so the rule
+/// would fire without the freshness gate.
+fn price_below_fixture(
+    target: &TargetId,
+    today: i64,
+) -> (Arc<FakeHistory>, Arc<FakeAlertRules>, Arc<FakeAlertEvents>) {
+    use amtracker_core::domain::{
+        AlertCondition,
+        NewAlertRule,
+    };
+
+    let history = Arc::new(FakeHistory::default());
+    let item1 = item(1);
+    let mut fold = DayFold::new(item1.clone());
+    fold.apply(&[listing(1, &item1, 100, 1)]);
+    history
+        .save_fold(
+            target,
+            &item1,
+            amtracker_core::domain::utc_day(today),
+            Category::Commodity,
+            &fold,
+        )
+        .expect("save fold");
+    let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
+    rules
+        .add(&NewAlertRule {
+            target: target.clone(),
+            item: item1,
+            condition: AlertCondition::PriceBelow { copper: 150 },
+            note: None,
+        })
+        .expect("add rule");
+    (history, rules, events)
+}
+
+#[test]
+fn freshness_gate_lets_exact_age_pass_and_blocks_beyond_it() {
+    use amtracker_core::{
+        domain::NewSnapshot,
+        ports::AlertEventRepository,
+        services::alert::AlertEvaluationService,
+    };
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let gate = 48 * 60 * 60;
+    let (history, rules, events) = price_below_fixture(&target, today);
+
+    let snapshots = Arc::new(FakeSnapshots::new());
+    // Age exactly == gate: fresh enough (the gate compares strictly older).
+    snapshots
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: today - gate,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::default(),
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            b"".as_slice(),
+        )
+        .expect("record boundary snapshot");
+
+    let clock = MutableClock::new(today);
+    let sales = Arc::new(FakeSales::default());
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history,
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        None,
+        clock.clone(),
+        gate,
+    );
+
+    let run = service.evaluate(&target, 0).expect("evaluate at the boundary");
+    assert_eq!(run.fired, 1, "age == gate still fires");
+    assert_eq!(run.skipped_stale, 0);
+
+    // One second older: age > gate now, so the very same rule skips (cooldown
+    // disabled to isolate the gate).
+    clock.advance(1);
+    let run = service.evaluate(&target, 0).expect("evaluate past the boundary");
+    assert_eq!(run.evaluated, 1);
+    assert_eq!(run.fired, 0);
+    assert_eq!(run.skipped_stale, 1);
+    let recent = events.recent(&target, 10).expect("recent");
+    assert_eq!(recent.len(), 1, "only the boundary pass recorded an event");
+}
+
+#[test]
+fn freshness_gate_ages_from_source_last_modified() {
+    use amtracker_core::{
+        domain::NewSnapshot,
+        services::alert::AlertEvaluationService,
+    };
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let (history, rules, events) = price_below_fixture(&target, today);
+
+    let snapshots = Arc::new(FakeSnapshots::new());
+    // The fetch stamp alone would read as ~4.6 days stale, but the source's
+    // Last-Modified is fresh — the gate must anchor on the data's own stamp.
+    snapshots
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: today - 400_000,
+                source_last_modified: Some(today - 60),
+                entry_count: 1,
+                dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::default(),
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            b"".as_slice(),
+        )
+        .expect("record snapshot");
+
+    let clock = MutableClock::new(today);
+    let sales = Arc::new(FakeSales::default());
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history,
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        None,
+        clock.clone(),
+        48 * 60 * 60,
+    );
+
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 1, "last-modified anchored age is fresh");
+    assert_eq!(run.skipped_stale, 0);
+}
+
+#[test]
+fn no_snapshots_read_as_not_stale() {
+    use amtracker_core::services::alert::AlertEvaluationService;
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let gate = 48 * 60 * 60;
+    let (history, rules, events) = price_below_fixture(&target, today);
+    let snapshots = Arc::new(FakeSnapshots::new());
+
+    let clock = MutableClock::new(today);
+    let sales = Arc::new(FakeSales::default());
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history,
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        None,
+        clock.clone(),
+        gate,
+    );
+
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 1, "no snapshots = no data yet, not stale");
+    assert_eq!(run.skipped_stale, 0);
+}
+
+#[test]
+fn freshness_gate_is_per_market_kind() {
+    use amtracker_core::{
+        domain::{
+            AlertCondition,
+            Category,
+            NewAlertRule,
+            NewSnapshot,
+        },
+        services::alert::AlertEvaluationService,
+    };
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let commodity_item = item(7);
+    let auction_item = item(8);
+
+    // Fresh commodity evidence for item 7; fresh-per-fold auctions evidence
+    // for item 8 (only its market's feed will be stale).
+    let history = Arc::new(FakeHistory::default());
+    let mut commodity_fold = DayFold::new(commodity_item.clone());
+    commodity_fold.apply(&[listing(1, &commodity_item, 100, 1)]);
+    history
+        .save_fold(
+            &target,
+            &commodity_item,
+            amtracker_core::domain::utc_day(today),
+            Category::Commodity,
+            &commodity_fold,
+        )
+        .expect("save commodity fold");
+    let mut auction_fold = DayFold::new(auction_item.clone());
+    auction_fold.apply(&[listing(2, &auction_item, 100, 1)]);
+    history
+        .save_fold(
+            &target,
+            &auction_item,
+            amtracker_core::domain::utc_day(today),
+            Category::Item,
+            &auction_fold,
+        )
+        .expect("save item fold");
+
+    let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
+    for item_ref in [&commodity_item, &auction_item] {
+        rules
+            .add(&NewAlertRule {
+                target: target.clone(),
+                item: item_ref.clone(),
+                condition: AlertCondition::PriceBelow { copper: 150 },
+                note: None,
+            })
+            .expect("add rule");
+    }
+
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let snap = |kind, fetched_at| NewSnapshot {
+        target: target.clone(),
+        kind,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: 1,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::default(),
+        status: SnapshotStatus::Ok,
+    };
+    // Commodities fresh (now); auctions stale (~2.3 days). The old
+    // newest-of-both gate would have armed BOTH rules on the fresh feed.
+    snapshots
+        .record(&snap(PayloadKind::Commodities, today), &[], b"".as_slice())
+        .expect("record fresh commodities snapshot");
+    snapshots
+        .record(&snap(PayloadKind::Auctions, today - 200_000), &[], b"".as_slice())
+        .expect("record stale auctions snapshot");
+
+    let clock = MutableClock::new(today);
+    let sales = Arc::new(FakeSales::default());
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history,
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        None,
+        clock.clone(),
+        48 * 60 * 60,
+    );
+
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.evaluated, 2);
+    assert_eq!(run.fired, 1, "the commodity rule fires on its own fresh feed");
+    assert_eq!(
+        run.skipped_stale, 1,
+        "the auctions rule cannot fire on the sibling feed's freshness"
+    );
+    let stored = events.recent(&target, 10).expect("recent");
+    assert_eq!(stored.len(), 1);
+    assert!(stored[0].message.contains("[commodity]"), "{}", stored[0].message);
+}
+
+#[test]
+fn merged_pet_blocks_pool_the_newest_variant_sale() {
+    use amtracker_core::{
+        domain::{
+            Category,
+            SaleRecency,
+            Span,
+        },
+        services::metrics::MetricsService,
+    };
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let variant_a =
+        amtracker_core::domain::ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 4 };
+    let variant_b =
+        amtracker_core::domain::ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
+
+    let history = Arc::new(FakeHistory::default());
+    for (auction_id, variant) in [(10, &variant_a), (11, &variant_b)] {
+        let mut fold = DayFold::new(variant.clone());
+        fold.apply(&[listing(auction_id, variant, 900_000, 1)]);
+        history
+            .save_fold(
+                &target,
+                variant,
+                amtracker_core::domain::utc_day(today),
+                Category::Pet,
+                &fold,
+            )
+            .expect("save variant fold");
+    }
+    let sales = Arc::new(FakeSales::default());
+    sales.recencies.lock().unwrap().insert(
+        variant_a.clone(),
+        SaleRecency {
+            last_sale_day: amtracker_core::domain::utc_day(today) - 30,
+            closures_since: 5,
+        },
+    );
+    sales.recencies.lock().unwrap().insert(
+        variant_b.clone(),
+        SaleRecency {
+            last_sale_day: amtracker_core::domain::utc_day(today) - 2,
+            closures_since: 3,
+        },
+    );
+
+    let clock = Arc::new(FixedClock(today));
+    let metrics =
+        MetricsService::new(history, Arc::new(FakeCache::default()), sales.clone(), clock);
+    let block = metrics
+        .block_merged(&target, &[variant_a.clone(), variant_b.clone()], Category::Pet, Span::D1)
+        .expect("merged block")
+        .expect("block from seeded folds");
+    assert_eq!(
+        block.days_since_last_sale,
+        Some(2),
+        "MAX pooling: the newest variant's sale anchors the species"
+    );
+    // The port-default pool sums the per-member readings (5 + 3); the exact
+    // pooled closure sum is the store's query (see the infra test).
+    assert_eq!(block.closures_since_last_sale, Some(8));
 }
 
 #[derive(Default)]

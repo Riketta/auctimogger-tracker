@@ -422,16 +422,14 @@ pub(crate) async fn api_opportunities(
         .filter(|v| v.is_finite())
         .unwrap_or(1.0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
-    let sort = match params.get("sort").map_or("score", String::as_str) {
-        "score" => amtracker_core::services::opportunity::OpportunitySort::Score,
-        "last_sale" => amtracker_core::services::opportunity::OpportunitySort::LastSale,
-        other => {
-            return (
-                StatusCode::BAD_REQUEST,
-                format!("unknown sort '{other}' (expected score|last_sale)"),
-            )
-                .into_response();
-        }
+    let sort_param = params.get("sort").map_or("score", String::as_str);
+    let Some(sort) = amtracker_core::services::opportunity::OpportunitySort::parse(sort_param)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            format!("unknown sort '{sort_param}' (expected score|last_sale)"),
+        )
+            .into_response();
     };
     let list = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
@@ -903,7 +901,6 @@ pub(crate) async fn api_watchlist_metrics(
         }
     });
     let span_names: Vec<&'static str> = spans.iter().map(Span::name).collect();
-    let today = amtracker_core::domain::utc_day(state.clock.now());
     match report.await {
         Ok(Ok(list)) => {
             let entries_json =
@@ -920,14 +917,8 @@ pub(crate) async fn api_watchlist_metrics(
                         .map(|(name, block)| (name.to_string(), metric_block_json(block)))
                         .collect::<serde_json::Map<String, serde_json::Value>>(),
                     "saleRate": entry.sale_rate,
-                    "daysSinceLastSale": entry
-                        .recency
-                        .as_ref()
-                        .map(|recency| today - recency.last_sale_day),
-                    "closuresSinceLastSale": entry
-                        .recency
-                        .as_ref()
-                        .map(|recency| recency.closures_since),
+                    "daysSinceLastSale": entry.days_since_last_sale,
+                    "closuresSinceLastSale": entry.closures_since_last_sale,
                     "trend": entry.trend.iter().map(|row| serde_json::json!({
                         "day": row.day,
                         "listingCount": row.listing_count,

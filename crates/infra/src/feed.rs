@@ -356,6 +356,32 @@ mod tests {
         assert!(!lua.contains("closuresSinceLastSale"), "{lua}");
     }
 
+    /// JSON pins the same absence as explicit `null`s: the keys are always
+    /// present, only the Lua feed omits them.
+    #[test]
+    fn json_absence_renders_null_not_missing() {
+        let mut feed = sample_feed();
+        feed.entries.truncate(1);
+        let d1 = feed.entries[0].metrics.remove(&Span::D1).expect("d1");
+        feed.entries[0].metrics.insert(
+            Span::D1,
+            MetricBlock {
+                sale_rate: None,
+                sale_rate_180d: None,
+                days_since_last_sale: None,
+                closures_since_last_sale: None,
+                ..d1
+            },
+        );
+        let bytes = FeedCodec.render(&feed, FeedFormat::Json).expect("render");
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
+        let d1 = &value["items"][0]["metrics"]["d1"];
+        assert_eq!(d1["saleRate"], serde_json::Value::Null);
+        assert_eq!(d1["saleRate180d"], serde_json::Value::Null);
+        assert_eq!(d1["daysSinceLastSale"], serde_json::Value::Null);
+        assert_eq!(d1["closuresSinceLastSale"], serde_json::Value::Null);
+    }
+
     #[test]
     fn pet_entries_render_the_contract_identity() {
         let mut feed = sample_feed();

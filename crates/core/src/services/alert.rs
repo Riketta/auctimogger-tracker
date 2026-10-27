@@ -48,10 +48,10 @@ pub struct AlertRun {
     pub dispatched: usize,
     /// Fired events whose dispatch failed (logged; never retried here).
     pub dispatch_failures: usize,
-    /// Rules skipped because the target's newest feed snapshot is older than
-    /// `[alerts].max_data_age_secs` (freshness gate). Cooldown-skipped rules
-    /// are neither counted here nor in `evaluated`'s fired accounting — they
-    /// simply never reach observation.
+    /// Rules blocked by the freshness gate: at least one of the rule's market
+    /// categories was stale-gated and the rule did not fire on any fresh
+    /// category. Cooldown-skipped rules are neither counted here nor in
+    /// `fired` — they simply never reach observation.
     pub skipped_stale: usize,
 }
 
@@ -64,9 +64,9 @@ pub struct AlertEvaluationService {
     snapshots: Arc<dyn SnapshotRepository>,
     dispatcher: Option<Arc<dyn AlertDispatchPort>>,
     clock: Arc<dyn ClockPort>,
-    /// Freshness gate in seconds: rules are skipped (counted as
-    /// [`AlertRun::skipped_stale`]) when the target's newest feed snapshot is
-    /// older. `0` disables the gate.
+    /// Freshness gate in seconds: a market category only observes when its
+    /// feed payload's snapshot is fresher (rules blocked this way are counted
+    /// as [`AlertRun::skipped_stale`]). `0` disables the gate.
     max_data_age_secs: i64,
 }
 
@@ -136,8 +136,9 @@ impl AlertEvaluationService {
 
     /// Evaluates every rule of one target: skips rules inside their cooldown
     /// window, observes the surviving rules' conditions against the cached
-    /// metric blocks, records an event per fired rule (and stamps its
-    /// cooldown anchor) and dispatches it best effort.
+    /// metric blocks (each market category only when its own feed is fresh —
+    /// see the freshness gate below), records an event per fired rule (and
+    /// stamps its cooldown anchor) and dispatches it best effort.
     ///
     /// # Errors
     ///
@@ -150,73 +151,69 @@ impl AlertEvaluationService {
         // Freshness gate: a rule may only fire on data fresh enough to mean
         // anything. The TSM addon colors stale prices red but still trades on
         // them (and its own freshness bookkeeping forgot the commodity feeds
-        // entirely) — we refuse to fire instead. No snapshots at all reads as
-        // "no data yet", not "stale": observation naturally finds nothing.
-        let stale = self.max_data_age_secs > 0
-            && self.snapshot_age(target, now)?.is_some_and(|age| age > self.max_data_age_secs);
+        // entirely) — we refuse to fire instead. The gate is per market: each
+        // category observes only when ITS feed payload is fresh, so one live
+        // feed cannot launder stale evidence from the other. No snapshot at
+        // all for a kind reads as "no data yet", not "stale": observation
+        // naturally finds nothing.
+        let ages = self.snapshot_ages(target, now)?;
         let mut run = AlertRun::default();
         for rule in rules {
             run.evaluated += 1;
             if rule.last_fired_at.is_some_and(|last| now - last < cooldown_secs) {
                 continue;
             }
-            if stale {
-                run.skipped_stale += 1;
-                continue;
-            }
-            let Some(observed) = self.observe(&rule)? else {
-                continue;
-            };
-            let event = NewAlertEvent {
-                rule_id: rule.id,
-                target: rule.target.clone(),
-                item: rule.item.clone(),
-                condition: rule.condition,
-                observed: observed.value,
-                message: observed.message,
-                fired_at: now,
-            };
-            // Atomic: event + cooldown anchor in one store transaction, so a
-            // failed anchor write can never produce a re-fired duplicate.
-            let event_id = self.rules.record_firing(&event)?;
-            run.fired += 1;
-            if let Some(dispatcher) = &self.dispatcher {
-                let delivered = AlertEvent {
-                    id: event_id,
-                    rule_id: event.rule_id,
-                    target: event.target,
-                    item: event.item,
-                    condition: event.condition,
-                    observed: event.observed,
-                    message: event.message,
-                    fired_at: event.fired_at,
-                };
-                match dispatcher.dispatch(&delivered) {
-                    Ok(()) => run.dispatched += 1,
-                    // The core never logs (zero deps): the caller surfaces
-                    // the failure from the returned counters.
-                    Err(_) => run.dispatch_failures += 1,
+            // Walk the categories here so the gate is per market while the
+            // first fresh breach still wins in canonical order.
+            let mut gated = false;
+            let mut fired = false;
+            for category in Category::ALL {
+                if ages.gates(self.max_data_age_secs, feed_kind(category)) {
+                    gated = true;
+                    continue;
                 }
+                let Some(observed) = self.observe_category(&rule, category)? else {
+                    continue;
+                };
+                fired = true;
+                let event = NewAlertEvent {
+                    rule_id: rule.id,
+                    target: rule.target.clone(),
+                    item: rule.item.clone(),
+                    condition: rule.condition,
+                    observed: observed.value,
+                    message: observed.message,
+                    fired_at: now,
+                };
+                // Atomic: event + cooldown anchor in one store transaction, so
+                // a failed anchor write can never produce a re-fired duplicate.
+                let event_id = self.rules.record_firing(&event)?;
+                run.fired += 1;
+                if let Some(dispatcher) = &self.dispatcher {
+                    let delivered = AlertEvent {
+                        id: event_id,
+                        rule_id: event.rule_id,
+                        target: event.target,
+                        item: event.item,
+                        condition: event.condition,
+                        observed: event.observed,
+                        message: event.message,
+                        fired_at: event.fired_at,
+                    };
+                    match dispatcher.dispatch(&delivered) {
+                        Ok(()) => run.dispatched += 1,
+                        // The core never logs (zero deps): the caller surfaces
+                        // the failure from the returned counters.
+                        Err(_) => run.dispatch_failures += 1,
+                    }
+                }
+                break;
+            }
+            if gated && !fired {
+                run.skipped_stale += 1;
             }
         }
         Ok(run)
-    }
-
-    /// Observes one rule's condition across the rule's item's market
-    /// categories: each category's block / sale rate is checked in canonical
-    /// order and the first breach fires, its message naming the category.
-    /// `None` = no category breached (or none had enough data to decide).
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Backend` when the underlying reads fail.
-    fn observe(&self, rule: &AlertRule) -> Result<Option<Observation>, StoreError> {
-        for category in Category::ALL {
-            if let Some(observation) = self.observe_category(rule, category)? {
-                return Ok(Some(observation));
-            }
-        }
-        Ok(None)
     }
 
     /// One category's observation: `Ok(Some(_))` only when the condition
@@ -291,21 +288,62 @@ impl AlertEvaluationService {
         }
     }
 
-    /// Age in seconds of the target's newest feed snapshot (source
-    /// `Last-Modified` when present, else the fetch stamp); `None` when the
-    /// target has no snapshots at all.
-    fn snapshot_age(&self, target: &TargetId, now: i64) -> Result<Option<i64>, StoreError> {
-        let mut newest: Option<i64> = None;
-        for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
-            if let Some(meta) = self.snapshots.latest(target, kind)? {
-                let stamp = meta.source_last_modified.unwrap_or(meta.fetched_at);
-                newest = Some(match newest {
-                    Some(current) => current.max(stamp),
-                    None => stamp,
-                });
-            }
+    /// Ages in seconds of the target's newest feed snapshot per payload kind
+    /// (source `Last-Modified` when present, else the fetch stamp); a kind
+    /// with no snapshot at all reads as `None`.
+    fn snapshot_ages(&self, target: &TargetId, now: i64) -> Result<FeedAges, StoreError> {
+        Ok(FeedAges {
+            commodities: self.kind_age(target, now, PayloadKind::Commodities)?,
+            auctions: self.kind_age(target, now, PayloadKind::Auctions)?,
+        })
+    }
+
+    /// Age of one kind's newest snapshot, in seconds.
+    fn kind_age(
+        &self,
+        target: &TargetId,
+        now: i64,
+        kind: PayloadKind,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(self
+            .snapshots
+            .latest(target, kind)?
+            .map(|meta| now - meta.source_last_modified.unwrap_or(meta.fetched_at)))
+    }
+}
+
+/// Per-payload-kind snapshot ages for one target. The freshness gate is per
+/// market: each [`Category`] only observes against its own kind's age, so a
+/// live commodities feed cannot arm rules whose evidence is the (dead)
+/// auctions feed, and vice versa.
+struct FeedAges {
+    commodities: Option<i64>,
+    auctions: Option<i64>,
+}
+
+impl FeedAges {
+    /// `true` when the gate is enabled and the kind's feed is older than the
+    /// maximum data age (`None` = no snapshot of that kind: "no data yet",
+    /// not stale — observation naturally finds nothing).
+    fn gates(&self, max_data_age_secs: i64, kind: PayloadKind) -> bool {
+        if max_data_age_secs <= 0 {
+            return false;
         }
-        Ok(newest.map(|stamp| now - stamp))
+        let age = match kind {
+            PayloadKind::Commodities => self.commodities,
+            PayloadKind::Auctions => self.auctions,
+        };
+        age.is_some_and(|age| age > max_data_age_secs)
+    }
+}
+
+/// The feed payload kind a market category's evidence comes from: the
+/// commodity AH dump feeds the commodity market, the per-item auction dump
+/// feeds the item and pet markets.
+fn feed_kind(category: Category) -> PayloadKind {
+    match category {
+        Category::Commodity => PayloadKind::Commodities,
+        Category::Item | Category::Pet => PayloadKind::Auctions,
     }
 }
 

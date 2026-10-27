@@ -72,7 +72,7 @@ normal for this item, and how do I know this deal is real?"*.
 - **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
-- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`, `days-since-last-sale-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Rules are skipped while a target's newest feed is older than `[alerts].max_data_age_secs` (48 h by default, `0` disables), so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
+- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`, `days-since-last-sale-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Each market category only observes while its own feed is younger than `[alerts].max_data_age_secs` (48 h by default, `0` disables) — commodity rules gate on the commodities feed, item/pet rules on the auctions feed — so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
   completions, item detail with interactive 30-day price-band chart (p05–p95,
   median, VWAP), opportunities, market overview, live watchlist, cross-target
@@ -268,9 +268,12 @@ block may also carry `saleRate180d` (the same sell-through estimator over 180
 days — the slow demand window), and the ledger-recency pair
 `daysSinceLastSale` / `closuresSinceLastSale` (days since the ledger last
 credited a sale, and how many listings closed after it — the "stopped
-selling" churn signal; the TSM `NumExpires` analog). All three are **absent
-when the ledger has no evidence** — never zero, so "missing" and "genuinely
-zero" stay distinguishable. The executable source of truth:
+selling" churn signal; the TSM `NumExpires` analog; counted from the sold
+listing's first-sighting day, so it includes the listing's time on market).
+In the Lua feed all three are **absent when the ledger has no evidence** —
+never zero, so "missing" and "genuinely zero" stay distinguishable; the
+JSON feed and the metrics API serialize the same absence as explicit
+`null`s. The executable source of truth:
 `crates/infra/src/feed.rs`, `scripts/verify_feed.lua`, and the addon's
 `spec/metrics_parity_spec.lua`.
 

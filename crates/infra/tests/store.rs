@@ -1935,3 +1935,102 @@ fn sale_recency_tracks_last_credit_and_closures_after_it() {
 
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[test]
+fn pooled_sale_recency_takes_the_newest_variant_sale_and_sums_closures_after_it() {
+    const DAY: i64 = 86_400;
+    let dir = temp_dir("pooled-sale-recency");
+    let t = |d: i64, hour: i64| d * DAY + hour * 3_600;
+    let store = open_store(&dir, t(15, 12));
+    let target = TargetId("us-4".into());
+    let variant_a = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 4 };
+    let variant_b = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
+    let never_sold = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 6 };
+
+    let snap = |_id: i64, at: i64, count: usize| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Auctions,
+        fetched_at: at,
+        source_last_modified: None,
+        entry_count: count as u64,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    let pet_listing = |auction_id: i64, item: &ItemRef, price: i64| {
+        let mut row = listing(auction_id, item, price, 1);
+        row.time_left = TimeLeftBand::Long;
+        row
+    };
+    let pet_expiry = |auction_id: i64, item: &ItemRef, price: i64| {
+        let mut row = listing(auction_id, item, price, 1);
+        row.time_left = TimeLeftBand::Short;
+        row
+    };
+    let mut next_id = 0i64;
+    let mut record = |store: &SqliteStore, at: i64, listings: &[NormalizedListing]| {
+        next_id += 1;
+        store
+            .record(&snap(next_id, at, listings.len()), listings, format!("p{next_id}").as_bytes())
+            .expect("record snapshot")
+    };
+
+    // Variant a: a Long-band sight opens day 10 and vanishes after one hour
+    // (inside the band's lower bound) — the vanish credits, booking the
+    // credit on the OPEN day 10 and the closure on the close day 10.
+    let open = [pet_listing(1, &variant_a, 900_000)];
+    let s1 = record(&store, t(10, 8), &open);
+    store.observe(&target, PayloadKind::Auctions, &open, s1, t(10, 8)).expect("observe a credit");
+    let s2 = record(&store, t(10, 9), &[]);
+    store.close_missing(&target, PayloadKind::Auctions, s2, t(10, 9)).expect("close a credit");
+
+    // Variant a again: a Short-band sight opens day 11 and vanishes a full
+    // day later — natural expiry, a closure WITHOUT credit on day 12.
+    let open = [pet_expiry(2, &variant_a, 900_000)];
+    let s3 = record(&store, t(11, 8), &open);
+    store.observe(&target, PayloadKind::Auctions, &open, s3, t(11, 8)).expect("observe a expiry");
+    let s4 = record(&store, t(12, 8), &[]);
+    store.close_missing(&target, PayloadKind::Auctions, s4, t(12, 8)).expect("close a expiry");
+
+    // Variant b: a credited sale on day 13 — the POOLED anchor (any variant
+    // selling resets the species' clock).
+    let open = [pet_listing(3, &variant_b, 950_000)];
+    let s5 = record(&store, t(13, 8), &open);
+    store.observe(&target, PayloadKind::Auctions, &open, s5, t(13, 8)).expect("observe b credit");
+    let s6 = record(&store, t(13, 9), &[]);
+    store.close_missing(&target, PayloadKind::Auctions, s6, t(13, 9)).expect("close b credit");
+
+    // Variants b and c expire together on day 15 (Short sights opened day
+    // 14): two closures AFTER the pooled day, one from a member that never
+    // credited a sale — species churn is pooled evidence.
+    let open = [pet_expiry(4, &variant_b, 950_000), pet_expiry(5, &never_sold, 900_000)];
+    let s7 = record(&store, t(14, 9), &open);
+    store
+        .observe(&target, PayloadKind::Auctions, &open, s7, t(14, 9))
+        .expect("observe b/c expiries");
+    let s8 = record(&store, t(15, 8), &[]);
+    store.close_missing(&target, PayloadKind::Auctions, s8, t(15, 8)).expect("close b/c expiries");
+
+    // Pooled: anchor day 13 (MAX — the old earliest-variant MIN would read
+    // 10); closures strictly after it are b's and c's day-15 expiries (2).
+    // Variant a's day-12 closure falls between the anchors — invisible per
+    // member, visible to the pooled query only through the exact pass.
+    let pooled = store
+        .sale_recency_multi(
+            &target,
+            &[variant_a.clone(), variant_b.clone(), never_sold.clone()],
+            Category::Pet,
+        )
+        .expect("sale_recency_multi")
+        .expect("a credited sale exists in the group");
+    assert_eq!(pooled.last_sale_day, 13);
+    assert_eq!(pooled.closures_since, 2);
+
+    // A group where no member ever credited a sale reads as None.
+    let quiet = store
+        .sale_recency_multi(&target, std::slice::from_ref(&never_sold), Category::Pet)
+        .expect("sale_recency_multi quiet");
+    assert_eq!(quiet, None);
+
+    std::fs::remove_dir_all(&dir).ok();
+}

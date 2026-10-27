@@ -454,8 +454,8 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
             "post": post_op(
                 "Create alert rule",
                 concat!("Body: ", "{\"target\", item identity, \"condition\": {...}, \"note\"?} — conditions mirror the /help glossary ",
-                        "(price-below, below-floor, sale-rate-above, days-since-last-sale-above). Rules are skipped while ",
-                        "the target's newest feed is older than [alerts].max_data_age_secs."),
+                        "(price-below, below-floor, sale-rate-above, days-since-last-sale-above). Each market category only observes ",
+                        "while its own feed snapshot is younger than [alerts].max_data_age_secs."),
                 vec![],
                 json!({ "type": "object" }),
             ),

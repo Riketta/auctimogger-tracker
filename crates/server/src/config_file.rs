@@ -471,10 +471,9 @@ fn map_loaded(file: FileConfig) -> Result<LoadedConfig, ConfigError> {
     Ok(LoadedConfig { tracker, observability })
 }
 
-/// Builds the core config from the file shapes, applying the Blizzard
+/// Builds the runtime config from the file model, applying the Blizzard
 /// default auth (OAuth client credentials) and parsing the configured span
 /// names.
-/// Builds the runtime config from the file model.
 ///
 /// # Errors
 ///

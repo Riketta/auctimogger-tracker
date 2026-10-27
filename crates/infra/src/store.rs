@@ -1177,6 +1177,20 @@ impl SalesRepository for SqliteStore {
         let recencies = sale_recencies_by_id(&conn, target, &known, category)?;
         Ok(ids.iter().map(|id| id.and_then(|id| recencies.get(&id)).copied()).collect())
     }
+
+    fn sale_recency_multi(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        category: Category,
+    ) -> Result<Option<amtracker_core::domain::SaleRecency>, StoreError> {
+        let conn = self.open_transaction();
+        let ids = resolve_item_ids(&conn, items)?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        pooled_sale_recency_by_id(&conn, target, &ids, category)
+    }
 }
 
 /// Stored day-row shape shared by `item_day_rows` and its item-scoped
@@ -1377,6 +1391,76 @@ fn sale_recencies_by_id(
         }));
     }
     Ok(out)
+}
+
+/// Pooled ledger recency over several `item_ref` ids (pet variants of one
+/// species share their market): the pooled last-sale day is the MOST RECENT
+/// member's (`MAX` — any variant selling resets the species' clock) and the
+/// closures are the exact sum over EVERY member's rows strictly after that
+/// day; members that never credited a sale contribute their closures too,
+/// since churn in the pooled window is species evidence. `None` when no
+/// member ever credited a sale. Two chunked passes (pooled day, then
+/// closures) stay exact at any group size; placeholders are bound values,
+/// never interpolated input.
+fn pooled_sale_recency_by_id(
+    conn: &Connection,
+    target: &TargetId,
+    ids: &[i64],
+    category: Category,
+) -> Result<Option<amtracker_core::domain::SaleRecency>, StoreError> {
+    /// Ids per query — same chunking rationale as [`sale_rates_by_id`].
+    const POOLED_RECENCY_CHUNK: usize = 500;
+    // Pass 1: the most recent credited-sale day across the whole group.
+    let mut pooled_day: Option<i64> = None;
+    for chunk in ids.chunks(POOLED_RECENCY_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT MAX(day) FROM sales WHERE target_id = ? AND item_ref_id IN ({placeholders})\n             AND category = ? AND credited > 0"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 2);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
+        let mut statement =
+            conn.prepare(&sql).map_err(|e| backend("prepare pooled recency day", e))?;
+        let day = statement
+            .query_row(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, Option<i64>>(0)
+            })
+            .map_err(|e| backend("query pooled recency day", e))?;
+        pooled_day = match (pooled_day, day) {
+            (Some(current), Some(day)) => Some(current.max(day)),
+            (None, Some(day)) => Some(day),
+            (current, None) => current,
+        };
+    }
+    let Some(last_sale_day) = pooled_day else {
+        return Ok(None);
+    };
+    // Pass 2: every member's closures strictly after the pooled day.
+    let mut closures_since = 0i64;
+    for chunk in ids.chunks(POOLED_RECENCY_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT COALESCE(SUM(closed), 0) FROM sales WHERE target_id = ?\n             AND item_ref_id IN ({placeholders}) AND category = ? AND day > ?"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
+        params.push(rusqlite::types::Value::Integer(last_sale_day));
+        let mut statement =
+            conn.prepare(&sql).map_err(|e| backend("prepare pooled recency closures", e))?;
+        let sum = statement
+            .query_row(rusqlite::params_from_iter(params.iter()), |row| row.get::<_, i64>(0))
+            .map_err(|e| backend("query pooled recency closures", e))?;
+        closures_since += sum;
+    }
+    Ok(Some(amtracker_core::domain::SaleRecency { last_sale_day, closures_since }))
 }
 
 /// Persists one rebuilt (target, item, day) group: one fold row per category

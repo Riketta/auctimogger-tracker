@@ -526,7 +526,9 @@ pub struct MetricBlock {
     /// the window (the ledger only accrues this much history over time).
     pub sale_rate_180d: Option<f64>,
     /// Whole days since the last credited sale (ledger-derived, window-
-    /// independent); `None` when no sale was ever credited for the identity.
+    /// independent; counted from the sold sight's open day, so it includes
+    /// the listing's time on market); `None` when no sale was ever credited
+    /// for the identity.
     pub days_since_last_sale: Option<i64>,
     /// Net listings that closed after the last credited sale day (closes −
     /// reversals); `None` for the same reason as `days_since_last_sale` —
@@ -539,7 +541,10 @@ pub struct MetricBlock {
 /// `MetricBlock`'s `days_since_last_sale` / `closures_since_last_sale`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SaleRecency {
-    /// UTC day number of the last credited sale (see `utc_day`).
+    /// UTC day number of the last credited sale (see `utc_day`). Credits
+    /// book on the sold sight's OPEN day — the same day its sale-rate
+    /// denominator was booked — so "days since last sale" includes the
+    /// listing's time on market.
     pub last_sale_day: i64,
     /// Net listings closed strictly after `last_sale_day` — same-day closures
     /// belong to the sale day's own ledger row.

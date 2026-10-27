@@ -267,10 +267,7 @@ impl OpportunityService {
                 out.push(opportunity);
             }
         }
-        match sort {
-            OpportunitySort::Score => apply_sort(&mut out, OpportunitySort::Score),
-            OpportunitySort::LastSale => apply_sort(&mut out, OpportunitySort::LastSale),
-        }
+        apply_sort(&mut out, sort);
         out.truncate(limit.max(1));
         Ok(out)
     }

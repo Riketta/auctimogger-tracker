@@ -1262,10 +1262,10 @@ pub(crate) async fn opportunities_page(
         .filter(|v| v.is_finite())
         .unwrap_or(1.0);
     let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
-    let sort = match params.get("sort").map_or("score", String::as_str) {
-        "last_sale" => amtracker_core::services::opportunity::OpportunitySort::LastSale,
-        _ => amtracker_core::services::opportunity::OpportunitySort::Score,
-    };
+    let sort = params
+        .get("sort")
+        .and_then(|value| amtracker_core::services::opportunity::OpportunitySort::parse(value))
+        .unwrap_or(amtracker_core::services::opportunity::OpportunitySort::Score);
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
@@ -1679,7 +1679,6 @@ pub(crate) async fn watchlist_page(
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
-        let today_day = amtracker_core::domain::utc_day(state.clock.now());
         for row in &report {
             let now = row.blocks.first().and_then(|block| block.as_ref()).map(|b| b.median);
             let week = row.blocks.get(1).and_then(|block| block.as_ref());
@@ -1718,10 +1717,8 @@ pub(crate) async fn watchlist_page(
                 delta,
                 row.sale_rate.map_or(String::new(), |r| format!("{r:.2}")),
                 row.sale_rate.map_or("—".to_string(), |r| format!("{:.0}%", r * 100.0)),
-                row.recency.as_ref().map_or(-1, |recency| today_day - recency.last_sale_day),
-                row.recency.as_ref().map_or(String::new(), |recency| {
-                    format!("{days}", days = today_day - recency.last_sale_day)
-                }),
+                row.days_since_last_sale.unwrap_or(-1),
+                row.days_since_last_sale.map_or(String::new(), |days| days.to_string()),
                 sparkline(&medians),
                 html_escape(row.entry.note.as_deref().unwrap_or("")),
                 html_escape(&human_time(row.entry.added_at)),
@@ -1968,7 +1965,7 @@ pub(crate) async fn help_page() -> Response {
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
         ("watchlist", "Your curated per-target list. Drives feed-slim.lua — the addon consumes exactly those items."),
-        ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Rules are skipped (never fire) while the target's newest feed is older than [alerts].max_data_age_secs, so a dead feed can never manufacture an alert."),
+        ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),
         ("cooldown", "A fired rule re-fires at most once per [alerts].cooldown_secs, so a persistently cheap item does not spam delivery. The anchor is the rule's last-fired stamp."),
         ("delivery", "Where fired alerts go: log (this page + JSON API only), discord (webhook message) or telegram (bot message). Webhook/token values are read from the named environment variables on every send, so rotating them needs no restart."),
         ("generatedAt / source modified", "The feed's freshness anchor: taken from the source's Last-Modified header so the addon can trust how current its data is."),

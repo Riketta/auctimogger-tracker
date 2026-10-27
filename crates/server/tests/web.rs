@@ -789,6 +789,96 @@ async fn alert_api_adds_evaluates_and_removes_rules() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The days-since-last-sale condition end to end: created via POST, echoed
+/// back by the rules read, and its invalid shapes rejected before any write.
+#[tokio::test]
+async fn alert_api_accepts_the_days_since_last_sale_condition() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"target":"t1","type":"item","itemID":2589,
+                         "condition":{"type":"days-since-last-sale-above","days":10}}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK, "valid days condition adds");
+
+    let (status, body) = get(router.clone(), "/api/alerts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let rules = json.get("rules").and_then(Value::as_array).expect("rules array");
+    assert_eq!(rules.len(), 1);
+    assert_eq!(
+        rules[0].get("condition"),
+        Some(&serde_json::json!({"type": "days-since-last-sale-above", "days": 10})),
+        "the condition round-trips"
+    );
+
+    // Missing days and sub-1 days are rejected before any store write.
+    for body in [
+        r#"{"target":"t1","type":"item","itemID":2589,
+             "condition":{"type":"days-since-last-sale-above"}}"#,
+        r#"{"target":"t1","type":"item","itemID":2589,
+             "condition":{"type":"days-since-last-sale-above","days":0}}"#,
+    ] {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/alerts")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST, "rejected: {body}");
+    }
+    let (_, body) = get(router, "/api/alerts?target=t1").await;
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json.get("rules").and_then(Value::as_array).map(Vec::len), Some(1));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The opportunities sort param: `last_sale` is accepted, anything unknown
+/// is a 400 naming the allowed values.
+#[tokio::test]
+async fn opportunities_api_sort_param_validates() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) = get(router.clone(), "/api/opportunities?target=t1&sort=last_sale").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = get(router, "/api/opportunities?target=t1&sort=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert!(body.contains("unknown sort"), "{body}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// app.js is embedded into the binary; the alert form's condition serializer
+/// must know every wire type the API accepts, or the UI silently posts
+/// conditions the server then rejects (the exact drift this guards).
+#[test]
+fn alert_form_serializer_knows_every_condition_wire_type() {
+    let app_js = include_str!("../assets/app.js");
+    for wire in ["price-below", "below-floor", "sale-rate-above", "days-since-last-sale-above"] {
+        assert!(
+            app_js.contains(&format!("type === \"{wire}\"")),
+            "app.js form serializer is missing the `{wire}` branch"
+        );
+    }
+}
+
 // ---------------------------------------------------- catalog name lanes
 
 /// Seeds two day folds for pet species 264, so the warm-up and render lanes
