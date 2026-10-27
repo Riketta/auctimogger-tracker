@@ -8,6 +8,7 @@ use std::{
 use crate::{
     domain::{
         utc_day,
+        BlockLedger,
         Category,
         ItemDayHistogram,
         ItemRef,
@@ -34,6 +35,9 @@ const MAX_CACHE_AGE_SECONDS: i64 = 300;
 
 /// Window for the sell-through rate attached to every block.
 const SALE_RATE_WINDOW_DAYS: i64 = 14;
+/// Slow demand window for `sale_rate_180d` — stable enough to validate
+/// (or discount) a fast-window spike, per the TSM `SaleRate` lesson.
+const SALE_RATE_SLOW_WINDOW_DAYS: i64 = 180;
 
 /// Identities per bulk fold/sale pass. Bounds the fold state one batch
 /// materializes (500 items × up to 30 day-folds) while keeping a market-scale
@@ -210,8 +214,13 @@ impl MetricsService {
         let folds =
             self.history.load_folds(target, items, today - span.days() + 1, today, category)?;
         let rates = self.sales.sale_rate_each(target, items, SALE_RATE_WINDOW_DAYS, category)?;
+        let rates_slow =
+            self.sales.sale_rate_each(target, items, SALE_RATE_SLOW_WINDOW_DAYS, category)?;
+        let recencies = self.sales.sale_recency_each(target, items, category)?;
         let mut blocks = Vec::with_capacity(items.len());
-        for (per_item, rate) in folds.into_iter().zip(rates) {
+        for ((per_item, rate), (rate_slow, recency)) in
+            folds.into_iter().zip(rates).zip(rates_slow.into_iter().zip(recencies))
+        {
             let mut histograms = Vec::new();
             for (_, fold) in per_item {
                 let histogram = fold.histogram();
@@ -219,7 +228,8 @@ impl MetricsService {
                     histograms.push(histogram);
                 }
             }
-            blocks.push(block_from_histograms(&histograms, rate));
+            let ledger = BlockLedger::from_recency(rate, rate_slow, recency, today);
+            blocks.push(block_from_histograms(&histograms, ledger));
         }
         self.cache.put_many(target, category, span, items, &blocks, now)?;
         Ok(blocks)
@@ -276,7 +286,11 @@ impl MetricsService {
             }
             let sale_rate =
                 self.sales.sale_rate_multi(target, group, SALE_RATE_WINDOW_DAYS, category)?;
-            out.push(block_from_histograms(std::slice::from_ref(&merged), sale_rate));
+            let sale_rate_slow =
+                self.sales.sale_rate_multi(target, group, SALE_RATE_SLOW_WINDOW_DAYS, category)?;
+            let recency = self.sales.sale_recency_multi(target, group, category)?;
+            let ledger = BlockLedger::from_recency(sale_rate, sale_rate_slow, recency, today);
+            out.push(block_from_histograms(std::slice::from_ref(&merged), ledger));
         }
         Ok(out)
     }

@@ -52,13 +52,16 @@ weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 
 # Alert rules (per target, managed on the /alerts page or via the API) are
 # evaluated after every ingest cycle. A fired rule re-fires at most once per
-# cooldown window. Delivery: "log" records events in the UI/API only;
+# cooldown window. Rules are skipped while a target's newest feed snapshot is
+# older than max_data_age_secs (0 disables the gate), so a dead feed can
+# never fire an alert. Delivery: "log" records events in the UI/API only;
 # "discord" posts to the webhook URL read from webhook_env; "telegram" sends
 # via the bot token/chat id read from token_env/chat_id_env. Token values are
 # environment variables — never put secrets in this file.
 # [alerts]
 # enabled = true
-# cooldown_secs = 21600    # re-fire the same rule at most every 6 h
+# cooldown_secs = 21600       # re-fire the same rule at most every 6 h
+# max_data_age_secs = 172800  # skip rules while the newest feed is older than 48 h (0 = off)
 # delivery = "log"
 # webhook_env = "AMT_DISCORD_WEBHOOK"   # required when delivery = "discord"
 # token_env = "AMT_TELEGRAM_TOKEN"      # required when delivery = "telegram"

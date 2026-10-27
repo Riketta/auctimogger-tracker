@@ -385,8 +385,10 @@ fn build_app_state(
                 store.clone(),
                 metrics.clone(),
                 store.clone(),
+                store.clone(),
                 dispatcher,
                 clock.clone(),
+                i64::try_from(config.alerts.max_data_age_secs).unwrap_or(i64::MAX),
             ))
         },
         feed_export: Arc::new(FeedExportService::new(

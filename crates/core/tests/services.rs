@@ -59,7 +59,10 @@ use amtracker_core::{
             CycleOutcome,
             IngestCycleService,
         },
-        opportunity::OpportunityService,
+        opportunity::{
+            OpportunityService,
+            OpportunitySort,
+        },
         watchlist::WatchlistService,
     },
 };
@@ -331,6 +334,9 @@ struct FakeSales {
     credits: Mutex<Vec<amtracker_core::domain::SaleCredit>>,
     /// Optional per-item rates served by `sale_rate` (default: none).
     rates: Mutex<HashMap<ItemRef, f64>>,
+    /// Optional per-item ledger recency served by `sale_recency` (default:
+    /// none — never sold).
+    recencies: Mutex<HashMap<ItemRef, amtracker_core::domain::SaleRecency>>,
 }
 
 impl FakeSales {
@@ -340,6 +346,7 @@ impl FakeSales {
             closes: Mutex::new(0),
             credits: Mutex::new(credits),
             rates: Mutex::new(HashMap::new()),
+            recencies: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -376,6 +383,15 @@ impl SalesRepository for FakeSales {
         _category: amtracker_core::domain::Category,
     ) -> Result<Option<f64>, StoreError> {
         Ok(self.rates.lock().unwrap().get(item).copied())
+    }
+
+    fn sale_recency(
+        &self,
+        _target: &TargetId,
+        item: &ItemRef,
+        _category: amtracker_core::domain::Category,
+    ) -> Result<Option<amtracker_core::domain::SaleRecency>, StoreError> {
+        Ok(self.recencies.lock().unwrap().get(item).copied())
     }
 }
 
@@ -827,8 +843,10 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
             clock.clone(),
         )),
         Arc::new(FakeSales::default()),
+        Arc::new(FakeSnapshots::new()),
         Some(dispatched.clone()),
         clock.clone(),
+        0,
     );
 
     // First pass: the price rule fires (100 ≤ 150), the data-less one skips.
@@ -862,8 +880,10 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
             clock.clone(),
         )),
         Arc::new(FakeSales::default()),
+        Arc::new(FakeSnapshots::new()),
         Some(Arc::new(FailingDispatcher)),
         clock.clone(),
+        0,
     );
     let run = failing.evaluate(&target, 21_600).expect("evaluate after cooldown");
     assert_eq!(run.fired, 1);
@@ -874,6 +894,159 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
     // A target without rules evaluates to a quiet zero-run.
     let quiet = service.evaluate(&TargetId("eu-9".into()), 21_600).expect("evaluate empty");
     assert_eq!(quiet.evaluated, 0);
+}
+
+#[test]
+fn days_since_last_sale_alert_fires_and_never_sold_never_fires() {
+    use amtracker_core::{
+        domain::{
+            AlertCondition,
+            NewAlertRule,
+            SaleRecency,
+        },
+        ports::AlertEventRepository,
+        services::alert::AlertEvaluationService,
+    };
+
+    let today = 1_000_000; // utc day 11
+    let target = TargetId("us-4".into());
+    let stale_item = item(3); // last sold 12 days ago
+    let fresh_item = item(4); // sold today
+    let never_sold = item(5);
+
+    let history = Arc::new(FakeHistory::default());
+    let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
+    let sales = Arc::new(FakeSales::default());
+    sales.recencies.lock().unwrap().insert(
+        stale_item.clone(),
+        SaleRecency {
+            last_sale_day: amtracker_core::domain::utc_day(today) - 12,
+            closures_since: 7,
+        },
+    );
+    sales.recencies.lock().unwrap().insert(
+        fresh_item.clone(),
+        SaleRecency { last_sale_day: amtracker_core::domain::utc_day(today), closures_since: 0 },
+    );
+    for item_ref in [&stale_item, &fresh_item, &never_sold] {
+        rules
+            .add(&NewAlertRule {
+                target: target.clone(),
+                item: item_ref.clone(),
+                condition: AlertCondition::DaysSinceLastSaleAbove { days: 10 },
+                note: None,
+            })
+            .expect("add rule");
+    }
+
+    let clock = MutableClock::new(today);
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history,
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        Arc::new(FakeSnapshots::new()),
+        None,
+        clock.clone(),
+        0,
+    );
+
+    let run = service.evaluate(&target, 21_600).expect("evaluate");
+    assert_eq!(run.evaluated, 3);
+    assert_eq!(run.fired, 1, "only the 12-day-stale item fires");
+    let stored = events.recent(&target, 10).expect("recent");
+    assert_eq!(stored.len(), 1);
+    assert_eq!(stored[0].observed, Some(12.0));
+    assert!(stored[0].message.contains("12 days since last sale"), "{}", stored[0].message);
+}
+
+#[test]
+fn stale_feed_snapshot_skips_rules_and_counts_them() {
+    use amtracker_core::{
+        domain::{
+            AlertCondition,
+            NewAlertRule,
+            NewSnapshot,
+            PayloadKind,
+            SnapshotStatus,
+        },
+        ports::AlertEventRepository,
+        services::alert::AlertEvaluationService,
+    };
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let history = Arc::new(FakeHistory::default());
+    let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
+    rules
+        .add(&NewAlertRule {
+            target: target.clone(),
+            item: item(1),
+            condition: AlertCondition::PriceBelow { copper: 150 },
+            note: None,
+        })
+        .expect("add rule");
+
+    let snapshots = Arc::new(FakeSnapshots::new());
+    // One stale feed: the newest snapshot is ~2.3 days old, past the 48h gate.
+    snapshots
+        .record(
+            &NewSnapshot {
+                target: target.clone(),
+                kind: PayloadKind::Commodities,
+                fetched_at: today - 200_000,
+                source_last_modified: None,
+                entry_count: 1,
+                dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::default(),
+                status: SnapshotStatus::Ok,
+            },
+            &[],
+            b"".as_slice(),
+        )
+        .expect("record stale snapshot");
+
+    let clock = MutableClock::new(today);
+    let sales = Arc::new(FakeSales::default());
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history,
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        None,
+        clock.clone(),
+        48 * 60 * 60,
+    );
+
+    // The rule would fire on its block (the fixture fold is 100 ≤ 150), but
+    // the stale gate must refuse — and count the skip.
+    let run = service.evaluate(&target, 21_600).expect("evaluate");
+    assert_eq!(run.evaluated, 1);
+    assert_eq!(run.fired, 0);
+    assert_eq!(run.skipped_stale, 1);
+    let recent = events.recent(&target, 10).expect("recent");
+    assert_eq!(recent.as_slice(), &[], "stale gate must not record events");
 }
 
 #[derive(Default)]
@@ -1202,6 +1375,7 @@ fn opportunity_config() -> TrackerConfig {
             webhook_env: None,
             token_env: None,
             chat_id_env: None,
+            max_data_age_secs: 0,
         },
         catalog: amtracker_core::config::CatalogConfig::default(),
         targets: vec![target()],
@@ -1259,7 +1433,9 @@ fn refresh_prepares_the_scan_so_requests_read_nothing() {
     assert_eq!(covered, 2, "both scanned items are covered");
 
     for _ in 0..3 {
-        let ranked = service.opportunities(&target, Category::Commodity, 1.0, 50).expect("ranked");
+        let ranked = service
+            .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+            .expect("ranked");
         assert_eq!(ranked.len(), 2);
         let overview = service.overview(&target, Category::Commodity, 15).expect("overview");
         assert_eq!(overview.most_active.len(), 2);
@@ -1274,12 +1450,15 @@ fn prepared_ranking_matches_the_inline_semantics() {
     // The same data through the cold inline fallback and through a prepared
     // snapshot must produce identical ranking.
     let (cold, _, _, _) = opportunity_fixture(1_000_000);
-    let inline = cold.opportunities(&target, Category::Commodity, 1.0, 50).expect("inline ranked");
+    let inline = cold
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("inline ranked");
 
     let (prepared, history, sales, _clock) = opportunity_fixture(1_000_000);
     prepared.refresh(&target, Category::Commodity).expect("refresh");
-    let warmed =
-        prepared.opportunities(&target, Category::Commodity, 1.0, 50).expect("prepared ranked");
+    let warmed = prepared
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("prepared ranked");
 
     assert_eq!(inline, warmed, "prepared rates must reproduce the inline math");
     assert_eq!(
@@ -1319,7 +1498,9 @@ fn a_single_troll_floor_cannot_fake_a_deep_discount() {
     let clock = MutableClock::new(1_000_000);
     let service = OpportunityService::new(history, sales, clock, &opportunity_config());
 
-    let ranked = service.opportunities(&target, Category::Commodity, 0.0, 50).expect("ranked");
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
     let top = ranked.first().expect("rankable");
     assert_eq!(top.floor_now, 1, "the displayed floor stays the true min");
     assert_eq!(top.median7, 100_000);
@@ -1340,7 +1521,7 @@ fn stale_snapshot_is_still_served_without_recompute() {
     assert_eq!(service.snapshot_age_secs(&target, Category::Commodity), Some(ttl + 60));
 
     service
-        .opportunities(&target, Category::Commodity, 1.0, 50)
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
         .expect("ranked from the stale snapshot");
     service.overview(&target, Category::Commodity, 15).expect("overview from the stale snapshot");
     assert_eq!(history.item_day_rows_calls(), 1, "a stale snapshot must not recompute inline");
@@ -1352,7 +1533,9 @@ fn cold_cache_falls_back_to_inline_compute() {
     let target = TargetId("us-4".into());
     let (service, history, sales, _clock) = opportunity_fixture(1_000_000);
 
-    let ranked = service.opportunities(&target, Category::Commodity, 1.0, 50).expect("ranked");
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("ranked");
     assert_eq!(ranked.len(), 2);
     assert_eq!(history.item_day_rows_calls(), 1, "cold cache computes inline");
     assert_eq!(sales.sale_rate_each_calls(), 1);
@@ -1398,8 +1581,9 @@ fn a_failed_refresh_keeps_the_previous_snapshot_serving() {
 
     // The failed pass must not evict or poison the cached artifact: ranking
     // and overview keep serving the previous snapshot without store reads.
-    let ranked =
-        service.opportunities(&target, Category::Commodity, 1.0, 50).expect("stale ranked");
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("stale ranked");
     assert_eq!(ranked.len(), 2);
     service.overview(&target, Category::Commodity, 15).expect("stale overview");
     assert_eq!(
@@ -1433,7 +1617,9 @@ fn requests_self_heal_once_a_snapshot_passes_the_backstop() {
     // A dead scheduler would leave the snapshot aging forever; past six TTLs
     // the request path recomputes inline instead of serving it.
     clock.advance(ttl * 6 + 1);
-    let ranked = service.opportunities(&target, Category::Commodity, 1.0, 50).expect("ranked");
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("ranked");
     assert_eq!(ranked.len(), 2);
     assert_eq!(history.item_day_rows_calls(), 2, "the backstop recomputed inline");
     assert_eq!(sales.sale_rate_each_calls(), 2);

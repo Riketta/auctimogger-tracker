@@ -21,6 +21,7 @@ use std::{
 use amtracker_core::{
     domain::{
         utc_day,
+        BlockLedger,
         Category,
         Flavor,
         ItemRef,
@@ -933,7 +934,9 @@ async fn item_detail_page(
                 }
                 // Golden engine on the single-day fold: the chart's
                 // percentiles are exactly what the addon would compute.
-                if let Some(block) = block_from_histograms(std::slice::from_ref(&histogram), None) {
+                if let Some(block) =
+                    block_from_histograms(std::slice::from_ref(&histogram), BlockLedger::NONE)
+                {
                     chart_rows.push(serde_json::json!({
                         "label": day,
                         "median": block.median,
@@ -1107,6 +1110,9 @@ async fn item_detail_page(
         ("vwap", "Volume-weighted average price: Σ(price × qty) ÷ Σqty over the window."),
         ("qty", "Summed quantity across the window's auctions."),
         ("sale rate", "Estimated sell-through over 14 days: fraction of daily sightings that vanish and stay gone long enough to count as sold. “—” = no sell-through evidence yet."),
+        ("sale rate 180d", "The same estimator over 180 days — the slow, stable demand signal that validates (or discounts) a hot 14-day rate. “—” = the ledger has no 180-day sighting evidence yet."),
+        ("days since sale", "Whole days since the ledger last credited a sale (the quiet-stretch clock; TSM's NumExpires analog). “—” = no sale ever credited — a young ledger is not evidence of a stalled market."),
+        ("closures", "Listings that closed after that last credited sale — how long the quiet stretch has been running."),
     ] {
         let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
     }
@@ -1119,6 +1125,9 @@ async fn item_detail_page(
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+             <td class=\"num\" data-v=\"{}\">{}</td>\
+             <td class=\"num\" data-v=\"{}\">{}</td>\
+             <td class=\"num\" data-v=\"{}\">{}</td>\
              <td class=\"num\" data-v=\"{}\">{}</td></tr>",
             span.name(),
             block.n, block.n,
@@ -1133,7 +1142,13 @@ async fn item_detail_page(
             money(block.vwap),
             block.qty_sum, block.qty_sum,
             block.sale_rate.unwrap_or(-1.0),
-            block.sale_rate.map_or_else(|| "—".into(), |rate| format!("{rate:.2}"))
+            block.sale_rate.map_or_else(|| "—".into(), |rate| format!("{rate:.2}")),
+            block.sale_rate_180d.unwrap_or(-1.0),
+            block.sale_rate_180d.map_or_else(|| "—".into(), |rate| format!("{rate:.2}")),
+            block.days_since_last_sale.unwrap_or(-1),
+            block.days_since_last_sale.map_or_else(|| "—".into(), |days| format!("{days}")),
+            block.closures_since_last_sale.unwrap_or(-1),
+            block.closures_since_last_sale.map_or_else(|| "—".into(), |closures| format!("{closures}"))
         );
     }
     body.push_str("</tbody></table></div>");
@@ -1247,10 +1262,14 @@ pub(crate) async fn opportunities_page(
         .filter(|v| v.is_finite())
         .unwrap_or(1.0);
     let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let sort = match params.get("sort").map_or("score", String::as_str) {
+        "last_sale" => amtracker_core::services::opportunity::OpportunitySort::LastSale,
+        _ => amtracker_core::services::opportunity::OpportunitySort::Score,
+    };
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.opportunities(&target, category, min_churn, limit)
+        move || state.opportunities.opportunities(&target, category, min_churn, limit, sort)
     });
     let data = match data.await {
         Ok(Ok(data)) => data,
@@ -1269,6 +1288,27 @@ pub(crate) async fn opportunities_page(
 
     let min_churn_text = format!("{min_churn}");
     let limit_text = format!("{limit}");
+    let sort_text = sort.as_str();
+    let mut sort_options = String::new();
+    for (value, tip_key, tip_text) in [
+        (
+            "score",
+            "sort score",
+            "Weighted ranking score — the default ordering.",
+        ),
+        (
+            "last_sale",
+            "sort stale",
+            "Items whose last credited sale is longest ago first; never-sold identities last (a young ledger is not evidence of a stalled market).",
+        ),
+    ] {
+        let selected = if value == sort_text { " selected" } else { "" };
+        let _ = write!(
+            sort_options,
+            "<option value=\"{value}\"{selected}>{} </option>",
+            tip(tip_key, tip_text)
+        );
+    }
     let mut limit_options = String::new();
     for n in [25usize, 50, 100, 200] {
         let selected = if n == limit { " selected" } else { "" };
@@ -1282,6 +1322,7 @@ pub(crate) async fn opportunities_page(
             ("category", category.as_str()),
             ("min_churn", &min_churn_text),
             ("limit", limit_text.as_str()),
+            ("sort", sort_text),
         ],
     );
 
@@ -1295,6 +1336,8 @@ pub(crate) async fn opportunities_page(
          <input type=\"number\" id=\"min-churn\" name=\"min_churn\" value=\"{min_churn}\" min=\"0\" step=\"0.1\" style=\"width:6rem\">\
          <label for=\"limit\">{}</label>\
          <select id=\"limit\" name=\"limit\">{limit_options}</select>\
+         <label for=\"sort\">{}</label>\
+         <select id=\"sort\" name=\"sort\" data-autosubmit>{sort_options}</select>\
          <button class=\"btn btn-sm btn-primary\" type=\"submit\">apply</button>\
          </form>",
         tip("score", "score = Σ wᵢ·componentᵢ over discount, reliability, churn and stability (weights from [opportunities] in the config; only ratios matter)."),
@@ -1305,6 +1348,7 @@ pub(crate) async fn opportunities_page(
         category_options(category),
         tip("min churn", "Only items with at least this many listings churning per day rank — filters out thin, un-tradeable markets."),
         tip("rows", "Maximum number of ranked items to show."),
+        tip("sort", "Row ordering: weighted score (default) or stalest-since-last-sale first."),
     );
 
     if data.is_empty() {
@@ -1325,6 +1369,8 @@ pub(crate) async fn opportunities_page(
             ("floor now", "Cheapest listing folded today."),
             ("median 7d", "7-day median price."),
             ("samples 7d", "Unique listings folded over the last 7 days (the evidence behind confidence)."),
+            ("last sale", "Whole days since the ledger last credited a sale — the 'stopped selling' churn signal (TSM's NumExpires). — = no sale ever credited."),
+            ("closures", "Listings that closed after that last credited sale — how long the quiet stretch has been running."),
             ("", "Watchlist action (open mode only)."),
         ] {
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
@@ -1341,6 +1387,8 @@ pub(crate) async fn opportunities_page(
                  <td data-v=\"{:.4}\">{}</td>\
                  <td class=\"num\" data-v=\"{:.2}\">{:.1}</td>\
                  <td data-v=\"{:.4}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
@@ -1364,6 +1412,11 @@ pub(crate) async fn opportunities_page(
                 money(o.median7),
                 o.samples7,
                 o.samples7,
+                o.days_since_last_sale.unwrap_or(-1),
+                o.days_since_last_sale.map_or_else(|| "—".into(), |days| format!("{days}")),
+                o.closures_since_last_sale.unwrap_or(-1),
+                o.closures_since_last_sale
+                    .map_or_else(|| "—".into(), |closures| format!("{closures}")),
                 watch_button(open, watched.contains(&item_key(&o.item)), &target, &o.item)
             );
         }
@@ -1614,6 +1667,10 @@ pub(crate) async fn watchlist_page(
                 "sale rate 14d",
                 "Share of this item's listings credited as sold within the last 14 days.",
             ),
+            (
+                "last sale",
+                "Whole days since the ledger last credited a sale — the 'stopped selling' churn signal (TSM's NumExpires). — = no sale ever credited.",
+            ),
             ("trend 30d", "Daily medians over the last 30 days."),
             ("note", "Your free-form note."),
             ("added", "When the entry was added (UTC)."),
@@ -1622,6 +1679,7 @@ pub(crate) async fn watchlist_page(
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
+        let today_day = amtracker_core::domain::utc_day(state.clock.now());
         for row in &report {
             let now = row.blocks.first().and_then(|block| block.as_ref()).map(|b| b.median);
             let week = row.blocks.get(1).and_then(|block| block.as_ref());
@@ -1646,6 +1704,7 @@ pub(crate) async fn watchlist_page(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
                  {}\
                  <td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td><td>{}</td></tr>",
@@ -1659,6 +1718,10 @@ pub(crate) async fn watchlist_page(
                 delta,
                 row.sale_rate.map_or(String::new(), |r| format!("{r:.2}")),
                 row.sale_rate.map_or("—".to_string(), |r| format!("{:.0}%", r * 100.0)),
+                row.recency.as_ref().map_or(-1, |recency| today_day - recency.last_sale_day),
+                row.recency.as_ref().map_or(String::new(), |recency| {
+                    format!("{days}", days = today_day - recency.last_sale_day)
+                }),
                 sparkline(&medians),
                 html_escape(row.entry.note.as_deref().unwrap_or("")),
                 html_escape(&human_time(row.entry.added_at)),
@@ -1690,6 +1753,9 @@ fn condition_label(condition: &amtracker_core::domain::AlertCondition) -> String
             format!("{} median ≤ {} floor", span.name(), percentile.as_str())
         }
         AlertCondition::SaleRateAbove { rate } => format!("14d sale rate ≥ {rate:.2}"),
+        AlertCondition::DaysSinceLastSaleAbove { days } => {
+            format!("days since last sale ≥ {days}")
+        }
     }
 }
 
@@ -1798,6 +1864,7 @@ pub(crate) async fn alerts_page(
              <option value=\"price-below\">d1 median ≤ copper</option>\
              <option value=\"below-floor\">median ≤ floor percentile</option>\
              <option value=\"sale-rate-above\">14d sale rate ≥ rate</option>\
+             <option value=\"days-since-last-sale-above\">days since last sale ≥ days</option>\
              </select>\
              <input name=\"copper\" type=\"number\" min=\"1\" placeholder=\"copper\" aria-label=\"copper threshold\">\
              <select name=\"span\" aria-label=\"span\">\
@@ -1808,6 +1875,7 @@ pub(crate) async fn alerts_page(
              <option value=\"p05\">p05</option><option value=\"p25\">p25</option>\
              </select>\
              <input name=\"rate\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" placeholder=\"rate\" aria-label=\"sale rate threshold\">\
+             <input name=\"days\" type=\"number\" min=\"1\" step=\"1\" placeholder=\"days\" aria-label=\"days since last sale threshold\">\
              <input name=\"note\" placeholder=\"note (optional)\" aria-label=\"rule note\">\
              <button class=\"btn btn-sm\" type=\"submit\">add rule</button>\
              </form>\
@@ -1900,7 +1968,7 @@ pub(crate) async fn help_page() -> Response {
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
         ("watchlist", "Your curated per-target list. Drives feed-slim.lua — the addon consumes exactly those items."),
-        ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle."),
+        ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Rules are skipped (never fire) while the target's newest feed is older than [alerts].max_data_age_secs, so a dead feed can never manufacture an alert."),
         ("cooldown", "A fired rule re-fires at most once per [alerts].cooldown_secs, so a persistently cheap item does not spam delivery. The anchor is the rule's last-fired stamp."),
         ("delivery", "Where fired alerts go: log (this page + JSON API only), discord (webhook message) or telegram (bot message). Webhook/token values are read from the named environment variables on every send, so rotating them needs no restart."),
         ("generatedAt / source modified", "The feed's freshness anchor: taken from the source's Last-Modified header so the addon can trust how current its data is."),

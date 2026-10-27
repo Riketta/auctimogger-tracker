@@ -291,6 +291,10 @@ pub struct FileAlerts {
     /// Telegram chat id env var name (`telegram` delivery).
     #[serde(default)]
     pub chat_id_env: Option<String>,
+    /// Freshness gate, seconds; rules skip while the target's newest feed is
+    /// older. `0` disables. Defaults to 48 hours.
+    #[serde(default = "default_alert_max_data_age")]
+    pub max_data_age_secs: u64,
 }
 
 impl Default for FileAlerts {
@@ -302,6 +306,7 @@ impl Default for FileAlerts {
             webhook_env: None,
             token_env: None,
             chat_id_env: None,
+            max_data_age_secs: default_alert_max_data_age(),
         }
     }
 }
@@ -316,6 +321,10 @@ fn default_alert_cooldown() -> u64 {
 
 fn default_alert_delivery() -> String {
     "log".into()
+}
+
+fn default_alert_max_data_age() -> u64 {
+    48 * 60 * 60
 }
 
 /// File shape of the score-weight table under `[opportunities]`.
@@ -465,10 +474,13 @@ fn map_loaded(file: FileConfig) -> Result<LoadedConfig, ConfigError> {
 /// Builds the core config from the file shapes, applying the Blizzard
 /// default auth (OAuth client credentials) and parsing the configured span
 /// names.
+/// Builds the runtime config from the file model.
 ///
 /// # Errors
+///
 /// Returns [`ConfigError`] when a configured span name is not one of
 /// `d1|d7|d14|d30`.
+#[allow(clippy::too_many_lines)] // one declarative mapping per config section
 fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
     let mut targets = Vec::with_capacity(file.targets.len());
     for target in file.targets {
@@ -554,6 +566,7 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             webhook_env: file.alerts.webhook_env,
             token_env: file.alerts.token_env,
             chat_id_env: file.alerts.chat_id_env,
+            max_data_age_secs: file.alerts.max_data_age_secs,
         },
         catalog: CatalogConfig {
             source: file.catalog.source.unwrap_or_else(|| CatalogConfig::default().source),
@@ -660,7 +673,15 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
         collect_unknown(
             alerts,
             "alerts",
-            &["enabled", "cooldown_secs", "delivery", "webhook_env", "token_env", "chat_id_env"],
+            &[
+                "enabled",
+                "cooldown_secs",
+                "delivery",
+                "webhook_env",
+                "token_env",
+                "chat_id_env",
+                "max_data_age_secs",
+            ],
             &mut unknown,
         );
     }

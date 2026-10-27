@@ -12,6 +12,7 @@ use crate::{
         ItemDayRow,
         ItemRef,
         MetricBlock,
+        SaleRecency,
         Span,
         TargetId,
         WatchlistEntry,
@@ -35,6 +36,9 @@ pub struct WatchlistReportEntry {
     pub blocks: Vec<Option<MetricBlock>>,
     /// Trailing-window sale rate; `None` = no sales rows yet.
     pub sale_rate: Option<f64>,
+    /// Ledger recency; `None` = no credited sale ever (the "stopped
+    /// selling" signal behind the watchlist page and metrics API).
+    pub recency: Option<SaleRecency>,
     /// Per-day aggregate rows over the trend window, ordered by day.
     pub trend: Vec<ItemDayRow>,
 }
@@ -92,14 +96,16 @@ impl WatchlistReportService {
             .map(|span| self.metrics.blocks(target, &items, category, *span))
             .collect::<Result<Vec<_>, _>>()?;
         let rates = self.sales.sale_rate_each(target, &items, sale_days, category)?;
+        let recencies = self.sales.sale_recency_each(target, &items, category)?;
         let mut out = Vec::with_capacity(entries.len());
         for (i, entry) in entries.into_iter().enumerate() {
             let rate = rates.get(i).copied().flatten();
+            let recency = recencies.get(i).copied().flatten();
             let blocks =
                 per_span.iter().map(|spans_items| spans_items.get(i).cloned().flatten()).collect();
             let trend =
                 self.history.item_day_rows_for_item(target, &entry.item, since_day, category)?;
-            out.push(WatchlistReportEntry { entry, blocks, sale_rate: rate, trend });
+            out.push(WatchlistReportEntry { entry, blocks, sale_rate: rate, recency, trend });
         }
         Ok(out)
     }

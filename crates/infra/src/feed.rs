@@ -51,6 +51,18 @@ fn metric_fields_lua(block: &MetricBlock) -> String {
         // `String`'s `fmt::Write` impl is infallible.
         let _ = write!(out, ", saleRate = {rate:.4}");
     }
+    // Additive v3 fields (the addon's ingestor validates known keys and
+    // ignores unknown ones): absent when the ledger has no evidence — never
+    // zero, so "missing" and "genuinely zero" stay distinguishable.
+    if let Some(rate) = block.sale_rate_180d {
+        let _ = write!(out, ", saleRate180d = {rate:.4}");
+    }
+    if let Some(days) = block.days_since_last_sale {
+        let _ = write!(out, ", daysSinceLastSale = {days}");
+    }
+    if let Some(closures) = block.closures_since_last_sale {
+        let _ = write!(out, ", closuresSinceLastSale = {closures}");
+    }
     out
 }
 
@@ -113,6 +125,9 @@ fn metric_json(block: &MetricBlock) -> serde_json::Value {
         "qtySum": block.qty_sum,
         "listingCount": block.listing_count,
         "saleRate": block.sale_rate,
+        "saleRate180d": block.sale_rate_180d,
+        "daysSinceLastSale": block.days_since_last_sale,
+        "closuresSinceLastSale": block.closures_since_last_sale,
     })
 }
 
@@ -276,6 +291,9 @@ mod tests {
             qty_sum: 150,
             listing_count: 5,
             sale_rate: Some(0.25),
+            sale_rate_180d: Some(0.2),
+            days_since_last_sale: Some(9),
+            closures_since_last_sale: Some(14),
         };
         let mut metrics = BTreeMap::new();
         metrics.insert(Span::D1, block.clone());
@@ -309,8 +327,33 @@ mod tests {
         let text = String::from_utf8(lua).expect("utf-8");
         let expected = "AuctiMoggerTrackerFeed = {\n  \
             version = 3,\n  generatedAt = 1760000000,\n  items = {\n    \
-            { itemID = 194784, category = \"commodity\", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500 } } }\n  },\n}\n";
+            { itemID = 194784, category = \"commodity\", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000, daysSinceLastSale = 9, closuresSinceLastSale = 14 } } }\n  },\n}\n";
         assert_eq!(text, expected);
+    }
+
+    /// Ledger evidence absent from a block must render ABSENT, never zero:
+    /// the zero-vs-missing lesson from TSM's `value > 0 and value or nil`.
+    #[test]
+    fn ledger_absence_renders_absent_not_zero() {
+        let mut feed = sample_feed();
+        feed.entries.truncate(1);
+        let d1 = feed.entries[0].metrics.remove(&Span::D1).expect("d1");
+        feed.entries[0].metrics.insert(
+            Span::D1,
+            MetricBlock {
+                sale_rate: None,
+                sale_rate_180d: None,
+                days_since_last_sale: None,
+                closures_since_last_sale: None,
+                ..d1
+            },
+        );
+        let lua = String::from_utf8(FeedCodec.render(&feed, FeedFormat::Lua).expect("render"))
+            .expect("utf-8");
+        assert!(lua.contains("listingCount = 5 }"), "no trailing fields after listingCount: {lua}");
+        assert!(!lua.contains("saleRate180d"), "{lua}");
+        assert!(!lua.contains("daysSinceLastSale"), "{lua}");
+        assert!(!lua.contains("closuresSinceLastSale"), "{lua}");
     }
 
     #[test]
@@ -341,6 +384,9 @@ mod tests {
         assert_eq!(value["items"][0]["category"], "commodity");
         assert_eq!(value["items"][0]["metrics"]["d1"]["median"], 300);
         assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate"], 0.25);
+        assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate180d"], 0.2);
+        assert_eq!(value["items"][0]["metrics"]["d1"]["daysSinceLastSale"], 9);
+        assert_eq!(value["items"][0]["metrics"]["d1"]["closuresSinceLastSale"], 14);
         assert_eq!(value["items"][1]["kind"], "pet");
         assert_eq!(value["items"][1]["category"], "pet");
         assert_eq!(value["items"][1]["speciesID"], 2546);

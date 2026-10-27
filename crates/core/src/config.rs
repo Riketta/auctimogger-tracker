@@ -160,6 +160,10 @@ pub struct AlertsConfig {
     /// Environment variable holding the Telegram chat id
     /// (`delivery = "telegram"`; required for that delivery).
     pub chat_id_env: Option<String>,
+    /// Freshness gate: rules are skipped (and counted as skipped-stale) while
+    /// the target's newest feed snapshot is older than this many seconds, so
+    /// a silently dead feed can never fire alerts. `0` disables the gate.
+    pub max_data_age_secs: u64,
 }
 
 impl AlertsConfig {

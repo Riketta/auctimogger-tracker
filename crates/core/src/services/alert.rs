@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use crate::{
     domain::{
+        utc_day,
         AlertCondition,
         AlertEvent,
         AlertRule,
@@ -16,6 +17,7 @@ use crate::{
         ItemRef,
         NewAlertEvent,
         NewAlertRule,
+        PayloadKind,
         Span,
         TargetId,
     },
@@ -26,6 +28,7 @@ use crate::{
         AlertRuleRepository,
         ClockPort,
         SalesRepository,
+        SnapshotRepository,
     },
     services::metrics::MetricsService,
 };
@@ -45,6 +48,11 @@ pub struct AlertRun {
     pub dispatched: usize,
     /// Fired events whose dispatch failed (logged; never retried here).
     pub dispatch_failures: usize,
+    /// Rules skipped because the target's newest feed snapshot is older than
+    /// `[alerts].max_data_age_secs` (freshness gate). Cooldown-skipped rules
+    /// are neither counted here nor in `evaluated`'s fired accounting — they
+    /// simply never reach observation.
+    pub skipped_stale: usize,
 }
 
 /// Evaluates alert rules and persists/dispatches the events they fire.
@@ -53,23 +61,33 @@ pub struct AlertEvaluationService {
     events: Arc<dyn AlertEventRepository>,
     metrics: Arc<MetricsService>,
     sales: Arc<dyn SalesRepository>,
+    snapshots: Arc<dyn SnapshotRepository>,
     dispatcher: Option<Arc<dyn AlertDispatchPort>>,
     clock: Arc<dyn ClockPort>,
+    /// Freshness gate in seconds: rules are skipped (counted as
+    /// [`AlertRun::skipped_stale`]) when the target's newest feed snapshot is
+    /// older. `0` disables the gate.
+    max_data_age_secs: i64,
 }
 
 impl AlertEvaluationService {
     /// Wires the evaluator to its ports. `dispatcher` is the configured
     /// delivery adapter; `None` (the `log` delivery) still records events —
     /// they surface in the UI and JSON API without any outbound message.
+    /// `snapshots` fuels the freshness gate; `max_data_age_secs` of `0`
+    /// disables gating.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         rules: Arc<dyn AlertRuleRepository>,
         events: Arc<dyn AlertEventRepository>,
         metrics: Arc<MetricsService>,
         sales: Arc<dyn SalesRepository>,
+        snapshots: Arc<dyn SnapshotRepository>,
         dispatcher: Option<Arc<dyn AlertDispatchPort>>,
         clock: Arc<dyn ClockPort>,
+        max_data_age_secs: i64,
     ) -> Self {
-        Self { rules, events, metrics, sales, dispatcher, clock }
+        Self { rules, events, metrics, sales, snapshots, dispatcher, clock, max_data_age_secs }
     }
 
     // ------------------------------------------------------------- rule CRUD
@@ -129,10 +147,21 @@ impl AlertEvaluationService {
     pub fn evaluate(&self, target: &TargetId, cooldown_secs: i64) -> Result<AlertRun, StoreError> {
         let rules = self.rules.list(target)?;
         let now = self.clock.now();
+        // Freshness gate: a rule may only fire on data fresh enough to mean
+        // anything. The TSM addon colors stale prices red but still trades on
+        // them (and its own freshness bookkeeping forgot the commodity feeds
+        // entirely) — we refuse to fire instead. No snapshots at all reads as
+        // "no data yet", not "stale": observation naturally finds nothing.
+        let stale = self.max_data_age_secs > 0
+            && self.snapshot_age(target, now)?.is_some_and(|age| age > self.max_data_age_secs);
         let mut run = AlertRun::default();
         for rule in rules {
             run.evaluated += 1;
             if rule.last_fired_at.is_some_and(|last| now - last < cooldown_secs) {
+                continue;
+            }
+            if stale {
+                run.skipped_stale += 1;
                 continue;
             }
             let Some(observed) = self.observe(&rule)? else {
@@ -243,7 +272,40 @@ impl AlertEvaluationService {
                     _ => Ok(None),
                 }
             }
+            AlertCondition::DaysSinceLastSaleAbove { days } => {
+                let today = utc_day(self.clock.now());
+                let observed_days = self
+                    .sales
+                    .sale_recency(&rule.target, &rule.item, category)?
+                    .map(|recency| today - recency.last_sale_day);
+                match observed_days {
+                    Some(idle_days) if idle_days >= days => Ok(Some(Observation {
+                        value: Some(days_observation(idle_days)),
+                        message: format!(
+                            "{label}: {idle_days} days since last sale (target ≥ {days})"
+                        ),
+                    })),
+                    _ => Ok(None),
+                }
+            }
         }
+    }
+
+    /// Age in seconds of the target's newest feed snapshot (source
+    /// `Last-Modified` when present, else the fetch stamp); `None` when the
+    /// target has no snapshots at all.
+    fn snapshot_age(&self, target: &TargetId, now: i64) -> Result<Option<i64>, StoreError> {
+        let mut newest: Option<i64> = None;
+        for kind in [PayloadKind::Commodities, PayloadKind::Auctions] {
+            if let Some(meta) = self.snapshots.latest(target, kind)? {
+                let stamp = meta.source_last_modified.unwrap_or(meta.fetched_at);
+                newest = Some(match newest {
+                    Some(current) => current.max(stamp),
+                    None => stamp,
+                });
+            }
+        }
+        Ok(newest.map(|stamp| now - stamp))
     }
 }
 
@@ -268,6 +330,12 @@ struct Observation {
 #[allow(clippy::cast_precision_loss)]
 fn median_observation(median: i64) -> f64 {
     median as f64
+}
+
+/// Days-since-last-sale as the event's observed value (display-only widening).
+#[allow(clippy::cast_precision_loss)]
+fn days_observation(days: i64) -> f64 {
+    days as f64
 }
 
 /// Compact identity label for event messages: items by id, pets by their

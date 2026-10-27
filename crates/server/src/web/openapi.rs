@@ -262,6 +262,7 @@ fn spec_paths_market(target: &Value) -> Value {
                     category_param(),
                     json!({ "name": "min_churn", "in": "query", "required": false, "description": "Only items with at least this many unique listings churning per day rank (per category). Non-finite values fall back to the default.", "schema": { "type": "number", "default": 1.0 } }),
                     json!({ "name": "limit", "in": "query", "required": false, "description": "Maximum rows per category; 0 is treated as 1.", "schema": { "type": "integer", "default": 50 } }),
+                    json!({ "name": "sort", "in": "query", "required": false, "description": "Row ordering: score (weighted score, default) or last_sale (stalest days-since-last-sale first; never-sold rows last). Unknown values are rejected with 400.", "schema": { "type": "string", "enum": ["score", "last_sale"], "default": "score" } }),
                 ],
                 ok_json_ref("OpportunitiesResponse"),
             ),
@@ -453,7 +454,8 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
             "post": post_op(
                 "Create alert rule",
                 concat!("Body: ", "{\"target\", item identity, \"condition\": {...}, \"note\"?} — conditions mirror the /help glossary ",
-                        "(price-below, below-floor, sale-rate-above)."),
+                        "(price-below, below-floor, sale-rate-above, days-since-last-sale-above). Rules are skipped while ",
+                        "the target's newest feed is older than [alerts].max_data_age_secs."),
                 vec![],
                 json!({ "type": "object" }),
             ),
@@ -484,6 +486,7 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
 }
 
 /// Price/statistics schemas shared by the ranking and history payloads.
+#[allow(clippy::too_many_lines)] // one flat JSON literal per schema
 fn spec_schemas_market() -> Value {
     json!({
         "ItemRef": {
@@ -513,7 +516,9 @@ fn spec_schemas_market() -> Value {
         "MetricBlock": {
             "description": concat!("Nearest-rank price statistics over one span window; all price fields are integer copper. ",
                                    "n is unique auctions folded (dedup'd per day), vwap is the quantity-weighted mean ",
-                                   "(median fallback when qty is 0), saleRate is the trailing-14d sell-through fraction."),
+                                   "(median fallback when qty is 0), saleRate is the trailing-14d sell-through fraction and ",
+                                   "saleRate180d the same estimator over 180 days (the slow demand window). ",
+                                   "daysSinceLastSale/closuresSinceLastSale are ledger recency (null = no credited sale ever)."),
             "type": "object",
             "properties": {
                 "n": { "type": "integer" },
@@ -528,7 +533,10 @@ fn spec_schemas_market() -> Value {
                 "vwap": { "type": "integer" },
                 "qtySum": { "type": "integer" },
                 "listingCount": { "type": "integer" },
-                "saleRate": { "type": ["number", "null"], "description": "0..1; null when no sightings exist." }
+                "saleRate": { "type": ["number", "null"], "description": "0..1; null when no sightings exist." },
+                "saleRate180d": { "type": ["number", "null"], "description": "0..1 over 180 days; null when the window has no sighting evidence." },
+                "daysSinceLastSale": { "type": ["integer", "null"], "description": "Whole days since the ledger last credited a sale; null = never sold." },
+                "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale; null alongside daysSinceLastSale." }
             }
         },
         "Opportunity": {
@@ -544,7 +552,9 @@ fn spec_schemas_market() -> Value {
                 "stability": { "type": "number", "description": "1 - min(1, mad7/median7)." },
                 "samples7": { "type": "integer", "description": "Unique listings folded over the window." },
                 "confidence": { "type": "number", "description": "min(1, samples7/[opportunities].min_samples)." },
-                "score": { "type": "number", "description": "Weighted ranking score — for RANKING only." }
+                "score": { "type": "number", "description": "Weighted ranking score — for RANKING only." },
+                "daysSinceLastSale": { "type": ["integer", "null"], "description": "Whole days since the ledger last credited a sale; null = no credited sale ever (sorts last under sort=last_sale)." },
+                "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale." }
             }
         },
         "OpportunitiesResponse": {

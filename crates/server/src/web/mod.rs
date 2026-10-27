@@ -503,6 +503,7 @@ mod tests {
                 webhook_env: None,
                 token_env: None,
                 chat_id_env: None,
+                max_data_age_secs: 0,
             },
             catalog: amtracker_core::config::CatalogConfig::default(),
             targets: vec![amtracker_core::config::TargetConfig {

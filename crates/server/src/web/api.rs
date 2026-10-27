@@ -400,9 +400,10 @@ pub(crate) async fn api_history(
     }
 }
 
-/// `GET /api/opportunities?target=&category=&min_churn=&limit=` — without
-/// `category`, one response keyed by all three categories; with it, the bare
-/// single-category shape. Every row names its category.
+/// `GET /api/opportunities?target=&category=&min_churn=&limit=&sort=` —
+/// without `category`, one response keyed by all three categories; with it,
+/// the bare single-category shape. Every row names its category. `sort` is
+/// `score` (default) or `last_sale` (stalest first).
 pub(crate) async fn api_opportunities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -421,6 +422,17 @@ pub(crate) async fn api_opportunities(
         .filter(|v| v.is_finite())
         .unwrap_or(1.0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let sort = match params.get("sort").map_or("score", String::as_str) {
+        "score" => amtracker_core::services::opportunity::OpportunitySort::Score,
+        "last_sale" => amtracker_core::services::opportunity::OpportunitySort::LastSale,
+        other => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("unknown sort '{other}' (expected score|last_sale)"),
+            )
+                .into_response();
+        }
+    };
     let list = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
@@ -434,7 +446,7 @@ pub(crate) async fn api_opportunities(
                 .map(|category| {
                     state
                         .opportunities
-                        .opportunities(&target, *category, min_churn, limit)
+                        .opportunities(&target, *category, min_churn, limit, sort)
                         .map(|rows| (*category, rows))
                 })
                 .collect()
@@ -457,6 +469,8 @@ pub(crate) async fn api_opportunities(
                             "samples7": o.samples7,
                             "confidence": o.confidence,
                             "score": o.score,
+                            "daysSinceLastSale": o.days_since_last_sale,
+                            "closuresSinceLastSale": o.closures_since_last_sale,
                         })
                     })
                     .collect::<Vec<_>>()
@@ -565,6 +579,9 @@ fn metric_block_json(block: &amtracker_core::domain::MetricBlock) -> serde_json:
         "median": block.median, "p75": block.p75, "p95": block.p95, "max": block.max,
         "mad": block.mad, "vwap": block.vwap, "qtySum": block.qty_sum,
         "listingCount": block.listing_count, "saleRate": block.sale_rate,
+        "saleRate180d": block.sale_rate_180d,
+        "daysSinceLastSale": block.days_since_last_sale,
+        "closuresSinceLastSale": block.closures_since_last_sale,
     })
 }
 
@@ -886,6 +903,7 @@ pub(crate) async fn api_watchlist_metrics(
         }
     });
     let span_names: Vec<&'static str> = spans.iter().map(Span::name).collect();
+    let today = amtracker_core::domain::utc_day(state.clock.now());
     match report.await {
         Ok(Ok(list)) => {
             let entries_json =
@@ -902,6 +920,14 @@ pub(crate) async fn api_watchlist_metrics(
                         .map(|(name, block)| (name.to_string(), metric_block_json(block)))
                         .collect::<serde_json::Map<String, serde_json::Value>>(),
                     "saleRate": entry.sale_rate,
+                    "daysSinceLastSale": entry
+                        .recency
+                        .as_ref()
+                        .map(|recency| today - recency.last_sale_day),
+                    "closuresSinceLastSale": entry
+                        .recency
+                        .as_ref()
+                        .map(|recency| recency.closures_since),
                     "trend": entry.trend.iter().map(|row| serde_json::json!({
                         "day": row.day,
                         "listingCount": row.listing_count,
@@ -1124,13 +1150,15 @@ pub(crate) async fn api_watchlist_delete(
 /// JSON shape of one alert condition (the tagged union of rule triggers).
 #[derive(Deserialize)]
 pub(crate) struct AlertConditionPost {
-    /// `price-below` | `below-floor` | `sale-rate-above`.
+    /// `price-below` | `below-floor` | `sale-rate-above` |
+    /// `days-since-last-sale-above`.
     #[serde(rename = "type")]
     kind: String,
     copper: Option<i64>,
     span: Option<String>,
     percentile: Option<String>,
     rate: Option<f64>,
+    days: Option<i64>,
 }
 
 impl AlertConditionPost {
@@ -1166,8 +1194,16 @@ impl AlertConditionPost {
                 }
                 Ok(AlertCondition::SaleRateAbove { rate })
             }
+            "days-since-last-sale-above" => {
+                let days = self.days.ok_or("days-since-last-sale-above requires days")?;
+                if days < 1 {
+                    return Err("days must be at least 1".into());
+                }
+                Ok(AlertCondition::DaysSinceLastSaleAbove { days })
+            }
             other => Err(format!(
-                "unknown condition type '{other}' (expected price-below|below-floor|sale-rate-above)"
+                "unknown condition type '{other}' (expected \
+                 price-below|below-floor|sale-rate-above|days-since-last-sale-above)"
             )),
         }
     }
@@ -1187,6 +1223,9 @@ fn condition_json(condition: &amtracker_core::domain::AlertCondition) -> serde_j
         }),
         AlertCondition::SaleRateAbove { rate } => {
             serde_json::json!({ "type": "sale-rate-above", "rate": rate })
+        }
+        AlertCondition::DaysSinceLastSaleAbove { days } => {
+            serde_json::json!({ "type": "days-since-last-sale-above", "days": days })
         }
     }
 }

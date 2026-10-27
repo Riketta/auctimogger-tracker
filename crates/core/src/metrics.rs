@@ -3,6 +3,7 @@
 //! either side without the other must fail a spec).
 
 use crate::domain::{
+    BlockLedger,
     ItemDayHistogram,
     MetricBlock,
 };
@@ -31,7 +32,7 @@ use crate::domain::{
 #[must_use]
 pub fn block_from_histograms(
     histograms: &[ItemDayHistogram],
-    sale_rate: Option<f64>,
+    ledger: BlockLedger,
 ) -> Option<MetricBlock> {
     let mut samples: Vec<i64> = Vec::new();
     // `qty_sum` saturates like the ranking math: the i128 `value_qty` care
@@ -98,7 +99,10 @@ pub fn block_from_histograms(
         vwap,
         qty_sum,
         listing_count: n,
-        sale_rate,
+        sale_rate: ledger.sale_rate,
+        sale_rate_180d: ledger.sale_rate_slow,
+        days_since_last_sale: ledger.days_since_last_sale,
+        closures_since_last_sale: ledger.closures_since_last_sale,
     })
 }
 
@@ -133,7 +137,8 @@ mod tests {
     }
 
     fn block(samples: &[(i64, i64)]) -> MetricBlock {
-        block_from_histograms(&[hist_from_samples(samples)], None).expect("data present")
+        block_from_histograms(&[hist_from_samples(samples)], BlockLedger::NONE)
+            .expect("data present")
     }
 
     /// GOLDEN VECTOR V1 — odd sample count. Mirrored in the addon repo's
@@ -203,7 +208,8 @@ mod tests {
         merged.buckets.insert(250, PriceBucket { listings: 1, qty: 5 });
         merged.listing_count = 4;
         merged.qty_sum = 65;
-        let from_bucket = block_from_histograms(&[merged], None).expect("data present");
+        let from_bucket =
+            block_from_histograms(&[merged], BlockLedger::NONE).expect("data present");
 
         assert_eq!(from_bucket, expanded);
         assert_eq!(from_bucket.median, 100); // samples: 100,100,100,250 → middle pair 100,100
@@ -219,8 +225,8 @@ mod tests {
 
     #[test]
     fn empty_input_yields_none() {
-        assert!(block_from_histograms(&[], None).is_none());
-        assert!(block_from_histograms(&[ItemDayHistogram::default()], None).is_none());
+        assert!(block_from_histograms(&[], BlockLedger::NONE).is_none());
+        assert!(block_from_histograms(&[ItemDayHistogram::default()], BlockLedger::NONE).is_none());
     }
 
     /// Extreme values: `price * qty` products that overflow any i64
@@ -232,7 +238,8 @@ mod tests {
         hist.buckets.insert(i64::MAX - 1, PriceBucket { listings: 2, qty: i64::MAX });
         hist.listing_count = 2;
         hist.qty_sum = i64::MAX;
-        let b = block_from_histograms(std::slice::from_ref(&hist), None).expect("data present");
+        let b = block_from_histograms(std::slice::from_ref(&hist), BlockLedger::NONE)
+            .expect("data present");
         assert_eq!(b.qty_sum, i64::MAX);
         assert_eq!(b.vwap, i64::MAX - 1, "floor((MAX-1) · MAX / MAX)");
     }
@@ -249,7 +256,8 @@ mod tests {
         moderate.buckets.insert(100, PriceBucket { listings: 1, qty: 1 });
         moderate.listing_count = 1;
         moderate.qty_sum = 1;
-        let b = block_from_histograms(&[extreme, moderate], None).expect("data present");
+        let b =
+            block_from_histograms(&[extreme, moderate], BlockLedger::NONE).expect("data present");
         assert_eq!(b.qty_sum, i64::MAX, "in-range total quantity");
         assert_eq!(b.vwap, i64::MAX - 2, "floor(((MAX-1)² + 100) / MAX)");
     }

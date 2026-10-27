@@ -86,6 +86,9 @@ fn sample_block_holder(n: i64) -> MetricBlock {
         qty_sum: 50 * n,
         listing_count: n,
         sale_rate: Some(0.125),
+        sale_rate_180d: None,
+        days_since_last_sale: None,
+        closures_since_last_sale: None,
     }
 }
 

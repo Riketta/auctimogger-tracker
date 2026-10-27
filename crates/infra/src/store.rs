@@ -1146,6 +1146,37 @@ impl SalesRepository for SqliteStore {
             })
             .collect())
     }
+
+    fn sale_recency(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        category: Category,
+    ) -> Result<Option<amtracker_core::domain::SaleRecency>, StoreError> {
+        let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(None);
+        };
+        Ok(sale_recencies_by_id(&conn, target, &[item_ref_id], category)?.remove(&item_ref_id))
+    }
+
+    fn sale_recency_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        category: Category,
+    ) -> Result<Vec<Option<amtracker_core::domain::SaleRecency>>, StoreError> {
+        let conn = self.open_transaction();
+        // Positional resolution (None = unknown item), so the result stays
+        // aligned with `items`.
+        let ids = item_ids_in_order(&conn, items)?;
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        if known.is_empty() {
+            return Ok(vec![None; items.len()]);
+        }
+        let recencies = sale_recencies_by_id(&conn, target, &known, category)?;
+        Ok(ids.iter().map(|id| id.and_then(|id| recencies.get(&id)).copied()).collect())
+    }
 }
 
 /// Stored day-row shape shared by `item_day_rows` and its item-scoped
@@ -1298,6 +1329,52 @@ fn sale_rates_by_id(
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| backend("sale_rates row", e))?;
         out.extend(rows.into_iter().map(|(id, credited, listings)| (id, (credited, listings))));
+    }
+    Ok(out)
+}
+
+/// Last credited-sale day plus net closures after it, per `item_ref` id, in
+/// one chunked CTE query per batch (the batched fuel for `sale_recency` and
+/// `sale_recency_each`). Ids without any credited sale are absent from the
+/// result — "days since last sale" is meaningless without a sale. Closures
+/// count strictly after the sale day (`day > last_sale_day`): same-day
+/// closures belong to the sale day's own ledger row, mirroring how the
+/// close-day booking writes them.
+fn sale_recencies_by_id(
+    conn: &Connection,
+    target: &TargetId,
+    ids: &[i64],
+    category: Category,
+) -> Result<HashMap<i64, amtracker_core::domain::SaleRecency>, StoreError> {
+    /// Ids per query — same chunking rationale as [`sale_rates_by_id`].
+    const SALE_RECENCY_CHUNK: usize = 500;
+    let mut out = HashMap::new();
+    for chunk in ids.chunks(SALE_RECENCY_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "WITH last_sale AS (\n             SELECT item_ref_id, MAX(day) AS last_sale_day FROM sales\n             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND category = ?\n               AND credited > 0\n             GROUP BY item_ref_id)\n             SELECT s.item_ref_id, ls.last_sale_day,\n                    COALESCE(SUM(CASE WHEN s.day > ls.last_sale_day THEN s.closed ELSE 0 END), 0)\n             FROM sales s JOIN last_sale ls ON ls.item_ref_id = s.item_ref_id\n             WHERE s.target_id = ? AND s.item_ref_id IN ({placeholders}) AND s.category = ?\n             GROUP BY s.item_ref_id"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() * 2 + 4);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
+        let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare sale_recencies", e))?;
+        let rows = statement
+            .query(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| backend("query sale_recencies", e))?
+            .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("sale_recencies row", e))?;
+        out.extend(rows.into_iter().map(|(id, last_sale_day, closures)| {
+            (id, amtracker_core::domain::SaleRecency { last_sale_day, closures_since: closures })
+        }));
     }
     Ok(out)
 }
@@ -2799,6 +2876,14 @@ struct SerMetricBlock {
     qty_sum: i64,
     listing_count: i64,
     sale_rate: Option<f64>,
+    /// `default` so cache rows written before the ledger-recency upgrade
+    /// deserialize as "absent" instead of failing the whole read.
+    #[serde(default)]
+    sale_rate_180d: Option<f64>,
+    #[serde(default)]
+    days_since_last_sale: Option<i64>,
+    #[serde(default)]
+    closures_since_last_sale: Option<i64>,
 }
 
 impl From<&MetricBlock> for SerMetricBlock {
@@ -2817,6 +2902,9 @@ impl From<&MetricBlock> for SerMetricBlock {
             qty_sum: block.qty_sum,
             listing_count: block.listing_count,
             sale_rate: block.sale_rate,
+            sale_rate_180d: block.sale_rate_180d,
+            days_since_last_sale: block.days_since_last_sale,
+            closures_since_last_sale: block.closures_since_last_sale,
         }
     }
 }
@@ -2837,6 +2925,9 @@ impl From<SerMetricBlock> for MetricBlock {
             qty_sum: ser.qty_sum,
             listing_count: ser.listing_count,
             sale_rate: ser.sale_rate,
+            sale_rate_180d: ser.sale_rate_180d,
+            days_since_last_sale: ser.days_since_last_sale,
+            closures_since_last_sale: ser.closures_since_last_sale,
         }
     }
 }
@@ -2863,6 +2954,11 @@ enum SerAlertCondition {
         /// Threshold fraction (0.0..=1.0).
         rate: f64,
     },
+    /// Mirror of `AlertCondition::DaysSinceLastSaleAbove`.
+    DaysSinceLastSaleAbove {
+        /// Threshold in whole days.
+        days: i64,
+    },
 }
 
 impl From<&amtracker_core::domain::AlertCondition> for SerAlertCondition {
@@ -2875,6 +2971,9 @@ impl From<&amtracker_core::domain::AlertCondition> for SerAlertCondition {
                 percentile: percentile.as_str().to_string(),
             },
             AlertCondition::SaleRateAbove { rate } => Self::SaleRateAbove { rate },
+            AlertCondition::DaysSinceLastSaleAbove { days } => {
+                Self::DaysSinceLastSaleAbove { days }
+            }
         }
     }
 }
@@ -2898,6 +2997,9 @@ impl TryFrom<SerAlertCondition> for amtracker_core::domain::AlertCondition {
                 Ok(AlertCondition::BelowFloor { span, percentile })
             }
             SerAlertCondition::SaleRateAbove { rate } => Ok(AlertCondition::SaleRateAbove { rate }),
+            SerAlertCondition::DaysSinceLastSaleAbove { days } => {
+                Ok(AlertCondition::DaysSinceLastSaleAbove { days })
+            }
         }
     }
 }
@@ -3016,7 +3118,10 @@ mod tests {
         };
         let block = amtracker_core::metrics::block_from_histograms(
             std::slice::from_ref(&histogram),
-            Some(0.5),
+            amtracker_core::domain::BlockLedger {
+                sale_rate: Some(0.5),
+                ..amtracker_core::domain::BlockLedger::NONE
+            },
         )
         .expect("block from non-empty histogram");
         let blocks = [Some(block.clone()), None, Some(block)];

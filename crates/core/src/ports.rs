@@ -372,6 +372,79 @@ pub trait SalesRepository: Send + Sync {
         }
         Ok(rates)
     }
+    /// Ledger recency for one identity: the last credited-sale day and the
+    /// net closures since, in one category. `Ok(None)` when no sale was ever
+    /// credited (items with sales rows but zero credits read as `None` too —
+    /// "days since last sale" is meaningless without a sale).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the ledger cannot be read.
+    fn sale_recency(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        category: Category,
+    ) -> Result<Option<crate::domain::SaleRecency>, StoreError> {
+        let _ = (target, item, category);
+        Ok(None)
+    }
+    /// Ledger recency for EACH of the given identities, positionally aligned
+    /// (`recencies[i]` belongs to `items[i]`). Batched twin of
+    /// [`SalesRepository::sale_recency`]. Scoped to one category.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the ledger cannot be read.
+    fn sale_recency_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        category: Category,
+    ) -> Result<Vec<Option<crate::domain::SaleRecency>>, StoreError> {
+        // Correct-by-default fallback: one query per identity.
+        let mut recencies = Vec::with_capacity(items.len());
+        for item in items {
+            recencies.push(self.sale_recency(target, item, category)?);
+        }
+        Ok(recencies)
+    }
+    /// Ledger recency pooled over several item identities (pet variants of
+    /// one species share their market): the EARLIEST member's last-sale day
+    /// (a variant selling resets the whole species' clock) and the summed
+    /// closures after that day across all members. `Ok(None)` when no member
+    /// ever credited a sale.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the ledger cannot be read.
+    fn sale_recency_multi(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        category: Category,
+    ) -> Result<Option<crate::domain::SaleRecency>, StoreError> {
+        // Correct-by-default fallback: pool the per-identity readings.
+        let mut last_sale_day: Option<i64> = None;
+        let mut closures_since = 0i64;
+        let mut sold_any = false;
+        for recency in self.sale_recency_each(target, items, category)? {
+            let Some(recency) = recency else { continue };
+            sold_any = true;
+            last_sale_day = Some(match last_sale_day {
+                Some(day) => day.min(recency.last_sale_day),
+                None => recency.last_sale_day,
+            });
+            closures_since += recency.closures_since;
+        }
+        if !sold_any {
+            return Ok(None);
+        }
+        Ok(Some(crate::domain::SaleRecency {
+            last_sale_day: last_sale_day.unwrap_or_default(),
+            closures_since,
+        }))
+    }
 }
 
 /// Outbound: memoized span metrics (invalidated per item on ingest).

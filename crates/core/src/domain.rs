@@ -521,6 +521,76 @@ pub struct MetricBlock {
     /// Fraction of vanished listings credited as sold over the trailing
     /// 14 days; `None` when no sightings exist.
     pub sale_rate: Option<f64>,
+    /// Same estimator over the trailing 180 days — the slow, stable demand
+    /// signal behind fast-window spikes; `None` when no sightings exist in
+    /// the window (the ledger only accrues this much history over time).
+    pub sale_rate_180d: Option<f64>,
+    /// Whole days since the last credited sale (ledger-derived, window-
+    /// independent); `None` when no sale was ever credited for the identity.
+    pub days_since_last_sale: Option<i64>,
+    /// Net listings that closed after the last credited sale day (closes −
+    /// reversals); `None` for the same reason as `days_since_last_sale` —
+    /// the "stopped selling" churn signal.
+    pub closures_since_last_sale: Option<i64>,
+}
+
+/// Ledger-derived recency for one identity: the last day a sale was credited
+/// and how many listings have closed since (the raw material behind a
+/// `MetricBlock`'s `days_since_last_sale` / `closures_since_last_sale`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaleRecency {
+    /// UTC day number of the last credited sale (see `utc_day`).
+    pub last_sale_day: i64,
+    /// Net listings closed strictly after `last_sale_day` — same-day closures
+    /// belong to the sale day's own ledger row.
+    pub closures_since: i64,
+}
+
+/// Ledger-derived stats attached to every span block of one identity (they
+/// are window-independent, so all spans of the same (item, category) carry
+/// identical values).
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BlockLedger {
+    /// Trailing 14-day sale rate (the block cache's fast window).
+    pub sale_rate: Option<f64>,
+    /// Trailing 180-day sale rate (the slow demand window).
+    pub sale_rate_slow: Option<f64>,
+    /// Days since the last credited sale; `None` = never sold in the ledger.
+    pub days_since_last_sale: Option<i64>,
+    /// Net closures after the last credited sale; `None` alongside
+    /// `days_since_last_sale`.
+    pub closures_since_last_sale: Option<i64>,
+}
+
+impl BlockLedger {
+    /// No ledger evidence at all — the historic `block_from_histograms(..,
+    /// None)` argument.
+    pub const NONE: Self = Self {
+        sale_rate: None,
+        sale_rate_slow: None,
+        days_since_last_sale: None,
+        closures_since_last_sale: None,
+    };
+
+    /// Builds the ledger from a sale recency reading, counting whole days
+    /// since the last credited sale as of `today` (day number).
+    #[must_use]
+    pub fn from_recency(
+        sale_rate: Option<f64>,
+        sale_rate_slow: Option<f64>,
+        recency: Option<SaleRecency>,
+        today: i64,
+    ) -> Self {
+        match recency {
+            None => Self { sale_rate, sale_rate_slow, ..Self::NONE },
+            Some(recency) => Self {
+                sale_rate,
+                sale_rate_slow,
+                days_since_last_sale: Some(today - recency.last_sale_day),
+                closures_since_last_sale: Some(recency.closures_since),
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------- feed
@@ -750,6 +820,14 @@ pub enum AlertCondition {
     SaleRateAbove {
         /// Threshold fraction (0.0..=1.0).
         rate: f64,
+    },
+    /// Whole days since the ledger last credited a sale reach `days` or more
+    /// — the item has gone quiet (the `NumExpires` lesson from TSM). Identities
+    /// with no credited sale at all never fire: a young ledger is not evidence
+    /// of a stalled market.
+    DaysSinceLastSaleAbove {
+        /// Threshold in whole days (≥ 1).
+        days: i64,
     },
 }
 

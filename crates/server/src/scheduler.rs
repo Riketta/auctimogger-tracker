@@ -791,7 +791,14 @@ fn evaluate_alerts(state: &Arc<AppState>, target: &str) {
             fired = run.fired,
             dispatched = run.dispatched,
             failures = run.dispatch_failures,
+            skipped_stale = run.skipped_stale,
             "alerts evaluated"
+        ),
+        Ok(run) if run.skipped_stale > 0 => tracing::warn!(
+            target,
+            evaluated = run.evaluated,
+            skipped_stale = run.skipped_stale,
+            "alerts skipped: feed data older than [alerts].max_data_age_secs"
         ),
         Ok(_) => {}
         Err(error) => {

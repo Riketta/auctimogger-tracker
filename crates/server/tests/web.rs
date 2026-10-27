@@ -175,6 +175,7 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             webhook_env: None,
             token_env: None,
             chat_id_env: None,
+            max_data_age_secs: 0,
         },
         catalog: CatalogConfig::default(),
         targets: vec![TargetConfig {
@@ -302,8 +303,10 @@ fn test_state_with_config(
             store.clone(),
             metrics.clone(),
             store.clone(),
+            store.clone(),
             None,
             clock.clone(),
+            0,
         )),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),

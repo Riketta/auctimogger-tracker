@@ -650,6 +650,9 @@ fn metrics_cache_round_trips_and_invalidates() {
         qty_sum: 900,
         listing_count: 42,
         sale_rate: None,
+        sale_rate_180d: None,
+        days_since_last_sale: None,
+        closures_since_last_sale: None,
     };
     store.put(&target, &item, Category::Commodity, Span::D1, &block, 1234).expect("put");
 
@@ -691,6 +694,9 @@ fn metrics_cache_invalidation_targets_only_named_items() {
         qty_sum: 900,
         listing_count: 42,
         sale_rate: None,
+        sale_rate_180d: None,
+        days_since_last_sale: None,
+        closures_since_last_sale: None,
     };
     store.put(&target, &item_a, Category::Commodity, Span::D1, &block, 1234).expect("put a d1");
     store.put(&target, &item_b, Category::Commodity, Span::D1, &block, 1234).expect("put b d1");
@@ -1101,6 +1107,9 @@ fn metrics_cache_get_many_aligns_blocks_with_identities() {
         qty_sum: 1,
         listing_count: 1,
         sale_rate: None,
+        sale_rate_180d: None,
+        days_since_last_sale: None,
+        closures_since_last_sale: None,
     };
 
     store.put(&target, &item1, Category::Item, Span::D7, &block(100), 999).expect("put item1");
@@ -1855,6 +1864,74 @@ fn id_reuse_reversal_books_on_the_prior_identity_and_reopens_under_the_new_one()
     assert_eq!(credits.first().map(|c| c.item.clone()), Some(item(2)));
     let rate2 = store.sale_rate(&target, &item(2), 14, Category::Commodity).expect("rate2");
     assert_eq!(rate2, Some(1.0), "item 2: 1 credit against its own 1 listing");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn sale_recency_tracks_last_credit_and_closures_after_it() {
+    const DAY: i64 = 86_400;
+    let dir = temp_dir("sale-recency");
+    // Clock pinned to day 15: `sale_recency` measures "days since" against
+    // the injected clock; the cycles below pass their own `at` stamps, so
+    // ledger rows still book on their true days.
+    let t = |d: i64, hour: i64| d * DAY + hour * 3_600;
+    let store = open_store(&dir, t(15, 12));
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+
+    let snap = |_id: i64, at: i64, count: usize| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at: at,
+        source_last_modified: None,
+        entry_count: count as u64,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+
+    // Day 12: a Long-band sight opens at 08:00 and is gone by 09:00 —
+    // vanished well before the band's 2 h lower bound, so the vanishing
+    // credits as a sale (open-day cohort booking) and the closure itself
+    // books on the close day.
+    let mut open1 = [listing(1, &item1, 100, 1)];
+    open1[0].time_left = TimeLeftBand::Long;
+    store.record(&snap(1, t(12, 8), open1.len()), &open1, b"p1".as_slice()).expect("record s1");
+    store.observe(&target, PayloadKind::Commodities, &open1, 1, t(12, 8)).expect("observe s1");
+    store.record(&snap(2, t(12, 9), 0), &[], b"p2".as_slice()).expect("record s2");
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, 2, t(12, 9)).expect("close s2");
+    assert_eq!(credits.len(), 1, "the 1-hour vanish credits");
+
+    // Day 14: a fresh Short-band sight opens; day 15 it vanishes after ten
+    // minutes — inside the band, so it closes WITHOUT a credit.
+    let open2 = [listing(2, &item1, 120, 1)];
+    let mut short = open2;
+    short[0].time_left = TimeLeftBand::Short;
+    store.record(&snap(3, t(14, 10), short.len()), &short, b"p3".as_slice()).expect("record s3");
+    store.observe(&target, PayloadKind::Commodities, &short, 3, t(14, 10)).expect("observe s3");
+    store.record(&snap(4, t(15, 8), 0), &[], b"p4".as_slice()).expect("record s4");
+    store.close_missing(&target, PayloadKind::Commodities, 4, t(15, 8)).expect("close s4");
+
+    // Recency: last credited sale on day 12 (its own close books on the
+    // same day, so the strict `day > last_sale_day` excludes it); the only
+    // later closure is the quiet Short vanish (day 15). Days since =
+    // day 15 − day 12 = 3.
+    let recency = store
+        .sale_recency(&target, &item1, Category::Commodity)
+        .expect("sale_recency")
+        .expect("a credited sale exists");
+    assert_eq!(recency.last_sale_day, 12);
+    assert_eq!(recency.closures_since, 1);
+
+    // Batched path stays positionally aligned; a never-sold identity reads
+    // as None (absence, not zero).
+    let recencies = store
+        .sale_recency_each(&target, &[item1.clone(), item(2)], Category::Commodity)
+        .expect("sale_recency_each");
+    assert_eq!(recencies[0].as_ref(), Some(&recency));
+    assert_eq!(recencies[1], None);
 
     std::fs::remove_dir_all(&dir).ok();
 }

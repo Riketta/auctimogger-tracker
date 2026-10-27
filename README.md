@@ -58,7 +58,10 @@ normal for this item, and how do I know this deal is real?"*.
   snapshot metadata and the item-name catalog are kept forever.
 - **Span analytics** — per item and per span (`d1`/`d7`/`d14`/`d30`):
   `n, min, p05, p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`
-  plus a 14-day `saleRate` (`d1` is the current UTC day-to-date, so it is
+  plus a 14-day `saleRate`, its 180-day slow-window twin `saleRate180d`, and
+  the ledger-recency pair `daysSinceLastSale` / `closuresSinceLastSale`
+  (the "stopped selling" churn signal; TSM's `NumExpires` analog)
+  (`d1` is the current UTC day-to-date, so it is
   thin right after midnight). The engine is **bit-identical** to the in-game
   addon's (golden vectors asserted in both repos), and one auction is counted
   once per UTC day at its last observed price (hourly snapshots don't inflate
@@ -69,7 +72,7 @@ normal for this item, and how do I know this deal is real?"*.
 - **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
-- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
+- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`, `days-since-last-sale-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Rules are skipped while a target's newest feed is older than `[alerts].max_data_age_secs` (48 h by default, `0` disables), so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
   completions, item detail with interactive 30-day price-band chart (p05–p95,
   median, VWAP), opportunities, market overview, live watchlist, cross-target
@@ -192,7 +195,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole JSON API + feed surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
-| `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15) |
+| `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
@@ -201,7 +204,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` | every watchlist entry joined to its metric blocks, sale rate and 30-day trend — one batched read (the live watchlist page's contract) |
 | `GET /api/alerts?target=&events=` | a target's alert rules + newest fired events |
-| `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"sale-rate-above","rate":0.3}` |
+| `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"sale-rate-above","rate":0.3}` \| `{"type":"days-since-last-sale-above","days":14}` |
 | `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
@@ -246,7 +249,8 @@ AuctiMoggerTrackerFeed = {
   items = {
     { itemID = 194784, category = "commodity", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200,
       median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366,
-      qtySum = 150, listingCount = 5, saleRate = 0.2500 } } },
+      qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000,
+      daysSinceLastSale = 9, closuresSinceLastSale = 14 } } },
     { kind = "pet", speciesID = 2546, level = 1, qualityID = 3, breedID = 11,
       category = "pet",
       metrics = { /* same block shape */ } },
@@ -259,7 +263,14 @@ categories are separate evidence pools — items and commodities split the
 auction houses, pets split off the item-AH rows by identity — so an item
 trading in both auction houses exports once per category, each entry carrying
 only its own market's metrics. Entries without metrics are omitted; the
-in-game addon's ingestor parses this strictly. The executable source of truth:
+in-game addon's ingestor parses this strictly. Additive v3 fields: each span
+block may also carry `saleRate180d` (the same sell-through estimator over 180
+days — the slow demand window), and the ledger-recency pair
+`daysSinceLastSale` / `closuresSinceLastSale` (days since the ledger last
+credited a sale, and how many listings closed after it — the "stopped
+selling" churn signal; the TSM `NumExpires` analog). All three are **absent
+when the ledger has no evidence** — never zero, so "missing" and "genuinely
+zero" stay distinguishable. The executable source of truth:
 `crates/infra/src/feed.rs`, `scripts/verify_feed.lua`, and the addon's
 `spec/metrics_parity_spec.lua`.
 

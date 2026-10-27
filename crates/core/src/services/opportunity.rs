@@ -22,6 +22,7 @@ use crate::{
         Category,
         ItemDayRow,
         ItemRef,
+        SaleRecency,
         TargetId,
     },
     error::StoreError,
@@ -89,6 +90,45 @@ pub struct Opportunity {
     pub confidence: f64,
     /// Weighted sum of the components (config weights).
     pub score: f64,
+    /// Whole days since the ledger last credited a sale; `None` = no sale
+    /// ever credited (a young ledger is not evidence of a stalled market).
+    pub days_since_last_sale: Option<i64>,
+    /// Net listings that closed after the last credited sale — the "stopped
+    /// selling" churn signal riding with `days_since_last_sale`.
+    pub closures_since_last_sale: Option<i64>,
+}
+
+/// Row ordering for [`OpportunityService::opportunities`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OpportunitySort {
+    /// Weighted score, descending (the default).
+    Score,
+    /// Stalest first: `days_since_last_sale` descending, never-sold rows
+    /// last (no sale evidence is not evidence of a long quiet streak), ties
+    /// broken by score descending. The value-add surfacing of the TSM
+    /// `NumExpires` lesson.
+    LastSale,
+}
+
+impl OpportunitySort {
+    /// Lowercase wire spelling (query param).
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OpportunitySort::Score => "score",
+            OpportunitySort::LastSale => "last_sale",
+        }
+    }
+
+    /// Parses the lowercase spelling; `None` for unknown values.
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "score" => Some(OpportunitySort::Score),
+            "last_sale" => Some(OpportunitySort::LastSale),
+            _ => None,
+        }
+    }
 }
 
 /// One overview row: an item's current median vs its window median, within
@@ -135,6 +175,9 @@ pub struct ScanSnapshot {
     /// 14-day sale rates positionally aligned with `rows` (`None` = the item
     /// has no sales evidence in the window).
     rates: Arc<Vec<Option<f64>>>,
+    /// Ledger recencies positionally aligned with `rows` (`None` = no
+    /// credited sale ever).
+    recencies: Arc<Vec<Option<SaleRecency>>>,
 }
 
 /// Per-item intermediate scan row (pre-filter, pre-ranking).
@@ -203,13 +246,19 @@ impl OpportunityService {
         category: Category,
         min_churn_per_day: f64,
         limit: usize,
+        sort: OpportunitySort,
     ) -> Result<Vec<Opportunity>, StoreError> {
         let scan = self.scan(target, category)?;
         let mut out: Vec<Opportunity> = Vec::new();
-        // Sale rates come with the prepared snapshot, positionally aligned
-        // with the rows; requests never re-query the sales store.
-        for (row, rate) in scan.rows.iter().zip(scan.rates.iter()) {
-            let Some(opportunity) = self.opportunity_for(row, rate.unwrap_or(0.0), category) else {
+        // Sale rates and recencies come with the prepared snapshot,
+        // positionally aligned with the rows; requests never re-query the
+        // sales store.
+        for ((row, rate), recency) in
+            scan.rows.iter().zip(scan.rates.iter()).zip(scan.recencies.iter())
+        {
+            let Some(opportunity) =
+                self.opportunity_for(row, rate.unwrap_or(0.0), *recency, category)
+            else {
                 continue;
             };
             if opportunity.samples7 >= i64::from(self.min_samples)
@@ -218,7 +267,10 @@ impl OpportunityService {
                 out.push(opportunity);
             }
         }
-        out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        match sort {
+            OpportunitySort::Score => apply_sort(&mut out, OpportunitySort::Score),
+            OpportunitySort::LastSale => apply_sort(&mut out, OpportunitySort::LastSale),
+        }
         out.truncate(limit.max(1));
         Ok(out)
     }
@@ -348,16 +400,23 @@ impl OpportunityService {
         // positionally with the stored rows by construction.
         let items: Vec<ItemRef> = scans.iter().map(|scan| scan.item.clone()).collect();
         let rates = self.sales.sale_rate_each(target, &items, SALE_RATE_WINDOW_DAYS, category)?;
+        let recencies = self.sales.sale_recency_each(target, &items, category)?;
         debug_assert_eq!(
             scans.len(),
             rates.len(),
             "sale_rate_each must stay positionally aligned with the scan rows"
+        );
+        debug_assert_eq!(
+            scans.len(),
+            recencies.len(),
+            "sale_recency_each must stay positionally aligned with the scan rows"
         );
         Ok(ScanSnapshot {
             computed_at: now,
             items: scans.len(),
             rows: Arc::new(scans),
             rates: Arc::new(rates),
+            recencies: Arc::new(recencies),
         })
     }
 
@@ -426,6 +485,7 @@ impl OpportunityService {
         &self,
         scan: &ItemScan,
         reliability: f64,
+        recency: Option<SaleRecency>,
         category: Category,
     ) -> Option<Opportunity> {
         if scan.median7 <= 0.0 || scan.floor_now <= 0 {
@@ -453,6 +513,7 @@ impl OpportunityService {
         // the floored integer median, matching the addon's display rule.
         #[allow(clippy::cast_possible_truncation)]
         let median7 = scan.median7 as i64;
+        let today = utc_day(self.clock.now());
         Some(Opportunity {
             item: scan.item.clone(),
             category,
@@ -466,6 +527,8 @@ impl OpportunityService {
             samples7: scan.samples7,
             confidence,
             score,
+            days_since_last_sale: recency.map(|recency| today - recency.last_sale_day),
+            closures_since_last_sale: recency.map(|recency| recency.closures_since),
         })
     }
 
@@ -484,6 +547,24 @@ impl OpportunityService {
             change,
             churn_per_day: scan.churn_per_day,
         })
+    }
+}
+
+/// Applies one row ordering in place. `LastSale` sorts stalest first, ranks
+/// never-sold identities last (no sale evidence is not evidence of a long
+/// quiet streak) and breaks ties by score descending.
+fn apply_sort(out: &mut [Opportunity], sort: OpportunitySort) {
+    match sort {
+        OpportunitySort::Score => {
+            out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        }
+        OpportunitySort::LastSale => {
+            out.sort_by(|a, b| {
+                b.days_since_last_sale.cmp(&a.days_since_last_sale).then_with(|| {
+                    b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal)
+                })
+            });
+        }
     }
 }
 
@@ -528,6 +609,43 @@ mod tests {
         // counts: 1@100, 1@300 → total 2; ranks 1 and 2 → (100+300)/2 = 200
         assert_eq!(weighted_median(&[(100, 1), (300, 1)]), 200.0);
         assert_eq!(weighted_median(&[]), 0.0);
+    }
+
+    /// `last_sale` ordering: stalest first, never-sold last, ties by score.
+    #[test]
+    #[allow(clippy::indexing_slicing)] // fixed synthetic rows, not hostile data
+    fn last_sale_sort_orders_stalest_first_and_never_sold_last() {
+        // score is the tiebreaker only; the fabricated rows are otherwise
+        // identical shells.
+        let row = |score: f64, days: Option<i64>| Opportunity {
+            item: ItemRef::Item { item_id: 1 },
+            category: Category::Commodity,
+            median7: 100,
+            floor_now: 100,
+            discount: 0.0,
+            reliability: 0.0,
+            churn_per_day: 0.0,
+            churn_score: 0.0,
+            stability: 0.0,
+            samples7: 10,
+            confidence: 1.0,
+            score,
+            days_since_last_sale: days,
+            closures_since_last_sale: None,
+        };
+        let mut rows = vec![
+            row(0.9, Some(2)),  // freshest
+            row(0.1, None),     // never sold
+            row(0.5, Some(30)), // stalest, ties with the next by score
+            row(0.7, Some(30)), // stalest, higher score
+        ];
+        apply_sort(&mut rows, OpportunitySort::LastSale);
+        assert_eq!(rows[0].days_since_last_sale, Some(30));
+        assert_eq!(rows[0].score, 0.7, "tie on staleness breaks by score");
+        assert_eq!(rows[1].days_since_last_sale, Some(30));
+        assert_eq!(rows[1].score, 0.5);
+        assert_eq!(rows[2].days_since_last_sale, Some(2));
+        assert_eq!(rows[3].days_since_last_sale, None, "never sold ranks last");
     }
 
     #[test]
