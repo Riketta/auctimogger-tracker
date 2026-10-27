@@ -1380,7 +1380,7 @@ pub(crate) async fn opportunities_page(
         for o in &data {
             let _ = write!(
                 body,
-                "<tr><td>{}</td>\
+                "<tr>{}\
                  <td data-v=\"{:.4}\"><strong>{:.3}</strong></td>\
                  <td data-v=\"{:.3}\">{:.0}%</td>\
                  <td data-v=\"{:.4}\">{}</td>\
@@ -1392,7 +1392,7 @@ pub(crate) async fn opportunities_page(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
-                 {}</tr>",
+                 <td>{}</td></tr>",
                 item_cell(&target, &o.item, &names),
                 o.score,
                 o.score,
@@ -1697,14 +1697,14 @@ pub(crate) async fn watchlist_page(
             let medians: Vec<i64> = days.iter().map(|day| day.median).collect();
             let _ = write!(
                 body,
-                "<tr><td>{}</td>\
+                "<tr>{}\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
-                 {}\
+                 <td>{}</td>\
                  <td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td><td>{}</td></tr>",
                 item_cell(&target, &row.entry.item, &names),

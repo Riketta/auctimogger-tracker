@@ -473,6 +473,59 @@ async fn advertised_tables_render_sortable_headers() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Table integrity: every data row carries one cell per header column. The
+/// watchlist sparkline and the opportunities watch button were once emitted
+/// bare inside `<tr>`; browsers foster-parent such content out of the table,
+/// silently shifting the remaining columns one cell to the left.
+#[tokio::test]
+async fn table_rows_carry_a_cell_for_every_header_column() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    let target = TargetId(TARGET.into());
+    state.watchlist.add(&target, ItemRef::Item { item_id: 2589 }, None).expect("watch item");
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router.clone(), "/watchlist?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let (headers, rows) = table_shape(&body, "watchlist");
+    assert_eq!(headers, 11, "watchlist header columns");
+    assert!(!rows.is_empty(), "seeded watchlist renders at least one row");
+    assert!(
+        rows.iter().all(|cells| *cells == headers),
+        "every watchlist row is complete: {rows:?}",
+    );
+    assert!(body.contains("<td><svg"), "the trend sparkline renders inside a cell");
+
+    let (status, body) = get(router, "/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let (headers, rows) = table_shape(&body, "opportunities");
+    assert_eq!(headers, 13, "opportunities header columns");
+    assert!(!rows.is_empty(), "seeded ranking renders at least one row");
+    assert!(rows.iter().all(|cells| *cells == headers), "every ranking row is complete");
+    assert!(body.contains("<td><button"), "the watch action renders inside a cell");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Counts `<th>` headers and per-row `<td>` cells of one table by id. `<th `
+/// (trailing space) so `<thead>` never matches; colspan tables are out of
+/// scope — only whole-row tables assert through this helper.
+fn table_shape(body: &str, table_id: &str) -> (usize, Vec<usize>) {
+    let marker = format!(r#"<table id="{table_id}">"#);
+    let table = body.split_once(&marker).expect("table present").1;
+    let table = table.split("</table>").next().expect("table closed");
+    let thead = table.split_once("<thead>").expect("thead").1;
+    let thead = thead.split("</thead>").next().expect("thead closed");
+    let headers = thead.match_indices("<th ").count();
+    let rows_html = table.split_once("<tbody>").expect("tbody").1;
+    let rows = rows_html
+        .split("<tr>")
+        .skip(1)
+        .map(|row| row.match_indices("<td").count())
+        .filter(|cells| *cells > 0)
+        .collect();
+    (headers, rows)
+}
+
 /// Tables link resolved catalog names (the raw id rides in the data-tip for
 /// the floating tooltip layer) instead of the bare `item {id}` label.
 #[tokio::test]
