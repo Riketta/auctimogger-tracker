@@ -39,7 +39,11 @@ use axum::{
         Query,
         State,
     },
-    response::Response,
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        Response,
+    },
 };
 
 use super::{
@@ -601,10 +605,23 @@ pub(crate) async fn items_page(
     }
 
     // Alphabetical browse below the search (keyset pagination).
+    // A present-but-unparseable `after_id` is a malformed link: rejecting it
+    // beats silently skipping every same-name row below the i64::MAX
+    // tiebreaker (an absent id keeps the legacy tiebreak for name-only
+    // navigation).
+    let after_id = match params.get("after_id") {
+        None => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "after_id must be an integer").into_response();
+            }
+        },
+    };
     let cursor = params.get("after_name").map(|after_name| amtracker_core::domain::BrowseCursor {
         name: after_name.clone(),
         kind: params.get("after_kind").cloned().unwrap_or_else(|| "item".into()),
-        id: params.get("after_id").and_then(|v| v.parse().ok()).unwrap_or(i64::MAX),
+        id: after_id.unwrap_or(i64::MAX),
     });
     let browse = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
@@ -1224,7 +1241,11 @@ pub(crate) async fn opportunities_page(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let min_churn: f64 = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let min_churn: f64 = params
+        .get("min_churn")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(1.0);
     let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);

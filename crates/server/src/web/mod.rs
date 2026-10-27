@@ -479,7 +479,9 @@ mod tests {
             storage: amtracker_core::config::StorageConfig {
                 database: "mem.sqlite3".into(),
                 raw_listing_days: 7,
+                sight_retention_days: 0,
                 archive_dir: "raw".into(),
+                feed_dir: "feeds".into(),
                 backup_dir: None,
                 backup_secs: 0,
                 backup_keep: 7,

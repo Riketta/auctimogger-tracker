@@ -244,7 +244,7 @@ fn spec_paths_market(target: &Value) -> Value {
         "/api/search": {
             "get": get_op(
                 "Catalog search",
-                "Case-insensitive item/pet name search over the resolved catalog. Page with offset until hasMore is false.",
+                "Case-insensitive item/pet name search over the resolved catalog (SQLite NOCASE: case-folding is ASCII-only — non-ASCII names match exact case). Page with offset until hasMore is false.",
                 vec![
                     json!({ "name": "q", "in": "query", "required": true, "description": "Name fragment.", "schema": { "type": "string" } }),
                     json!({ "name": "limit", "in": "query", "required": false, "description": "Page size, clamped to 1..=200.", "schema": { "type": "integer", "default": 20, "minimum": 1, "maximum": 200 } }),
@@ -260,7 +260,7 @@ fn spec_paths_market(target: &Value) -> Value {
                 vec![
                     target.clone(),
                     category_param(),
-                    json!({ "name": "min_churn", "in": "query", "required": false, "description": "Only items with at least this many unique listings churning per day rank (per category).", "schema": { "type": "number", "default": 1.0 } }),
+                    json!({ "name": "min_churn", "in": "query", "required": false, "description": "Only items with at least this many unique listings churning per day rank (per category). Non-finite values fall back to the default.", "schema": { "type": "number", "default": 1.0 } }),
                     json!({ "name": "limit", "in": "query", "required": false, "description": "Maximum rows per category; 0 is treated as 1.", "schema": { "type": "integer", "default": 50 } }),
                 ],
                 ok_json_ref("OpportunitiesResponse"),
@@ -329,7 +329,7 @@ fn spec_paths_items_and_feeds() -> Value {
                     json!({ "name": "target_id", "in": "path", "required": true, "description": "Target slug.", "schema": { "type": "string" } }),
                     json!({ "name": "item_id", "in": "path", "required": true, "description": "Item id.", "schema": { "type": "integer" } }),
                     category_param(),
-                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d1." }),
+                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d1. Unknown span names are rejected with 400." }),
                 ],
                 ok_json(json!({
                     "type": "object",
@@ -348,7 +348,7 @@ fn spec_paths_items_and_feeds() -> Value {
                     json!({ "name": "level", "in": "query", "required": true, "description": "Pet level.", "schema": { "type": "integer" } }),
                     json!({ "name": "quality", "in": "query", "required": true, "description": "Pet quality id.", "schema": { "type": "integer" } }),
                     json!({ "name": "breed", "in": "query", "required": true, "description": "Pet breed id.", "schema": { "type": "integer" } }),
-                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d1.", "schema": { "type": "string" } }),
+                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d1. Unknown span names are rejected with 400.", "schema": { "type": "string" } }),
                 ],
                 ok_json(json!({
                     "type": "object",
@@ -414,7 +414,8 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
             "post": post_op(
                 "Add watchlist entry",
                 concat!("Body: ", "{\"target\", \"type\": \"item\", \"itemID\", \"note\"?} or ",
-                        "{\"target\", \"type\": \"pet\", \"speciesID\", \"level\", \"qualityID\", \"breedID\", \"note\"?}."),
+                        "{\"target\", \"type\": \"pet\", \"speciesID\", \"level\", \"qualityID\", \"breedID\", \"note\"?}.",
+                        " Pet fields are validated (species ≥ 1, level 1..=25, quality 0..=6, breed 3..=11); violations answer 400."),
                 vec![],
                 json!({ "type": "object" }),
             ),
@@ -432,7 +433,7 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
                 vec![
                     target.clone(),
                     category_param(),
-                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d7.", "schema": { "type": "string" } }),
+                    json!({ "name": "span", "in": "query", "required": false, "description": "Comma-separated spans; default d7. Unknown span names are rejected with 400.", "schema": { "type": "string" } }),
                     days_param("sale_days", 14, 90, "Trailing sale-rate window (sale_days)."),
                     json!({ "name": "trend_days", "in": "query", "required": false, "description": "Trend window, clamped to 1..=90.", "schema": { "type": "integer", "default": 30, "minimum": 1, "maximum": 90 } }),
                 ],
@@ -501,10 +502,10 @@ fn spec_schemas_market() -> Value {
                     "required": ["type", "speciesID", "level", "qualityID", "breedID"],
                     "properties": {
                         "type": { "const": "pet" },
-                        "speciesID": { "type": "integer" },
-                        "level": { "type": "integer" },
-                        "qualityID": { "type": "integer" },
-                        "breedID": { "type": "integer" }
+                        "speciesID": { "type": "integer", "description": "Positive species id.", "minimum": 1 },
+                        "level": { "type": "integer", "description": "1..=25.", "minimum": 1, "maximum": 25 },
+                        "qualityID": { "type": "integer", "description": "0 (poor) ..= 6 (artifact).", "minimum": 0, "maximum": 6 },
+                        "breedID": { "type": "integer", "description": "3..=11.", "minimum": 3, "maximum": 11 }
                     }
                 }
             ]

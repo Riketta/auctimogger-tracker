@@ -396,7 +396,7 @@ fn build_app_state(
             metrics,
             clock.clone(),
         )),
-        publisher: Arc::new(FileFeedPublisher::new(PathBuf::from("feeds"))),
+        publisher: Arc::new(FileFeedPublisher::new(PathBuf::from(&config.storage.feed_dir))),
         renderer: Arc::new(FeedCodec),
         cycle: Arc::new(IngestCycleService::new(
             Arc::new(BlizzardSource::new()),

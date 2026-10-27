@@ -3,7 +3,13 @@
 
 // Test assertions may unwrap/expect/panic and index: fixture-driven,
 // deterministic inputs (the SecOutfall precedent).
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::indexing_slicing,
+    clippy::assert_is_empty
+)]
 
 use std::{
     path::PathBuf,
@@ -1216,32 +1222,26 @@ fn alert_rules_and_events_round_trip() {
     );
     assert_eq!(rule.last_fired_at, None);
 
-    store.mark_fired(rule.id, 1_000_500).expect("mark fired");
-    let listed = store.list(&target).expect("list");
-    assert_eq!(listed.len(), 1);
-    assert_eq!(listed[0].last_fired_at, Some(1_000_500));
-    assert_eq!(listed[0].item, pet, "identity rebuilds through the join");
-
-    let event_id = AlertEventRepository::record(
-        &store,
-        &NewAlertEvent {
-            rule_id: rule.id,
-            target: target.clone(),
-            item: pet.clone(),
-            condition: AlertCondition::BelowFloor {
-                span: Span::D7,
-                percentile: FloorPercentile::P25,
-            },
-            observed: Some(0.5),
-            message: "pet 264: d7 median at/below p25 floor".into(),
-            fired_at: 1_000_500,
-        },
-    )
-    .expect("record event");
+    let event = NewAlertEvent {
+        rule_id: rule.id,
+        target: target.clone(),
+        item: pet.clone(),
+        condition: AlertCondition::BelowFloor { span: Span::D7, percentile: FloorPercentile::P25 },
+        observed: Some(0.5),
+        message: "pet 264: d7 median at/below p25 floor".into(),
+        fired_at: 1_000_500,
+    };
+    let event_id = store.record_firing(&event).expect("record firing");
     let events = store.recent(&target, 10).expect("recent");
     assert_eq!(events.len(), 1);
     assert_eq!(events[0].id, event_id);
     assert_eq!(events[0].observed, Some(0.5));
+
+    // record_firing books the cooldown anchor atomically with the event.
+    let listed = store.list(&target).expect("list");
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].last_fired_at, Some(1_000_500));
+    assert_eq!(listed[0].item, pet, "identity rebuilds through the join");
 
     // Removing the rule keeps the event history (events are the audit log).
     assert!(store.remove(rule.id).expect("remove rule"));
@@ -1259,6 +1259,97 @@ fn alert_rules_and_events_round_trip() {
         .expect("add other rule");
     assert_eq!(store.list(&target).expect("list").len(), 0);
     assert_eq!(store.list(&TargetId("eu-9".into())).expect("list").len(), 1);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Databases stamped with a NEWER schema version are refused: running older
+/// code against newer tables would misread them in every query, and the
+/// stamp is never lowered, so the file stays intact for the matching build.
+#[test]
+fn future_schema_files_are_refused_with_the_stamp_intact() {
+    let dir = temp_dir("future-schema");
+    let path = dir.join("db.sqlite3");
+    {
+        let store = open_store(&dir, 1_000);
+        store.latest(&TargetId("us-4".into()), PayloadKind::Commodities).expect("touch");
+    }
+    {
+        let conn = rusqlite::Connection::open(&path).expect("open for stamping");
+        conn.pragma_update(None, "user_version", 99).expect("stamp future version");
+    }
+    let Err(error) = SqliteStore::open(
+        &path,
+        &dir.join("raw"),
+        Arc::new(FixedClock(1_000)) as Arc<dyn ClockPort>,
+    ) else {
+        panic!("future schema must be refused");
+    };
+    assert!(error.to_string().contains("v99"), "the error names the schema version: {error}");
+    // The refusal never touches the file: the matching build can still open it.
+    let conn = rusqlite::Connection::open(&path).expect("reopen");
+    let version: i64 = conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("stamp");
+    assert_eq!(version, 99, "the marker stays untouched");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Sight retention deletes only CLOSED sights closed before the cutoff;
+/// open sights and anything newer stay (the reopen-reversal horizon).
+#[test]
+fn sight_retention_prunes_only_old_closed_sights() {
+    use amtracker_core::ports::SalesRepository;
+
+    let dir = temp_dir("sight-retention");
+    let day = 86_400;
+    let store = open_store(&dir, 111 * day);
+    let target = TargetId("us-4".into());
+
+    // Sight A: opened day 100, closed day 100 (OLD closed → pruned).
+    let a = [listing(1, &item(1), 100, 1)];
+    store.record(&snap(&target, PayloadKind::Commodities, 100 * day, 1), &a, b"s1").expect("s1");
+    store.observe(&target, PayloadKind::Commodities, &a, 1, 100 * day).expect("observe s1");
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 100 * day + 600, 0), &[], b"s2")
+        .expect("s2");
+    store.close_missing(&target, PayloadKind::Commodities, 2, 100 * day + 600).expect("close A");
+
+    // Sight B: opened day 105, closed day 105 (RECENT closed → kept).
+    let b = [listing(2, &item(1), 200, 1)];
+    store.record(&snap(&target, PayloadKind::Commodities, 105 * day, 1), &b, b"s3").expect("s3");
+    store.observe(&target, PayloadKind::Commodities, &b, 3, 105 * day).expect("observe s3");
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 105 * day + 600, 0), &[], b"s4")
+        .expect("s4");
+    store.close_missing(&target, PayloadKind::Commodities, 4, 105 * day + 600).expect("close B");
+
+    // Sight C: opened day 110, never closed (OPEN → kept).
+    let c = [listing(3, &item(1), 300, 1)];
+    store.record(&snap(&target, PayloadKind::Commodities, 110 * day, 1), &c, b"s5").expect("s5");
+    store.observe(&target, PayloadKind::Commodities, &c, 5, 110 * day).expect("observe s5");
+
+    let removed = store.prune_sights_before(&target, 104).expect("prune sights");
+    assert_eq!(removed, 1, "only sight A is older than the cutoff");
+
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let total: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sight WHERE target_id = ?1",
+                rusqlite::params![target.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(total, 2, "recent-closed + open sights survive");
+        let open: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sight WHERE target_id = ?1 AND closed_at IS NULL",
+                rusqlite::params![target.as_str()],
+                |row| row.get(0),
+            )
+            .expect("count open");
+        assert_eq!(open, 1, "the open sight is never pruned");
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1551,6 +1642,219 @@ fn v7_category_migration_rebuilds_folds_from_retained_listings() {
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
         assert_eq!(version, 7, "the file is stamped at the new schema version");
     }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Snapshot helper for the sales-ledger tests below.
+fn snap(target: &TargetId, kind: PayloadKind, at: i64, entries: u64) -> NewSnapshot {
+    NewSnapshot {
+        target: target.clone(),
+        kind,
+        fetched_at: at,
+        source_last_modified: None,
+        entry_count: entries,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    }
+}
+
+/// Credits must book on the sight's OPEN day (the same day its `listings`
+/// denominator books), not on the close day. Otherwise sights opened just
+/// before a trailing window and credited just inside it inflate the rate
+/// past 1.0 — with a 12h `VERY_LONG` floor this needs an open late in day N
+/// credited early in day N+1, which is an ordinary overnight sale.
+#[test]
+fn credits_book_on_the_open_day_so_sale_rate_stays_within_one() {
+    use amtracker_core::ports::SalesRepository;
+
+    let dir = temp_dir("cohort");
+    let day = 86_400;
+    // "Now" is day 110 noon: the 14d sale-rate window covers days 97..110.
+    let store = open_store(&dir, 110 * day + 12 * 3_600);
+    let target = TargetId("us-4".into());
+
+    // Two VERY_LONG sights opened late on day 96 (outside the window). A
+    // sub-12h vanish crossing midnight is a credit: booked on day 97 by the
+    // old close-day scheme, on day 96 by the cohort scheme.
+    let late_evening = 96 * day + 22 * 3_600;
+    let batch = [listing(1, &item(1), 100, 1), listing(2, &item(1), 200, 1)];
+    store
+        .record(&snap(&target, PayloadKind::Commodities, late_evening, 2), &batch, b"s1")
+        .expect("s1");
+    store.observe(&target, PayloadKind::Commodities, &batch, 1, late_evening).expect("observe s1");
+
+    // Close pass early on day 97: vanish gaps of ~11h/10.5h < 12h floor →
+    // both credited. (The second sight was never re-sighted, so its
+    // last-seen stays day 96 22:00.)
+    let morning = 97 * day + 9 * 3_600;
+    store.record(&snap(&target, PayloadKind::Commodities, morning, 0), &[], b"s2").expect("s2");
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, 2, morning).expect("close");
+    assert_eq!(credits.len(), 2, "overnight vanishes inside the band floor are sales");
+
+    // One in-window listing for the same item, still open.
+    let mid = 100 * day;
+    let open_batch = [listing(3, &item(1), 300, 1)];
+    store.record(&snap(&target, PayloadKind::Commodities, mid, 1), &open_batch, b"s3").expect("s3");
+    store.observe(&target, PayloadKind::Commodities, &open_batch, 3, mid).expect("observe s3");
+
+    // The invariant the UI/ranking rely on: per (item, day) cohort, credits
+    // never exceed that day's own listings.
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let rows: Vec<(i64, i64, i64)> = conn
+            .prepare("SELECT day, listings, credited FROM sales WHERE category = 'commodity'")
+            .expect("prepare sales scan")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query sales")
+            .filter_map(Result::ok)
+            .collect();
+        assert_eq!(rows.len(), 3, "two open-day cohort rows + the day-97 close-event row");
+        for &(day_, listings, credited) in &rows {
+            assert!(credited <= listings, "day {day_}: {credited} credits vs {listings} listings");
+        }
+        let open_day_rows = rows.iter().filter(|(_, listings, _)| *listings > 0).count();
+        assert_eq!(open_day_rows, 2, "listings book on their open days (96 and 100) only");
+    }
+
+    // Window rate: in-window credits (0 — both booked on day 96) over
+    // in-window listings (1) — NOT 2/1 under close-day booking.
+    let rate =
+        store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate").expect("rate");
+    assert!((rate - 0.0).abs() < 1e-9, "pre-window opens must not inflate the window rate: {rate}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The close pass re-checks `last_seen_snapshot` under the write: a sight
+/// re-sighted under a NEWER snapshot than the one being closed against must
+/// stay open. This replays the CLI-fetch-vs-serve race (the candidate scan
+/// and the UPDATE are not atomic across processes) sequentially.
+#[test]
+fn stale_snapshot_close_never_closes_a_re_sighted_auction() {
+    use amtracker_core::ports::SalesRepository;
+
+    let dir = temp_dir("stale-close");
+    let store = open_store(&dir, 11_000);
+    let target = TargetId("us-4".into());
+
+    let batch = [listing(1, &item(1), 100, 1)];
+    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &batch, b"s1").expect("s1");
+    store.observe(&target, PayloadKind::Commodities, &batch, 1, 10_000).expect("observe s1");
+
+    // The serve process re-sights the same auction under snapshot 2.
+    store.record(&snap(&target, PayloadKind::Commodities, 11_000, 1), &batch, b"s2").expect("s2");
+    store.observe(&target, PayloadKind::Commodities, &batch, 2, 11_000).expect("observe s2");
+
+    // A concurrent CLI fetch closing against the OLDER snapshot 1 must not
+    // close (nor credit) the auction that snapshot 2 just re-sighted.
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, 1, 11_000).expect("stale close");
+    assert!(credits.is_empty(), "a re-sighted auction never vanished: no credit");
+
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let (closed_at, credited): (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT closed_at, credited FROM sight
+                 WHERE target_id = ?1 AND auction_id = 1 AND kind = 'commodities'",
+                rusqlite::params![target.as_str()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("sight present");
+        assert!(closed_at.is_none(), "re-sighted sight must stay open");
+        assert_eq!(credited, 0, "no credit may be stamped");
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sales WHERE closed + credited > 0", [], |r| r.get(0))
+            .expect("sales scan");
+        assert_eq!(rows, 0, "no close/credit ledger entries may be booked");
+    }
+
+    // The current close pass still works normally: nothing vanished, so it
+    // closes nothing.
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, 2, 11_000).expect("fresh close");
+    assert!(credits.is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A sight reopened under a DIFFERENT identity reverses its prior close on
+/// the prior identity's ledger (never on the incoming item's), re-points the
+/// sight at the new identity, books a fresh listing event for it, and any
+/// later credit books there too.
+#[test]
+fn id_reuse_reversal_books_on_the_prior_identity_and_reopens_under_the_new_one() {
+    use amtracker_core::ports::SalesRepository;
+
+    let dir = temp_dir("id-reuse");
+    let store = open_store(&dir, 11_800);
+    let target = TargetId("us-4".into());
+
+    // Auction 5 = item 1; vanishes 10 minutes later (VERY_LONG: credit).
+    let first = [listing(5, &item(1), 100, 2)];
+    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &first, b"s1").expect("s1");
+    store.observe(&target, PayloadKind::Commodities, &first, 1, 10_000).expect("observe s1");
+    store.record(&snap(&target, PayloadKind::Commodities, 10_600, 0), &[], b"s2").expect("s2");
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 2, 10_600).expect("close");
+    assert_eq!(credits.len(), 1, "phantom-sale credit for item 1");
+
+    // The same auction id comes back as item 2 (emulator id reuse).
+    let reused = [listing(5, &item(2), 500, 1)];
+    store.record(&snap(&target, PayloadKind::Commodities, 11_200, 1), &reused, b"s3").expect("s3");
+    store.observe(&target, PayloadKind::Commodities, &reused, 3, 11_200).expect("reopen");
+
+    // Item 1's phantom credit is reversed on ITEM 1's ledger; item 2 got a
+    // fresh listing event so its later credit has a denominator.
+    let rate1 = store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate1");
+    assert_eq!(rate1, Some(0.0), "item 1: phantom credit fully reversed");
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let (item1_listings, item1_credited): (i64, i64) = conn
+            .query_row(
+                "SELECT listings, credited FROM sales
+                 WHERE item_ref_id = (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 1)
+                   AND category = 'commodity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("item 1 ledger row");
+        assert_eq!((item1_listings, item1_credited), (1, 0));
+        let item2_listings: i64 = conn
+            .query_row(
+                "SELECT listings FROM sales
+                 WHERE item_ref_id = (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 2)
+                   AND category = 'commodity'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("item 2 ledger row");
+        assert_eq!(item2_listings, 1, "identity-changing reopen books a fresh listing event");
+        let sight_ref: i64 = conn
+            .query_row(
+                "SELECT item_ref_id FROM sight WHERE target_id = ?1 AND auction_id = 5
+                   AND kind = 'commodities'",
+                rusqlite::params![target.as_str()],
+                |row| row.get(0),
+            )
+            .expect("sight present");
+        let item2_ref: i64 = conn
+            .query_row("SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 2", [], |row| {
+                row.get(0)
+            })
+            .expect("item 2 ref");
+        assert_eq!(sight_ref, item2_ref, "sight re-points at the incoming identity");
+    }
+
+    // The reused sight's own vanish credits item 2 (not item 1).
+    store.record(&snap(&target, PayloadKind::Commodities, 11_800, 0), &[], b"s4").expect("s4");
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 4, 11_800).expect("close");
+    assert_eq!(credits.len(), 1);
+    assert_eq!(credits.first().map(|c| c.item.clone()), Some(item(2)));
+    let rate2 = store.sale_rate(&target, &item(2), 14, Category::Commodity).expect("rate2");
+    assert_eq!(rate2, Some(1.0), "item 2: 1 credit against its own 1 listing");
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -22,6 +22,13 @@ token_env = "AMT_API_TOKEN" # unset or empty = mutating endpoints are open (loca
 database = "./data/tracker.sqlite3"
 raw_listing_days = 7      # raw listing working set; snapshot metadata live forever
 archive_dir = "./data/raw"
+# Feed output directory for `serve` (feed.lua / feed.json); relative paths
+# resolve against the working directory serve is started from.
+# feed_dir = "./feeds"
+# Closed sell-through sightings older than this many days are pruned once per
+# UTC day (0 = keep forever, the default). Their sale-rate aggregates live in
+# the sales ledger regardless; pruning only caps the fastest-growing table.
+# sight_retention_days = 30
 # Scheduled online backups: with backup_dir set and backup_secs > 0, `serve`
 # writes a consistent copy of the database (VACUUM INTO - safe while serving)
 # to amtracker-backup-<UTC timestamp>.sqlite3 in that directory and prunes

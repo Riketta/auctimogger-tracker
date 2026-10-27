@@ -415,7 +415,11 @@ pub(crate) async fn api_opportunities(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let min_churn = params.get("min_churn").and_then(|v| v.parse().ok()).unwrap_or(1.0);
+    let min_churn = params
+        .get("min_churn")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite())
+        .unwrap_or(1.0);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let list = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
@@ -564,11 +568,33 @@ fn metric_block_json(block: &amtracker_core::domain::MetricBlock) -> serde_json:
     })
 }
 
-/// Parses the `?span=` list (comma-separated); `d1` when absent.
-fn spans_param(params: &HashMap<String, String>, default: Span) -> Vec<Span> {
-    params
-        .get("span")
-        .map_or_else(|| vec![default], |s| s.split(',').filter_map(Span::parse).collect())
+/// Parses the `?span=` list (comma-separated); `default` when absent.
+/// Unknown span names are rejected with a 400, matching the API's own
+/// `category`/`kind` conventions — silently dropping a typo would read as
+/// empty metrics, which is indistinguishable from "no data".
+fn spans_param(
+    params: &HashMap<String, String>,
+    default: Span,
+) -> Result<Vec<Span>, Box<Response>> {
+    match params.get("span") {
+        None => Ok(vec![default]),
+        Some(raw) => {
+            let mut spans = Vec::new();
+            for token in raw.split(',') {
+                let Some(span) = Span::parse(token) else {
+                    return Err(Box::new(
+                        (
+                            StatusCode::BAD_REQUEST,
+                            format!("unknown span '{token}' (expected d1, d7, d14 or d30)"),
+                        )
+                            .into_response(),
+                    ));
+                };
+                spans.push(span);
+            }
+            Ok(spans)
+        }
+    }
 }
 
 /// Blocking read of one item identity's category's blocks across `spans`;
@@ -605,7 +631,10 @@ pub(crate) async fn api_item_metrics(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let spans = spans_param(&params, Span::D1);
+    let spans = match spans_param(&params, Span::D1) {
+        Ok(spans) => spans,
+        Err(response) => return *response,
+    };
     let item = amtracker_core::domain::ItemRef::Item { item_id };
     let computed = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
@@ -657,7 +686,10 @@ pub(crate) async fn api_item_pet_metrics(
         Ok(item) => item,
         Err(response) => return *response,
     };
-    let spans = spans_param(&params, Span::D1);
+    let spans = match spans_param(&params, Span::D1) {
+        Ok(spans) => spans,
+        Err(response) => return *response,
+    };
     // Pets only ever trade in the item AH: the pet identity's category is
     // always `pet` (the commodity payload never carries pets).
     let computed = tokio::task::spawn_blocking({
@@ -800,7 +832,7 @@ pub(crate) async fn api_snapshots(
                 "entryCount": meta.entry_count,
                 "droppedCount": meta.dropped_count,
                 "droppedReasons": meta.dropped_reasons,
-                "status": format!("{:?}", meta.status),
+                "status": meta.status.as_str(),
             }))
             .collect::<Vec<_>>(),
         }))
@@ -827,7 +859,10 @@ pub(crate) async fn api_watchlist_metrics(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let spans = spans_param(&params, Span::D7);
+    let spans = match spans_param(&params, Span::D7) {
+        Ok(spans) => spans,
+        Err(response) => return *response,
+    };
     let sale_days = days_param(&params, "sale_days", 14);
     let trend_days = days_param(&params, "trend_days", 30);
     let report = tokio::task::spawn_blocking({
@@ -953,6 +988,31 @@ impl ApiItemRef {
             }
         }
     }
+
+    /// Rejects pet identity fields outside their in-game domains before they
+    /// become unusable watchlist rows that can never match a fold. Ranges
+    /// follow the domain's own documentation: species ids are positive,
+    /// levels run 1..=25, quality 0 (poor) ..= 6 (artifact), breeds 3..=11.
+    /// Deletion paths stay permissive — anything already stored can be
+    /// removed.
+    fn validate_for_add(&self) -> Result<(), &'static str> {
+        match self {
+            ApiItemRef::Item { .. } => Ok(()),
+            ApiItemRef::Pet { species, level, quality, breed } => {
+                if *species <= 0 {
+                    Err("pet speciesID must be positive")
+                } else if !(1..=25).contains(level) {
+                    Err("pet level must be within 1..=25")
+                } else if !(0..=6).contains(quality) {
+                    Err("pet qualityID must be within 0..=6")
+                } else if !(3..=11).contains(breed) {
+                    Err("pet breedID must be within 3..=11")
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    }
 }
 
 /// `GET /api/watchlist?target=`
@@ -1001,6 +1061,9 @@ pub(crate) async fn api_watchlist_post(
         Ok(target) => target,
         Err(response) => return *response,
     };
+    if let Err(message) = body.item.validate_for_add() {
+        return (StatusCode::BAD_REQUEST, message).into_response();
+    }
     // SQLite access stays off the async workers, like every other store path:
     // the single connection mutex can be held for a while by ingest
     // transactions, and a blocked worker stalls the whole runtime.

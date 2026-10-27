@@ -215,8 +215,16 @@ pub struct FileStorage {
     /// Days raw listings are kept before pruning; defaults to 7.
     #[serde(default = "default_raw_days")]
     pub raw_listing_days: u32,
+    /// Days closed sell-through sightings are kept before pruning;
+    /// defaults to 0 (kept forever).
+    #[serde(default)]
+    pub sight_retention_days: u32,
     /// Directory where raw snapshot payloads are archived.
     pub archive_dir: String,
+    /// Directory feed.lua / feed.json are published to (serve mode);
+    /// defaults to CWD-relative `./feeds` (the historical behavior).
+    #[serde(default = "default_feed_dir")]
+    pub feed_dir: String,
     /// Directory for scheduled online backups; absent = they stay off.
     #[serde(default)]
     pub backup_dir: Option<PathBuf>,
@@ -232,6 +240,10 @@ pub struct FileStorage {
 
 fn default_raw_days() -> u32 {
     7
+}
+
+fn default_feed_dir() -> String {
+    "feeds".to_string()
 }
 
 fn default_backup_secs() -> u64 {
@@ -518,7 +530,9 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
         storage: StorageConfig {
             database: file.storage.database,
             raw_listing_days: file.storage.raw_listing_days,
+            sight_retention_days: file.storage.sight_retention_days,
             archive_dir: file.storage.archive_dir,
+            feed_dir: file.storage.feed_dir,
             backup_dir: file.storage.backup_dir,
             backup_secs: file.storage.backup_secs,
             backup_keep: file.storage.backup_keep,
@@ -603,7 +617,9 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
             &[
                 "database",
                 "raw_listing_days",
+                "sight_retention_days",
                 "archive_dir",
+                "feed_dir",
                 "backup_dir",
                 "backup_secs",
                 "backup_keep",

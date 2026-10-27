@@ -147,8 +147,9 @@ impl AlertEvaluationService {
                 message: observed.message,
                 fired_at: now,
             };
-            let event_id = self.events.record(&event)?;
-            self.rules.mark_fired(rule.id, now)?;
+            // Atomic: event + cooldown anchor in one store transaction, so a
+            // failed anchor write can never produce a re-fired duplicate.
+            let event_id = self.rules.record_firing(&event)?;
             run.fired += 1;
             if let Some(dispatcher) = &self.dispatcher {
                 let delivered = AlertEvent {

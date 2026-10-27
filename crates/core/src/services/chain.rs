@@ -17,9 +17,10 @@ use crate::{
 /// Tries its legs in order per lookup. A leg answers one of three ways —
 /// resolved (`Ok(Some)`), not-in-this-source (`Ok(None)`), or source trouble
 /// (`Err`). Only a resolved record short-circuits; `Ok(None)` falls through
-/// to the next leg (flavor coverage differs between sources), and any `Err`
-/// poisons the whole lookup so transient outages are never mistaken for
-/// "does not exist" (which the caller negative-caches).
+/// to the next leg (flavor coverage differs between sources), and an `Err`
+/// is never mistaken for "does not exist": it falls through to the next leg
+/// and surfaces only when NO leg resolves — so transient outages are never
+/// negative-cached as missing (which the caller would otherwise lock in).
 pub struct ChainedItemInfo {
     legs: Vec<Arc<dyn ItemInfoPort>>,
 }

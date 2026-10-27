@@ -154,7 +154,9 @@ fn config(token_env: Option<String>) -> TrackerConfig {
         storage: StorageConfig {
             database: "web-test.sqlite3".into(),
             raw_listing_days: 7,
+            sight_retention_days: 0,
             archive_dir: "raw".into(),
+            feed_dir: "feeds".into(),
             backup_dir: None,
             backup_secs: 0,
             backup_keep: 7,
@@ -649,6 +651,11 @@ async fn snapshots_api_serves_filterable_metadata() {
     assert_eq!(rows[0].get("entryCount").and_then(Value::as_u64), Some(3));
     assert_eq!(rows[0].get("droppedCount").and_then(Value::as_u64), Some(1));
     assert_eq!(rows[0].get("sourceLastModified").and_then(Value::as_i64), Some(999));
+    assert_eq!(
+        rows[0].get("status").and_then(Value::as_str),
+        Some("ok"),
+        "lowercase wire spelling, matching the health endpoint and SnapshotStatus::as_str"
+    );
 
     let (status, body) =
         get(build_router_arc(Arc::clone(&state)), "/api/snapshots?target=t1&kind=auctions").await;
@@ -1046,5 +1053,86 @@ async fn api_history_returns_bulk_day_rows() {
     assert_eq!(status, StatusCode::OK);
     let json: Value = serde_json::from_str(&body).expect("history json");
     assert_eq!(json["days"], 30, "the window clamps to 30 days");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Unknown span names must answer 400 like every other enum-ish query
+/// parameter: silently dropping a typo reads as empty metrics, which is
+/// indistinguishable from "no data".
+#[tokio::test]
+async fn unknown_span_names_are_rejected_not_silently_dropped() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    for uri in [
+        "/api/items/t1/2589/metrics?span=bogus",
+        "/api/items/t1/2589/metrics?span=d1,,d7",
+        "/api/items/t1/2589/metrics?span=",
+        "/api/watchlist/metrics?target=t1&span=nope",
+    ] {
+        let (status, _) = get(router.clone(), uri).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} must reject unknown spans");
+    }
+    let (status, _) = get(router, "/api/items/t1/2589/metrics?span=d1,d7").await;
+    assert_eq!(status, StatusCode::OK, "valid span lists still parse");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Watchlist adds validate pet identity fields against their in-game domains
+/// (species ≥ 1, level 1..=25, quality 0..=6, breed 3..=11): out-of-range
+/// rows could never match a fold and would sit in the watchlist forever.
+#[tokio::test]
+async fn watchlist_add_rejects_out_of_range_pet_fields() {
+    let (state, root) = test_state(None);
+
+    let post = |state: &Arc<AppState>, body: Value| {
+        let router = build_router_arc(Arc::clone(state));
+        async move {
+            router
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/watchlist")
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request"),
+                )
+                .await
+                .expect("response")
+                .status()
+        }
+    };
+
+    let pet = |species: i64, level: i32, quality: i32, breed: i32| {
+        serde_json::json!({
+            "target": TARGET, "type": "pet",
+            "speciesID": species, "level": level, "qualityID": quality, "breedID": breed
+        })
+    };
+    assert_eq!(post(&state, pet(2546, 1, 3, 11)).await, StatusCode::OK, "valid identity accepted");
+    for (species, level, quality, breed) in
+        [(0, 1, 3, 11), (2546, 0, 3, 11), (2546, 26, 3, 11), (2546, 1, 7, 11), (2546, 1, 3, 12)]
+    {
+        assert_eq!(
+            post(&state, pet(species, level, quality, breed)).await,
+            StatusCode::BAD_REQUEST,
+            "out-of-range pet identity ({species}, {level}, {quality}, {breed}) rejected"
+        );
+    }
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A present-but-unparseable `after_id` is a malformed link: it must 400
+/// instead of silently skipping every same-name row via the `i64::MAX`
+/// tiebreaker.
+#[tokio::test]
+async fn items_page_rejects_unparseable_after_id() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) =
+        get(router.clone(), "/items?target=t1&after_name=foo&after_id=not-a-number").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "malformed cursor rejected");
+    let (status, _) = get(router, "/items?target=t1").await;
+    assert_eq!(status, StatusCode::OK, "plain page renders");
     std::fs::remove_dir_all(&root).ok();
 }

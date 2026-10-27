@@ -190,6 +190,11 @@ jobs:
           path: dist
           merge-multiple: true
 
+      - name: Generate SHA256SUMS
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+
       - name: Attach archives to the tag release
         env:
           GH_TOKEN: ${{ github.token }}

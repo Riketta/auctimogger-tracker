@@ -4,7 +4,10 @@
 //! `run_cycle` doc for the exact per-stage failure semantics).
 
 use std::{
-    collections::HashMap,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
     sync::{
         Arc,
         Mutex,
@@ -122,6 +125,7 @@ impl IngestCycleService {
     /// persisted then), and `CycleError::Store` when any persistence stage
     /// fails — the cycle stops at the first failing write, leaving earlier
     /// writes of this cycle in place.
+    #[allow(clippy::too_many_lines)]
     pub fn run_cycle(
         &self,
         target: &TargetConfig,
@@ -194,17 +198,40 @@ impl IngestCycleService {
                     PayloadKind::Commodities => ListingKind::Commodity,
                     PayloadKind::Auctions => ListingKind::Item,
                 };
+                // Bulk fold pass: one chunked load per category and one bulk
+                // save at the end, instead of two queries plus one commit per
+                // item (market-scale dumps fold five-digit identity counts).
+                let mut by_category: BTreeMap<Category, Vec<ItemRef>> = BTreeMap::new();
+                for (item_ref, _) in &grouped {
+                    by_category
+                        .entry(Category::derive(listing_kind, item_ref))
+                        .or_default()
+                        .push(item_ref.clone());
+                }
+                let mut folds: BTreeMap<(ItemRef, Category), DayFold> = BTreeMap::new();
+                for (category, items) in &by_category {
+                    let loaded = self.history.load_folds(&target.id, items, day, day, *category)?;
+                    for (item, per_item) in items.iter().zip(loaded) {
+                        let fold = per_item
+                            .into_iter()
+                            .next()
+                            .map_or_else(|| DayFold::new(item.clone()), |(_, fold)| fold);
+                        folds.insert((item.clone(), *category), fold);
+                    }
+                }
                 let mut affected: Vec<(ItemRef, Category)> = Vec::with_capacity(grouped.len());
+                let mut writes: Vec<(ItemRef, i64, Category, DayFold)> =
+                    Vec::with_capacity(grouped.len());
                 for (item_ref, listings) in &grouped {
                     let category = Category::derive(listing_kind, item_ref);
-                    let mut fold = self
-                        .history
-                        .load_fold(&target.id, item_ref, day, category)?
-                        .unwrap_or_else(|| DayFold::new(item_ref.clone()));
+                    let mut fold = folds
+                        .remove(&(item_ref.clone(), category))
+                        .ok_or_else(|| StoreError::Backend("cycle fold lost its load".into()))?;
                     fold.apply(listings);
-                    self.history.save_fold(&target.id, item_ref, day, category, &fold)?;
+                    writes.push((item_ref.clone(), day, category, fold));
                     affected.push((item_ref.clone(), category));
                 }
+                self.history.save_folds(&target.id, &writes)?;
 
                 // Sell-through bookkeeping: register sightings, then close
                 // the ones absent from the newest snapshot of this kind.

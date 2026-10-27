@@ -53,8 +53,9 @@ normal for this item, and how do I know this deal is real?"*.
   reads behind every page/API endpoint are logged server-side, not just
   returned as 500s.
 - **SQLite storage (WAL)** — the raw listing working set is pruned after
-  `storage.raw_listing_days` (default 7); day-folds, snapshot metadata,
-  sell-through sightings and the item-name catalog are kept forever.
+  `storage.raw_listing_days` (default 7) and closed sell-through sightings
+  after `storage.sight_retention_days` (default 0 = kept forever); day-folds,
+  snapshot metadata and the item-name catalog are kept forever.
 - **Span analytics** — per item and per span (`d1`/`d7`/`d14`/`d30`):
   `n, min, p05, p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`
   plus a 14-day `saleRate` (`d1` is the current UTC day-to-date, so it is
@@ -65,10 +66,10 @@ normal for this item, and how do I know this deal is real?"*.
 - **Opportunity ranking** — transparent weighted score (discount, sale-rate
   reliability, churn, stability + confidence) over the stored history,
   ranked per market category (items, commodities, pets).
-- **Tracker feed v2** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
+- **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
-- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot.
+- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
   completions, item detail with interactive 30-day price-band chart (p05–p95,
   median, VWAP), opportunities, market overview, live watchlist, cross-target
@@ -116,7 +117,9 @@ only — never put secrets in this file.
 | `server.feed_publish_secs` | `300` | minimum seconds between feed re-publications per target |
 | `storage.database` | `./data/tracker.sqlite3` | SQLite database (WAL) |
 | `storage.archive_dir` | `./data/raw` | raw payload archive |
+| `storage.feed_dir` | `./feeds` | where `serve` publishes `feed.lua` / `feed.json` (CWD-relative unless absolute) |
 | `storage.raw_listing_days` | `7` | raw working-set retention; metadata/folds stay forever |
+| `storage.sight_retention_days` | `0` | days closed sell-through sightings are kept (`0` = forever; aggregates live in the sales ledger regardless) |
 | `storage.backup_dir` | absent | directory for scheduled online backups; absent = off |
 | `storage.backup_secs` | `0` | minimum seconds between scheduled backups (`0` = off) |
 | `storage.backup_keep` | `7` | recent backups kept (oldest pruned after each backup) |
@@ -545,7 +548,12 @@ the binary under `/opt`, and restarts the unit.
 - Keep the DB on **local disk**; NFS/CIFS mounts can corrupt WAL databases.
 - Raw listings prune after `raw_listing_days` (the scheduler applies it once
   per UTC day); folds/metadata/catalog grow slowly (multi-month DBs stay in
-  the low single-digit GB).
+  the low single-digit GB). Closed sell-through sightings are the fastest-
+  growing table on busy realms — set `sight_retention_days` (e.g. 30–60) to
+  cap them; their sale-rate aggregates live in the sales ledger regardless.
+- Feeds are published to `storage.feed_dir` (default `./feeds`) — a bare-metal
+  launcher's working directory decides where that lands unless the path is
+  made absolute.
 - **Upgrading from a pre-v2 database**: tracker schema v2 scopes sell-through
   sightings per payload kind (commodity and item auction ids are separate
   namespaces). Old files carry no kind on their sighting rows and cannot be

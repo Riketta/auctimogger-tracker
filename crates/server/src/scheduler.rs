@@ -753,6 +753,21 @@ fn run_prune_if_due(
         Ok(removed) => {
             maintenance.prune_day.insert(target.to_string(), today);
             tracing::debug!(target, removed, "raw listing retention applied");
+            // Closed sightings age out on their own knob (0 = keep forever,
+            // the historical default): their aggregates already live in the
+            // sales ledger, so only the reopen-reversal horizon is lost.
+            let retention = i64::from(config.storage.sight_retention_days);
+            if retention > 0 {
+                match state
+                    .history
+                    .prune_sights_before(&TargetId(target.to_string()), today - retention + 1)
+                {
+                    Ok(removed) => tracing::debug!(target, removed, "sight retention applied"),
+                    Err(error) => {
+                        tracing::warn!(target, error = %error, "sight retention failed");
+                    }
+                }
+            }
         }
         Err(error) => {
             tracing::warn!(target, error = %error, "raw listing retention failed");

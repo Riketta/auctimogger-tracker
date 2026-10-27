@@ -534,7 +534,7 @@ pub enum FeedFormat {
     Json,
 }
 
-/// One feed contract entry (tracker feed v2): an item or pet identity plus its
+/// One feed contract entry (tracker feed v3): an item or pet identity plus its
 /// per-span metric blocks.
 #[derive(Clone, Debug, PartialEq)]
 pub struct FeedEntry {
@@ -723,8 +723,11 @@ pub struct NewAlertRule {
     pub note: Option<String>,
 }
 
-/// What an alert rule watches for. All conditions observe the same cached
-/// metric blocks the UI shows, so an alert can never contradict its page.
+/// What an alert rule watches for. Price and floor conditions observe the
+/// same cached metric blocks the UI shows, so an alert can never contradict
+/// its page; the sale-rate condition reads the trailing sale ledger live
+/// (the ledger is the same source the blocks' cached rate was computed
+/// from — it only updates more often than the block cache).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum AlertCondition {
     /// The current day's median unit price drops to `copper` or below —

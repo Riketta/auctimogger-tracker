@@ -1,6 +1,6 @@
-//! Feed export (tracker feed v2): gathers per-item span metrics and shapes
+//! Feed export (tracker feed v3): gathers per-item span metrics and shapes
 //! them into the frozen cross-addon contract (see the README's
-//! "Feed contract (v2)" section). Rendering and publication are outbound
+//! "Feed contract (v3)" section). Rendering and publication are outbound
 //! ports; this service owns the selection, freshness and grain rules.
 //!
 //! Grain rule: the addon collapses every pet variant onto its species (the
@@ -100,7 +100,19 @@ impl FeedExportService {
         let mut entries = Vec::new();
         for category in Category::ALL {
             let items: Vec<ItemRef> = match &watchlist_items {
-                Some(items) => items.clone(),
+                Some(items) => {
+                    // The watchlist is identity-shaped, not category-scoped:
+                    // pet-category rows only ever hold pet identities and
+                    // item/commodity rows only plain items (see
+                    // `Category::derive`), so skip the sweep instead of
+                    // querying every identity against all three categories.
+                    let want_pet = category == Category::Pet;
+                    items
+                        .iter()
+                        .filter(|item| matches!(**item, ItemRef::Pet { .. }) == want_pet)
+                        .cloned()
+                        .collect()
+                }
                 None => self.history.items_with_data(target, today - window_days + 1, category)?,
             };
             if items.is_empty() {
@@ -125,7 +137,7 @@ impl FeedExportService {
                 }
             }
 
-            // Per-span block matrices, row-aligned with `singles` / `populations`.
+            // Per-span block matrices: outer index = span, inner = group.
             let single_blocks = options
                 .spans
                 .iter()
@@ -138,26 +150,45 @@ impl FeedExportService {
                 .map(|span| self.metrics.blocks_merged(target, &population_refs, category, *span))
                 .collect::<Result<Vec<_>, _>>()?;
 
-            // Stitch: walk the groups in the same order the split ran, pulling
-            // each group's rows off the matching cursor. The cursors can only
-            // under-run when `spans` is empty (no rows at all), which yields an
-            // empty row and therefore entry-less output — the degenerate config.
-            let empty_row: Vec<Option<MetricBlock>> = Vec::new();
-            let mut single_rows = single_blocks.iter();
-            let mut merged_rows = merged_blocks.iter();
+            // Transpose to per-group rows: row i = [block(i, span_0), ..,
+            // block(i, span_n)]. The bulk paths above are span-major (one
+            // full-market pass per span), but each entry below needs its own
+            // group's blocks across all spans — so every group gets exactly
+            // one full-width row and the stitch cannot under- or over-run.
+            let single_rows: Vec<Vec<Option<MetricBlock>>> = (0..singles.len())
+                .map(|i| {
+                    single_blocks.iter().map(|row| row.get(i).and_then(Clone::clone)).collect()
+                })
+                .collect();
+            let merged_rows: Vec<Vec<Option<MetricBlock>>> = (0..populations.len())
+                .map(|i| {
+                    merged_blocks.iter().map(|row| row.get(i).and_then(Clone::clone)).collect()
+                })
+                .collect();
+
+            // Stitch: walk the groups in the same order the split ran, taking
+            // each single group's row off `single_rows` and each population
+            // group's row off `merged_rows`. Both cursors hold exactly one
+            // full-width row per matching group, so they cannot under-run.
+            let mut single_rows = single_rows.into_iter();
+            let mut merged_rows = merged_rows.into_iter();
             for members in groups.into_values() {
                 let first = members
                     .first()
                     .ok_or_else(|| StoreError::Backend("feed group lost its members".into()))?;
                 let rows = if members.len() == 1 {
-                    single_rows.next().unwrap_or(&empty_row)
+                    single_rows.next().ok_or_else(|| {
+                        StoreError::Backend("feed single group lost its row".into())
+                    })?
                 } else {
-                    merged_rows.next().unwrap_or(&empty_row)
+                    merged_rows.next().ok_or_else(|| {
+                        StoreError::Backend("feed population group lost its row".into())
+                    })?
                 };
                 let mut metrics = BTreeMap::new();
                 for (span, block) in options.spans.iter().zip(rows) {
                     if let Some(block) = block {
-                        metrics.insert(*span, block.clone());
+                        metrics.insert(*span, block);
                     }
                 }
                 // Entries without any valid span would be rejected by the

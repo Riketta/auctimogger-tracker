@@ -60,8 +60,14 @@ pub struct StorageConfig {
     pub database: String,
     /// Raw listing working set in days; snapshot metadata live forever.
     pub raw_listing_days: u32,
+    /// Closed sell-through sightings older than this many days are pruned
+    /// (their aggregates already live in the sales ledger); `0` keeps them
+    /// forever — the historical default.
+    pub sight_retention_days: u32,
     /// Directory raw payload archives are written to.
     pub archive_dir: String,
+    /// Directory feed.lua / feed.json are published to (serve mode).
+    pub feed_dir: String,
     /// Directory for scheduled online backups: when set together with a
     /// positive `backup_secs`, `serve` writes rotated
     /// `amtracker-backup-*.sqlite3` copies here; `None` disables them.

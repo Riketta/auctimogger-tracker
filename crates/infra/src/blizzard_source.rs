@@ -477,6 +477,9 @@ enum DropReason {
     NonPositiveQuantity,
     /// Pet-cage row with no species field or modifier.
     CageWithoutSpecies,
+    /// Pet species evidence (field or modifier) on a non-cage item: wire
+    /// drift — identity must never silently cross into the pet namespace.
+    SpeciesOutsideCage,
     /// No usable per-unit/stack price (including bid-only rows).
     MissingPrice,
 }
@@ -486,6 +489,7 @@ impl DropReason {
         match self {
             Self::NonPositiveQuantity => "non-positive-quantity",
             Self::CageWithoutSpecies => "cage-without-species",
+            Self::SpeciesOutsideCage => "species-outside-cage",
             Self::MissingPrice => "missing-price",
         }
     }
@@ -505,6 +509,10 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<NormalizedListing, D
         return Err(DropReason::NonPositiveQuantity);
     }
 
+    // Pet identity requires BOTH sides of the cage convention: species
+    // evidence AND the cage item id (82800). Either one alone is wire drift
+    // and drops — a plain item carrying a species modifier would otherwise
+    // silently mis-key its identity into the pet namespace.
     let species = a
         .item
         .pet_species_id
@@ -513,22 +521,33 @@ fn map_auction(kind: PayloadKind, a: WireAuction) -> Result<NormalizedListing, D
         })
         .filter(|s| *s > 0);
 
-    let item_ref = match species {
-        Some(species) => ItemRef::Pet {
+    let item_ref = match (species, a.item.id == PET_CAGE_ITEM_ID) {
+        (Some(species), true) => ItemRef::Pet {
             species,
             level: pet_field(a.item.pet_level),
             quality: pet_field(a.item.pet_quality_id),
             breed: pet_field(a.item.pet_breed_id),
         },
-        None if a.item.id == PET_CAGE_ITEM_ID => {
+        (Some(_), false) => return Err(DropReason::SpeciesOutsideCage),
+        (None, true) => {
             return Err(DropReason::CageWithoutSpecies); // degenerate, drop
         }
-        None => ItemRef::Item { item_id: a.item.id },
+        (None, false) => ItemRef::Item { item_id: a.item.id },
     };
 
     let unit_price = match (kind, a.unit_price, a.buyout) {
         (PayloadKind::Commodities, Some(price), _) if price > 0 => price, // already per unit
-        (PayloadKind::Auctions, _, Some(buyout)) if buyout > 0 => buyout / quantity,
+        (PayloadKind::Auctions, _, Some(buyout)) if buyout > 0 => {
+            // `buyout / quantity` floors to zero for stacks cheaper than
+            // their stack size (1 copper per unit or less): those carry no
+            // usable per-unit price, so drop them rather than polluting a
+            // day's minimum with a 0-copper listing.
+            let per_unit = buyout / quantity;
+            if per_unit <= 0 {
+                return Err(DropReason::MissingPrice);
+            }
+            per_unit
+        }
         _ => return Err(DropReason::MissingPrice), // incl. bid-only rows
     };
 
@@ -649,6 +668,28 @@ mod tests {
         assert!(listings.is_empty());
         assert_eq!(dropped, 3);
         assert_eq!(reasons.len(), 2, "three drops across two reasons");
+    }
+
+    #[test]
+    fn pet_identity_requires_the_cage_item_and_sub_copper_stacks_drop() {
+        // Species evidence on a NON-cage item is wire drift: it must drop
+        // rather than silently mis-key a plain item into the pet namespace.
+        // And a stack whose buyout divides below one copper per unit carries
+        // no usable per-unit price (would floor to 0) — dropped too.
+        let payload = r#"{"auctions":[
+            {"id":1,"item":{"id":2589,"pet_species_id":2546},"quantity":1,"buyout":100,"time_left":"SHORT"},
+            {"id":2,"item":{"id":2589,"modifiers":[{"type":6,"value":2546}]},"quantity":1,"buyout":100,"time_left":"SHORT"},
+            {"id":3,"item":{"id":2589},"quantity":10,"buyout":5,"time_left":"SHORT"},
+            {"id":4,"item":{"id":2589},"quantity":10,"buyout":10,"time_left":"SHORT"}
+        ]}"#;
+        let (listings, dropped, reasons) =
+            parse_payload(PayloadKind::Auctions, payload.as_bytes()).expect("parses");
+        assert_eq!(dropped, 3, "two cage mismatches + one sub-copper stack");
+        assert_eq!(listings.len(), 1, "exactly 1 copper per unit is still usable");
+        assert_eq!(listings[0].auction_id, 4);
+        assert_eq!(listings[0].unit_price, 1);
+        assert_eq!(reasons.get("species-outside-cage"), Some(&2));
+        assert_eq!(reasons.get("missing-price"), Some(&1));
     }
 
     // -------------------------------------------------- fetch status paths

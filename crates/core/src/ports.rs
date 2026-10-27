@@ -153,6 +153,10 @@ pub trait PriceHistoryRepository: Send + Sync {
     /// for feed builds: one chunked query replaces per-item-per-day loads.
     /// Only folds of the given category are returned.
     ///
+    /// Callers must pass DISTINCT identities: adapters resolve positionally
+    /// by identity, so a repeated identity would read back empty for its
+    /// second occurrence. (All current callers dedupe by construction.)
+    ///
     /// The default falls back to per-item [`PriceHistoryRepository::load_fold`]
     /// reads — correct for any adapter, just less efficient.
     ///
@@ -194,6 +198,28 @@ pub trait PriceHistoryRepository: Send + Sync {
         category: Category,
         fold: &DayFold,
     ) -> Result<(), StoreError>;
+    /// Persists many folds in one bulk pass: tuple = (item, day, category,
+    /// fold), each replacing any previous state for that (item, day,
+    /// category). Batched fuel for the ingest cycle — adapters should write
+    /// the whole batch in one transaction instead of one commit per fold
+    /// (market-scale dumps fold five-digit identity counts per cycle).
+    ///
+    /// The default falls back to per-item [`PriceHistoryRepository::save_fold`]
+    /// writes — correct for any adapter, just less efficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when any fold cannot be written.
+    fn save_folds(
+        &self,
+        target: &TargetId,
+        folds: &[(ItemRef, i64, Category, DayFold)],
+    ) -> Result<(), StoreError> {
+        for (item, day, category, fold) in folds {
+            self.save_fold(target, item, *day, *category, fold)?;
+        }
+        Ok(())
+    }
     /// Drops the raw listing working set older than the given UTC day.
     /// Returns the number of raw rows removed. Snapshot metadata, folds and
     /// sale credits are permanent.
@@ -202,6 +228,19 @@ pub trait PriceHistoryRepository: Send + Sync {
     ///
     /// Returns `StoreError::Backend` when the raw rows cannot be deleted.
     fn prune_raw_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError>;
+    /// Deletes CLOSED sell-through sightings closed before the given UTC day
+    /// (their aggregates already live in the sales ledger); returns the rows
+    /// removed. Open sights and anything newer stay untouched. Retention
+    /// counterpart to [`PriceHistoryRepository::prune_raw_before`] — callers
+    /// gate it on their own config (`0` = never call).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the sights cannot be deleted.
+    fn prune_sights_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
+        let _ = (target, day);
+        Ok(0)
+    }
     /// Distinct items that have fold data of the given category on/after the
     /// given UTC day.
     ///
@@ -395,6 +434,9 @@ pub trait MetricsCacheRepository: Send + Sync {
     /// positionally aligned (`blocks[i]` belongs to `items[i]`); `None`
     /// entries have no cached block. Batched fuel for whole-watchlist views.
     ///
+    /// Callers must pass DISTINCT identities (same positional-resolution
+    /// contract as [`PriceHistoryRepository::load_folds`]).
+    ///
     /// The default falls back to per-item reads — correct for any adapter,
     /// just less efficient.
     ///
@@ -555,23 +597,23 @@ pub trait AlertRuleRepository: Send + Sync {
     ///
     /// Returns `StoreError::Backend` when rules cannot be read.
     fn list(&self, target: &TargetId) -> Result<Vec<crate::domain::AlertRule>, StoreError>;
-    /// Stamps the rule's cooldown anchor after it fired. A no-op for unknown
-    /// ids.
+    /// Atomically persists one fired alert (event row + the rule's cooldown
+    /// anchor) and returns the event id. The two writes share one transaction:
+    /// an event recorded without its anchor would make the next pass re-fire
+    /// and re-dispatch a duplicate. The anchor stamp is a no-op for unknown
+    /// rule ids.
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when the anchor cannot be written.
-    fn mark_fired(&self, rule_id: i64, at: i64) -> Result<(), StoreError>;
+    /// Returns `StoreError::Backend` when the event or the anchor cannot be
+    /// written.
+    fn record_firing(&self, event: &crate::domain::NewAlertEvent) -> Result<i64, StoreError>;
 }
 
-/// Outbound: fired-alert history.
+/// Outbound: fired-alert history (read side — writes go through
+/// [`AlertRuleRepository::record_firing`], which books the event and the
+/// cooldown anchor atomically).
 pub trait AlertEventRepository: Send + Sync {
-    /// Persists one fired alert and returns its id.
-    ///
-    /// # Errors
-    ///
-    /// Returns `StoreError::Backend` when the event cannot be written.
-    fn record(&self, event: &crate::domain::NewAlertEvent) -> Result<i64, StoreError>;
     /// The `limit` newest events of a target, newest first.
     ///
     /// # Errors

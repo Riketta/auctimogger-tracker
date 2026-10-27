@@ -792,8 +792,12 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
         .save_fold(&target, &item1, utc_day(today), Category::Commodity, &fold)
         .expect("save fold");
 
-    let rules = Arc::new(FakeAlertRules::default());
     let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
     rules
         .add(&NewAlertRule {
             target: target.clone(),
@@ -876,6 +880,7 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
 struct FakeAlertRules {
     rules: Mutex<Vec<amtracker_core::domain::AlertRule>>,
     next_id: Mutex<i64>,
+    events: Arc<FakeAlertEvents>,
 }
 
 impl AlertRuleRepository for FakeAlertRules {
@@ -920,13 +925,17 @@ impl AlertRuleRepository for FakeAlertRules {
             .collect())
     }
 
-    fn mark_fired(&self, rule_id: i64, at: i64) -> Result<(), StoreError> {
+    fn record_firing(
+        &self,
+        event: &amtracker_core::domain::NewAlertEvent,
+    ) -> Result<i64, StoreError> {
+        let event_id = self.events.record(event);
         for rule in self.rules.lock().unwrap().iter_mut() {
-            if rule.id == rule_id {
-                rule.last_fired_at = Some(at);
+            if rule.id == event.rule_id {
+                rule.last_fired_at = Some(event.fired_at);
             }
         }
-        Ok(())
+        Ok(event_id)
     }
 }
 
@@ -935,8 +944,8 @@ struct FakeAlertEvents {
     events: Mutex<Vec<amtracker_core::domain::AlertEvent>>,
 }
 
-impl AlertEventRepository for FakeAlertEvents {
-    fn record(&self, event: &amtracker_core::domain::NewAlertEvent) -> Result<i64, StoreError> {
+impl FakeAlertEvents {
+    fn record(&self, event: &amtracker_core::domain::NewAlertEvent) -> i64 {
         let mut events = self.events.lock().unwrap();
         let id = i64::try_from(events.len() + 1).unwrap_or(i64::MAX);
         events.push(amtracker_core::domain::AlertEvent {
@@ -949,9 +958,11 @@ impl AlertEventRepository for FakeAlertEvents {
             message: event.message.clone(),
             fired_at: event.fired_at,
         });
-        Ok(id)
+        id
     }
+}
 
+impl AlertEventRepository for FakeAlertEvents {
     fn recent(
         &self,
         target: &TargetId,
@@ -1165,7 +1176,9 @@ fn opportunity_config() -> TrackerConfig {
         storage: amtracker_core::config::StorageConfig {
             database: "mem.sqlite3".into(),
             raw_listing_days: 7,
+            sight_retention_days: 0,
             archive_dir: "raw".into(),
+            feed_dir: "feeds".into(),
             backup_dir: None,
             backup_secs: 0,
             backup_keep: 7,
@@ -1605,4 +1618,74 @@ fn feed_export_builds_canonical_entries_through_the_bulk_paths() {
     let item_block = item_entry.metrics.get(&Span::D1).expect("item d1 block");
     assert_eq!(item_block.n, 2);
     assert_eq!(item_block.median, 100);
+}
+
+#[test]
+fn feed_export_attributes_every_span_to_its_own_item_across_many_singles() {
+    // More single groups than spans, and two spans: the shape where a
+    // span-major matrix consumed as group-major cross-contaminates early
+    // entries and silently drops the tail.
+    let today = 1_000_000; // utc day 11
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let item2 = item(2);
+    let item3 = item(3);
+    let yesterday = utc_day(today) - 1;
+
+    let watchlist = Arc::new(FakeWatchlist::default());
+    for watched in [&item1, &item2, &item3] {
+        watchlist
+            .add(&NewWatchlistEntry { target: target.clone(), item: watched.clone(), note: None })
+            .expect("add watch");
+    }
+
+    let history = Arc::new(FakeHistory::default());
+    let save = |item: &ItemRef, day: i64, price: i64, count: i64| {
+        let listings: Vec<_> = (0..count).map(|i| listing(1_000 + i, item, price, 1)).collect();
+        let mut fold = DayFold::new(item.clone());
+        fold.apply(&listings);
+        history.save_fold(&target, item, day, Category::Commodity, &fold).expect("save fold");
+    };
+    save(&item1, utc_day(today), 100, 2);
+    save(&item1, yesterday, 100, 1); // d7: n=3, median 100
+    save(&item2, utc_day(today), 500, 1);
+    save(&item2, yesterday, 900, 1); // d7: n=2, median 700
+    save(&item3, utc_day(today), 900, 1); // d7: n=1, median 900
+
+    let sales = Arc::new(FakeSales::default());
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history.clone(),
+        Arc::new(FakeCache::default()),
+        sales,
+        Arc::new(FixedClock(today)),
+    ));
+    let feed = amtracker_core::services::feed_export::FeedExportService::new(
+        Arc::new(FakeSnapshots::new()),
+        history,
+        watchlist,
+        metrics,
+        Arc::new(FixedClock(today)),
+    )
+    .build_feed(
+        &target,
+        &amtracker_core::services::feed_export::ExportOptions {
+            spans: vec![Span::D1, Span::D7],
+            watchlist_only: true,
+        },
+    )
+    .expect("feed");
+
+    assert_eq!(feed.entries.len(), 3, "every single exports, none dropped");
+    let expected = [(1i64, 2i64, 100i64, 3i64, 100i64), (2, 1, 500, 2, 700), (3, 1, 900, 1, 900)];
+    for (id, d1_n, d1_median, d7_n, d7_median) in expected {
+        let entry = feed
+            .entries
+            .iter()
+            .find(|entry| entry.item == ItemRef::Item { item_id: id })
+            .unwrap_or_else(|| panic!("entry for item {id} missing"));
+        let d1 = entry.metrics.get(&Span::D1).unwrap_or_else(|| panic!("item {id} d1 missing"));
+        assert_eq!((d1.n, d1.median), (d1_n, d1_median), "item {id} d1 block");
+        let d7 = entry.metrics.get(&Span::D7).unwrap_or_else(|| panic!("item {id} d7 missing"));
+        assert_eq!((d7.n, d7.median), (d7_n, d7_median), "item {id} d7 block");
+    }
 }

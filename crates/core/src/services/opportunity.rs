@@ -63,7 +63,9 @@ pub struct Opportunity {
     pub item: ItemRef,
     /// Which market the row ranks in.
     pub category: Category,
-    /// Count-weighted median unit price over the window (copper).
+    /// Weighted median of the window's per-day medians (each day weighted by
+    /// its listing count; copper). An approximation of a true count-weighted
+    /// median — chosen for parity with the addon's math.
     pub median7: i64,
     /// Cheapest unit price of the newest day in the window (copper).
     pub floor_now: i64,
