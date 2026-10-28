@@ -46,9 +46,11 @@ USER amtracker
 # SQLite database + raw archive live on /data, published feeds on /work/feeds
 # (named volumes inherit these directories' ownership on first use).
 VOLUME ["/data", "/work/feeds"]
-# EnvFilter falls back to "info" when unset; set explicitly for
-# discoverability (RUST_LOG always wins over the config's debug flag).
-ENV RUST_LOG=info
+# RUST_LOG is deliberately NOT baked into the image: an env var always wins
+# over the config's stdout defaults (the top-level `debug` flag in
+# config.docker.toml), so baking one in would silently disable that flag.
+# EnvFilter falls back to "info" when unset; set RUST_LOG per-run via a
+# compose `environment:` entry when directive-level control is wanted.
 
 ENTRYPOINT ["/usr/local/bin/auctimogger-tracker"]
 CMD ["serve", "--config", "/work/config.toml"]
