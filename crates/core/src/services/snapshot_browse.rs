@@ -84,6 +84,10 @@ impl SnapshotBrowseService {
             return Ok(page);
         }
         let clamped = query.page.max(1).min(page.pages);
+        // The SQLite adapter already clamps `page` before returning, so the
+        // re-query below never fires with it; it exists so port
+        // implementations that report an out-of-range page verbatim still
+        // yield a clamped view with real rows.
         if page.page != clamped {
             query.page = clamped;
             page = self.snapshots.listings_page(flavor, snapshot_id, &query)?;

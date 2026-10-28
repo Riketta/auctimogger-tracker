@@ -26,7 +26,6 @@ use amtracker_core::{
         Category,
         Flavor,
         ItemRef,
-        ListingQuery,
         ListingRow,
         ListingSortKey,
         MetricBlock,
@@ -53,9 +52,11 @@ use axum::{
 };
 
 use super::{
+    browse_query_params,
     category_param,
     health_blocking,
     mutations_open,
+    non_empty_param,
     render::{
         self,
         component_bar,
@@ -73,6 +74,7 @@ use super::{
         sparkline,
         target_switcher,
         tip,
+        url_encode_component,
     },
     target_param,
     AppState,
@@ -545,18 +547,36 @@ fn band_label(band: TimeLeftBand) -> &'static str {
 fn browse_item_cell(target: &TargetId, row: &ListingRow) -> String {
     let target_slug = html_escape(target.as_str());
     let (href, label, export) = match &row.item {
-        ItemRef::Item { item_id } => (
-            format!("/items/{target_slug}/{item_id}"),
-            row.name.clone().unwrap_or_else(|| format!("item {item_id}")),
-            format!("item {item_id}"),
-        ),
-        ItemRef::Pet { species, level, quality, breed } => (
-            format!(
-                "/items/{target_slug}/pet/{species}?level={level}&quality={quality}&breed={breed}"
-            ),
-            row.name.clone().unwrap_or_else(|| format!("pet {species}")),
-            format!("pet {species}"),
-        ),
+        ItemRef::Item { item_id } => {
+            // CSV keeps the stable identity first, then the resolved name
+            // when the catalog has one (the raw label exports bare).
+            let export = match &row.name {
+                Some(name) => format!("item {item_id} · {name}"),
+                None => format!("item {item_id}"),
+            };
+            (
+                format!("/items/{target_slug}/{item_id}"),
+                row.name.clone().unwrap_or_else(|| format!("item {item_id}")),
+                export,
+            )
+        }
+        ItemRef::Pet { species, level, quality, breed } => {
+            // Species alone collapses variants in the export; carry the full
+            // tuple so CSV rows stay distinguishable per auction variant.
+            let variant =
+                format!("pet {species} · lvl {level} · quality {quality} · breed {breed}");
+            let export = match &row.name {
+                Some(name) => format!("{variant} · {name}"),
+                None => variant,
+            };
+            (
+                format!(
+                    "/items/{target_slug}/pet/{species}?level={level}&quality={quality}&breed={breed}"
+                ),
+                row.name.clone().unwrap_or_else(|| format!("pet {species}")),
+                export,
+            )
+        }
     };
     format!(
         "<td data-export=\"{}\"><a href=\"{}\">{}</a></td>",
@@ -582,10 +602,7 @@ pub(crate) async fn browse_page(
         Err(response) => return *response,
     };
     // Empty-string params (unselected dropdowns) mean "absent", not 400.
-    let non_empty = |value: Option<&String>| -> Option<String> {
-        value.map(|value| value.trim()).filter(|trimmed| !trimmed.is_empty()).map(str::to_string)
-    };
-    let kind = match non_empty(params.get("kind")) {
+    let kind = match non_empty_param(&params, "kind") {
         None => PayloadKind::Commodities,
         Some(raw) => match PayloadKind::parse(&raw) {
             Some(kind) => kind,
@@ -595,7 +612,7 @@ pub(crate) async fn browse_page(
             }
         },
     };
-    let snapshot_id = match non_empty(params.get("snapshot")) {
+    let snapshot_id = match non_empty_param(&params, "snapshot") {
         None => None,
         Some(raw) => match raw.parse::<i64>() {
             Ok(id) => Some(id),
@@ -604,30 +621,16 @@ pub(crate) async fn browse_page(
             }
         },
     };
-    let item_id = match non_empty(params.get("item")) {
-        None => None,
-        Some(raw) => match raw.parse::<i64>() {
-            Ok(id) => Some(id),
-            Err(_) => {
-                return (StatusCode::BAD_REQUEST, "item must be an integer id").into_response()
-            }
-        },
+    let query = match browse_query_params(&params, false) {
+        Ok(query) => query,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
-    let q = non_empty(params.get("q"));
-    let class = non_empty(params.get("class"));
-    let quality = non_empty(params.get("quality"));
-    let sort = params.get("sort").map_or(ListingSortKey::Price, |raw| ListingSortKey::parse(raw));
-    let desc = params.get("dir").is_some_and(|dir| dir == "desc");
-    let page_no = params.get("page").and_then(|raw| raw.parse::<u32>().ok()).unwrap_or(1);
-    let query = ListingQuery {
-        name_prefix: q.clone(),
-        item_id,
-        class: class.clone(),
-        quality: quality.clone(),
-        sort,
-        desc,
-        page: page_no,
-    };
+    let item_id = query.item_id;
+    let q = query.name_prefix.clone();
+    let class = query.class.clone();
+    let quality = query.quality.clone();
+    let sort = query.sort;
+    let desc = query.desc;
     let flavor = super::target_flavor(&state.config, &target);
 
     let browse = tokio::task::spawn_blocking({
@@ -664,25 +667,28 @@ pub(crate) async fn browse_page(
     };
 
     // Preserves every current filter in header-sort and pagination links.
+    // Filter values are percent-encoded first: html_escape alone is HTML
+    // safety, not URL safety (a raw `&` splits the query, `#` truncates it,
+    // `+` decodes as a space).
     let browse_url = |sort_key: Option<ListingSortKey>, dir: bool, page_no: u32| -> String {
         let mut parts = vec![
-            format!("target={}", html_escape(target.as_str())),
+            format!("target={}", html_escape(&url_encode_component(target.as_str()))),
             format!("kind={}", kind.as_str()),
         ];
         if let Some(id) = snapshot_id {
             parts.push(format!("snapshot={id}"));
         }
         if let Some(prefix) = &q {
-            parts.push(format!("q={}", html_escape(prefix)));
+            parts.push(format!("q={}", html_escape(&url_encode_component(prefix))));
         }
         if let Some(id) = item_id {
             parts.push(format!("item={id}"));
         }
         if let Some(label) = &class {
-            parts.push(format!("class={}", html_escape(label)));
+            parts.push(format!("class={}", html_escape(&url_encode_component(label))));
         }
         if let Some(label) = &quality {
-            parts.push(format!("quality={}", html_escape(label)));
+            parts.push(format!("quality={}", html_escape(&url_encode_component(label))));
         }
         if let Some(key) = sort_key {
             parts.push(format!("sort={}", key.as_str()));
@@ -775,6 +781,19 @@ pub(crate) async fn browse_page(
             candidate.entry_count
         );
     }
+    // A pinned snapshot older than the recent window has no option of its
+    // own; without this the select silently displays "latest" and a toolbar
+    // submit would drop the pin. Render it as an explicit selected entry.
+    if let Some(id) = snapshot_id {
+        if !recent.iter().any(|candidate| candidate.id == id) {
+            let _ = write!(
+                body,
+                "<option value=\"{id}\" selected>{id} · {} · {} listings</option>",
+                html_escape(&human_time(meta.fetched_at)),
+                meta.entry_count
+            );
+        }
+    }
     body.push_str("</select>");
     let _ = write!(
         body,
@@ -854,13 +873,16 @@ pub(crate) async fn browse_page(
                 ItemRef::Pet { level, .. } => Some(i64::from(*level)),
                 ItemRef::Item { .. } => row.item_level,
             };
+            // The machine attribute is only rendered when a bid exists: a
+            // "-1" sentinel would read as a one-copper bid to data consumers.
+            let bid_attr = row.bid.map_or_else(String::new, |bid| format!(" data-v=\"{bid}\""));
             let _ = write!(
                 body,
                 "<tr><td class=\"num\" data-v=\"{}\">{}</td>{}\
                  <td class=\"num\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td>\
-                 <td class=\"num\" data-v=\"{}\">{}</td></tr>",
+                 <td class=\"num\"{}>{}</td></tr>",
                 row.unit_price,
                 money(row.unit_price),
                 browse_item_cell(&target, row),
@@ -868,7 +890,7 @@ pub(crate) async fn browse_page(
                 row.quantity,
                 row.quantity,
                 band_label(row.time_left),
-                row.bid.unwrap_or(-1),
+                bid_attr,
                 row.bid.map_or_else(|| "—".to_string(), money)
             );
         }
@@ -1074,7 +1096,7 @@ pub(crate) async fn items_page(
                             body,
                             "<div class=\"pagenav\"><a class=\"btn btn-sm\" href=\"/items?target={}&amp;after_name={}&amp;after_kind={}&amp;after_id={}\">next page →</a> <span class=\"muted\">alphabetical, 30 per page</span></div>",
                             html_escape(target.as_str()),
-                            html_escape(&last_name),
+                            html_escape(&url_encode_component(&last_name)),
                             last_kind,
                             last_id
                         );

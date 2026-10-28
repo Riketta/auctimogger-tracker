@@ -474,7 +474,8 @@ pub struct ListingPage {
 }
 
 /// Per-item-class listing count for one snapshot — the class filter's honest
-/// dropdown (built once at ingest, read back instantly).
+/// dropdown (aggregated on first read, then cached against a catalog
+/// watermark and recomputed when later enrichment moves it).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ClassSummary {
     /// Catalog item-class label; only enriched listings are counted.
@@ -841,6 +842,50 @@ impl NameRecord {
             && self.icon.is_none()
             && self.sell_price.is_none()
             && self.item_level.is_none()
+    }
+
+    /// Fills this record's absent enrichment fields from `other` (the source
+    /// chain's merge step: the first leg that answers keeps its name, later
+    /// legs top up the fields it could not see — e.g. Wowhead carries the
+    /// icon, Blizzard the class and level). `self`'s id and name always win.
+    #[must_use]
+    pub fn merged_with(mut self, other: NameRecord) -> NameRecord {
+        if self.item_class.is_none() {
+            self.item_class = other.item_class;
+        }
+        if self.item_subclass.is_none() {
+            self.item_subclass = other.item_subclass;
+        }
+        if self.inventory_slot.is_none() {
+            self.inventory_slot = other.inventory_slot;
+        }
+        if self.quality.is_none() {
+            self.quality = other.quality;
+        }
+        if self.icon.is_none() {
+            self.icon = other.icon;
+        }
+        if self.sell_price.is_none() {
+            self.sell_price = other.sell_price;
+        }
+        if self.item_level.is_none() {
+            self.item_level = other.item_level;
+        }
+        self
+    }
+
+    /// Whether every enrichment field is present — the source chain's
+    /// stop-early signal: no later leg could contribute anything, so asking
+    /// one would only burn a request.
+    #[must_use]
+    pub fn is_enrichment_complete(&self) -> bool {
+        self.item_class.is_some()
+            && self.item_subclass.is_some()
+            && self.inventory_slot.is_some()
+            && self.quality.is_some()
+            && self.icon.is_some()
+            && self.sell_price.is_some()
+            && self.item_level.is_some()
     }
 }
 

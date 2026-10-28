@@ -81,6 +81,9 @@ use rusqlite::Connection;
 /// Version 8 added the snapshot-viewer read surface: catalog item levels,
 /// the per-snapshot class-summary cache, and snapshot-leading listing
 /// indexes for the browse page queries (all idempotent ALTER/CREATE steps).
+/// The pre-v7 aggregate pass inside the same gate is shape-guarded, so a
+/// v7 file upgrading to v8 skips it instead of re-running the destructive
+/// rebuild.
 const SCHEMA_VERSION: i64 = 8;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
@@ -135,8 +138,12 @@ COMMIT;
 /// them in snapshot order — the same last-observation-wins semantics live
 /// ingest applies. Sale aggregates and metric-cache rows are dropped, not
 /// rebuilt: sale rates re-accumulate over their rolling window and metric
-/// blocks recompute on demand. Re-running the whole pass is safe — it reads
-/// only `listing`/`snapshots`/`item_ref`, which it never modifies.
+/// blocks recompute on demand. The pass reads only `listing`/`snapshots`/
+/// `item_ref`, which it never modifies, so a crash before the version stamp
+/// can safely re-run it. It is shape-guarded at the call site (the v7
+/// `category` column on `item_day`) so only genuinely pre-v7 files pay the
+/// destructive pass — a v7 file opened by a newer build must skip it, or its
+/// sale aggregates would be wiped and its folds replayed for nothing.
 const CATEGORY_V7_MIGRATION: &str = "
 BEGIN IMMEDIATE;
 DROP TABLE IF EXISTS metrics_cache;
@@ -446,13 +453,22 @@ impl SqliteStore {
             // v7 keyed the aggregate tables per market category. Pre-v7 rows
             // are merged across categories and cannot be split, so the tables
             // are recreated and day folds rebuild from the retained raw
-            // listings. Runs unguarded on every pre-v7 open — the pass is
-            // idempotent (fresh files replay an empty listing table), and a
-            // crash before the version stamp below must re-run it rather than
-            // silently skip a half-populated rebuild.
-            conn.execute_batch(CATEGORY_V7_MIGRATION)
-                .map_err(|e| backend("migrate aggregates to category keys", e))?;
-            Self::rebuild_category_folds(&conn)?;
+            // listings. Shape-guarded on the v7 `category` column so exactly
+            // the genuinely pre-v7 files run the destructive pass (see the
+            // migration's doc above) — already-v7 files skip it untouched.
+            let day_has_category = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('item_day') WHERE name = 'category')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|flag| flag == 1)
+                .map_err(|e| backend("inspect item_day schema", e))?;
+            if !day_has_category {
+                conn.execute_batch(CATEGORY_V7_MIGRATION)
+                    .map_err(|e| backend("migrate aggregates to category keys", e))?;
+                Self::rebuild_category_folds(&conn)?;
+            }
             // v8 added the snapshot-viewer read surface. All steps are
             // idempotent so fresh v8 files (created at the new shape by the
             // SCHEMA batch above) pass through unchanged.
@@ -1018,34 +1034,52 @@ impl SnapshotRepository for SqliteStore {
         snapshot_id: i64,
     ) -> Result<Vec<ClassSummary>, StoreError> {
         let conn = self.open_transaction();
-        let read = |conn: &Connection| -> Result<Vec<ClassSummary>, StoreError> {
-            let mut statement = conn
-                .prepare(
-                    "SELECT item_class, listings FROM snapshot_class_summary \
-                     WHERE snapshot_id = ?1 AND flavor = ?2 ORDER BY listings DESC, item_class ASC",
+        // Catalog watermark for the flavor: (row count, newest fetch stamp).
+        // Snapshots are immutable, but the catalog is not — later enrichment
+        // adds classes — so a cached summary carries the watermark it was
+        // computed against and recomputes once that watermark moves. A
+        // sentinel row (`watermark:` class label) stores it alongside the
+        // cached counts and is filtered out of every read.
+        let watermark: String = {
+            let (count, newest): (i64, i64) = conn
+                .query_row(
+                    "SELECT COUNT(*), COALESCE(MAX(fetched_at), 0) FROM item_catalog \
+                     WHERE flavor = ?1",
+                    rusqlite::params![flavor.as_str()],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
-                .map_err(|e| backend("prepare class summary", e))?;
-            let rows = statement
-                .query_map(rusqlite::params![snapshot_id, flavor.as_str()], |row| {
-                    Ok(ClassSummary {
-                        class: row.get(0)?,
-                        listings: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
-                    })
-                })
-                .map_err(|e| backend("query class summary", e))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(|e| backend("class summary row", e))?);
-            }
-            Ok(out)
+                .map_err(|e| backend("catalog watermark", e))?;
+            format!("watermark:{count}:{newest}")
         };
-        let cached = read(&conn)?;
-        if !cached.is_empty() {
+        let mut statement = conn
+            .prepare(
+                "SELECT item_class, listings FROM snapshot_class_summary \
+                 WHERE snapshot_id = ?1 AND flavor = ?2",
+            )
+            .map_err(|e| backend("prepare class summary", e))?;
+        let rows = statement
+            .query_map(rusqlite::params![snapshot_id, flavor.as_str()], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+            })
+            .map_err(|e| backend("query class summary", e))?;
+        let mut cached_watermark = None;
+        let mut cached = Vec::new();
+        for row in rows {
+            let (class, listings) = row.map_err(|e| backend("class summary row", e))?;
+            if let Some(stamp) = class.strip_prefix("watermark:") {
+                cached_watermark = Some(stamp.to_owned());
+            } else {
+                cached.push(ClassSummary { class, listings: u64::try_from(listings).unwrap_or(0) });
+            }
+        }
+        drop(statement);
+        if cached_watermark.as_deref() == Some(watermark.as_str()) {
+            cached.sort_by(|a, b| b.listings.cmp(&a.listings).then(a.class.cmp(&b.class)));
             return Ok(cached);
         }
-        // First read for this snapshot/flavor: aggregate from the listings
-        // and cache. One ingest-time-classified snapshot later re-reads the
-        // cached table instead of re-aggregating per request.
+        // First read for this snapshot/flavor, or the catalog moved since the
+        // cache was written (a cached-empty snapshot gains classes the same
+        // way): aggregate from the listings and rewrite the cache.
         let aggregate_sql = "SELECT ic.item_class, COUNT(*) \
              FROM listing l \
              JOIN item_ref r ON r.id = l.item_ref_id \
@@ -1067,27 +1101,34 @@ impl SnapshotRepository for SqliteStore {
             computed.push(row.map_err(|e| backend("class aggregate row", e))?);
         }
         drop(statement);
-        if !computed.is_empty() {
-            let tx = conn.unchecked_transaction().map_err(|e| backend("begin", e))?;
-            for summary in &computed {
-                tx.execute(
-                    "INSERT INTO snapshot_class_summary (snapshot_id, flavor, item_class, listings) \
-                     VALUES (?1, ?2, ?3, ?4) \
-                     ON CONFLICT (snapshot_id, flavor, item_class) DO UPDATE SET listings = excluded.listings",
-                    rusqlite::params![
-                        snapshot_id,
-                        flavor.as_str(),
-                        summary.class,
-                        i64::try_from(summary.listings).unwrap_or(i64::MAX),
-                    ],
-                )
-                .map_err(|e| backend("cache class summary", e))?;
-            }
-            tx.commit().map_err(|e| backend("commit class summary", e))?;
-            computed.sort_by(|a, b| b.listings.cmp(&a.listings).then(a.class.cmp(&b.class)));
-            return Ok(computed);
+        let tx = conn.unchecked_transaction().map_err(|e| backend("begin", e))?;
+        tx.execute(
+            "DELETE FROM snapshot_class_summary WHERE snapshot_id = ?1 AND flavor = ?2",
+            rusqlite::params![snapshot_id, flavor.as_str()],
+        )
+        .map_err(|e| backend("clear class summary", e))?;
+        tx.execute(
+            "INSERT INTO snapshot_class_summary (snapshot_id, flavor, item_class, listings) \
+             VALUES (?1, ?2, ?3, 0)",
+            rusqlite::params![snapshot_id, flavor.as_str(), watermark],
+        )
+        .map_err(|e| backend("cache class summary watermark", e))?;
+        for summary in &computed {
+            tx.execute(
+                "INSERT INTO snapshot_class_summary (snapshot_id, flavor, item_class, listings) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                rusqlite::params![
+                    snapshot_id,
+                    flavor.as_str(),
+                    summary.class,
+                    i64::try_from(summary.listings).unwrap_or(i64::MAX),
+                ],
+            )
+            .map_err(|e| backend("cache class summary", e))?;
         }
-        Ok(Vec::new())
+        tx.commit().map_err(|e| backend("commit class summary", e))?;
+        computed.sort_by(|a, b| b.listings.cmp(&a.listings).then(a.class.cmp(&b.class)));
+        Ok(computed)
     }
 }
 
@@ -2905,6 +2946,17 @@ impl PriceHistoryRepository for SqliteStore {
                 break;
             }
         }
+        // The class-summary cache would otherwise outlive its data: once a
+        // snapshot's raw listings are pruned, its pinned view shows an empty
+        // table while the cached rows keep populating the class dropdown.
+        let conn = self.open_transaction();
+        conn.execute(
+            "DELETE FROM snapshot_class_summary WHERE snapshot_id NOT IN \
+             (SELECT DISTINCT snapshot_id FROM listing)",
+            [],
+        )
+        .map_err(|e| backend("prune class summaries", e))?;
+        drop(conn);
         let conn = self.open_transaction();
         // Best-effort archive cleanup: payload files of old snapshots. The
         // row's path is cleared alongside the file so a re-run neither

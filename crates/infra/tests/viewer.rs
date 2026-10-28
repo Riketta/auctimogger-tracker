@@ -42,6 +42,7 @@ use amtracker_core::{
     ports::{
         ClockPort,
         ItemCatalogRepository,
+        PriceHistoryRepository,
         SnapshotRepository,
     },
 };
@@ -190,14 +191,15 @@ fn listing_pages_sort_filter_and_paginate() {
         .expect("seed catalog");
     let sparse = item(9);
 
-    // Prices chosen so every sort order is a distinct permutation; bands so
-    // the semantic rank (Short < Medium < Long) differs from the wire text
-    // order (LONG < MEDIUM < SHORT alphabetically).
+    // Prices order every sort unambiguously except one deliberate 100/100
+    // tie (101/103) so the auction-id tiebreak is actually exercised; bands
+    // so the semantic rank (Short < Medium < Long) differs from the wire
+    // text order (LONG < MEDIUM < SHORT alphabetically).
     let listings = [
         view_listing(100, &item(1), 300, 20, None, TimeLeftBand::Long),
         view_listing(101, &item(2), 100, 1, Some(90), TimeLeftBand::Short),
         view_listing(102, &item(3), 200, 5, None, TimeLeftBand::Medium),
-        view_listing(103, &sparse, 250, 2, None, TimeLeftBand::VeryLong),
+        view_listing(103, &sparse, 100, 2, None, TimeLeftBand::VeryLong),
     ];
     let snapshot_id = store
         .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 4), &listings, b"p")
@@ -215,18 +217,18 @@ fn listing_pages_sort_filter_and_paginate() {
     assert_eq!(page.pages, 1);
     assert_eq!(page.page, 1);
     let prices: Vec<i64> = page.rows.iter().map(|row| row.unit_price).collect();
-    assert_eq!(prices, [100, 200, 250, 300]);
+    assert_eq!(prices, [100, 100, 200, 300]);
     let names: Vec<Option<&str>> = page.rows.iter().map(|row| row.name.as_deref()).collect();
     assert_eq!(
         names,
-        [Some("Swiftness Potion"), Some("Arcane Crystal"), None, Some("Linen Cloth")],
+        [Some("Swiftness Potion"), None, Some("Arcane Crystal"), Some("Linen Cloth")],
         "catalog names resolve; sparse identities read None"
     );
     let levels: Vec<Option<i64>> = page.rows.iter().map(|row| row.item_level).collect();
     assert_eq!(levels, [Some(5), None, None, None], "item level comes from the catalog");
 
-    // Price descending flips; the auction-id tiebreak keeps equal prices
-    // deterministic.
+    // Price descending flips; the tied 100s stay deterministic via the
+    // ascending auction-id tiebreak (stable in both directions).
     let page = store
         .listings_page(
             &flavor,
@@ -235,7 +237,7 @@ fn listing_pages_sort_filter_and_paginate() {
         )
         .expect("price desc");
     let ids: Vec<i64> = page.rows.iter().map(|row| row.auction_id).collect();
-    assert_eq!(ids, [100, 103, 102, 101], "descending price, ties broken by auction id");
+    assert_eq!(ids, [100, 102, 101, 103], "descending price, ties broken by auction id");
 
     // Time-left sorts by semantic rank, not the wire text.
     let page = store
@@ -441,7 +443,8 @@ fn snapshot_class_summary_lazily_counts_enriched_listings() {
 
 /// v8 upgrades a v7 file in place: the catalog gains its (nullable) item
 /// level column, the viewer tables/indexes appear, and all prior data
-/// survives untouched.
+/// survives untouched — including the sale aggregates, since the destructive
+/// v7 pass must not re-run on an already-upgraded file.
 #[test]
 fn v8_migration_adds_viewer_surface_and_preserves_data() {
     let dir = temp_dir("viewer-v8");
@@ -517,6 +520,7 @@ fn v8_migration_adds_viewer_surface_and_preserves_data() {
                      qty_sold INTEGER NOT NULL DEFAULT 0,
                      PRIMARY KEY (target_id, item_ref_id, day, category)
                  );
+                 INSERT INTO sales VALUES ('us-4', 1, 11, 'commodity', 3, 2, 1, 5);
                  CREATE TABLE item_catalog (
                      flavor TEXT NOT NULL DEFAULT 'retail',
                      item_id INTEGER NOT NULL,
@@ -590,6 +594,16 @@ fn v8_migration_adds_viewer_surface_and_preserves_data() {
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
         assert_eq!(version, 8, "the file is stamped at the new schema version");
+        let sale_rows: i64 =
+            conn.query_row("SELECT COUNT(*) FROM sales", [], |row| row.get(0)).expect("sales");
+        assert_eq!(
+            sale_rows, 1,
+            "a v7 file keeps its sale aggregates: the destructive v7 pass must not re-run"
+        );
+        let day_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM item_day", [], |row| row.get(0))
+            .expect("item_day rows");
+        assert_eq!(day_rows, 1, "the seeded fold survives the upgrade untouched");
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -637,5 +651,238 @@ fn item_level_round_trips_and_coalesces() {
     assert_eq!(record.item_level, Some(80), "a level-less upsert COALESCEs, never erases");
     assert_eq!(record.icon.as_deref(), Some("inv_sword_39"));
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A genuinely pre-v7 file (merged aggregates, no `category` column) still
+/// runs the destructive v7 pass: merged sale rows are dropped and the day
+/// folds rebuild from the retained raw listings. The shape guard added with
+/// the viewer must not skip files the pass exists for.
+#[test]
+fn pre_v7_files_still_rebuild_their_aggregates() {
+    let dir = temp_dir("viewer-prev7");
+    let db = dir.join("db.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&db).expect("open pre-v7 file");
+        connection
+            .execute_batch(
+                "CREATE TABLE snapshots (
+                     id INTEGER PRIMARY KEY,
+                     target_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     source_last_modified INTEGER,
+                     sha256 TEXT NOT NULL,
+                     archive_path TEXT,
+                     entry_count INTEGER NOT NULL,
+                     dropped_count INTEGER NOT NULL,
+                     drop_reasons TEXT,
+                     status TEXT NOT NULL
+                 );
+                 CREATE TABLE item_ref (
+                     id INTEGER PRIMARY KEY,
+                     kind TEXT NOT NULL,
+                     item_id INTEGER NOT NULL,
+                     pet_species INTEGER NOT NULL DEFAULT 0,
+                     pet_level INTEGER NOT NULL DEFAULT 0,
+                     pet_quality INTEGER NOT NULL DEFAULT 0,
+                     pet_breed INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE (kind, item_id, pet_species, pet_level, pet_quality, pet_breed)
+                 );
+                 INSERT INTO item_ref VALUES (1, 'item', 2589, 0, 0, 0, 0);
+                 INSERT INTO snapshots VALUES (1, 'us-4', 'commodities', 950400, NULL, 'c', NULL, 1, 0, NULL, 'ok');
+                 CREATE TABLE listing (
+                     snapshot_id INTEGER NOT NULL,
+                     target_id TEXT NOT NULL,
+                     day INTEGER NOT NULL,
+                     auction_id INTEGER NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     quantity INTEGER NOT NULL,
+                     unit_price INTEGER NOT NULL,
+                     bid INTEGER,
+                     time_left TEXT NOT NULL,
+                     context INTEGER,
+                     bonus_lists TEXT NOT NULL DEFAULT '[]'
+                 );
+                 INSERT INTO listing VALUES (1, 'us-4', 11, 100, 1, 3, 100, NULL, 'VERY_LONG', NULL, '[]');
+                 CREATE TABLE item_day (
+                     target_id TEXT NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     day INTEGER NOT NULL,
+                     fold_json TEXT NOT NULL,
+                     PRIMARY KEY (target_id, item_ref_id, day)
+                 );
+                 CREATE TABLE metrics_cache (
+                     target_id TEXT NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     span TEXT NOT NULL,
+                     computed_at INTEGER NOT NULL,
+                     block_json TEXT NOT NULL,
+                     PRIMARY KEY (target_id, item_ref_id, span)
+                 );
+                 CREATE TABLE sales (
+                     target_id TEXT NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     day INTEGER NOT NULL,
+                     listings INTEGER NOT NULL DEFAULT 0,
+                     closed INTEGER NOT NULL DEFAULT 0,
+                     credited INTEGER NOT NULL DEFAULT 0,
+                     qty_sold INTEGER NOT NULL DEFAULT 0,
+                     PRIMARY KEY (target_id, item_ref_id, day)
+                 );
+                 INSERT INTO sales VALUES ('us-4', 1, 11, 7, 3, 1, 9);
+                 CREATE TABLE item_catalog (
+                     flavor TEXT NOT NULL DEFAULT 'retail',
+                     item_id INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     item_class TEXT,
+                     item_subclass TEXT,
+                     inventory_slot TEXT,
+                     quality TEXT,
+                     icon TEXT,
+                     sell_price INTEGER,
+                     fetched_at INTEGER NOT NULL,
+                     PRIMARY KEY (flavor, item_id)
+                 );
+                 CREATE TABLE pet_catalog (
+                     flavor TEXT NOT NULL DEFAULT 'retail',
+                     species_id INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     PRIMARY KEY (flavor, species_id)
+                 );
+                 PRAGMA user_version = 6;",
+            )
+            .expect("seed pre-v7 file");
+    }
+    let _store = open_store(&dir, 1_000_001);
+
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect db");
+        let has_category: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('item_day') WHERE name = 'category')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma");
+        assert_eq!(has_category, 1, "the v7 pass ran for the pre-v7 shape");
+        let merged_sales: i64 =
+            conn.query_row("SELECT COUNT(*) FROM sales", [], |row| row.get(0)).expect("sales");
+        assert_eq!(merged_sales, 0, "merged sale rows are dropped, not split");
+        let rebuilt: i64 = conn
+            .query_row("SELECT COUNT(*) FROM item_day WHERE category = 'commodity'", [], |row| {
+                row.get(0)
+            })
+            .expect("rebuilt folds");
+        assert_eq!(rebuilt, 1, "day folds rebuild from the retained raw listings");
+        let version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
+        assert_eq!(version, 8, "the file lands at the current schema version");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The class-summary cache invalidates on catalog movement: enrichment after
+/// the first read recomputes the counts, and an unenriched snapshot caches
+/// its emptiness against the watermark instead of re-aggregating every read.
+#[test]
+fn snapshot_class_summary_refreshes_when_the_catalog_enriches() {
+    let dir = temp_dir("summary-refresh");
+    let store = open_store(&dir, 1_000_000);
+    let flavor = Flavor("retail".into());
+    let target = TargetId("us-4".into());
+    let listings = [view_listing(1, &item(9), 100, 1, None, TimeLeftBand::Long)];
+    let snapshot_id = store
+        .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 1), &listings, b"p")
+        .expect("record");
+
+    // Nothing enriched yet: the empty summary is cached under the watermark.
+    let summary = store.snapshot_class_summary(&flavor, snapshot_id).expect("empty summary");
+    assert!(summary.is_empty(), "unenriched identities are not counted");
+
+    // Enrichment lands (a new catalog row moves the watermark)…
+    let mut enriched = record("Minor Wizard Oil", Some("Consumable"), None, None);
+    enriched.item_id = 9;
+    store.upsert(&flavor, &[enriched]).expect("enrich");
+
+    // …and the same read now sees the class without a fresh snapshot.
+    let summary = store.snapshot_class_summary(&flavor, snapshot_id).expect("refreshed");
+    assert_eq!(
+        summary,
+        vec![ClassSummary { class: "Consumable".into(), listings: 1 }],
+        "later enrichment recomputes the cached summary"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Pruning a snapshot's raw listings also drops its class-summary cache, so
+/// the pinned view of a pruned snapshot no longer offers phantom classes.
+#[test]
+fn pruning_raw_listings_drops_the_class_summary_cache() {
+    let dir = temp_dir("summary-prune");
+    let store = open_store(&dir, 1_000_000);
+    let flavor = Flavor("retail".into());
+    let target = TargetId("us-4".into());
+    store
+        .upsert(&flavor, &[catalog_record(1, record("Linen Cloth", Some("Cloth"), None, None))])
+        .expect("seed catalog");
+    let listings = [view_listing(1, &item(1), 100, 1, None, TimeLeftBand::Long)];
+    let snapshot_id = store
+        .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 1), &listings, b"p")
+        .expect("record");
+    assert_eq!(
+        store.snapshot_class_summary(&flavor, snapshot_id).expect("summary").len(),
+        1,
+        "the class is cached"
+    );
+
+    // Retention prunes the snapshot's raw listings (day 11 < 12)…
+    let pruned = store.prune_raw_before(&target, 12).expect("prune");
+    assert_eq!(pruned, 1, "the listing row is pruned");
+
+    // …and the cache rows for the emptied snapshot go with them.
+    assert!(
+        store.snapshot_class_summary(&flavor, snapshot_id).expect("post-prune").is_empty(),
+        "the summary cache does not outlive its snapshot's listings"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The price sort plans through the snapshot-leading index, so the viewer's
+/// default page stays indexed as snapshots grow (pins the v8 index choice).
+#[test]
+fn price_sort_plans_through_the_snapshot_index() {
+    let dir = temp_dir("sort-plan");
+    {
+        let store = open_store(&dir, 1_000_000);
+        let target = TargetId("us-4".into());
+        let listings = [
+            view_listing(1, &item(1), 100, 1, None, TimeLeftBand::Long),
+            view_listing(2, &item(2), 200, 1, None, TimeLeftBand::Long),
+        ];
+        store
+            .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 2), &listings, b"p")
+            .expect("record");
+    }
+    let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("reopen db");
+    let mut statement = conn
+        .prepare(
+            "EXPLAIN QUERY PLAN SELECT l.auction_id FROM listing l \
+             WHERE l.snapshot_id = 1 \
+             ORDER BY l.unit_price ASC, l.auction_id ASC LIMIT 50 OFFSET 0",
+        )
+        .expect("prepare plan");
+    let plan = statement
+        .query_map([], |row| row.get::<_, String>(3))
+        .expect("plan rows")
+        .filter_map(Result::ok)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    assert!(
+        plan.contains("idx_listing_snapshot_price"),
+        "the default sort rides the snapshot-leading index, got: {plan}"
+    );
     std::fs::remove_dir_all(&dir).ok();
 }

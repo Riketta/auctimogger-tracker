@@ -158,7 +158,10 @@ pub trait SnapshotRepository: Send + Sync {
     /// Per-item-class listing counts for one snapshot under one flavor, most-
     /// listed class first (the viewer's class filter dropdown). Only
     /// enriched listings are counted; sparse identities appear only in the
-    /// unfiltered view.
+    /// unfiltered view. Counts are cached per snapshot against a catalog
+    /// watermark and recomputed when enrichment moves it, so classes gained
+    /// by later enrichment surface in the dropdown; pruning a snapshot's
+    /// listings drops its cache rows with them.
     ///
     /// # Errors
     ///

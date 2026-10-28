@@ -47,6 +47,27 @@ pub fn html_escape(value: &str) -> String {
         .replace('\'', "&#39;")
 }
 
+/// Percent-encodes one query-string component (RFC 3986 unreserved bytes
+/// pass through, everything else becomes `%XX`). HTML escaping alone is not
+/// URL safety: a raw `&` splits the query, `#` truncates it, and `+` decodes
+/// as a space — filter echoes in generated links must be encoded first,
+/// then HTML-escaped for the attribute context.
+#[must_use]
+pub fn url_encode_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char);
+            }
+            other => {
+                let _ = write!(out, "%{other:02X}");
+            }
+        }
+    }
+    out
+}
+
 /// Formats a copper amount as gold/silver/copper.
 #[must_use]
 pub fn money(copper: i64) -> String {

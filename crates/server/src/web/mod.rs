@@ -32,6 +32,8 @@ use amtracker_core::{
     domain::{
         Category,
         Flavor,
+        ListingQuery,
+        ListingSortKey,
         TargetId,
     },
     error::StoreError,
@@ -413,6 +415,57 @@ pub(crate) fn category_option(
 /// retail (they are rejected by `known_target` on the render paths anyway).
 pub(crate) fn target_flavor(config: &TrackerConfig, target: &TargetId) -> Flavor {
     config.find_target(target.as_str()).map_or_else(Flavor::default, |target| target.flavor.clone())
+}
+
+/// An empty-string query param (an unselected toolbar dropdown) means
+/// "absent", not junk — shared by the browse page and its JSON twin.
+pub(crate) fn non_empty_param(params: &HashMap<String, String>, name: &str) -> Option<String> {
+    params
+        .get(name)
+        .map(|value| value.trim())
+        .filter(|trimmed| !trimmed.is_empty())
+        .map(str::to_string)
+}
+
+/// Shared browse `ListingQuery` parsing for the viewer's page and its JSON
+/// twin. `strict_page` is the page/API contract split: the API rejects a
+/// non-integer `page` with 400 (documented in the `OpenAPI` spec), while the
+/// page's own links always submit well-formed pages, so junk there clamps
+/// silently to page 1. The only other `Err` is a non-integer `item` id —
+/// both surfaces reject that.
+///
+/// # Errors
+///
+/// Returns the 400 message for a non-integer `item` id (and, under
+/// `strict_page`, a non-integer `page`).
+pub(crate) fn browse_query_params(
+    params: &HashMap<String, String>,
+    strict_page: bool,
+) -> Result<ListingQuery, &'static str> {
+    let parse_id =
+        |raw: Option<String>, message: &'static str| -> Result<Option<i64>, &'static str> {
+            match raw {
+                None => Ok(None),
+                Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| message),
+            }
+        };
+    let page = if strict_page {
+        match params.get("page") {
+            None => 1,
+            Some(raw) => raw.parse::<u32>().map_err(|_| "page must be a positive integer")?,
+        }
+    } else {
+        params.get("page").and_then(|raw| raw.parse::<u32>().ok()).unwrap_or(1)
+    };
+    Ok(ListingQuery {
+        name_prefix: non_empty_param(params, "q"),
+        item_id: parse_id(non_empty_param(params, "item"), "item must be an integer id")?,
+        class: non_empty_param(params, "class"),
+        quality: non_empty_param(params, "quality"),
+        sort: params.get("sort").map_or(ListingSortKey::Price, |raw| ListingSortKey::parse(raw)),
+        desc: params.get("dir").is_some_and(|dir| dir == "desc"),
+        page,
+    })
 }
 
 /// Maps a raw target slug to a configured [`TargetId`], rejecting unknown

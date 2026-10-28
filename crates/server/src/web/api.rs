@@ -13,8 +13,6 @@ use amtracker_core::{
     domain::{
         Category,
         FeedFormat,
-        ListingQuery,
-        ListingSortKey,
         PayloadKind,
         Span,
     },
@@ -44,10 +42,12 @@ use axum::{
 use serde::Deserialize;
 
 use super::{
+    browse_query_params,
     category_option,
     expected_api_token,
     known_target,
     log_failure,
+    non_empty_param,
     required_target,
     target_param,
     AppState,
@@ -859,30 +859,6 @@ pub(crate) async fn api_snapshots(
     }
 }
 
-/// Shared browse-parameter parsing (the JSON twin of the page's toolbar):
-/// filters, sort key and 1-based page. `Err` carries the 400 message.
-fn browse_query_params(params: &HashMap<String, String>) -> Result<ListingQuery, &'static str> {
-    let non_empty = |value: Option<&String>| -> Option<String> {
-        value.map(|value| value.trim()).filter(|trimmed| !trimmed.is_empty()).map(str::to_string)
-    };
-    let parse_id =
-        |raw: Option<String>, message: &'static str| -> Result<Option<i64>, &'static str> {
-            match raw {
-                None => Ok(None),
-                Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| message),
-            }
-        };
-    Ok(ListingQuery {
-        name_prefix: non_empty(params.get("q")),
-        item_id: parse_id(non_empty(params.get("item")), "item must be an integer id")?,
-        class: non_empty(params.get("class")),
-        quality: non_empty(params.get("quality")),
-        sort: params.get("sort").map_or(ListingSortKey::Price, |raw| ListingSortKey::parse(raw)),
-        desc: params.get("dir").is_some_and(|dir| dir == "desc"),
-        page: params.get("page").and_then(|raw| raw.parse::<u32>().ok()).unwrap_or(1),
-    })
-}
-
 /// The alerts/watch wire shape for a listing's identity.
 fn browse_identity_json(item: &amtracker_core::domain::ItemRef) -> serde_json::Value {
     match item {
@@ -911,10 +887,7 @@ pub(crate) async fn api_browse(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    let non_empty = |value: Option<&String>| -> Option<String> {
-        value.map(|value| value.trim()).filter(|trimmed| !trimmed.is_empty()).map(str::to_string)
-    };
-    let kind = match non_empty(params.get("kind")) {
+    let kind = match non_empty_param(&params, "kind") {
         None => PayloadKind::Commodities,
         Some(raw) => match PayloadKind::parse(&raw) {
             Some(kind) => kind,
@@ -927,7 +900,7 @@ pub(crate) async fn api_browse(
             }
         },
     };
-    let snapshot_id = match non_empty(params.get("snapshot")) {
+    let snapshot_id = match non_empty_param(&params, "snapshot") {
         None => None,
         Some(raw) => match raw.parse::<i64>() {
             Ok(id) => Some(id),
@@ -936,7 +909,7 @@ pub(crate) async fn api_browse(
             }
         },
     };
-    let query = match browse_query_params(&params) {
+    let query = match browse_query_params(&params, true) {
         Ok(query) => query,
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };

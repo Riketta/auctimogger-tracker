@@ -285,10 +285,12 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
 
 /// Assembles the item/pet name-resolution chain from `[catalog].source`:
 /// `"wowhead"` runs the credential-free adapter alone, `"blizzard"` the
-/// authenticated one alone, and `"chain"` (the default) tries Wowhead first
-/// with Blizzard as the fallback leg — omitted entirely (with one log line)
-/// when no Blizzard credentials are configured, so the chain never burns a
-/// doomed request per lookup.
+/// authenticated one alone, and `"chain"` (the default) merges Wowhead and
+/// Blizzard item data, Wowhead first: a Wowhead hit answers with icon and
+/// vendor price, and the Blizzard leg tops up the fields it cannot see
+/// (class, subclass, slot, item level). The Blizzard leg is omitted entirely
+/// (with one log line) when no Blizzard credentials are configured, so the
+/// chain never burns a doomed request per lookup.
 fn build_item_info(config: &TrackerConfig) -> Arc<dyn ItemInfoPort> {
     match config.catalog.source.as_str() {
         "wowhead" => Arc::new(WowheadItemInfo::from_config(config)) as Arc<dyn ItemInfoPort>,

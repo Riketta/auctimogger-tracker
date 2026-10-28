@@ -579,7 +579,10 @@ async fn browse_page_serves_seeded_snapshot_rows() {
     assert!(body.contains("snapshot viewer"), "page title present");
     assert!(body.contains("2 listings match · page 1 of 1"), "count and paging line");
     assert!(body.contains("Named Item 2589"), "catalog name resolves");
-    assert!(body.contains("data-export=\"item 2589\""), "CSV export identity present");
+    assert!(
+        body.contains("data-export=\"item 2589 · Named Item 2589\""),
+        "CSV export keeps identity and resolved name"
+    );
     let price_asc = body.find("1s 0c").expect("cheapest price row");
     let price_desc = body.find("3s 0c").expect("dearer price row");
     assert!(price_asc < price_desc, "default sort is cheapest first");
@@ -713,6 +716,88 @@ async fn browse_api_mirrors_the_page() {
 
     let (status, _) = get(router, "/api/browse?target=t1&kind=commodities&snapshot=999").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "unknown pins are 404 on the API too");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Generated filter links percent-encode user input: a prefix arriving with
+/// spaces (form encoding's `+`) must re-appear as `%20` in sort/pagination
+/// links, or clicking one would silently search for something else.
+#[tokio::test]
+async fn browse_links_percent_encode_user_filters() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    let listings = [listing(100, &ItemRef::Item { item_id: 2589 }, 100)];
+    seed_snapshot(&state, PayloadKind::Commodities, 1_000_000, &listings);
+    let router = build_router_arc(Arc::clone(&state));
+    let (_, _) = get(router.clone(), "/items/t1/2589").await; // enrich
+
+    // `+` decodes to a space, so the prefix is "named item" and matches.
+    let (_, body) = get(router, "/browse?target=t1&kind=commodities&q=named+item").await;
+    assert!(body.contains("1 listings match"), "the decoded prefix matches the row");
+    assert!(body.contains("value=\"named item\""), "the toolbar echoes the decoded prefix");
+    assert!(
+        body.contains("q=named%20item"),
+        "generated links re-encode the prefix instead of passing it raw"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// CSV export labels keep the resolved name and never collapse pet variants
+/// into their bare species id.
+#[tokio::test]
+async fn browse_export_labels_carry_names_and_pet_variants() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    let listings = [
+        listing(100, &ItemRef::Item { item_id: 2589 }, 300),
+        listing(101, &ItemRef::Pet { species: 42, level: 5, quality: 2, breed: 3 }, 100),
+    ];
+    seed_snapshot(&state, PayloadKind::Commodities, 1_000_000, &listings);
+    let router = build_router_arc(Arc::clone(&state));
+    let (_, _) = get(router.clone(), "/items/t1/2589").await; // enrich the item
+
+    let (_, body) = get(router, "/browse?target=t1&kind=commodities").await;
+    assert!(
+        body.contains("data-export=\"item 2589 · Named Item 2589\""),
+        "the item export keeps identity and resolved name"
+    );
+    assert!(
+        body.contains("data-export=\"pet 42 · lvl 5 · quality 2 · breed 3\""),
+        "the pet export carries the full variant tuple"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A pinned snapshot older than the recent-30 dropdown keeps its own
+/// selected option, so submitting the toolbar does not silently drop the
+/// pin back to the newest snapshot.
+#[tokio::test]
+async fn browse_toolbar_keeps_a_pin_outside_the_recent_window() {
+    let (state, root) = test_state(None);
+    let mut last = 0;
+    for n in 0..31_i64 {
+        last = seed_snapshot(&state, PayloadKind::Commodities, 1_000_000 + n * 1_000, &[]);
+    }
+    let router = build_router_arc(Arc::clone(&state));
+    let oldest = last - 30;
+    let (_, body) =
+        get(router, &format!("/browse?target=t1&kind=commodities&snapshot={oldest}")).await;
+    assert!(
+        body.contains(&format!("<option value=\"{oldest}\" selected>")),
+        "a pinned snapshot outside the recent window keeps its own option"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The API contract's error edges: an empty pair is 404 (the page renders a
+/// 200 empty state instead, covered by the per-kind test above), and a
+/// non-integer page is 400 as the spec documents.
+#[tokio::test]
+async fn browse_api_rejects_junk_pages_and_empty_pairs() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) = get(router.clone(), "/api/browse?target=t1&kind=commodities").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "no snapshots yet is 404 on the API");
+    let (status, _) = get(router, "/api/browse?target=t1&kind=commodities&page=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a non-integer page is 400");
     std::fs::remove_dir_all(&root).ok();
 }
 

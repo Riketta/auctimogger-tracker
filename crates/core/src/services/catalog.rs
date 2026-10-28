@@ -168,9 +168,10 @@ impl CatalogService {
     /// stick forever, but every render re-querying the API is worse), and a
     /// failed API call is remembered for a shorter error window so outages
     /// degrade to raw labels instead of timing out every render. Sparse rows
-    /// past the enrichment window are re-fetched to gain the newer fields —
-    /// but a stored name always beats an empty or failed refresh: "cached
-    /// forever" must not silently demote to a raw label.
+    /// and rows still missing the class field are re-fetched once past the
+    /// enrichment window to gain the merged fields — but a stored name always
+    /// beats an empty or failed refresh: "cached forever" must not silently
+    /// demote to a raw label.
     ///
     /// # Errors
     ///
@@ -179,7 +180,13 @@ impl CatalogService {
     pub fn ensure(&self, flavor: &Flavor, item_id: i64) -> Result<Option<NameRecord>, StoreError> {
         let cached = self.catalog.by_id(flavor, item_id)?;
         if let Some(record) = &cached {
-            let stale = record.is_sparse()
+            // Two refresh triggers, both windowed: sparse rows (stored before
+            // the enriched columns existed) and rows still missing the
+            // item-class field — the Blizzard leg's contribution, which a
+            // Wowhead-first lookup cannot carry. The window keeps the heal
+            // gradual; a class-less row stops re-fetching once the merged
+            // answer fills the class (or the chain runs a single source).
+            let stale = (record.is_sparse() || record.item_class.is_none())
                 && self.clock.now().saturating_sub(record.fetched_at) > SPARSE_REFRESH_SECONDS;
             if !stale {
                 return Ok(Some(record.clone()));
@@ -216,6 +223,25 @@ impl CatalogService {
     /// Returns `StoreError::Backend` when the catalog cannot be read.
     pub fn known(&self, flavor: &Flavor, item_id: i64) -> Result<bool, StoreError> {
         self.catalog.by_id(flavor, item_id).map(|record| record.is_some())
+    }
+
+    /// Whether an item lookup would hit the source right now: the id is
+    /// unseen, or its stored row is past the enrichment window while still
+    /// missing fields (sparse, or class-less under a merged chain). The
+    /// background warmer's candidate check — pacing re-fetches so existing
+    /// rows gain the richer fields without a mass refresh, while fresh rows
+    /// never cost a request.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    pub fn needs_enrichment(&self, flavor: &Flavor, item_id: i64) -> Result<bool, StoreError> {
+        let Some(record) = self.catalog.by_id(flavor, item_id)? else {
+            return Ok(true);
+        };
+        let stale = (record.is_sparse() || record.item_class.is_none())
+            && self.clock.now().saturating_sub(record.fetched_at) > SPARSE_REFRESH_SECONDS;
+        Ok(stale)
     }
 
     /// Whether the catalog already holds `(flavor, species_id)` in the PET

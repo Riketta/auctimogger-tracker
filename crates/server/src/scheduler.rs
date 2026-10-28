@@ -696,15 +696,16 @@ fn warm_item_names(
         if examined >= config.catalog.idle_names_per_cycle as usize {
             break;
         }
-        // Only ids the catalog has never seen cost a request; known ones are
-        // a single local read away (the pet check MUST consult the pet
-        // table — species ids are their own namespace). Ids remembered as
-        // missing or recently failed are skipped outright: re-asking would
-        // burn the budget and the pacing sleep without new information, and
-        // both windows expire, so those ids get their turn again later.
+        // Only ids whose lookup would hit the source right now cost a
+        // request: never-seen ids, and rows past the enrichment window that
+        // still miss fields (the merged chain's class/level heal). Fresh rows
+        // are a single local read away. Ids remembered as missing or recently
+        // failed are skipped outright: re-asking would burn the budget and
+        // the pacing sleep without new information, and both windows expire,
+        // so those ids get their turn again later.
         let outcome = match &item {
             ItemRef::Item { item_id }
-                if !matches!(state.catalog.known(flavor, *item_id), Ok(true))
+                if state.catalog.needs_enrichment(flavor, *item_id).is_ok_and(|needs| needs)
                     && !state.catalog.deferred(flavor, *item_id) =>
             {
                 state.catalog.ensure(flavor, *item_id).map(|_| ())

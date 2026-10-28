@@ -212,15 +212,15 @@ fn parse_item(item_id: i64, bytes: &[u8]) -> Result<Option<NameRecord>, SourceEr
         item_id,
         name: decode_entities(&name),
         item_class: None,
-        // The tooltip JSON carries no class/subclass/slot; the chain's
-        // Blizzard leg fills those when it answers first elsewhere.
+        // The tooltip JSON carries no class/subclass/slot; the chain merges
+        // the Blizzard leg's fields in.
         item_subclass: None,
         inventory_slot: None,
         quality: quality_name(wire.quality),
         icon: wire.icon,
         sell_price,
-        // Tooltip JSON carries no item level; the chain's Blizzard leg fills
-        // it and the COALESCE upsert keeps it.
+        // Tooltip JSON carries no item level; the chain's merged answer
+        // fills it and the COALESCE upsert keeps it.
         item_level: None,
         fetched_at: 0,
     }))
