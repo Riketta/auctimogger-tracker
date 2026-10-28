@@ -407,6 +407,9 @@ impl SqliteStore {
     /// synchronous, foreign-keys pragmas), the schema batch cannot be
     /// applied, or a pre-kind (schema v1) database is opened — those cannot
     /// be migrated faithfully and must be rebuilt.
+    // One declarative open-and-migrate sequence: the version ladder reads
+    // best as a single ordered block.
+    #[allow(clippy::too_many_lines)]
     pub fn open(
         database: &Path,
         archive_dir: &Path,
@@ -429,6 +432,23 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON").map_err(|e| backend("foreign_keys", e))?;
         let version = Self::read_schema_version(&conn)?;
         Self::check_schema_version(&conn, version)?;
+        // Open/migration telemetry: `serve` and the subscriber-backed CLI
+        // commands emit these to stdout/file/Sentry; one-shot commands
+        // without observability (backup, config-check) simply skip them.
+        let fresh = version == 0;
+        if fresh {
+            tracing::info!(
+                database = %database.display(),
+                schema_version = SCHEMA_VERSION,
+                "new store created"
+            );
+        } else {
+            tracing::info!(
+                database = %database.display(),
+                schema_version = version,
+                "store opened"
+            );
+        }
         conn.execute_batch(SCHEMA).map_err(|e| backend("schema", e))?;
         // v5 added the per-reason drop breakdown column. Older files get an
         // in-place ALTER guarded by the version gate and a column check, so
@@ -436,6 +456,13 @@ impl SqliteStore {
         // missing) converge; the column is nullable — pre-v5 rows read as
         // "no breakdown recorded".
         if version < SCHEMA_VERSION {
+            if !fresh {
+                tracing::info!(
+                    from_version = version,
+                    to_version = SCHEMA_VERSION,
+                    "migrating store schema"
+                );
+            }
             let has_column = conn
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM pragma_table_info('snapshots') WHERE name = 'drop_reasons')",
@@ -445,6 +472,10 @@ impl SqliteStore {
                 .map(|flag| flag == 1)
                 .map_err(|e| backend("inspect snapshots schema", e))?;
             if !has_column {
+                tracing::debug!(
+                    from_version = version,
+                    "migrating: adding snapshots.drop_reasons (v5)"
+                );
                 conn.execute_batch("ALTER TABLE snapshots ADD COLUMN drop_reasons TEXT")
                     .map_err(|e| backend("migrate drop_reasons", e))?;
             }
@@ -462,6 +493,11 @@ impl SqliteStore {
                 .map(|flag| flag == 1)
                 .map_err(|e| backend("inspect item_catalog schema", e))?;
             if !catalog_has_flavor {
+                tracing::debug!(
+                    from_version = version,
+                    "migrating: rebuilding catalog tables with (flavor, id) keys (v6); \
+                     pre-v6 rows carry over as retail with NULL enrichment"
+                );
                 conn.execute_batch(CATALOG_V6_MIGRATION)
                     .map_err(|e| backend("migrate catalog to flavor keys", e))?;
             }
@@ -480,6 +516,12 @@ impl SqliteStore {
                 .map(|flag| flag == 1)
                 .map_err(|e| backend("inspect item_day schema", e))?;
             if !day_has_category {
+                tracing::warn!(
+                    from_version = version,
+                    "migrating: destructive v7 pass - aggregate tables are rebuilt per \
+                     market category from the retained raw listings; pre-v7 day folds \
+                     cannot be split by category and are re-derived"
+                );
                 conn.execute_batch(CATEGORY_V7_MIGRATION)
                     .map_err(|e| backend("migrate aggregates to category keys", e))?;
                 Self::rebuild_category_folds(&conn)?;
@@ -496,8 +538,18 @@ impl SqliteStore {
                 .map(|flag| flag == 1)
                 .map_err(|e| backend("inspect item_catalog schema", e))?;
             if !catalog_has_level {
+                tracing::debug!(
+                    from_version = version,
+                    "migrating: adding item_catalog.item_level (v8)"
+                );
                 conn.execute_batch("ALTER TABLE item_catalog ADD COLUMN item_level INTEGER")
                     .map_err(|e| backend("migrate item_level", e))?;
+            }
+            if !fresh {
+                tracing::debug!(
+                    from_version = version,
+                    "migrating: creating snapshot-viewer read tables (v8)"
+                );
             }
             conn.execute_batch(SNAPSHOT_VIEWER_V8_MIGRATION)
                 .map_err(|e| backend("migrate snapshot viewer tables", e))?;
@@ -505,6 +557,12 @@ impl SqliteStore {
             // idempotent CREATE, built from the same expression constant the
             // query's ORDER BY uses, so upgraded files converge with fresh
             // ones.
+            if !fresh {
+                tracing::debug!(
+                    from_version = version,
+                    "migrating: creating the time-left sort index (v9)"
+                );
+            }
             conn.execute_batch(&format!(
                 "CREATE INDEX IF NOT EXISTS idx_listing_snapshot_time \
                  ON listing(snapshot_id, {TIME_RANK_EXPR}, auction_id)"
@@ -512,6 +570,13 @@ impl SqliteStore {
             .map_err(|e| backend("migrate time rank index", e))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
+            if !fresh {
+                tracing::info!(
+                    from_version = version,
+                    to_version = SCHEMA_VERSION,
+                    "store schema migration complete"
+                );
+            }
         }
         Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf(), clock })
     }

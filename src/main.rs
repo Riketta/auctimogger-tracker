@@ -194,6 +194,10 @@ fn run_config_check(path: &Path) -> i32 {
 /// Writes one consistent online backup of the database (`VACUUM INTO`), then
 /// exits: safe to run against a live `serve`, since it reads the store like
 /// any other client.
+///
+/// Like `config-check`, this one-shot command installs no tracing
+/// subscriber, so `SqliteStore::open`'s open/migration records are not
+/// emitted here; failures still print to stderr.
 fn run_backup(path: &Path, out: &Path) -> i32 {
     let loaded = match load_config(path) {
         Ok(loaded) => loaded,
@@ -245,10 +249,25 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => {
+            tracing::error!(error = %error, "store open failed");
             eprintln!("error: {error}");
             return 1;
         }
     };
+    // One-line startup banner: docker logs / journald should describe the
+    // running instance without cross-referencing the config file.
+    let targets = config.targets.iter().map(|t| t.id.as_str()).collect::<Vec<_>>().join(",");
+    tracing::info!(
+        store = %config.storage.database,
+        targets = %targets,
+        catalog = %config.catalog.source,
+        feed_dir = %config.storage.feed_dir,
+        raw_retention_days = config.storage.raw_listing_days,
+        sight_retention_days = config.storage.sight_retention_days,
+        alerts = %alert_delivery_summary(config),
+        backup = %backup_summary(config),
+        "serve configuration"
+    );
     let item_info = build_item_info(config);
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
@@ -322,6 +341,31 @@ fn blizzard_credentials_present(config: &TrackerConfig) -> bool {
     }
 }
 
+/// Builds the alert dispatcher for the configured delivery; `None` is the
+/// `log` delivery (events stay recorded, no outbound messages). Dispatchers
+/// read their env values on every dispatch, so rotated URLs and tokens apply
+/// without a restart; config loading has already guaranteed the env-var
+/// NAMES are present (`validate_alerts_delivery` refuses otherwise).
+fn alert_dispatcher(
+    config: &amtracker_core::config::TrackerConfig,
+) -> Option<Arc<dyn amtracker_core::ports::AlertDispatchPort>> {
+    use amtracker_core::config::AlertDelivery;
+    match config.alerts.delivery_kind() {
+        AlertDelivery::Log => None,
+        AlertDelivery::Discord => {
+            Some(Arc::new(amtracker_infra::alert_discord::DiscordAlertDispatcher::new(
+                config.alerts.webhook_env.as_deref().unwrap_or_default(),
+            )))
+        }
+        AlertDelivery::Telegram => {
+            Some(Arc::new(amtracker_infra::alert_telegram::TelegramAlertDispatcher::new(
+                config.alerts.token_env.as_deref().unwrap_or_default(),
+                config.alerts.chat_id_env.as_deref().unwrap_or_default(),
+            )))
+        }
+    }
+}
+
 /// Assembles the shared application state for `serve`: every port wiring
 /// lives here so `run_serve` stays a readable startup sequence.
 fn build_app_state(
@@ -368,34 +412,16 @@ fn build_app_state(
                 clock.clone(),
             ),
         ),
-        alerts: {
-            use amtracker_core::config::AlertDelivery;
-            let dispatcher: Option<Arc<dyn amtracker_core::ports::AlertDispatchPort>> =
-                match config.alerts.delivery_kind() {
-                    AlertDelivery::Log => None,
-                    AlertDelivery::Discord => {
-                        Some(Arc::new(amtracker_infra::alert_discord::DiscordAlertDispatcher::new(
-                            config.alerts.webhook_env.clone().unwrap_or_default(),
-                        )))
-                    }
-                    AlertDelivery::Telegram => Some(Arc::new(
-                        amtracker_infra::alert_telegram::TelegramAlertDispatcher::new(
-                            config.alerts.token_env.clone().unwrap_or_default(),
-                            config.alerts.chat_id_env.clone().unwrap_or_default(),
-                        ),
-                    )),
-                };
-            Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
-                store.clone(),
-                store.clone(),
-                metrics.clone(),
-                store.clone(),
-                store.clone(),
-                dispatcher,
-                clock.clone(),
-                i64::try_from(config.alerts.max_data_age_secs).unwrap_or(i64::MAX),
-            ))
-        },
+        alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
+            store.clone(),
+            store.clone(),
+            metrics.clone(),
+            store.clone(),
+            store.clone(),
+            alert_dispatcher(config),
+            clock.clone(),
+            i64::try_from(config.alerts.max_data_age_secs).unwrap_or(i64::MAX),
+        )),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),
             store.clone(),
@@ -439,6 +465,41 @@ fn open_store(
     )
     .map(Arc::new)
     .map_err(|error| error.to_string())
+}
+
+/// The alert delivery actually in effect, for the startup banner. Config
+/// loading guarantees a named transport has its env-var names present
+/// (`validate_alerts_delivery` refuses otherwise).
+fn alert_delivery_summary(config: &amtracker_core::config::TrackerConfig) -> String {
+    if !config.alerts.enabled {
+        return "disabled".to_owned();
+    }
+    match config.alerts.delivery_kind() {
+        amtracker_core::config::AlertDelivery::Log => "log".to_owned(),
+        amtracker_core::config::AlertDelivery::Discord => format!(
+            "discord webhook_env={}",
+            config.alerts.webhook_env.as_deref().unwrap_or_default()
+        ),
+        amtracker_core::config::AlertDelivery::Telegram => format!(
+            "telegram token_env={} chat_id_env={}",
+            config.alerts.token_env.as_deref().unwrap_or_default(),
+            config.alerts.chat_id_env.as_deref().unwrap_or_default()
+        ),
+    }
+}
+
+/// The scheduled-backup setting for the banner (mirrors the scheduler's
+/// gate: both `backup_dir` and a positive `backup_secs`).
+fn backup_summary(config: &amtracker_core::config::TrackerConfig) -> String {
+    match config.storage.backup_dir.as_deref() {
+        Some(dir) if config.storage.backup_secs > 0 => format!(
+            "every {}s keep {} -> {}",
+            config.storage.backup_secs,
+            config.storage.backup_keep,
+            dir.display()
+        ),
+        _ => "disabled".to_owned(),
+    }
 }
 
 fn run_export_feed(
@@ -607,6 +668,7 @@ fn run_fetch(config: &amtracker_core::config::TrackerConfig, only_target: Option
     let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => {
+            tracing::error!(error = %error, "store open failed");
             eprintln!("error: {error}");
             return 1;
         }

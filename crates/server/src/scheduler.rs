@@ -688,6 +688,7 @@ fn warm_item_names(
         }
     }
     let mut warmed = 0u32;
+    let mut deferred = 0u32;
     for (examined, item) in items.into_iter().enumerate() {
         // Every examined item counts against the budget, known or not: the
         // accounting must precede the known/deferred branch, or an all-known
@@ -702,21 +703,29 @@ fn warm_item_names(
         // are a single local read away. Ids remembered as missing or recently
         // failed are skipped outright: re-asking would burn the budget and
         // the pacing sleep without new information, and both windows expire,
-        // so those ids get their turn again later.
+        // so those ids get their turn again later. Counting the deferred ids
+        // per pass makes a persistent source outage (or a junk-id burst)
+        // visible at the edge even when the other chain leg absorbs it.
+        let (needs_lookup, is_deferred) = match &item {
+            ItemRef::Item { item_id } => (
+                state.catalog.needs_enrichment(flavor, *item_id).is_ok_and(|needs| needs),
+                state.catalog.deferred(flavor, *item_id),
+            ),
+            ItemRef::Pet { species, .. } => (
+                !matches!(state.catalog.known_pet(flavor, *species), Ok(true)),
+                state.catalog.deferred_pet(flavor, *species),
+            ),
+        };
+        if is_deferred {
+            deferred += 1;
+            continue;
+        }
+        if !needs_lookup {
+            continue;
+        }
         let outcome = match &item {
-            ItemRef::Item { item_id }
-                if state.catalog.needs_enrichment(flavor, *item_id).is_ok_and(|needs| needs)
-                    && !state.catalog.deferred(flavor, *item_id) =>
-            {
-                state.catalog.ensure(flavor, *item_id).map(|_| ())
-            }
-            ItemRef::Pet { species, .. }
-                if !matches!(state.catalog.known_pet(flavor, *species), Ok(true))
-                    && !state.catalog.deferred_pet(flavor, *species) =>
-            {
-                state.catalog.ensure_pet(flavor, *species).map(|_| ())
-            }
-            _ => continue,
+            ItemRef::Item { item_id } => state.catalog.ensure(flavor, *item_id).map(|_| ()),
+            ItemRef::Pet { species, .. } => state.catalog.ensure_pet(flavor, *species).map(|_| ()),
         };
         match outcome {
             Ok(()) => warmed += 1,
@@ -732,7 +741,13 @@ fn warm_item_names(
         thread::sleep(pace);
     }
     if warmed > 0 {
-        tracing::info!(target, warmed, "background item-name warm-up pass");
+        tracing::info!(target, warmed, deferred, "background item-name warm-up pass");
+    } else if deferred > 0 {
+        tracing::debug!(
+            target,
+            deferred,
+            "name warm-up pass: every candidate id is deferred by the negative/error cache"
+        );
     }
 }
 
