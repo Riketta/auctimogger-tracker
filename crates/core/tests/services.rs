@@ -1818,6 +1818,7 @@ fn opportunity_config() -> TrackerConfig {
             backup_dir: None,
             backup_secs: 0,
             backup_keep: 7,
+            vacuum: amtracker_core::config::VacuumPolicy::Off,
         },
         metrics: amtracker_core::config::MetricsConfig {
             spans: vec![amtracker_core::domain::Span::D1],

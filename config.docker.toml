@@ -23,6 +23,9 @@ token_env = "AMT_API_TOKEN"
 database = "/data/tracker.sqlite3"
 raw_listing_days = 7
 archive_dir = "/data/raw"
+# Freed-space reclamation after prunes: "incremental" (default), "full"
+# (daily complete VACUUM), or "off".
+vacuum = "incremental"
 
 [metrics]
 spans = ["d1", "d7", "d14", "d30"]

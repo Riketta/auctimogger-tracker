@@ -805,3 +805,102 @@ pub trait FeedPublisher: Send + Sync {
     /// Returns `StoreError::Backend` when the stored bytes cannot be read.
     fn read(&self, target: &TargetId, format: FeedFormat) -> Result<Option<Vec<u8>>, StoreError>;
 }
+
+/// File-level space usage of the backing store, for logging and
+/// reclamation decisions. Counts are SQLite page accounting: the total is
+/// what the file occupies on disk, the freelist is pages freed by deletes
+/// that are reused before the file grows again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SpaceStats {
+    /// SQLite page size in bytes.
+    pub page_size: i64,
+    /// Total pages in the database file.
+    pub page_count: i64,
+    /// Pages freed by deletes and currently unused.
+    pub freelist_count: i64,
+}
+
+impl SpaceStats {
+    /// Bytes the database file occupies on disk (excluding the WAL).
+    #[must_use]
+    pub fn total_bytes(&self) -> u64 {
+        u64::try_from(self.page_size.saturating_mul(self.page_count)).unwrap_or(u64::MAX)
+    }
+
+    /// Bytes currently in the freelist (reclaimable without a rebuild).
+    #[must_use]
+    pub fn free_bytes(&self) -> u64 {
+        u64::try_from(self.page_size.saturating_mul(self.freelist_count)).unwrap_or(u64::MAX)
+    }
+
+    /// Fraction of the file that is free pages (`0.0..=1.0`); `0.0` when
+    /// the file has no pages.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // page counts far below 2^53: exact
+    pub fn free_ratio(&self) -> f64 {
+        if self.page_count == 0 {
+            return 0.0;
+        }
+        self.freelist_count as f64 / self.page_count as f64
+    }
+}
+
+/// Outbound: storage-file maintenance — space accounting and reclamation.
+/// Implemented by the SQLite store; driven by the scheduler's maintenance
+/// pass and the `vacuum` CLI command. Every method is a short standalone
+/// operation (the store serializes internally), so callers may interleave
+/// them with normal traffic; only `VACUUM`-based operations block writers
+/// for their duration.
+pub trait SpaceMaintenance: Send + Sync {
+    /// Page-level space accounting of the database file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the pragmas cannot be read.
+    fn space_stats(&self) -> Result<SpaceStats, StoreError>;
+
+    /// The database header's auto-vacuum mode: `0` none, `1` full, `2`
+    /// incremental. A `0` header ignores the in-memory pragma until a full
+    /// `VACUUM` rebuilds the file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the pragma cannot be read.
+    fn auto_vacuum_mode(&self) -> Result<i64, StoreError>;
+
+    /// Switches the header to incremental auto-vacuum and compacts once
+    /// (the header change only takes effect through a full `VACUUM`).
+    /// Blocks writers for the duration of the rebuild.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the pragma or the `VACUUM` fails
+    /// (e.g. another process holds a conflicting lock).
+    fn enable_incremental_auto_vacuum(&self) -> Result<(), StoreError>;
+
+    /// Returns all freelist pages to the filesystem
+    /// (`PRAGMA incremental_vacuum`). Cheap no-op on an empty freelist.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the pragma fails.
+    fn incremental_vacuum(&self) -> Result<(), StoreError>;
+
+    /// Rebuilds the database file (`VACUUM`): compacts every free page and
+    /// defragments. Blocks writers for its duration and needs free disk
+    /// roughly the size of the database.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the `VACUUM` fails.
+    fn full_vacuum(&self) -> Result<(), StoreError>;
+
+    /// Checkpoints and truncates the WAL file
+    /// (`PRAGMA wal_checkpoint(TRUNCATE)`), returning its bytes to the
+    /// filesystem after write bursts.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when readers block the checkpoint.
+    fn checkpoint_wal(&self) -> Result<(), StoreError>;
+}

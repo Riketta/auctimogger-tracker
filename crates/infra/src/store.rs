@@ -6,6 +6,7 @@
 //! a bounded working set (`prune_raw_before`).
 
 use std::{
+    io::Write as _,
     path::{
         Path,
         PathBuf,
@@ -59,8 +60,14 @@ use amtracker_core::{
         PriceHistoryRepository,
         SalesRepository,
         SnapshotRepository,
+        SpaceMaintenance,
+        SpaceStats,
         WatchlistRepository,
     },
+};
+use flate2::{
+    write::GzEncoder,
+    Compression,
 };
 use rusqlite::Connection;
 
@@ -383,6 +390,18 @@ pub struct SqliteStore {
     clock: std::sync::Arc<dyn ClockPort>,
 }
 
+/// Whether fresh databases get `PRAGMA auto_vacuum = INCREMENTAL` baked
+/// into their header. `Off` preserves the historical never-shrink header;
+/// `Incremental` makes freed pages reclaimable by `PRAGMA
+/// incremental_vacuum` without a full rebuild.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutoVacuum {
+    /// Historical header: freed pages are only reused, never returned.
+    Off,
+    /// Header mode 2: freed pages returnable via incremental vacuum.
+    Incremental,
+}
+
 fn backend<E: std::fmt::Display>(context: &str, error: E) -> StoreError {
     StoreError::Backend(format!("{context}: {error}"))
 }
@@ -407,6 +426,12 @@ impl SqliteStore {
     /// synchronous, foreign-keys pragmas), the schema batch cannot be
     /// applied, or a pre-kind (schema v1) database is opened — those cannot
     /// be migrated faithfully and must be rebuilt.
+    ///
+    /// `auto_vacuum` decides the fresh-file header: [`AutoVacuum::Incremental`]
+    /// bakes `PRAGMA auto_vacuum = INCREMENTAL` in so freed pages are
+    /// reclaimable without a full rebuild; [`AutoVacuum::Off`] preserves the
+    /// historical never-shrink header. Existing files ignore the pragma
+    /// until a full `VACUUM` (the maintenance conversion path).
     // One declarative open-and-migrate sequence: the version ladder reads
     // best as a single ordered block.
     #[allow(clippy::too_many_lines)]
@@ -414,14 +439,24 @@ impl SqliteStore {
         database: &Path,
         archive_dir: &Path,
         clock: std::sync::Arc<dyn ClockPort>,
+        auto_vacuum: AutoVacuum,
     ) -> Result<Self, StoreError> {
         if let Some(parent) = database.parent() {
             std::fs::create_dir_all(parent).map_err(|e| backend("create data dir", e))?;
         }
         std::fs::create_dir_all(archive_dir).map_err(|e| backend("create archive dir", e))?;
         let conn = Connection::open(database).map_err(|e| backend("open sqlite", e))?;
+        // Must precede journal_mode: WAL writes the header immediately, and
+        // auto_vacuum only applies to a database that is still empty (on an
+        // existing file this pragma is inert until a full VACUUM).
+        let mode = match auto_vacuum {
+            AutoVacuum::Off => "NONE",
+            AutoVacuum::Incremental => "INCREMENTAL",
+        };
+        conn.pragma_update(None, "auto_vacuum", mode).map_err(|e| backend("auto_vacuum", e))?;
         conn.pragma_update(None, "journal_mode", "WAL").map_err(|e| backend("journal_mode", e))?;
         conn.pragma_update(None, "synchronous", "NORMAL").map_err(|e| backend("synchronous", e))?;
+        conn.pragma_update(None, "auto_vacuum", mode).map_err(|e| backend("auto_vacuum", e))?;
         // Operators run CLI one-offs against a live `serve` (documented in
         // the README); a 5 s busy wait turns those races into waits instead
         // of `SQLITE_BUSY` errors.
@@ -642,17 +677,24 @@ impl SqliteStore {
         raw: &[u8],
     ) -> Result<String, StoreError> {
         let relative =
-            PathBuf::from(target.as_str()).join(kind.as_str()).join(format!("{sha}.json"));
+            PathBuf::from(target.as_str()).join(kind.as_str()).join(format!("{sha}.json.gz"));
         let full = self.archive_dir.join(&relative);
         if !full.exists() {
             if let Some(parent) = full.parent() {
                 std::fs::create_dir_all(parent).map_err(|e| backend("archive dir", e))?;
             }
+            // Gzip (default level 6): auction JSON collapses ~10x, and the
+            // write stays on the ingest path, so the level trades little
+            // ratio for latency. Content-addressed name — identical raw
+            // bytes still collapse into one tmp-file-renamed file.
+            let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+            encoder.write_all(raw).map_err(|e| backend("archive compress", e))?;
+            let compressed = encoder.finish().map_err(|e| backend("archive compress", e))?;
             // Unique tmp name per call: two processes (serve + a CLI one-off)
             // archiving the same sha concurrently must not interleave writes
             // into one tmp file.
             let tmp = full.with_extension(format!("tmp.{}", unique_tmp_suffix()));
-            std::fs::write(&tmp, raw).map_err(|e| backend("archive write", e))?;
+            std::fs::write(&tmp, &compressed).map_err(|e| backend("archive write", e))?;
             std::fs::rename(&tmp, &full).map_err(|e| backend("archive rename", e))?;
         }
         relative
@@ -785,6 +827,52 @@ impl SqliteStore {
         }
         tx.commit().map_err(|e| backend("commit category rebuild", e))?;
         Ok(())
+    }
+}
+
+impl SpaceMaintenance for SqliteStore {
+    fn space_stats(&self) -> Result<SpaceStats, StoreError> {
+        let conn = self.open_transaction();
+        let read = |pragma: &str| -> Result<i64, StoreError> {
+            conn.query_row(&format!("PRAGMA {pragma}"), [], |row| row.get(0))
+                .map_err(|e| backend(pragma, e))
+        };
+        Ok(SpaceStats {
+            page_size: read("page_size")?,
+            page_count: read("page_count")?,
+            freelist_count: read("freelist_count")?,
+        })
+    }
+
+    fn auto_vacuum_mode(&self) -> Result<i64, StoreError> {
+        self.open_transaction()
+            .query_row("PRAGMA auto_vacuum", [], |row| row.get(0))
+            .map_err(|e| backend("auto_vacuum", e))
+    }
+
+    fn enable_incremental_auto_vacuum(&self) -> Result<(), StoreError> {
+        let conn = self.open_transaction();
+        conn.pragma_update(None, "auto_vacuum", "INCREMENTAL")
+            .map_err(|e| backend("auto_vacuum", e))?;
+        // The header change only takes effect through a full rebuild, which
+        // is exactly what makes this call the one-time legacy conversion.
+        conn.execute_batch("VACUUM").map_err(|e| backend("vacuum conversion", e))
+    }
+
+    fn incremental_vacuum(&self) -> Result<(), StoreError> {
+        self.open_transaction()
+            .execute_batch("PRAGMA incremental_vacuum;")
+            .map_err(|e| backend("incremental vacuum", e))
+    }
+
+    fn full_vacuum(&self) -> Result<(), StoreError> {
+        self.open_transaction().execute_batch("VACUUM").map_err(|e| backend("vacuum", e))
+    }
+
+    fn checkpoint_wal(&self) -> Result<(), StoreError> {
+        self.open_transaction()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| backend("wal checkpoint", e))
     }
 }
 
@@ -3084,7 +3172,7 @@ impl PriceHistoryRepository for SqliteStore {
             .collect();
         for path in paths {
             // Shared-payload guard: identical raw bytes collapse to one
-            // `<sha>.json` archive path, so a path surfaced via an old
+            // `<sha>.json.gz` archive path, so a path surfaced via an old
             // snapshot may still be the live archive of a newer one. Only
             // reclaim paths with no recent referent — the old row keeps a
             // path pointing at an existing file, which is harmless (and the
@@ -3570,6 +3658,7 @@ mod tests {
             &dir.join("fk.db"),
             &dir.join("raw"),
             std::sync::Arc::new(crate::clock::SystemClock) as std::sync::Arc<dyn ClockPort>,
+            AutoVacuum::Off,
         )
         .expect("open");
 
@@ -3582,6 +3671,10 @@ mod tests {
     }
 
     fn test_store(name: &str) -> (std::path::PathBuf, SqliteStore) {
+        test_store_auto(name, AutoVacuum::Off)
+    }
+
+    fn test_store_auto(name: &str, auto_vacuum: AutoVacuum) -> (std::path::PathBuf, SqliteStore) {
         let dir = std::env::temp_dir().join(format!(
             "amtracker-{name}-{}-{}",
             std::process::id(),
@@ -3592,6 +3685,7 @@ mod tests {
             &dir.join("test.db"),
             &dir.join("raw"),
             std::sync::Arc::new(crate::clock::SystemClock) as std::sync::Arc<dyn ClockPort>,
+            auto_vacuum,
         )
         .expect("open");
         (dir, store)
@@ -3732,6 +3826,72 @@ mod tests {
             conn.query_row("SELECT COUNT(*) FROM listing", [], |row| row.get(0)).expect("count");
         assert_eq!(remaining, 30, "stale target's fresh rows + the other target survive");
         drop(conn);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn incremental_auto_vacuum_is_baked_into_fresh_headers() {
+        let (dir, store) = test_store_auto("vacuum-header", AutoVacuum::Incremental);
+        assert_eq!(SpaceMaintenance::auto_vacuum_mode(&store).expect("mode"), 2);
+        drop(store);
+
+        let (dir_off, store_off) = test_store_auto("vacuum-header-off", AutoVacuum::Off);
+        assert_eq!(SpaceMaintenance::auto_vacuum_mode(&store_off).expect("mode"), 0);
+        drop(store_off);
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::remove_dir_all(&dir_off).ok();
+    }
+
+    #[test]
+    fn space_stats_and_full_vacuum_reclaim_freed_pages() {
+        let (dir, store) = test_store("vacuum-shrink");
+        let stale = TargetId("eu-1602".into());
+        {
+            let conn = store.open_transaction();
+            let item_ref_id =
+                get_or_create_item_ref(&conn, &ItemRef::Item { item_id: 9 }).expect("item ref");
+            for auction in 0..2_000 {
+                conn.execute(
+                    "INSERT INTO listing (snapshot_id, target_id, day, auction_id, item_ref_id,
+                                          quantity, unit_price, bid, time_left, context, bonus_lists)
+                     VALUES (1, ?1, 100, ?2, ?3, 1, 100, NULL, 'VERY_LONG', NULL, '[]')",
+                    rusqlite::params![stale.as_str(), auction, item_ref_id],
+                )
+                .expect("insert listing");
+            }
+        }
+        store.prune_raw_before(&stale, 101).expect("prune");
+
+        let before = SpaceMaintenance::space_stats(&store).expect("stats before");
+        assert!(before.freelist_count > 0, "deletes must leave free pages");
+        SpaceMaintenance::full_vacuum(&store).expect("vacuum");
+        let after = SpaceMaintenance::space_stats(&store).expect("stats after");
+        assert_eq!(after.freelist_count, 0, "full vacuum empties the freelist");
+        assert!(
+            after.total_bytes() < before.total_bytes(),
+            "file must shrink: {} -> {}",
+            before.total_bytes(),
+            after.total_bytes()
+        );
+        SpaceMaintenance::checkpoint_wal(&store).expect("checkpoint");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn archived_payloads_are_gzip_compressed_and_roundtrip() {
+        let (dir, store) = test_store("archive-gzip");
+        let raw: &[u8] = br#"{"auctions":[{"auc":1,"item":2589,"qty":20,"buy":100}]}"#;
+        let sha = sha256_hex(raw);
+        let path = store
+            .archive_payload(&TargetId("eu-1602".into()), PayloadKind::Commodities, &sha, raw)
+            .expect("archive");
+        assert!(path.ends_with(".json.gz"), "compressed extension: {path}");
+        let full = dir.join("raw").join(&path);
+        assert!(full.exists(), "archive file written");
+        let mut decoder = flate2::read::GzDecoder::new(std::fs::File::open(&full).expect("open"));
+        let mut payload = Vec::new();
+        std::io::Read::read_to_end(&mut decoder, &mut payload).expect("gunzip");
+        assert_eq!(payload, raw, "decompressed bytes match the payload");
         std::fs::remove_dir_all(&dir).ok();
     }
 }

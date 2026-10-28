@@ -20,6 +20,7 @@ use amtracker_core::{
         TargetConfig,
         TargetKind,
         TrackerConfig,
+        VacuumPolicy,
     },
     domain::Span,
     error::ConfigError,
@@ -236,6 +237,10 @@ pub struct FileStorage {
     /// backup); defaults to 7.
     #[serde(default = "default_backup_keep")]
     pub backup_keep: u32,
+    /// Freed-space reclamation after retention prunes:
+    /// `incremental` (default), `full`, or `off`.
+    #[serde(default = "default_vacuum")]
+    pub vacuum: String,
 }
 
 fn default_raw_days() -> u32 {
@@ -252,6 +257,10 @@ fn default_backup_secs() -> u64 {
 
 fn default_backup_keep() -> u32 {
     7
+}
+
+fn default_vacuum() -> String {
+    "incremental".to_string()
 }
 
 /// File shape of the `[metrics]` section.
@@ -531,6 +540,16 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
         })?;
         spans.push(span);
     }
+    let vacuum = match file.storage.vacuum.as_str() {
+        "incremental" => VacuumPolicy::Incremental,
+        "full" => VacuumPolicy::Full,
+        "off" => VacuumPolicy::Off,
+        other => {
+            return Err(ConfigError(format!(
+                "unknown [storage].vacuum '{other}' (expected incremental|full|off)"
+            )));
+        }
+    };
     Ok(TrackerConfig {
         server: ServerConfig {
             bind: file.server.bind,
@@ -547,6 +566,7 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             backup_dir: file.storage.backup_dir,
             backup_secs: file.storage.backup_secs,
             backup_keep: file.storage.backup_keep,
+            vacuum,
         },
         metrics: MetricsConfig { spans },
         opportunities: OpportunitiesConfig {
@@ -635,6 +655,7 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
                 "backup_dir",
                 "backup_secs",
                 "backup_keep",
+                "vacuum",
             ],
             &mut unknown,
         );

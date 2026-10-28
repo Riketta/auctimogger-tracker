@@ -34,7 +34,10 @@ use amtracker_core::{
 };
 use amtracker_infra::{
     blizzard_source::parse_payload,
-    store::SqliteStore,
+    store::{
+        AutoVacuum,
+        SqliteStore,
+    },
 };
 
 const SAMPLE: &str = include_str!("../../../fixtures/auctions_sample.json");
@@ -88,6 +91,7 @@ fn real_sample_sightings_close_and_credit() {
         &dir.join("db.sqlite3"),
         &dir.join("raw"),
         Arc::new(FixedClock(now + 600)),
+        AutoVacuum::Off,
     )
     .expect("open");
     let target = TargetId("us-4".into());

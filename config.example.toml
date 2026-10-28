@@ -22,6 +22,11 @@ token_env = "AMT_API_TOKEN" # unset or empty = mutating endpoints are open (loca
 database = "./data/tracker.sqlite3"
 raw_listing_days = 7      # raw listing working set; snapshot metadata live forever
 archive_dir = "./data/raw"
+# Freed-space reclamation after retention prunes: "incremental" (default)
+# returns freed pages once ~20% of the file is free; "full" runs a complete
+# VACUUM daily instead (slower, needs free disk ~ database size); "off"
+# keeps the historical never-shrink behavior.
+# vacuum = "incremental"
 # Feed output directory for `serve` (feed.lua / feed.json); relative paths
 # resolve against the working directory serve is started from.
 # feed_dir = "./feeds"

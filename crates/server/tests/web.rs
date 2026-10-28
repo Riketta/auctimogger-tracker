@@ -70,7 +70,10 @@ use amtracker_infra::{
         FeedCodec,
         FileFeedPublisher,
     },
-    store::SqliteStore,
+    store::{
+        AutoVacuum,
+        SqliteStore,
+    },
 };
 use amtracker_server::web::{
     api_routes,
@@ -160,6 +163,7 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             backup_dir: None,
             backup_secs: 0,
             backup_keep: 7,
+            vacuum: amtracker_core::config::VacuumPolicy::Off,
         },
         metrics: MetricsConfig {
             spans: vec![amtracker_core::domain::Span::D1, amtracker_core::domain::Span::D7],
@@ -271,8 +275,13 @@ fn test_state_with_config(
     mutate(&mut config);
     let clock: Arc<dyn ClockPort> = Arc::new(SystemClock);
     let store = Arc::new(
-        SqliteStore::open(&root.join("db.sqlite3"), &root.join("raw"), clock.clone())
-            .expect("open store"),
+        SqliteStore::open(
+            &root.join("db.sqlite3"),
+            &root.join("raw"),
+            clock.clone(),
+            AutoVacuum::Off,
+        )
+        .expect("open store"),
     );
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
@@ -331,6 +340,7 @@ fn test_state_with_config(
         )),
         history: store.clone(),
         snapshots: store.clone(),
+        maintenance: store.clone(),
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         recent_cycles: Arc::new(RecentCycles::new(8)),
         timers: Arc::new(std::sync::Mutex::new(

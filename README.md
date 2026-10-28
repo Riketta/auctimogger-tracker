@@ -126,6 +126,7 @@ only — never put secrets in this file.
 | `storage.backup_dir` | absent | directory for scheduled online backups; absent = off |
 | `storage.backup_secs` | `0` | minimum seconds between scheduled backups (`0` = off) |
 | `storage.backup_keep` | `7` | recent backups kept (oldest pruned after each backup) |
+| `storage.vacuum` | `incremental` | freed-space reclamation after prunes: `incremental` (returns pages once ~20% of the file is free; legacy stores convert with a one-time full VACUUM), `full` (complete VACUUM daily), `off` (never shrink) |
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
 | `opportunities.min_samples` | `30` | samples before an item is scored (per category) |
 | `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | score mix, tunable without code changes |

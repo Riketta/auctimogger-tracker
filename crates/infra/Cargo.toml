@@ -12,6 +12,10 @@ workspace = true
 [dependencies]
 amtracker-core = { path = "../core" }
 base64 = "0.22"
+# Raw payload archives are gzip-compressed at write time (pure-Rust
+# miniz_oxide backend — no C/zlib dependency); nothing reads them back in
+# production, so the format change needs no compatibility layer.
+flate2 = "1"
 httpdate = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

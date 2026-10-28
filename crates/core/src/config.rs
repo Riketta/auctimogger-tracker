@@ -52,6 +52,24 @@ pub struct ServerConfig {
     pub feed_publish_secs: u64,
 }
 
+/// Store-file space reclamation policy. Retention prunes free database
+/// pages internally, but SQLite keeps the file at its high-water mark until
+/// something returns them to the filesystem.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VacuumPolicy {
+    /// Fresh databases get `PRAGMA auto_vacuum = INCREMENTAL`; after each
+    /// prune pass the maintenance worker returns freed pages once the
+    /// freelist crosses a fragmentation threshold. Legacy stores are
+    /// converted with a one-time full `VACUUM` on the first pass.
+    Incremental,
+    /// A full `VACUUM` runs once per UTC day after the prune pass:
+    /// maximal shrink, but it needs free disk roughly the size of the
+    /// database and blocks writes for its duration.
+    Full,
+    /// Historical behavior: the file never shrinks.
+    Off,
+}
+
 /// Persistence settings: database location, retention, payload archives and
 /// optional scheduled online backups.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,6 +95,9 @@ pub struct StorageConfig {
     /// How many recent backup files to keep (the oldest are pruned after
     /// each backup).
     pub backup_keep: u32,
+    /// How freed database pages are returned to the filesystem after
+    /// retention prunes (see [`VacuumPolicy`]).
+    pub vacuum: VacuumPolicy,
 }
 
 /// Analytics exposure settings.

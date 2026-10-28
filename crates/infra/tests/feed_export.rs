@@ -44,7 +44,10 @@ use amtracker_core::{
 };
 use amtracker_infra::{
     feed::FeedCodec,
-    store::SqliteStore,
+    store::{
+        AutoVacuum,
+        SqliteStore,
+    },
 };
 
 struct FixedClock(i64);
@@ -92,8 +95,13 @@ fn pet_variants_export_as_one_species_entry_with_merged_metrics() {
     let dir = temp_dir("merge");
     let now = 86_400 * 100; // UTC day 100
     let store = Arc::new(
-        SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw"), Arc::new(FixedClock(now)))
-            .expect("open"),
+        SqliteStore::open(
+            &dir.join("db.sqlite3"),
+            &dir.join("raw"),
+            Arc::new(FixedClock(now)),
+            AutoVacuum::Off,
+        )
+        .expect("open"),
     );
     let target = TargetId("us-4".into());
 
@@ -174,8 +182,13 @@ fn multi_span_export_attributes_every_span_to_its_own_group() {
     let dir = temp_dir("multispan");
     let now = 86_400 * 100; // UTC day 100
     let store = Arc::new(
-        SqliteStore::open(&dir.join("db.sqlite3"), &dir.join("raw"), Arc::new(FixedClock(now)))
-            .expect("open"),
+        SqliteStore::open(
+            &dir.join("db.sqlite3"),
+            &dir.join("raw"),
+            Arc::new(FixedClock(now)),
+            AutoVacuum::Off,
+        )
+        .expect("open"),
     );
     let target = TargetId("us-4".into());
     let item1 = ItemRef::Item { item_id: 1 };

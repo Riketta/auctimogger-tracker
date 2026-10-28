@@ -46,7 +46,10 @@ use amtracker_core::{
         SnapshotRepository,
     },
 };
-use amtracker_infra::store::SqliteStore;
+use amtracker_infra::store::{
+    AutoVacuum,
+    SqliteStore,
+};
 
 /// Fixed clock: catalog stamps flow through the injected port so tests are
 /// deterministic by construction.
@@ -63,6 +66,7 @@ fn open_store(dir: &std::path::Path, now: i64) -> SqliteStore {
         &dir.join("db.sqlite3"),
         &dir.join("raw"),
         Arc::new(FixedClock(now)) as Arc<dyn ClockPort>,
+        AutoVacuum::Off,
     )
     .expect("open")
 }

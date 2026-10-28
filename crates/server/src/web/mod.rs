@@ -43,6 +43,7 @@ use amtracker_core::{
         FeedRenderer,
         PriceHistoryRepository,
         SnapshotRepository,
+        SpaceMaintenance,
     },
     services::{
         cycle::IngestCycleService,
@@ -111,6 +112,9 @@ pub struct AppState {
     pub history: Arc<dyn PriceHistoryRepository>,
     /// Snapshot metadata behind the snapshot browser's history view.
     pub snapshots: Arc<dyn SnapshotRepository>,
+    /// Storage-file space accounting + reclamation, driven by the
+    /// scheduler's maintenance pass and the `vacuum` CLI command.
+    pub maintenance: Arc<dyn SpaceMaintenance>,
     /// Serializes ingestion cycles (scheduled + manual `/api/fetch`) so the
     /// `observe`/`close_missing` sequences of two cycles never interleave.
     pub cycle_lock: Arc<std::sync::Mutex<()>>,
@@ -543,6 +547,7 @@ mod tests {
                 backup_dir: None,
                 backup_secs: 0,
                 backup_keep: 7,
+                vacuum: amtracker_core::config::VacuumPolicy::Off,
             },
             metrics: amtracker_core::config::MetricsConfig { spans: vec![Span::D1] },
             opportunities: amtracker_core::config::OpportunitiesConfig {

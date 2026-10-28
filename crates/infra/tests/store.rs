@@ -47,7 +47,10 @@ use amtracker_core::{
         SnapshotRepository,
     },
 };
-use amtracker_infra::store::SqliteStore;
+use amtracker_infra::store::{
+    AutoVacuum,
+    SqliteStore,
+};
 
 /// Fixed clock: `sale_rate` windows and watchlist/catalog stamps now flow
 /// through the injected port, so tests are deterministic by construction.
@@ -64,6 +67,7 @@ fn open_store(dir: &std::path::Path, now: i64) -> SqliteStore {
         &dir.join("db.sqlite3"),
         &dir.join("raw"),
         Arc::new(FixedClock(now)) as Arc<dyn ClockPort>,
+        AutoVacuum::Off,
     )
     .expect("open")
 }
@@ -619,6 +623,7 @@ fn expect_legacy_refusal(
         db_path,
         &dir.join("raw"),
         Arc::new(FixedClock(0)) as Arc<dyn ClockPort>,
+        AutoVacuum::Off,
     ) {
         Err(error) => error,
         Ok(_) => panic!("legacy v1 database must be refused"),
@@ -1294,6 +1299,7 @@ fn future_schema_files_are_refused_with_the_stamp_intact() {
         &path,
         &dir.join("raw"),
         Arc::new(FixedClock(1_000)) as Arc<dyn ClockPort>,
+        AutoVacuum::Off,
     ) else {
         panic!("future schema must be refused");
     };

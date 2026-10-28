@@ -37,6 +37,7 @@ use std::{
 };
 
 use amtracker_core::{
+    config::VacuumPolicy,
     domain::{
         utc_day,
         Category,
@@ -60,6 +61,11 @@ const TICK: Duration = Duration::from_secs(30);
 /// How long an idle maintenance worker waits before waking up anyway: due
 /// retention prunes depend on UTC day rolls, which enqueue nothing.
 const MAINTENANCE_IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// Freelist fraction above which the incremental pass returns pages to the
+/// filesystem. Below it, freed pages are simply reused by future writes, so
+/// reclaiming would churn without shrinking the file.
+const VACUUM_FREE_PAGE_RATIO: f64 = 0.2;
 
 /// Backoff applied to a rate-limited (target, kind) when the source sent no
 /// parseable `Retry-After` hint.
@@ -168,6 +174,8 @@ pub fn schedule_view(
 struct MaintenanceState {
     prune_day: HashMap<String, i64>,
     feed_publish: HashMap<String, Instant>,
+    /// UTC day the store-wide space-reclamation pass last ran.
+    vacuum_day: Option<i64>,
 }
 
 /// Deduplicated maintenance queue: at most one pending pass per target — a
@@ -610,6 +618,11 @@ fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
                 run_prune_if_due(state, &config, &mut maintenance, &target.id.0);
             });
         }
+        // Store-wide, once per UTC day, after the prunes that create the
+        // free pages it reclaims.
+        survive("vacuum", "-", || {
+            run_vacuum_if_due(state, &config, &mut maintenance);
+        });
     }
 }
 
@@ -788,6 +801,109 @@ fn run_prune_if_due(
         Err(error) => {
             tracing::warn!(target, error = %error, "raw listing retention failed");
         }
+    }
+}
+
+/// Store-wide space reclamation, at most once per UTC day and only after
+/// the prune sweep (which creates the free pages it reclaims). With
+/// `incremental`, a legacy never-shrink store is converted once (full
+/// `VACUUM`, logged loudly), then freed pages are returned when the
+/// freelist crosses the fragmentation threshold. With `full`, a complete
+/// `VACUUM` runs daily. Every failure warns and waits for the next day.
+fn run_vacuum_if_due(
+    state: &Arc<AppState>,
+    config: &amtracker_core::config::TrackerConfig,
+    maintenance: &mut MaintenanceState,
+) {
+    if config.storage.vacuum == VacuumPolicy::Off {
+        return;
+    }
+    let today = utc_day(state.clock.now());
+    if maintenance.vacuum_day == Some(today) {
+        return;
+    }
+    maintenance.vacuum_day = Some(today);
+    let store = &state.maintenance;
+    match config.storage.vacuum {
+        VacuumPolicy::Off => {}
+        VacuumPolicy::Full => {
+            let Ok(before) = store.space_stats() else {
+                tracing::warn!("store space stats failed; skipping vacuum");
+                return;
+            };
+            let started = Instant::now();
+            match store.full_vacuum() {
+                Ok(()) => {
+                    let after = store.space_stats().ok();
+                    tracing::info!(
+                        duration_secs = started.elapsed().as_secs(),
+                        before_bytes = before.total_bytes(),
+                        after_bytes = after.as_ref().map_or(
+                            before.total_bytes(),
+                            amtracker_core::ports::SpaceStats::total_bytes
+                        ),
+                        "full vacuum complete"
+                    );
+                }
+                Err(error) => {
+                    tracing::warn!(error = %error, "full vacuum failed");
+                }
+            }
+        }
+        VacuumPolicy::Incremental => {
+            // Legacy conversion: a 0 header ignores the pragma until a full
+            // VACUUM applies it; this runs exactly once and can take a
+            // while on a large store.
+            match store.auto_vacuum_mode() {
+                Ok(0) => {
+                    tracing::info!(
+                        "one-time store conversion: full VACUUM to enable incremental \
+                         auto-vacuum (blocks writes for its duration)"
+                    );
+                    match store.enable_incremental_auto_vacuum() {
+                        Ok(()) => {
+                            if let Ok(after) = store.space_stats() {
+                                tracing::info!(
+                                    total_bytes = after.total_bytes(),
+                                    "store converted to incremental auto-vacuum"
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(error = %error, "auto-vacuum conversion failed");
+                        }
+                    }
+                }
+                Ok(_) => {}
+                Err(error) => tracing::warn!(error = %error, "auto_vacuum read failed"),
+            }
+            match store.space_stats() {
+                Ok(space) => {
+                    if space.free_ratio() >= VACUUM_FREE_PAGE_RATIO {
+                        match store.incremental_vacuum() {
+                            Ok(()) => tracing::info!(
+                                freed_bytes = space.free_bytes(),
+                                freed_ratio = %format!("{:.0}%", 100.0 * space.free_ratio()),
+                                "incremental vacuum returned freed pages"
+                            ),
+                            Err(error) => {
+                                tracing::warn!(error = %error, "incremental vacuum failed");
+                            }
+                        }
+                    } else {
+                        tracing::debug!(
+                            total_bytes = space.total_bytes(),
+                            free_ratio = %format!("{:.1}%", 100.0 * space.free_ratio()),
+                            "store space stats"
+                        );
+                    }
+                }
+                Err(error) => tracing::warn!(error = %error, "store space stats failed"),
+            }
+        }
+    }
+    if let Err(error) = store.checkpoint_wal() {
+        tracing::debug!(error = %error, "WAL checkpoint failed");
     }
 }
 

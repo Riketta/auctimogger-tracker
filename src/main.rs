@@ -13,11 +13,13 @@ use amtracker_core::{
     config::{
         AuthConfig,
         TrackerConfig,
+        VacuumPolicy,
     },
     domain::PayloadKind,
     ports::{
         FeedRenderer,
         ItemInfoPort,
+        SpaceMaintenance,
     },
     services::{
         chain::ChainedItemInfo,
@@ -34,7 +36,10 @@ use amtracker_infra::{
         FeedCodec,
         FileFeedPublisher,
     },
-    store::SqliteStore,
+    store::{
+        AutoVacuum,
+        SqliteStore,
+    },
     wowhead_item_info::WowheadItemInfo,
 };
 use amtracker_server::{
@@ -110,6 +115,14 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         slim: bool,
     },
+    /// Compact the database file now: rebuild it without the retained free
+    /// pages and truncate the WAL. Safe to attempt against a live `serve`,
+    /// but it blocks all writers for its duration — stop `serve` for large
+    /// stores. Fails with `SQLITE_BUSY` when another process is mid-write.
+    Vacuum {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn main() {
@@ -132,6 +145,9 @@ fn main() {
             with_observability(&config, |loaded| {
                 run_export_feed(&loaded.tracker, target.as_deref(), &out, slim)
             })
+        }
+        Commands::Vacuum { config } => {
+            with_observability(&config, |loaded| run_vacuum(&loaded.tracker))
         }
     };
     exit(code);
@@ -223,6 +239,69 @@ fn run_backup(path: &Path, out: &Path) -> i32 {
             eprintln!("error: {error}");
             1
         }
+    }
+}
+
+/// Manual store compaction: stats, one full `VACUUM` (or, on a legacy
+/// non-auto-vacuum file under the `incremental` policy, the header
+/// conversion which is itself a full `VACUUM`), then a WAL truncate.
+/// Safe to attempt against a live `serve` — it fails with `SQLITE_BUSY`
+/// instead of corrupting — but the exclusive rebuild blocks writers, so
+/// stop `serve` for large stores.
+fn run_vacuum(config: &amtracker_core::config::TrackerConfig) -> i32 {
+    let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
+    let store = match open_store(config, clock) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(error = %error, "store open failed");
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let before = match store.space_stats() {
+        Ok(stats) => stats,
+        Err(error) => {
+            eprintln!("error: cannot read store stats: {error}");
+            return 1;
+        }
+    };
+    let converted = config.storage.vacuum == VacuumPolicy::Incremental
+        && store.auto_vacuum_mode().is_ok_and(|mode| mode == 0);
+    let result = if converted {
+        println!(
+            "converting {} to incremental auto-vacuum (full VACUUM rebuild)...",
+            config.storage.database
+        );
+        store.enable_incremental_auto_vacuum()
+    } else {
+        store.full_vacuum()
+    };
+    if let Err(error) = result {
+        eprintln!("error: vacuum failed: {error}");
+        return 1;
+    }
+    if let Err(error) = store.checkpoint_wal() {
+        eprintln!("warning: WAL checkpoint failed: {error}");
+    }
+    let after = store.space_stats().unwrap_or(before);
+    println!(
+        "vacuum complete: {} -> {} bytes ({:.1}% reclaimed, {} free pages remain)",
+        before.total_bytes(),
+        after.total_bytes(),
+        percent_of(before.total_bytes().saturating_sub(after.total_bytes()), before.total_bytes()),
+        after.freelist_count
+    );
+    0
+}
+
+/// Display percentage of `part` relative to `total`.
+#[allow(clippy::cast_precision_loss)] // byte counts far below 2^53: exact
+#[must_use]
+fn percent_of(part: u64, total: u64) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        100.0 * part as f64 / total as f64
     }
 }
 
@@ -441,6 +520,9 @@ fn build_app_state(
         )),
         history: store.clone(),
         snapshots: store.clone(),
+        // Storage-file space accounting + reclamation (scheduler pass and
+        // the `vacuum` command).
+        maintenance: store.clone(),
         // One lock serializes scheduled and manual (`/api/fetch`) cycles.
         cycle_lock: Arc::new(std::sync::Mutex::new(())),
         // Dashboard-visible ingest history (bounded ring).
@@ -453,15 +535,23 @@ fn build_app_state(
     })
 }
 
-/// Opens the SQLite store (shared by every command that touches state).
+/// Opens the SQLite store (shared by every command that touches state). The
+/// configured vacuum policy decides the fresh-file auto-vacuum header; on
+/// existing files the pragma is inert until the maintenance conversion or a
+/// manual `vacuum` run.
 fn open_store(
     config: &amtracker_core::config::TrackerConfig,
     clock: Arc<dyn amtracker_core::ports::ClockPort>,
 ) -> Result<Arc<SqliteStore>, String> {
+    let auto_vacuum = match config.storage.vacuum {
+        VacuumPolicy::Incremental => AutoVacuum::Incremental,
+        _ => AutoVacuum::Off,
+    };
     SqliteStore::open(
         std::path::Path::new(&config.storage.database),
         std::path::Path::new(&config.storage.archive_dir),
         clock,
+        auto_vacuum,
     )
     .map(Arc::new)
     .map_err(|error| error.to_string())
