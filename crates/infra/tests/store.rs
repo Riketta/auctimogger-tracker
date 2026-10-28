@@ -1652,7 +1652,7 @@ fn v7_category_migration_rebuilds_folds_from_retained_listings() {
         }
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 8, "the file is stamped at the new schema version");
+        assert_eq!(version, 9, "the file is stamped at the new schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();

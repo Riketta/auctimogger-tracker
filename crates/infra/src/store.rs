@@ -84,7 +84,12 @@ use rusqlite::Connection;
 /// The pre-v7 aggregate pass inside the same gate is shape-guarded, so a
 /// v7 file upgrading to v8 skips it instead of re-running the destructive
 /// rebuild.
-const SCHEMA_VERSION: i64 = 8;
+/// Version 9 added the expression index behind the time-left sort (the
+/// semantic band rank): the CASE sort temp-b-treed the snapshot's whole
+/// listing set on every page view (~360 ms at 400k listings); the index
+/// turns it into a covering-index read. The CREATE is idempotent, so v8
+/// files upgrade in place.
+const SCHEMA_VERSION: i64 = 9;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
 /// primary keys to `(flavor, id)` keys and gain the enrichment columns.
@@ -234,6 +239,8 @@ CREATE INDEX IF NOT EXISTS idx_listing_snapshot_price
     ON listing(snapshot_id, unit_price, auction_id);
 CREATE INDEX IF NOT EXISTS idx_listing_snapshot_qty
     ON listing(snapshot_id, quantity, auction_id);
+CREATE INDEX IF NOT EXISTS idx_listing_snapshot_time
+    ON listing(snapshot_id, CASE time_left WHEN 'SHORT' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LONG' THEN 3 WHEN 'VERY_LONG' THEN 4 ELSE 5 END, auction_id);
 
 CREATE TABLE IF NOT EXISTS item_day (
     target_id TEXT NOT NULL,
@@ -357,6 +364,14 @@ CREATE INDEX IF NOT EXISTS idx_listing_snapshot_price
 CREATE INDEX IF NOT EXISTS idx_listing_snapshot_qty
     ON listing(snapshot_id, quantity, auction_id);
 ";
+
+/// The semantic time-left rank: Short < Medium < Long < Very long. The
+/// `idx_listing_snapshot_time` index (fresh SCHEMA and the v9 migration
+/// step) and the query's ORDER BY are both built from this constant, so the
+/// planner satisfies the time sort from the index instead of temp-b-treeing
+/// the snapshot's whole listing set. Keep it the single source of truth.
+const TIME_RANK_EXPR: &str = "CASE time_left WHEN 'SHORT' THEN 1 WHEN 'MEDIUM' THEN 2 \
+     WHEN 'LONG' THEN 3 WHEN 'VERY_LONG' THEN 4 ELSE 5 END";
 
 /// Single-connection SQLite store (WAL journal) implementing the snapshot,
 /// sales, metrics-cache, watchlist, catalog and price-history repositories.
@@ -486,6 +501,15 @@ impl SqliteStore {
             }
             conn.execute_batch(SNAPSHOT_VIEWER_V8_MIGRATION)
                 .map_err(|e| backend("migrate snapshot viewer tables", e))?;
+            // v9 added the expression index behind the time-left sort. One
+            // idempotent CREATE, built from the same expression constant the
+            // query's ORDER BY uses, so upgraded files converge with fresh
+            // ones.
+            conn.execute_batch(&format!(
+                "CREATE INDEX IF NOT EXISTS idx_listing_snapshot_time \
+                 ON listing(snapshot_id, {TIME_RANK_EXPR}, auction_id)"
+            ))
+            .map_err(|e| backend("migrate time rank index", e))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
         }
@@ -945,15 +969,13 @@ impl SnapshotRepository for SqliteStore {
             format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
         });
         // Sort keys are a fixed whitelist (never interpolated user data); the
-        // band rank orders the semantic Short < Medium < Long < VeryLong.
+        // band rank orders the semantic Short < Medium < Long < VeryLong and
+        // is built from the same constant as the time index, so that sort
+        // reads the index instead of temp-b-treeing the snapshot.
         let sort_expr = match query.sort {
             ListingSortKey::Price => "l.unit_price".to_string(),
             ListingSortKey::Quantity => "l.quantity".to_string(),
-            ListingSortKey::TimeLeft => {
-                "CASE l.time_left WHEN 'SHORT' THEN 1 WHEN 'MEDIUM' THEN 2 \
-                 WHEN 'LONG' THEN 3 WHEN 'VERY_LONG' THEN 4 ELSE 5 END"
-                    .to_string()
-            }
+            ListingSortKey::TimeLeft => TIME_RANK_EXPR.to_string(),
         };
         let direction = if query.desc { "DESC" } else { "ASC" };
 
@@ -971,23 +993,42 @@ impl SnapshotRepository for SqliteStore {
                AND (?5 IS NULL OR ic.item_class = ?5 COLLATE NOCASE)
                AND (?6 IS NULL OR ic.quality = ?6 COLLATE NOCASE)";
 
-        let count_sql = format!("SELECT COUNT(*) {from_where}");
-        let total = u64::try_from(
-            conn.query_row(
-                &count_sql,
-                rusqlite::params![
-                    flavor.as_str(),
-                    snapshot_id,
-                    prefix_pattern,
-                    query.item_id,
-                    query.class,
-                    query.quality,
-                ],
-                |row| row.get::<_, i64>(0),
+        // Unfiltered views don't need the catalog joins at all: the plain
+        // snapshot-index count is ~9 ms at 400k listings, while the joined
+        // walk evaluates every LEFT JOIN per row (~330 ms) because the
+        // filter slots may bind. Any filter keeps the joined count.
+        let total = if query.name_prefix.is_none()
+            && query.item_id.is_none()
+            && query.class.is_none()
+            && query.quality.is_none()
+        {
+            u64::try_from(
+                conn.query_row(
+                    "SELECT COUNT(*) FROM listing WHERE snapshot_id = ?1",
+                    rusqlite::params![snapshot_id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| backend("count listings", e))?,
             )
-            .map_err(|e| backend("count listings", e))?,
-        )
-        .unwrap_or(0);
+            .unwrap_or(0)
+        } else {
+            u64::try_from(
+                conn.query_row(
+                    &format!("SELECT COUNT(*) {from_where}"),
+                    rusqlite::params![
+                        flavor.as_str(),
+                        snapshot_id,
+                        prefix_pattern,
+                        query.item_id,
+                        query.class,
+                        query.quality,
+                    ],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map_err(|e| backend("count listings", e))?,
+            )
+            .unwrap_or(0)
+        };
         let pages = u32::try_from(total.div_ceil(u64::try_from(LISTING_PAGE_SIZE).unwrap_or(1)))
             .unwrap_or(u32::MAX);
         let served_page = page.min(i64::from(pages.max(1)));

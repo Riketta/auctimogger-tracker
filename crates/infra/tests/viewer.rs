@@ -1,6 +1,6 @@
 //! Snapshot-viewer integration tests: the browse page read model (filters,
-//! sorts, pagination), the lazily-built class summary, the v8 in-place
-//! migration, and item-level round-trips through the catalog.
+//! sorts, pagination), the lazily-built class summary, the schema in-place
+//! migrations (v7→v8→v9), and item-level round-trips through the catalog.
 
 // Test assertions may unwrap/expect/panic and index: fixture-driven,
 // deterministic inputs (the SecOutfall precedent).
@@ -444,7 +444,8 @@ fn snapshot_class_summary_lazily_counts_enriched_listings() {
 /// v8 upgrades a v7 file in place: the catalog gains its (nullable) item
 /// level column, the viewer tables/indexes appear, and all prior data
 /// survives untouched — including the sale aggregates, since the destructive
-/// v7 pass must not re-run on an already-upgraded file.
+/// v7 pass must not re-run on an already-upgraded file. The file lands at
+/// the current schema version (v9's time-rank index included).
 #[test]
 fn v8_migration_adds_viewer_surface_and_preserves_data() {
     let dir = temp_dir("viewer-v8");
@@ -573,7 +574,9 @@ fn v8_migration_adds_viewer_surface_and_preserves_data() {
             )
             .expect("pragma");
         assert_eq!(has_level, 1, "item_catalog gained item_level");
-        for name in ["idx_listing_snapshot_price", "idx_listing_snapshot_qty"] {
+        for name in
+            ["idx_listing_snapshot_price", "idx_listing_snapshot_qty", "idx_listing_snapshot_time"]
+        {
             let exists: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
@@ -593,7 +596,7 @@ fn v8_migration_adds_viewer_surface_and_preserves_data() {
         assert_eq!(has_summary, 1, "snapshot_class_summary exists after migration");
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 8, "the file is stamped at the new schema version");
+        assert_eq!(version, 9, "the file is stamped at the new schema version");
         let sale_rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM sales", [], |row| row.get(0)).expect("sales");
         assert_eq!(
@@ -778,7 +781,7 @@ fn pre_v7_files_still_rebuild_their_aggregates() {
         assert_eq!(rebuilt, 1, "day folds rebuild from the retained raw listings");
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 8, "the file lands at the current schema version");
+        assert_eq!(version, 9, "the file lands at the current schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -850,10 +853,13 @@ fn pruning_raw_listings_drops_the_class_summary_cache() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
-/// The price sort plans through the snapshot-leading index, so the viewer's
-/// default page stays indexed as snapshots grow (pins the v8 index choice).
+/// The viewer's sorts plan through the snapshot-leading indexes, so pages
+/// stay covering-index reads as snapshots grow. Price/qty ride the v8
+/// indexes; the time sort rides the v9 expression index — its ORDER BY
+/// must stay byte-aligned with the index expression or the plan degrades
+/// to a temp-b-tree over the whole snapshot.
 #[test]
-fn price_sort_plans_through_the_snapshot_index() {
+fn viewer_sorts_plan_through_the_snapshot_indexes() {
     let dir = temp_dir("sort-plan");
     {
         let store = open_store(&dir, 1_000_000);
@@ -867,22 +873,128 @@ fn price_sort_plans_through_the_snapshot_index() {
             .expect("record");
     }
     let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("reopen db");
-    let mut statement = conn
-        .prepare(
-            "EXPLAIN QUERY PLAN SELECT l.auction_id FROM listing l \
-             WHERE l.snapshot_id = 1 \
-             ORDER BY l.unit_price ASC, l.auction_id ASC LIMIT 50 OFFSET 0",
+    for (index, order) in [
+        ("idx_listing_snapshot_price", "l.unit_price ASC"),
+        ("idx_listing_snapshot_qty", "l.quantity ASC"),
+        (
+            "idx_listing_snapshot_time",
+            "CASE time_left WHEN 'SHORT' THEN 1 WHEN 'MEDIUM' THEN 2 WHEN 'LONG' THEN 3 WHEN 'VERY_LONG' THEN 4 ELSE 5 END ASC",
+        ),
+    ] {
+        let mut statement = conn
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN SELECT l.auction_id FROM listing l \
+                 WHERE l.snapshot_id = 1 \
+                 ORDER BY {order}, l.auction_id ASC LIMIT 50 OFFSET 0"
+            ))
+            .expect("prepare plan");
+        let plan = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("plan rows")
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            plan.contains(index),
+            "the {index} sort must ride its snapshot-leading index, got: {plan}"
+        );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A v8 file (the schema the viewer shipped on) gains the v9 time-rank
+/// index on upgrade and lands at the current version stamp.
+#[test]
+fn v8_file_gains_the_time_rank_index_on_upgrade() {
+    let dir = temp_dir("viewer-v8-to-v9");
+    let db = dir.join("db.sqlite3");
+    {
+        let connection = rusqlite::Connection::open(&db).expect("open v8 file");
+        connection
+            .execute_batch(
+                "CREATE TABLE snapshots (
+                     id INTEGER PRIMARY KEY,
+                     target_id TEXT NOT NULL,
+                     kind TEXT NOT NULL,
+                     fetched_at INTEGER NOT NULL,
+                     source_last_modified INTEGER,
+                     sha256 TEXT NOT NULL,
+                     archive_path TEXT,
+                     entry_count INTEGER NOT NULL,
+                     dropped_count INTEGER NOT NULL,
+                     drop_reasons TEXT,
+                     status TEXT NOT NULL
+                 );
+                 CREATE TABLE item_ref (
+                     id INTEGER PRIMARY KEY,
+                     kind TEXT NOT NULL,
+                     item_id INTEGER NOT NULL,
+                     pet_species INTEGER NOT NULL DEFAULT 0,
+                     pet_level INTEGER NOT NULL DEFAULT 0,
+                     pet_quality INTEGER NOT NULL DEFAULT 0,
+                     pet_breed INTEGER NOT NULL DEFAULT 0,
+                     UNIQUE (kind, item_id, pet_species, pet_level, pet_quality, pet_breed)
+                 );
+                 INSERT INTO item_ref VALUES (1, 'item', 2589, 0, 0, 0, 0);
+                 CREATE TABLE listing (
+                     snapshot_id INTEGER NOT NULL,
+                     target_id TEXT NOT NULL,
+                     day INTEGER NOT NULL,
+                     auction_id INTEGER NOT NULL,
+                     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+                     quantity INTEGER NOT NULL,
+                     unit_price INTEGER NOT NULL,
+                     bid INTEGER,
+                     time_left TEXT NOT NULL,
+                     context INTEGER,
+                     bonus_lists TEXT NOT NULL DEFAULT '[]'
+                 );
+                 INSERT INTO listing VALUES (1, 'us-4', 11, 100, 1, 1, 100, NULL, 'VERY_LONG', NULL, '[]');
+                 CREATE TABLE item_catalog (
+                     flavor TEXT NOT NULL DEFAULT 'retail',
+                     item_id INTEGER NOT NULL,
+                     name TEXT NOT NULL,
+                     item_class TEXT,
+                     item_subclass TEXT,
+                     inventory_slot TEXT,
+                     quality TEXT,
+                     icon TEXT,
+                     sell_price INTEGER,
+                     item_level INTEGER,
+                     fetched_at INTEGER NOT NULL,
+                     PRIMARY KEY (flavor, item_id)
+                 );
+                 PRAGMA user_version = 8;",
+            )
+            .expect("seed v8 file");
+    }
+    let store = open_store(&dir, 1_000_001);
+
+    // The migrated file reads through the viewer at the new stamp.
+    let flavor = Flavor("retail".into());
+    let page = store
+        .listings_page(
+            &flavor,
+            1,
+            &query(None, None, None, None, ListingSortKey::TimeLeft, false, 1),
         )
-        .expect("prepare plan");
-    let plan = statement
-        .query_map([], |row| row.get::<_, String>(3))
-        .expect("plan rows")
-        .filter_map(Result::ok)
-        .collect::<Vec<_>>()
-        .join(" | ");
-    assert!(
-        plan.contains("idx_listing_snapshot_price"),
-        "the default sort rides the snapshot-leading index, got: {plan}"
-    );
+        .expect("time sort over migrated file");
+    assert_eq!(page.total, 1);
+
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect db");
+        let has_time_index: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_listing_snapshot_time'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("pragma");
+        assert_eq!(has_time_index, 1, "the v9 time-rank index exists after upgrade");
+        let version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
+        assert_eq!(version, 9, "the v8 file lands at the new schema version");
+    }
+
     std::fs::remove_dir_all(&dir).ok();
 }
