@@ -233,7 +233,10 @@ token configured, the browser never holds the secret, and watchlist/fetch
 actions stay API-only. Item and pet names resolve through Wowhead's
 credential-free endpoints first (`[catalog]`, optional Blizzard fallback)
 and are cached permanently in the per-flavor `item_catalog`/`pet_catalog`
-tables — no credentials needed, every id is fetched once.
+tables — no credentials needed, every id is fetched once. A background
+warmer thread continuously resolves every id ever folded (paced by
+`[catalog].warm_batch` / `warm_pace_ms`), so unnamed ids drain to zero
+without waiting on ingest cycles.
 
 Opportunities and overview are served from scans the scheduler prepares in
 the background: once right after startup, after each successful ingest cycle

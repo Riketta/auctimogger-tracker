@@ -80,8 +80,8 @@ weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 # source = "chain"           # "chain" | "wowhead" | "blizzard"
 # locale = "enUS"            # name language, game locale-code spelling
 # render_resolve_max = 8     # inline lookups a table render may wait for (0 = off)
-# idle_names_per_cycle = 25  # ids each ingest cycle warms in the background (0 = off)
-# idle_pace_ms = 500         # sleep between two background lookups
+# warm_batch = 25          # source lookups one background warmer pass may make (0 = off)
+# warm_pace_ms = 500        # sleep between two warmer lookups
 # wowhead_base = "https://nether.wowhead.com" # explicit base override (this is the default; point at a mirror/proxy if needed — the public www site blocks non-browser traffic)
 
 # Optional: persistent file logging. Startup-only: the subscriber is

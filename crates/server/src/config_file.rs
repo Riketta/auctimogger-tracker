@@ -433,13 +433,13 @@ pub struct FileCatalog {
     /// resolution. Defaults to 8.
     #[serde(default)]
     pub render_resolve_max: Option<u32>,
-    /// Ids one ingest cycle warms in the background; `0` disables warm-up.
-    /// Defaults to 25.
+    /// Source lookups one background warmer pass may make; `0` disables the
+    /// warmer thread. Defaults to 25.
     #[serde(default)]
-    pub idle_names_per_cycle: Option<u32>,
-    /// Milliseconds between two background lookups. Defaults to 500.
+    pub warm_batch: Option<u32>,
+    /// Milliseconds between two warmer lookups. Defaults to 500.
     #[serde(default)]
-    pub idle_pace_ms: Option<u64>,
+    pub warm_pace_ms: Option<u64>,
     /// Explicit Wowhead base override for every flavor. Absent = per-flavor
     /// defaults.
     #[serde(default)]
@@ -594,14 +594,11 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
                 .catalog
                 .render_resolve_max
                 .unwrap_or(CatalogConfig::default().render_resolve_max),
-            idle_names_per_cycle: file
+            warm_batch: file.catalog.warm_batch.unwrap_or(CatalogConfig::default().warm_batch),
+            warm_pace_ms: file
                 .catalog
-                .idle_names_per_cycle
-                .unwrap_or(CatalogConfig::default().idle_names_per_cycle),
-            idle_pace_ms: file
-                .catalog
-                .idle_pace_ms
-                .unwrap_or(CatalogConfig::default().idle_pace_ms),
+                .warm_pace_ms
+                .unwrap_or(CatalogConfig::default().warm_pace_ms),
             wowhead_base: file.catalog.wowhead_base,
         },
         targets,
@@ -682,8 +679,8 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
                 "source",
                 "locale",
                 "render_resolve_max",
-                "idle_names_per_cycle",
-                "idle_pace_ms",
+                "warm_batch",
+                "warm_pace_ms",
                 "wowhead_base",
             ],
             &mut unknown,

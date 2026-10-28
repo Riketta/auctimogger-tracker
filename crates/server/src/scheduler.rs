@@ -4,12 +4,13 @@
 //! publication (the files `/feed.lua` serves), and the prepared
 //! opportunity/overview scans (`OpportunityService::refresh`) — run on a
 //! companion maintenance thread fed by a deduplicated per-target queue, so a
-//! slow publish or prune can never delay the next target's fetch. Requests
-//! serve prepared data with no store reads; a plain `serve` stays
-//! self-contained — no cron, no exporter sidecar.
+//! slow publish or prune can never delay the next target's fetch. Name
+//! resolution for every id ever folded runs on its own warmer thread,//! decoupled from the ingest cadence. Requests serve prepared data with no
+//! store reads; a plain `serve` stays self-contained — no cron, no exporter
+//! sidecar.
 //!
 //! D13: no async in or around the core; everything below is blocking and
-//! runs on these two dedicated threads.
+//! runs on these three dedicated threads.
 
 use std::{
     any::Any,
@@ -61,6 +62,10 @@ const TICK: Duration = Duration::from_secs(30);
 /// How long an idle maintenance worker waits before waking up anyway: due
 /// retention prunes depend on UTC day rolls, which enqueue nothing.
 const MAINTENANCE_IDLE_TICK: Duration = Duration::from_secs(60);
+
+/// How long the name warmer waits after a pass that had nothing to fetch./// Passes that fetched (or hit the batch cap) loop immediately, so a fresh
+/// backlog drains at the pacing pace instead of one batch per tick.
+const WARMER_IDLE_TICK: Duration = Duration::from_secs(30);
 
 /// Freelist fraction above which the incremental pass returns pages to the
 /// filesystem. Below it, freed pages are simply reused by future writes, so
@@ -300,6 +305,7 @@ pub fn spawn(
     backup: Option<BackupHook>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let maintenance = spawn_maintenance_worker(&state)?;
+    spawn_name_warmer(&state)?;
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
         // Prepare every configured target's opportunity scan before the first
@@ -610,7 +616,7 @@ fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
             MaintenanceQueue::pop_timeout(&queue.0, &queue.1, MAINTENANCE_IDLE_TICK)
         {
             survive("maintenance-pass", &target, || {
-                run_pass(state, &config, &mut maintenance, &target, true);
+                run_pass(state, &config, &mut maintenance, &target);
             });
         }
         for target in &config.targets {
@@ -630,13 +636,13 @@ fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
 /// once-per-UTC-day retention pruning, throttled feed publication, and a
 /// refresh of the target's prepared opportunity scan (new folds/credits just
 /// landed). All are best effort — a failure is logged and retried on a later
-/// pass.
+/// pass. (Name warm-up is not among them: it runs on its own dedicated
+/// warmer thread, decoupled from the ingest cadence.)
 fn run_pass(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
     maintenance: &mut MaintenanceState,
     target: &str,
-    warm_names: bool,
 ) {
     run_prune_if_due(state, config, maintenance, target);
 
@@ -655,113 +661,191 @@ fn run_pass(
         refresh_opportunities(state, &TargetId(target.to_string()), category);
     }
     evaluate_alerts(state, target);
-    // Last, so the (pacing-sleeping) name warm-up never delays the critical
-    // maintenance work above it. The manual /api/fetch path skips it: an
-    // HTTP response must not wait out the pacing sleeps.
-    if warm_names {
-        warm_item_names(state, config, target);
+}
+
+/// Spawns the dedicated background name-warmer thread. `warm_batch == 0`
+/// disables it entirely (logged, not spawned). A spawn failure fails `serve`
+/// startup, like the other threads.
+fn spawn_name_warmer(state: &Arc<AppState>) -> std::io::Result<()> {
+    if state.config.catalog.warm_batch == 0 {
+        tracing::info!("background name warmer disabled ([catalog].warm_batch = 0)");
+        return Ok(());
+    }
+    let worker = state.clone();
+    thread::Builder::new().name("amtracker-warmer".into()).spawn(move || {
+        warmer_loop(&worker);
+    })?;
+    Ok(())
+}
+
+/// The warmer thread's loop: run a [`warm_pass`], then either loop
+/// immediately (the pass fetched, or stopped on the batch cap with work
+/// left — a fresh backlog drains continuously at the pacing pace) or sleep
+/// [`WARMER_IDLE_TICK`] (nothing actionable — steady state). A panicking
+/// pass is caught and logged; the thread lives on.
+fn warmer_loop(state: &Arc<AppState>) {
+    let config = state.config.clone();
+    tracing::info!(
+        batch = config.catalog.warm_batch,
+        pace_ms = config.catalog.warm_pace_ms,
+        "background name warmer started"
+    );
+    loop {
+        let pass = panic::catch_unwind(AssertUnwindSafe(|| warm_pass(state, &config)))
+            .unwrap_or_else(|payload| {
+                tracing::error!(
+                    panic = %panic_message(&payload),
+                    "name warmer pass panicked; continuing"
+                );
+                WarmPassStats::default()
+            });
+        if pass.fetched > 0 {
+            tracing::info!(
+                fetched = pass.fetched,
+                deferred = pass.deferred,
+                candidates = pass.candidates,
+                "name warmer pass"
+            );
+        } else if pass.deferred > 0 {
+            tracing::debug!(
+                deferred = pass.deferred,
+                candidates = pass.candidates,
+                "name warmer pass: every actionable id is deferred by the negative/error cache"
+            );
+        } else if pass.candidates > 0 {
+            tracing::debug!(
+                candidates = pass.candidates,
+                "name warmer pass: every id is already named"
+            );
+        }
+        if pass.fetched == 0 && !pass.more_work {
+            thread::sleep(WARMER_IDLE_TICK);
+        }
     }
 }
 
-/// Background name warm-up for one target after a successful cycle: the
-/// target's still-unnamed items/pets with recent fold data go through the
-/// catalog at the configured politeness pace, so tables usually show names
-/// before they are first viewed. Bounded per pass (`[catalog].idle_names_per_cycle`,
-/// `0` disables) and best effort — a source outage just pauses the warm-up
-/// until a later cycle. The pacing sleeps run on the maintenance worker,
-/// which is exactly the idle time this work belongs on.
-fn warm_item_names(
+/// What one warmer pass did, for logging and tests.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct WarmPassStats {
+    /// Distinct identities (per target) examined this pass.
+    pub candidates: usize,
+    /// Ids resolved from the source this pass (budget-limited by
+    /// `[catalog].warm_batch`).
+    pub fetched: u32,
+    /// Ids skipped because the negative/error cache still defers them.
+    pub deferred: u32,
+    /// The batch cap stopped the pass with actionable ids left.
+    pub more_work: bool,
+}
+
+/// One background name-warmer pass: every identity that ever produced a
+/// fold — all-time, all targets, all categories — goes through the catalog
+/// at the configured politeness pace, so no id stays unnamed in the store.
+/// Best effort: a source outage just pauses resolution until a later pass
+/// (the error cache defers the failing id briefly).
+///
+/// The budget (`[catalog].warm_batch`) caps *source lookups* per pass, not
+/// examined ids: with all-time candidate lists, capping examined ids would
+/// starve unnamed ids sitting behind thousands of already-named ones. The
+/// walk itself is cheap — known ids cost one local read each, deferred ones
+/// not even that — so walking the whole list per pass is safe. A listing
+/// read failure skips the pass (next one retries); a lookup failure pauses
+/// it, and the negative/error cache prevents re-asking the same id hot.
+pub fn warm_pass(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
-    target: &str,
-) {
-    let Some(target_config) = config.find_target(target) else { return };
-    let flavor = &target_config.flavor;
-    let pace = Duration::from_millis(config.catalog.idle_pace_ms);
-    let since_day = utc_day(state.clock.now()).saturating_sub(1);
-    // Distinct identities across all categories: the same item id can have
-    // both commodity and item-AH folds, and the catalog names ids, not
-    // categories.
-    let target_id = TargetId(target.to_string());
-    let mut items: Vec<ItemRef> = Vec::new();
-    let mut seen: HashSet<ItemRef> = HashSet::new();
-    for category in Category::ALL {
-        match state.history.items_with_data(&target_id, since_day, category) {
-            Ok(list) => {
-                for item in list {
-                    if seen.insert(item.clone()) {
-                        items.push(item);
+) -> WarmPassStats {
+    let budget = config.catalog.warm_batch;
+    if budget == 0 {
+        // The warmer thread is not spawned in this mode; guard the direct
+        // (test/manual) call path too.
+        return WarmPassStats::default();
+    }
+    let pace = Duration::from_millis(config.catalog.warm_pace_ms);
+    let mut pass = WarmPassStats::default();
+    for target in &config.targets {
+        let flavor = &target.flavor;
+        let target_id = TargetId(target.id.0.clone());
+        // Distinct identities across all categories: the same item id can
+        // have both commodity and item-AH folds, and the catalog names ids,
+        // not categories. `since_day = 0` means all-time coverage.
+        let mut items: Vec<ItemRef> = Vec::new();
+        let mut seen: HashSet<ItemRef> = HashSet::new();
+        for category in Category::ALL {
+            match state.history.items_with_data(&target_id, 0, category) {
+                Ok(list) => {
+                    for item in list {
+                        if seen.insert(item.clone()) {
+                            items.push(item);
+                        }
                     }
                 }
+                Err(error) => {
+                    tracing::warn!(
+                        target = %target.id.0,
+                        error = %error,
+                        "name warmer listing failed"
+                    );
+                    return WarmPassStats::default();
+                }
             }
-            Err(error) => {
-                tracing::warn!(target, error = %error, "name warm-up listing failed");
-                return;
+        }
+        pass.candidates += items.len();
+        for item in items {
+            // Only ids whose lookup would hit the source right now cost a
+            // request: never-seen ids, and rows past the enrichment window
+            // that still miss fields (the merged chain's class/level heal).
+            // Fresh rows are a single local read away. Ids remembered as
+            // missing or recently failed are skipped outright: re-asking
+            // would burn the budget and the pacing sleep without new
+            // information, and both windows expire, so those ids get their
+            // turn again later. Counting the deferred ids per pass makes a
+            // persistent source outage (or a junk-id burst) visible at the
+            // edge even when the other chain leg absorbs it.
+            let (needs_lookup, is_deferred) = match &item {
+                ItemRef::Item { item_id } => (
+                    state.catalog.needs_enrichment(flavor, *item_id).is_ok_and(|needs| needs),
+                    state.catalog.deferred(flavor, *item_id),
+                ),
+                ItemRef::Pet { species, .. } => (
+                    !matches!(state.catalog.known_pet(flavor, *species), Ok(true)),
+                    state.catalog.deferred_pet(flavor, *species),
+                ),
+            };
+            if is_deferred {
+                pass.deferred += 1;
+                continue;
+            }
+            if !needs_lookup {
+                continue;
+            }
+            if pass.fetched >= budget {
+                pass.more_work = true;
+                return pass;
+            }
+            let outcome = match &item {
+                ItemRef::Item { item_id } => state.catalog.ensure(flavor, *item_id).map(|_| ()),
+                ItemRef::Pet { species, .. } => {
+                    state.catalog.ensure_pet(flavor, *species).map(|_| ())
+                }
+            };
+            match outcome {
+                Ok(()) => {
+                    pass.fetched += 1;
+                    thread::sleep(pace);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target = %target.id.0,
+                        error = %error,
+                        "name warmer lookup failed; pausing until the next pass"
+                    );
+                    return pass;
+                }
             }
         }
     }
-    let mut warmed = 0u32;
-    let mut deferred = 0u32;
-    for (examined, item) in items.into_iter().enumerate() {
-        // Every examined item counts against the budget, known or not: the
-        // accounting must precede the known/deferred branch, or an all-known
-        // market would scan its entire item list every pass (the break could
-        // never fire) instead of at most `idle_names_per_cycle` items.
-        if examined >= config.catalog.idle_names_per_cycle as usize {
-            break;
-        }
-        // Only ids whose lookup would hit the source right now cost a
-        // request: never-seen ids, and rows past the enrichment window that
-        // still miss fields (the merged chain's class/level heal). Fresh rows
-        // are a single local read away. Ids remembered as missing or recently
-        // failed are skipped outright: re-asking would burn the budget and
-        // the pacing sleep without new information, and both windows expire,
-        // so those ids get their turn again later. Counting the deferred ids
-        // per pass makes a persistent source outage (or a junk-id burst)
-        // visible at the edge even when the other chain leg absorbs it.
-        let (needs_lookup, is_deferred) = match &item {
-            ItemRef::Item { item_id } => (
-                state.catalog.needs_enrichment(flavor, *item_id).is_ok_and(|needs| needs),
-                state.catalog.deferred(flavor, *item_id),
-            ),
-            ItemRef::Pet { species, .. } => (
-                !matches!(state.catalog.known_pet(flavor, *species), Ok(true)),
-                state.catalog.deferred_pet(flavor, *species),
-            ),
-        };
-        if is_deferred {
-            deferred += 1;
-            continue;
-        }
-        if !needs_lookup {
-            continue;
-        }
-        let outcome = match &item {
-            ItemRef::Item { item_id } => state.catalog.ensure(flavor, *item_id).map(|_| ()),
-            ItemRef::Pet { species, .. } => state.catalog.ensure_pet(flavor, *species).map(|_| ()),
-        };
-        match outcome {
-            Ok(()) => warmed += 1,
-            Err(error) => {
-                tracing::warn!(
-                    target,
-                    error = %error,
-                    "name warm-up lookup failed; pausing until a later cycle"
-                );
-                break;
-            }
-        }
-        thread::sleep(pace);
-    }
-    if warmed > 0 {
-        tracing::info!(target, warmed, deferred, "background item-name warm-up pass");
-    } else if deferred > 0 {
-        tracing::debug!(
-            target,
-            deferred,
-            "name warm-up pass: every candidate id is deferred by the negative/error cache"
-        );
-    }
+    pass
 }
 
 /// Applies retention pruning when the target has not been pruned today yet.
@@ -957,12 +1041,11 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 /// scheduled cycle would trigger them.
 /// Used by the manual `/api/fetch` path, whose successful cycles must show
 /// up in `/feed.lua` and the ranking pages immediately instead of waiting
-/// for the maintenance worker. That path passes `warm_names = false` — the
-/// name warm-up's pacing sleeps belong on the maintenance worker, not
-/// inside an HTTP response.
-pub fn after_cycle_now(state: &Arc<AppState>, target: &str, warm_names: bool) {
+/// for the maintenance worker. (Name resolution needs no trigger here: the
+/// dedicated warmer thread picks up new ids on its own.)
+pub fn after_cycle_now(state: &Arc<AppState>, target: &str) {
     let config = state.config.clone();
-    run_pass(state, &config, &mut MaintenanceState::default(), target, warm_names);
+    run_pass(state, &config, &mut MaintenanceState::default(), target);
 }
 
 /// Runs one step under `catch_unwind`, logging a panic and continuing.

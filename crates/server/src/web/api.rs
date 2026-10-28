@@ -1642,10 +1642,9 @@ pub(crate) async fn api_fetch(
                 if fetched {
                     // Same operational side effects the scheduler runs after
                     // its own successful cycles (retention + feed publish);
-                    // warm_names = false leaves the name warm-up on the
-                    // maintenance worker so this response never waits out
-                    // its pacing sleeps.
-                    crate::scheduler::after_cycle_now(&state, target.id.as_str(), false);
+                    // name resolution needs no trigger, the dedicated warmer
+                    // thread picks up new ids on its own.
+                    crate::scheduler::after_cycle_now(&state, target.id.as_str());
                 }
             }
             reports

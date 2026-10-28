@@ -118,7 +118,7 @@ pub struct OpportunitiesConfig {
 
 /// Item/pet name resolution settings: which source chain resolves unknown
 /// ids, in which language, and how eagerly (inline render budget + paced
-/// background warm-up).
+/// background warmer).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CatalogConfig {
     /// Resolution source: `"chain"` (Wowhead first, Blizzard fallback),
@@ -132,12 +132,14 @@ pub struct CatalogConfig {
     /// synchronously (the rest keep their id fallback labels until the next
     /// view). `0` disables inline resolution entirely.
     pub render_resolve_max: u32,
-    /// How many still-unnamed ids one ingest cycle warms in the background
-    /// (paced, see `idle_pace_ms`). `0` disables background warm-up.
-    pub idle_names_per_cycle: u32,
+    /// Source lookups one background warmer pass may make. The warmer is a
+    /// dedicated thread that continuously resolves every id ever seen in a
+    /// fold (all-time, all targets/categories, paced, see `warm_pace_ms`).
+    /// `0` disables the warmer thread entirely.
+    pub warm_batch: u32,
     /// Milliseconds the background warmer sleeps between two source lookups
     /// (politeness pacing for the credential-free adapters).
-    pub idle_pace_ms: u64,
+    pub warm_pace_ms: u64,
     /// Explicit Wowhead base override (e.g. a mirror or proxy), used for
     /// every flavor; `None` selects the per-flavor default bases.
     pub wowhead_base: Option<String>,
@@ -145,14 +147,14 @@ pub struct CatalogConfig {
 
 impl Default for CatalogConfig {
     /// The defaults: chained resolution, English names, a bounded inline
-    /// render budget and a polite background trickle.
+    /// render budget and a polite background warmer.
     fn default() -> Self {
         Self {
             source: "chain".into(),
             locale: "enUS".into(),
             render_resolve_max: 8,
-            idle_names_per_cycle: 25,
-            idle_pace_ms: 500,
+            warm_batch: 25,
+            warm_pace_ms: 500,
             wowhead_base: None,
         }
     }

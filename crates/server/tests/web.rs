@@ -1330,13 +1330,14 @@ async fn warm_up_names_pets_through_the_pet_table() {
     // ...while pet species 264 has fold data but no pet-catalog row.
     seed_pet_history(&state);
 
-    amtracker_server::scheduler::after_cycle_now(&state, TARGET, true);
+    let pass = amtracker_server::scheduler::warm_pass(&state, &state.config);
 
     assert_eq!(
         state.catalog.known_pet(&flavor, 264),
         Ok(true),
-        "the warm-up must consult the pet table for species ids"
+        "the warmer must consult the pet table for species ids"
     );
+    assert!(pass.fetched >= 1, "species 264 must have cost a source lookup");
     std::fs::remove_dir_all(&root).ok();
 }
 
