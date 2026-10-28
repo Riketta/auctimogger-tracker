@@ -13,6 +13,8 @@ use amtracker_core::{
     domain::{
         Category,
         FeedFormat,
+        ListingQuery,
+        ListingSortKey,
         PayloadKind,
         Span,
     },
@@ -855,6 +857,183 @@ pub(crate) async fn api_snapshots(
         Ok(Err(error)) => internal_error("snapshots", &error),
         Err(error) => internal_error("snapshots-join", &error),
     }
+}
+
+/// Shared browse-parameter parsing (the JSON twin of the page's toolbar):
+/// filters, sort key and 1-based page. `Err` carries the 400 message.
+fn browse_query_params(params: &HashMap<String, String>) -> Result<ListingQuery, &'static str> {
+    let non_empty = |value: Option<&String>| -> Option<String> {
+        value.map(|value| value.trim()).filter(|trimmed| !trimmed.is_empty()).map(str::to_string)
+    };
+    let parse_id =
+        |raw: Option<String>, message: &'static str| -> Result<Option<i64>, &'static str> {
+            match raw {
+                None => Ok(None),
+                Some(raw) => raw.parse::<i64>().map(Some).map_err(|_| message),
+            }
+        };
+    Ok(ListingQuery {
+        name_prefix: non_empty(params.get("q")),
+        item_id: parse_id(non_empty(params.get("item")), "item must be an integer id")?,
+        class: non_empty(params.get("class")),
+        quality: non_empty(params.get("quality")),
+        sort: params.get("sort").map_or(ListingSortKey::Price, |raw| ListingSortKey::parse(raw)),
+        desc: params.get("dir").is_some_and(|dir| dir == "desc"),
+        page: params.get("page").and_then(|raw| raw.parse::<u32>().ok()).unwrap_or(1),
+    })
+}
+
+/// The alerts/watch wire shape for a listing's identity.
+fn browse_identity_json(item: &amtracker_core::domain::ItemRef) -> serde_json::Value {
+    match item {
+        amtracker_core::domain::ItemRef::Item { item_id } => {
+            serde_json::json!({ "type": "item", "itemID": item_id })
+        }
+        amtracker_core::domain::ItemRef::Pet { species, level, quality, breed } => {
+            serde_json::json!({
+                "type": "pet", "speciesID": species,
+                "level": level, "qualityID": quality, "breedID": breed
+            })
+        }
+    }
+}
+
+/// `GET /api/browse?target=&kind=&snapshot=&q=&item=&class=&quality=&sort=&dir=&page=`
+/// — the snapshot viewer's JSON twin: one page of a stored snapshot's
+/// listings joined to their catalog identity. Without `snapshot`, the newest
+/// snapshot of the (target, kind) pair serves; `sort` is price|qty|time
+/// (default price, cheapest first) and `dir=desc` flips it.
+pub(crate) async fn api_browse(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let non_empty = |value: Option<&String>| -> Option<String> {
+        value.map(|value| value.trim()).filter(|trimmed| !trimmed.is_empty()).map(str::to_string)
+    };
+    let kind = match non_empty(params.get("kind")) {
+        None => PayloadKind::Commodities,
+        Some(raw) => match PayloadKind::parse(&raw) {
+            Some(kind) => kind,
+            None => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    format!("unknown kind '{raw}' (expected commodities|auctions)"),
+                )
+                    .into_response();
+            }
+        },
+    };
+    let snapshot_id = match non_empty(params.get("snapshot")) {
+        None => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "snapshot must be an integer id").into_response();
+            }
+        },
+    };
+    let query = match browse_query_params(&params) {
+        Ok(query) => query,
+        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    let flavor = super::target_flavor(&state.config, &target);
+
+    let browse = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || {
+            let meta = state.browse.resolve(&target, kind, snapshot_id)?;
+            let classes = state.browse.classes(&flavor, meta.id)?;
+            let page = state.browse.page(&flavor, meta.id, query)?;
+            Ok((meta, classes, page))
+        }
+    });
+    let (meta, classes, data) = match browse.await {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(amtracker_core::domain::BrowseError::NoSnapshots)) => {
+            return (StatusCode::NOT_FOUND, "no snapshots stored for this target/kind")
+                .into_response();
+        }
+        Ok(Err(amtracker_core::domain::BrowseError::UnknownSnapshot)) => {
+            return (StatusCode::NOT_FOUND, "unknown snapshot id").into_response();
+        }
+        Ok(Err(amtracker_core::domain::BrowseError::SnapshotMismatch)) => {
+            return (StatusCode::BAD_REQUEST, "snapshot belongs to a different target/kind")
+                .into_response();
+        }
+        Ok(Err(amtracker_core::domain::BrowseError::Store(error))) => {
+            return internal_error("browse", &error);
+        }
+        Err(error) => return internal_error("browse-join", &error.to_string()),
+    };
+    browse_json(&meta, &classes, &data)
+}
+
+/// Assembles the `/api/browse` payload (snapshot metadata, the class summary
+/// and the listing page) once the store pass has resolved it.
+fn browse_json(
+    meta: &amtracker_core::domain::SnapshotMeta,
+    classes: &[amtracker_core::domain::ClassSummary],
+    data: &amtracker_core::domain::ListingPage,
+) -> Response {
+    let listings = data
+        .rows
+        .iter()
+        .map(|row| {
+            let name = match &row.item {
+                amtracker_core::domain::ItemRef::Item { item_id } => {
+                    row.name.clone().unwrap_or_else(|| format!("item {item_id}"))
+                }
+                amtracker_core::domain::ItemRef::Pet { species, .. } => {
+                    row.name.clone().unwrap_or_else(|| format!("pet {species}"))
+                }
+            };
+            let level = match &row.item {
+                amtracker_core::domain::ItemRef::Pet { level, .. } => Some(i64::from(*level)),
+                amtracker_core::domain::ItemRef::Item { .. } => row.item_level,
+            };
+            serde_json::json!({
+                "auctionID": row.auction_id,
+                "item": browse_identity_json(&row.item),
+                "quantity": row.quantity,
+                "unitPrice": row.unit_price,
+                "bid": row.bid,
+                "timeLeft": row.time_left.as_str(),
+                "name": name,
+                "quality": row.quality,
+                "level": level,
+            })
+        })
+        .collect::<Vec<_>>();
+    Json(serde_json::json!({
+        "snapshot": {
+            "id": meta.id,
+            "target": meta.target.as_str(),
+            "kind": meta.kind.as_str(),
+            "fetchedAt": meta.fetched_at,
+            "sourceLastModified": meta.source_last_modified,
+            "entryCount": meta.entry_count,
+            "droppedCount": meta.dropped_count,
+            "status": meta.status.as_str(),
+        },
+        "classSummary": classes.iter().map(|summary| serde_json::json!({
+            "class": summary.class,
+            "listings": summary.listings,
+        }))
+        .collect::<Vec<_>>(),
+        "listings": listings,
+        "page": {
+            "page": data.page,
+            "pages": data.pages,
+            "size": amtracker_core::domain::LISTING_PAGE_SIZE,
+            "total": data.total,
+        },
+    }))
+    .into_response()
 }
 
 /// `GET /api/watchlist/metrics?target=&category=&span=&sale_days=&trend_days=`

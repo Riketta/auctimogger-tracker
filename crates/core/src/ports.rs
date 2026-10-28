@@ -8,11 +8,14 @@ use crate::{
         BrowseCursor,
         CatalogCounts,
         Category,
+        ClassSummary,
         FeedFormat,
         FeedSnapshot,
         FetchOutcome,
         Flavor,
         ItemRef,
+        ListingPage,
+        ListingQuery,
         MetricBlock,
         NameRecord,
         NewSnapshot,
@@ -128,6 +131,43 @@ pub trait SnapshotRepository: Send + Sync {
         kind: PayloadKind,
         limit: usize,
     ) -> Result<Vec<SnapshotMeta>, StoreError>;
+    /// Metadata for one snapshot id, any target/kind (the snapshot viewer's
+    /// pinned views); `None` when the id is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the metadata cannot be read.
+    fn snapshot_by_id(&self, id: i64) -> Result<Option<SnapshotMeta>, StoreError>;
+    /// One page of stored listings for a snapshot, joined to their flavor-
+    /// scoped catalog identity (the snapshot viewer's table). Ordering follows
+    /// `query.sort`/`query.desc` with `auction_id` as the stable tiebreak;
+    /// `query.page` addresses [`LISTING_PAGE_SIZE`]-sized pages and the
+    /// filter fields apply as exact/prefix matches (see [`ListingQuery`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the query cannot run; an unknown
+    /// snapshot id reads as an empty page (callers resolve ids first via
+    /// [`SnapshotRepository::snapshot_by_id`]).
+    fn listings_page(
+        &self,
+        flavor: &Flavor,
+        snapshot_id: i64,
+        query: &ListingQuery,
+    ) -> Result<ListingPage, StoreError>;
+    /// Per-item-class listing counts for one snapshot under one flavor, most-
+    /// listed class first (the viewer's class filter dropdown). Only
+    /// enriched listings are counted; sparse identities appear only in the
+    /// unfiltered view.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the summary cannot be read.
+    fn snapshot_class_summary(
+        &self,
+        flavor: &Flavor,
+        snapshot_id: i64,
+    ) -> Result<Vec<ClassSummary>, StoreError>;
 }
 
 /// Outbound: per-day unique-auction fold state (the long-term memory).

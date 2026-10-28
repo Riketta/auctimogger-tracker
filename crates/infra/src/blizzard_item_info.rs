@@ -259,6 +259,9 @@ struct WireItem {
     inventory_type: Option<WireNamed>,
     #[serde(default)]
     sell_price: Option<i64>,
+    /// Item level (equipment only — the API omits it for non-equipment).
+    #[serde(default)]
+    level: Option<i64>,
 }
 
 #[derive(Deserialize)]
@@ -350,6 +353,7 @@ fn parse_item(item_id: i64, locale: &str, bytes: &[u8]) -> Result<Option<NameRec
         // one-request and leaves icons empty.
         icon: None,
         sell_price: wire.sell_price,
+        item_level: wire.level,
         fetched_at: 0,
     }))
 }
@@ -409,7 +413,9 @@ mod tests {
             "item_subclass": {"key": {"href": "https://us.api.blizzard.com/data/wow/item-subclass/9/0"}, "name": "Cloth", "id": 0},
             "inventory_type": {"type": "NON_EQUIP", "name": "Generic"},
             "purchase_price": 5,
-            "sell_price": 1
+            "sell_price": 1,
+            "level": 5,
+            "required_level": 1
         }"#;
         let record = parse_item(2589, "en_US", payload).expect("parses").expect("named");
         assert_eq!(record.name, "Linen Cloth");
@@ -418,6 +424,7 @@ mod tests {
         assert_eq!(record.item_subclass.as_deref(), Some("Cloth"));
         assert_eq!(record.inventory_slot.as_deref(), Some("Generic"));
         assert_eq!(record.sell_price, Some(1));
+        assert_eq!(record.item_level, Some(5), "the wire item level lands on the record");
         assert!(!record.is_sparse(), "blizzard records carry enrichment");
     }
 

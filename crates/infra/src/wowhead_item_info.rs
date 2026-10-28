@@ -219,6 +219,9 @@ fn parse_item(item_id: i64, bytes: &[u8]) -> Result<Option<NameRecord>, SourceEr
         quality: quality_name(wire.quality),
         icon: wire.icon,
         sell_price,
+        // Tooltip JSON carries no item level; the chain's Blizzard leg fills
+        // it and the COALESCE upsert keeps it.
+        item_level: None,
         fetched_at: 0,
     }))
 }

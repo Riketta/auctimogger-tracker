@@ -5,6 +5,8 @@ use std::{
     fmt,
 };
 
+use crate::error::StoreError;
+
 // ---------------------------------------------------------------- identity
 
 /// Slug identifying one configured source target (see `config::TargetConfig`).
@@ -364,6 +366,157 @@ pub struct NewSnapshot {
     pub status: SnapshotStatus,
 }
 
+// ------------------------------------------------------- snapshot browsing
+
+/// Fixed number of listing rows per browse page (the snapshot viewer's page
+/// size; vanilla-AH page arrows sit on top of it).
+pub const LISTING_PAGE_SIZE: usize = 50;
+
+/// Column the snapshot viewer can order listings by. Global name ordering is
+/// intentionally absent — name access goes through the prefix/id search.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListingSortKey {
+    /// Unit price in copper, cheapest first by default (the AH "min price").
+    Price,
+    /// Listing stack size.
+    Quantity,
+    /// Remaining-time band, soonest-expiring first (`Short` < `Medium` <
+    /// `Long` < `VeryLong`), the semantic order — not the wire string order.
+    TimeLeft,
+}
+
+impl ListingSortKey {
+    /// Lowercase wire/URL spelling (the `sort` page/API parameter).
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ListingSortKey::Price => "price",
+            ListingSortKey::Quantity => "qty",
+            ListingSortKey::TimeLeft => "time",
+        }
+    }
+
+    /// Parses the lowercase spelling; anything else falls back to
+    /// [`ListingSortKey::Price`] (the AH default column).
+    #[must_use]
+    pub fn parse(value: &str) -> ListingSortKey {
+        match value {
+            "qty" => ListingSortKey::Quantity,
+            "time" => ListingSortKey::TimeLeft,
+            _ => ListingSortKey::Price,
+        }
+    }
+}
+
+/// One browse page request: catalog-backed filters, one sort column, and the
+/// 1-based page index over [`LISTING_PAGE_SIZE`]-sized pages.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListingQuery {
+    /// Case-insensitive item/pet name prefix (catalog names; empty or absent
+    /// disables the filter).
+    pub name_prefix: Option<String>,
+    /// Exact item id (not species id — pets are addressed by their tuple
+    /// through the identity search instead).
+    pub item_id: Option<i64>,
+    /// Exact catalog item-class label (e.g. `"Consumable"`); only enriched
+    /// rows can match.
+    pub class: Option<String>,
+    /// Exact catalog quality label (e.g. `"Common"`); only enriched rows can
+    /// match.
+    pub quality: Option<String>,
+    /// Sort column.
+    pub sort: ListingSortKey,
+    /// `true` orders the sort column descending (largest/last first).
+    pub desc: bool,
+    /// 1-based page index; values below 1 are clamped by the service.
+    pub page: u32,
+}
+
+/// One stored listing joined to its catalog identity — the snapshot viewer's
+/// row model. Names/quality/level arrive from the item (or pet) catalog and
+/// are `None` while the identity is still sparse.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListingRow {
+    /// Blizzard auction id (stable while the listing stays up).
+    pub auction_id: i64,
+    /// Canonical identity of the listing (pets carry their full variant
+    /// tuple, so the viewer can show pet level without a catalog join).
+    pub item: ItemRef,
+    /// Stack size of the listing.
+    pub quantity: i64,
+    /// Buyout per unit, copper (commodities are per-unit already).
+    pub unit_price: i64,
+    /// Current bid, copper (auctions-kind listings only).
+    pub bid: Option<i64>,
+    /// Remaining-time band last reported by the source.
+    pub time_left: TimeLeftBand,
+    /// Display name from the catalog; `None` = sparse identity (rendered as
+    /// the raw `item {id}` / `pet {species}` label).
+    pub name: Option<String>,
+    /// Catalog quality label (items only; pets carry quality in the tuple).
+    pub quality: Option<String>,
+    /// Catalog item level (items only; `None` until the API enrichment
+    /// reports one — non-equipment never has a level).
+    pub item_level: Option<i64>,
+}
+
+/// One page of [`ListingRow`]s plus the paging metadata the viewer renders.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ListingPage {
+    /// The page's rows, in query order (sort column, then `auction_id`).
+    pub rows: Vec<ListingRow>,
+    /// Total listings matching the filters (across all pages).
+    pub total: u64,
+    /// The served 1-based page index (clamped).
+    pub page: u32,
+    /// Number of non-empty pages (`0` when nothing matches).
+    pub pages: u32,
+}
+
+/// Per-item-class listing count for one snapshot — the class filter's honest
+/// dropdown (built once at ingest, read back instantly).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassSummary {
+    /// Catalog item-class label; only enriched listings are counted.
+    pub class: String,
+    /// Listings of that class in the snapshot.
+    pub listings: u64,
+}
+
+/// Snapshot resolution outcome for the browse viewer.
+#[derive(Debug, PartialEq, Eq)]
+pub enum BrowseError {
+    /// No explicit snapshot was requested and the target/kind pair has no
+    /// snapshots at all (the "run a fetch cycle" empty state).
+    NoSnapshots,
+    /// The requested snapshot id is not in the store.
+    UnknownSnapshot,
+    /// The snapshot exists but belongs to a different target/kind pair than
+    /// the URL addresses — the link is malformed, not the data.
+    SnapshotMismatch,
+    /// Underlying store failure.
+    Store(StoreError),
+}
+
+impl From<StoreError> for BrowseError {
+    fn from(error: StoreError) -> Self {
+        BrowseError::Store(error)
+    }
+}
+
+impl core::fmt::Display for BrowseError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            BrowseError::NoSnapshots => write!(f, "no snapshots stored for this target/kind"),
+            BrowseError::UnknownSnapshot => write!(f, "unknown snapshot id"),
+            BrowseError::SnapshotMismatch => {
+                write!(f, "snapshot belongs to a different target/kind")
+            }
+            BrowseError::Store(error) => write!(f, "{error}"),
+        }
+    }
+}
+
 // ---------------------------------------------------------------- analytics
 
 /// Aggregate price histogram for one item-day: per distinct unit price, the
@@ -666,6 +819,9 @@ pub struct NameRecord {
     pub icon: Option<String>,
     /// Vendor sell price in copper, when the API reports one.
     pub sell_price: Option<i64>,
+    /// Item level, when the API reports one (equipment only — non-equipment
+    /// items never carry a level and read as `None` forever).
+    pub item_level: Option<i64>,
     /// Unix seconds of the last successful source fetch (enrichment window
     /// bookkeeping), stamped by the store on upsert — the adapters deliver
     /// records without a clock. `0` for search/browse hits, which do not
@@ -684,6 +840,7 @@ impl NameRecord {
             && self.inventory_slot.is_none()
             && self.icon.is_none()
             && self.sell_price.is_none()
+            && self.item_level.is_none()
     }
 }
 

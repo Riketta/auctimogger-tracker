@@ -273,6 +273,7 @@ pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> 
     const NAV: &[(&str, &str, &str)] = &[
         ("/", "dashboard", "dashboard"),
         ("/items", "items", "items"),
+        ("/browse", "browse", "browse"),
         ("/opportunities", "opportunities", "opportunities"),
         ("/overview", "overview", "overview"),
         ("/watchlist", "watchlist", "watchlist"),

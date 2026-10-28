@@ -338,6 +338,9 @@ fn build_app_state(
             clock.clone(),
         )),
         search: Arc::new(amtracker_core::services::search::SearchService::new(store.clone())),
+        browse: Arc::new(amtracker_core::services::snapshot_browse::SnapshotBrowseService::new(
+            store.clone(),
+        )),
         catalog: Arc::new(amtracker_core::services::catalog::CatalogService::new(
             store.clone(),
             item_info.clone(),

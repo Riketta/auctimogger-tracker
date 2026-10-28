@@ -179,6 +179,9 @@ Pages: `/` dashboard (health cards, recent ingest cycles, auto-reload) ·
 `/snapshots` (recent snapshot history per target) · `/items?q=…` search +
 alphabetical catalog browse · `/items/{target}/{item}` item detail ·
 `/items/{target}/pet/{species}?level=&quality=&breed=` pet detail ·
+`/browse` snapshot viewer (one stored snapshot's listings, laid out like the
+in-game auction house: name/id/class/quality filters, sortable price/qty/time
+columns, page arrows; unpinned = newest snapshot, pinned = frozen history) ·
 `/opportunities` (filter/sort/CSV) · `/overview` (movers with real 30-day
 sparklines) · `/watchlist` · `/help` (terminology).
 
@@ -199,6 +202,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
+| `GET /api/browse?target=&kind=&snapshot=&q=&item=&class=&quality=&sort=&dir=&page=` | one page (50 rows) of a stored snapshot's listings joined to their catalog identity; without `snapshot` the newest for the pair serves; `sort=price\|qty\|time` (default price asc, `dir=desc` flips) |
 | `GET /api/snapshots?target=&kind=&limit=` | snapshot metadata rows, newest first (`kind=commodities\|auctions`) |
 | `GET /api/feed.json` | machine-readable feed (future companion client) |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |

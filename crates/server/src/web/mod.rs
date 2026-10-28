@@ -79,6 +79,9 @@ pub struct AppState {
     pub health: Arc<HealthService>,
     /// Case-insensitive item/pet-name search over the catalog tables.
     pub search: Arc<amtracker_core::services::search::SearchService>,
+    /// Snapshot viewer (browse) reads: pinned/latest resolution and paged
+    /// listing rows behind `/browse` and `/api/browse`.
+    pub browse: Arc<amtracker_core::services::snapshot_browse::SnapshotBrowseService>,
     /// Item/pet-name catalog backed by the store plus the Blizzard APIs.
     pub catalog: Arc<amtracker_core::services::catalog::CatalogService>,
     /// Precomputed per-span metric blocks (medians, VWAP, sale rate).
@@ -184,6 +187,7 @@ pub fn api_routes() -> Vec<ApiRoute> {
         ("/api/health", &["get"], get(api::api_health)),
         ("/api/openapi.json", &["get"], get(api::api_openapi)),
         ("/api/docs", &["get"], get(openapi::docs_page)),
+        ("/api/browse", &["get"], get(api::api_browse)),
         ("/api/history", &["get"], get(api::api_history)),
         ("/api/search", &["get"], get(api::api_search)),
         ("/api/opportunities", &["get"], get(api::api_opportunities)),
@@ -226,6 +230,7 @@ pub fn api_routes() -> Vec<ApiRoute> {
 pub fn build_router_arc(state: Arc<AppState>) -> Router {
     let mut router = Router::new()
         .route("/", get(pages::dashboard))
+        .route("/browse", get(pages::browse_page))
         .route("/snapshots", get(pages::snapshots_page))
         .route("/items", get(pages::items_page))
         .route("/items/{target_id}/{item_id}", get(pages::item_page))

@@ -22,14 +22,19 @@ use amtracker_core::{
     domain::{
         utc_day,
         BlockLedger,
+        BrowseError,
         Category,
         Flavor,
         ItemRef,
+        ListingQuery,
+        ListingRow,
+        ListingSortKey,
         MetricBlock,
         PayloadKind,
         SearchHit,
         Span,
         TargetId,
+        TimeLeftBand,
     },
     error::StoreError,
     metrics::block_from_histograms,
@@ -493,9 +498,12 @@ pub(crate) async fn snapshots_page(State(state): State<Arc<AppState>>) -> Respon
                 .join(", ");
             let _ = write!(
                 body,
-                "<tr><td class=\"num\" data-v=\"{}\">{}</td><td>{}</td><td>{}</td>\
+                "<tr><td class=\"num\" data-v=\"{}\"><a href=\"/browse?target={}&amp;kind={}&amp;snapshot={}\">{}</a></td><td>{}</td><td>{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\" title=\"{}\">{}</td><td>{}</td></tr>",
+                meta.id,
+                html_escape(target.as_str()),
+                kind.as_str(),
                 meta.id,
                 meta.id,
                 human_time(meta.fetched_at),
@@ -511,6 +519,388 @@ pub(crate) async fn snapshots_page(State(state): State<Arc<AppState>>) -> Respon
         body.push_str("</tbody></table></div>");
     }
     page("snapshots", "snapshots", &body, None)
+}
+
+// ------------------------------------------------------- snapshot browsing
+
+/// Conventional quality ladder behind the viewer's quality filter; the store
+/// matches case-insensitively so the Blizzard ("Common") and Wowhead
+/// ("common") catalog spellings both hit.
+const BROWSE_QUALITIES: &[&str] =
+    &["Poor", "Common", "Uncommon", "Rare", "Epic", "Legendary", "Artifact"];
+
+/// Viewer label for a remaining-time band (the AH duration column).
+fn band_label(band: TimeLeftBand) -> &'static str {
+    match band {
+        TimeLeftBand::Short => "short",
+        TimeLeftBand::Medium => "medium",
+        TimeLeftBand::Long => "long",
+        TimeLeftBand::VeryLong => "very long",
+    }
+}
+
+/// The viewer's name cell: the catalog name when enriched, the raw identity
+/// when sparse, linked into the item/pet detail page. Rows carry their name
+/// from the store's catalog join — no second resolution pass.
+fn browse_item_cell(target: &TargetId, row: &ListingRow) -> String {
+    let target_slug = html_escape(target.as_str());
+    let (href, label, export) = match &row.item {
+        ItemRef::Item { item_id } => (
+            format!("/items/{target_slug}/{item_id}"),
+            row.name.clone().unwrap_or_else(|| format!("item {item_id}")),
+            format!("item {item_id}"),
+        ),
+        ItemRef::Pet { species, level, quality, breed } => (
+            format!(
+                "/items/{target_slug}/pet/{species}?level={level}&quality={quality}&breed={breed}"
+            ),
+            row.name.clone().unwrap_or_else(|| format!("pet {species}")),
+            format!("pet {species}"),
+        ),
+    };
+    format!(
+        "<td data-export=\"{}\"><a href=\"{}\">{}</a></td>",
+        html_escape(&export),
+        html_escape(&href),
+        html_escape(&label)
+    )
+}
+
+/// `GET /browse?target=&kind=&snapshot=&q=&item=&class=&quality=&sort=&dir=&page=`
+/// — the snapshot viewer: one stored snapshot's listings laid out like the
+/// in-game auction house's browse tab (toolbar filters, sortable columns,
+/// page arrows). Without `snapshot`, the newest snapshot of the pair serves,
+/// so the default view behaves like the live AH; pinning an id freezes
+/// history the game cannot show.
+pub(crate) async fn browse_page(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let mut body = String::new();
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    // Empty-string params (unselected dropdowns) mean "absent", not 400.
+    let non_empty = |value: Option<&String>| -> Option<String> {
+        value.map(|value| value.trim()).filter(|trimmed| !trimmed.is_empty()).map(str::to_string)
+    };
+    let kind = match non_empty(params.get("kind")) {
+        None => PayloadKind::Commodities,
+        Some(raw) => match PayloadKind::parse(&raw) {
+            Some(kind) => kind,
+            None => {
+                return (StatusCode::BAD_REQUEST, "unknown kind (expected commodities|auctions)")
+                    .into_response();
+            }
+        },
+    };
+    let snapshot_id = match non_empty(params.get("snapshot")) {
+        None => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "snapshot must be an integer id").into_response();
+            }
+        },
+    };
+    let item_id = match non_empty(params.get("item")) {
+        None => None,
+        Some(raw) => match raw.parse::<i64>() {
+            Ok(id) => Some(id),
+            Err(_) => {
+                return (StatusCode::BAD_REQUEST, "item must be an integer id").into_response()
+            }
+        },
+    };
+    let q = non_empty(params.get("q"));
+    let class = non_empty(params.get("class"));
+    let quality = non_empty(params.get("quality"));
+    let sort = params.get("sort").map_or(ListingSortKey::Price, |raw| ListingSortKey::parse(raw));
+    let desc = params.get("dir").is_some_and(|dir| dir == "desc");
+    let page_no = params.get("page").and_then(|raw| raw.parse::<u32>().ok()).unwrap_or(1);
+    let query = ListingQuery {
+        name_prefix: q.clone(),
+        item_id,
+        class: class.clone(),
+        quality: quality.clone(),
+        sort,
+        desc,
+        page: page_no,
+    };
+    let flavor = super::target_flavor(&state.config, &target);
+
+    let browse = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || {
+            let meta = state.browse.resolve(&target, kind, snapshot_id)?;
+            let recent = state.snapshots.list_recent(&target, kind, 30)?;
+            let classes = state.browse.classes(&flavor, meta.id)?;
+            let page = state.browse.page(&flavor, meta.id, query)?;
+            Ok((meta, recent, classes, page))
+        }
+    });
+    let (meta, recent, classes, data) = match browse.await {
+        Ok(Ok(tuple)) => tuple,
+        Ok(Err(BrowseError::NoSnapshots)) => {
+            body.push_str(
+                "<div class=\"empty\">no snapshots stored yet for this market — run a fetch \
+                 cycle (or use “fetch now” on the dashboard) and browse it here</div>",
+            );
+            return page("browse", "browse", &body, None);
+        }
+        Ok(Err(BrowseError::UnknownSnapshot)) => {
+            return (StatusCode::NOT_FOUND, "unknown snapshot id").into_response();
+        }
+        Ok(Err(BrowseError::SnapshotMismatch)) => {
+            return (StatusCode::BAD_REQUEST, "snapshot belongs to a different target/kind")
+                .into_response();
+        }
+        Ok(Err(BrowseError::Store(error))) => return render::store_error_page(error).await,
+        Err(error) => {
+            return render::store_error_page(StoreError::Backend(error.to_string())).await;
+        }
+    };
+
+    // Preserves every current filter in header-sort and pagination links.
+    let browse_url = |sort_key: Option<ListingSortKey>, dir: bool, page_no: u32| -> String {
+        let mut parts = vec![
+            format!("target={}", html_escape(target.as_str())),
+            format!("kind={}", kind.as_str()),
+        ];
+        if let Some(id) = snapshot_id {
+            parts.push(format!("snapshot={id}"));
+        }
+        if let Some(prefix) = &q {
+            parts.push(format!("q={}", html_escape(prefix)));
+        }
+        if let Some(id) = item_id {
+            parts.push(format!("item={id}"));
+        }
+        if let Some(label) = &class {
+            parts.push(format!("class={}", html_escape(label)));
+        }
+        if let Some(label) = &quality {
+            parts.push(format!("quality={}", html_escape(label)));
+        }
+        if let Some(key) = sort_key {
+            parts.push(format!("sort={}", key.as_str()));
+            if dir {
+                parts.push("dir=desc".into());
+            }
+        }
+        parts.push(format!("page={page_no}"));
+        format!("/browse?{}", parts.join("&amp;"))
+    };
+    // Sortable header: the label is the link (server-side sort — no
+    // data-sortable hook, so app.js client sorting never fights it); the
+    // active column carries an arrow and its aria-sort state, and clicking
+    // it flips the direction, vanilla-style.
+    let sortable_header = |label: &str, tip_text: &str, key: ListingSortKey| -> String {
+        let active = sort == key;
+        let arrow = if active && desc {
+            " ▼"
+        } else if active {
+            " ▲"
+        } else {
+            ""
+        };
+        let href =
+            if active { browse_url(Some(key), !desc, 1) } else { browse_url(Some(key), false, 1) };
+        let aria = if active {
+            format!(" aria-sort=\"{}\"", if desc { "descending" } else { "ascending" })
+        } else {
+            String::new()
+        };
+        format!(
+            "<th{aria}><span class=\"tip\" tabindex=\"0\" data-tip=\"{}\"><a href=\"{}\">{}{arrow}</a></span></th>",
+            html_escape(tip_text),
+            href,
+            html_escape(label)
+        )
+    };
+    let plain_header = |label: &str, tip_text: &str| -> String {
+        format!(
+            "<th><span class=\"tip\" tabindex=\"0\" data-tip=\"{}\">{}</span></th>",
+            html_escape(tip_text),
+            html_escape(label)
+        )
+    };
+
+    let _ = write!(
+        body,
+        "<h2>snapshot viewer</h2><p class=\"muted\">snapshot {} — fetched {} · {} listings \
+         accepted, {} dropped by the strict parse</p>",
+        meta.id,
+        html_escape(&human_time(meta.fetched_at)),
+        meta.entry_count,
+        meta.dropped_count
+    );
+
+    // One GET toolbar: every filter is a named field so the view is fully
+    // shareable; selects auto-submit (noscript gets the go button).
+    let _ = write!(
+        body,
+        "<form class=\"toolbar\" method=\"get\" action=\"/browse\">\
+         <input type=\"hidden\" name=\"target\" value=\"{}\">\
+         <label for=\"browse-kind\">kind</label>\
+         <select id=\"browse-kind\" name=\"kind\" data-autosubmit>",
+        html_escape(target.as_str())
+    );
+    for candidate in [PayloadKind::Commodities, PayloadKind::Auctions] {
+        let selected = if candidate == kind { " selected" } else { "" };
+        let _ = write!(
+            body,
+            "<option value=\"{}\"{selected}>{}</option>",
+            candidate.as_str(),
+            candidate.as_str()
+        );
+    }
+    body.push_str("</select>");
+    let _ = write!(
+        body,
+        "<label for=\"browse-snapshot\">snapshot</label>\
+         <select id=\"browse-snapshot\" name=\"snapshot\" data-autosubmit><option value=\"\"{}>latest</option>",
+        if snapshot_id.is_none() { " selected" } else { "" }
+    );
+    for candidate in &recent {
+        let selected = if Some(candidate.id) == snapshot_id { " selected" } else { "" };
+        let _ = write!(
+            body,
+            "<option value=\"{}\"{selected}>{} · {} · {} listings</option>",
+            candidate.id,
+            candidate.id,
+            html_escape(&human_time(candidate.fetched_at)),
+            candidate.entry_count
+        );
+    }
+    body.push_str("</select>");
+    let _ = write!(
+        body,
+        "<input name=\"q\" value=\"{}\" placeholder=\"name starts with…\" aria-label=\"name prefix\">\
+         <input name=\"item\" type=\"number\" min=\"1\" value=\"{}\" placeholder=\"item id\" aria-label=\"exact item id\">",
+        html_escape(&q.clone().unwrap_or_default()),
+        item_id.map_or(String::new(), |id| id.to_string())
+    );
+    body.push_str(
+        "<label for=\"browse-class\">class</label>\
+         <select id=\"browse-class\" name=\"class\" data-autosubmit><option value=\"\">all</option>",
+    );
+    for summary in &classes {
+        let selected =
+            if class.as_deref() == Some(summary.class.as_str()) { " selected" } else { "" };
+        let _ = write!(
+            body,
+            "<option value=\"{}\"{selected}>{} ({})</option>",
+            html_escape(&summary.class),
+            html_escape(&summary.class),
+            summary.listings
+        );
+    }
+    body.push_str(
+        "</select><label for=\"browse-quality\">quality</label>\
+         <select id=\"browse-quality\" name=\"quality\" data-autosubmit><option value=\"\">all</option>",
+    );
+    for candidate in BROWSE_QUALITIES {
+        let selected = if quality.as_deref() == Some(*candidate) { " selected" } else { "" };
+        let _ = write!(body, "<option value=\"{candidate}\"{selected}>{candidate}</option>");
+    }
+    body.push_str(
+        "</select><button class=\"btn btn-sm\" type=\"submit\">search</button>\
+         <noscript><button class=\"btn btn-sm\" type=\"submit\">go</button></noscript></form>",
+    );
+
+    if data.total == 0 {
+        let why = if meta.entry_count == 0 {
+            "this snapshot is empty — the source answered with zero listings"
+        } else {
+            "no listings match these filters"
+        };
+        let _ = write!(body, "<div class=\"empty\">{why}</div>");
+    } else {
+        let _ = write!(
+            body,
+            "<p class=\"muted\">{} listings match · page {} of {}</p>\
+             <div class=\"scroll-x\"><table id=\"browse\"><thead><tr>",
+            data.total, data.page, data.pages
+        );
+        body.push_str(&sortable_header(
+            "price",
+            "Per-unit price in copper (the AH min price). Click again to flip the order.",
+            ListingSortKey::Price,
+        ));
+        body.push_str(&plain_header(
+            "item",
+            "Item or pet the listing offers — click for its full history.",
+        ));
+        body.push_str(&plain_header(
+            "lvl",
+            "Item level from the catalog (— until the API enrichment reports one; non-equipment never has one); pets show their auction level.",
+        ));
+        body.push_str(&sortable_header("qty", "Listing stack size.", ListingSortKey::Quantity));
+        body.push_str(&sortable_header(
+            "time left",
+            "Remaining-time band last reported by the source: short < 30m, medium < 2h, long < 12h, very long beyond.",
+            ListingSortKey::TimeLeft,
+        ));
+        body.push_str(&plain_header(
+            "bid",
+            "Current bid (auctions-kind listings only; commodities have none).",
+        ));
+        body.push_str("</tr></thead><tbody>");
+        for row in &data.rows {
+            let level = match &row.item {
+                ItemRef::Pet { level, .. } => Some(i64::from(*level)),
+                ItemRef::Item { .. } => row.item_level,
+            };
+            let _ = write!(
+                body,
+                "<tr><td class=\"num\" data-v=\"{}\">{}</td>{}\
+                 <td class=\"num\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td>{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td></tr>",
+                row.unit_price,
+                money(row.unit_price),
+                browse_item_cell(&target, row),
+                level.map_or_else(|| "—".to_string(), |level| level.to_string()),
+                row.quantity,
+                row.quantity,
+                band_label(row.time_left),
+                row.bid.unwrap_or(-1),
+                row.bid.map_or_else(|| "—".to_string(), money)
+            );
+        }
+        body.push_str("</tbody></table></div>");
+
+        // Page arrows, vanilla style: prev on the left, next on the right.
+        body.push_str("<div class=\"pagenav\">");
+        if data.page > 1 {
+            let _ = write!(
+                body,
+                "<a class=\"btn btn-sm\" href=\"{}\">← prev</a>",
+                browse_url(Some(sort), desc, data.page - 1)
+            );
+        } else {
+            body.push_str("<span class=\"muted\">← prev</span>");
+        }
+        let _ = write!(body, "<span class=\"muted\">page {} of {}</span>", data.page, data.pages);
+        if data.page < data.pages {
+            let _ = write!(
+                body,
+                "<a class=\"btn btn-sm\" href=\"{}\">next →</a>",
+                browse_url(Some(sort), desc, data.page + 1)
+            );
+        } else {
+            body.push_str("<span class=\"muted\">next →</span>");
+        }
+        body.push_str("</div>");
+        body.push_str(
+            "<p><button class=\"btn btn-sm\" data-csv=\"browse\">export CSV</button></p>",
+        );
+    }
+    page("browse", "browse", &body, Some(target_switcher(&state.config, "/browse", &target, &[])))
 }
 
 // ------------------------------------------------------------ items search
@@ -1965,6 +2355,7 @@ pub(crate) async fn help_page() -> Response {
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
         ("watchlist", "Your curated per-target list. Drives feed-slim.lua — the addon consumes exactly those items."),
+        ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
         ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),
         ("cooldown", "A fired rule re-fires at most once per [alerts].cooldown_secs, so a persistently cheap item does not spam delivery. The anchor is the rule's last-fired stamp."),
         ("delivery", "Where fired alerts go: log (this page + JSON API only), discord (webhook message) or telegram (bot message). Webhook/token values are read from the named environment variables on every send, so rotating them needs no restart."),

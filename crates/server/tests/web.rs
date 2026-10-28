@@ -208,6 +208,7 @@ impl ItemInfoPort for StaticItemInfo {
             quality: Some("common".into()),
             icon: None,
             sell_price: None,
+            item_level: Some(5),
             fetched_at: 0,
         }))
     }
@@ -280,6 +281,9 @@ fn test_state_with_config(
         clock: clock.clone(),
         health: Arc::new(HealthService::new(store.clone(), config.clone(), clock.clone())),
         search: Arc::new(SearchService::new(store.clone())),
+        browse: Arc::new(amtracker_core::services::snapshot_browse::SnapshotBrowseService::new(
+            store.clone(),
+        )),
         catalog: Arc::new(CatalogService::new(store.clone(), item_info, clock.clone())),
         metrics: metrics.clone(),
         opportunities: Arc::new(OpportunityService::new(
@@ -524,6 +528,192 @@ fn table_shape(body: &str, table_id: &str) -> (usize, Vec<usize>) {
         .filter(|cells| *cells > 0)
         .collect();
     (headers, rows)
+}
+
+// ------------------------------------------------------- snapshot browsing
+
+/// Records one snapshot with the given listings (raw `[]`, no drops).
+fn seed_snapshot(
+    state: &AppState,
+    kind: PayloadKind,
+    at: i64,
+    listings: &[NormalizedListing],
+) -> i64 {
+    state
+        .snapshots
+        .record(
+            &NewSnapshot {
+                target: TargetId(TARGET.into()),
+                kind,
+                fetched_at: at,
+                source_last_modified: Some(at - 60),
+                entry_count: u64::try_from(listings.len()).unwrap_or(u64::MAX),
+                dropped_count: 0,
+                dropped_reasons: std::collections::BTreeMap::new(),
+                status: SnapshotStatus::Ok,
+            },
+            listings,
+            b"[]",
+        )
+        .expect("record snapshot")
+}
+
+/// The snapshot viewer: seeded listings render as AH-style rows with catalog
+/// names, item levels and per-unit money, sorted cheapest-first by default.
+#[tokio::test]
+async fn browse_page_serves_seeded_snapshot_rows() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    let listings = [
+        listing(100, &ItemRef::Item { item_id: 2589 }, 300),
+        listing(101, &ItemRef::Item { item_id: 2589 }, 100),
+    ];
+    let snapshot_id = seed_snapshot(&state, PayloadKind::Commodities, 1_000_000, &listings);
+    // Visiting the item page enriches the catalog, so the viewer's rows
+    // carry the resolved name instead of the raw id.
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) = get(router.clone(), "/items/t1/2589").await;
+    assert_eq!(status, StatusCode::OK, "item visit enriches the catalog");
+
+    let (status, body) = get(router, "/browse?target=t1&kind=commodities").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("snapshot viewer"), "page title present");
+    assert!(body.contains("2 listings match · page 1 of 1"), "count and paging line");
+    assert!(body.contains("Named Item 2589"), "catalog name resolves");
+    assert!(body.contains("data-export=\"item 2589\""), "CSV export identity present");
+    let price_asc = body.find("1s 0c").expect("cheapest price row");
+    let price_desc = body.find("3s 0c").expect("dearer price row");
+    assert!(price_asc < price_desc, "default sort is cheapest first");
+    assert!(body.contains(">5<"), "catalog item level renders in the lvl column");
+    assert!(body.contains("very long"), "time-left band renders");
+    assert!(body.contains("data-tip=\"Current bid"), "bid column present");
+    assert!(
+        body.contains(&format!("snapshot {snapshot_id}")),
+        "meta line names the served snapshot"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Header links re-query server-side (aria-sort + direction flip), and the
+/// toolbar filters narrow the results through the store.
+#[tokio::test]
+async fn browse_page_sort_and_filters_flow_through() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    let listings = [
+        listing(100, &ItemRef::Item { item_id: 2589 }, 300),
+        listing(101, &ItemRef::Item { item_id: 7909 }, 100),
+    ];
+    seed_snapshot(&state, PayloadKind::Commodities, 1_000_000, &listings);
+    let router = build_router_arc(Arc::clone(&state));
+    // Enrich both ids so rows resolve names through the store's join.
+    let (_, _) = get(router.clone(), "/items/t1/2589").await;
+    let (_, _) = get(router.clone(), "/items/t1/7909").await;
+
+    let (_, body) =
+        get(router.clone(), "/browse?target=t1&kind=commodities&sort=price&dir=desc").await;
+    assert!(body.contains("aria-sort=\"descending\""), "current sort state on the header");
+    let dearer = body.find("3s 0c").expect("300c row");
+    let cheaper = body.find("1s 0c").expect("100c row");
+    assert!(dearer < cheaper, "dir=desc puts the dearer listing first");
+
+    let (_, body) = get(router.clone(), "/browse?target=t1&kind=commodities&item=7909").await;
+    assert!(body.contains("1 listings match"), "exact item-id filter narrows");
+    assert!(body.contains("Named Item 7909"));
+    assert!(!body.contains("Named Item 2589"), "the other id is filtered out");
+
+    let (_, body) = get(router.clone(), "/browse?target=t1&kind=commodities&q=named").await;
+    assert!(body.contains("2 listings match"), "name prefix matches case-insensitively");
+
+    let (_, body) = get(router.clone(), "/browse?target=t1&kind=commodities&q=zzz").await;
+    assert!(body.contains("no listings match these filters"), "empty result state");
+
+    let (_, body) =
+        get(router.clone(), "/browse?target=t1&kind=commodities&quality=common&class=").await;
+    assert!(body.contains("2 listings match"), "quality matches case-insensitively");
+
+    // Both kinds are browsable; the other kind simply has no snapshots.
+    let (status, body) = get(router, "/browse?target=t1&kind=auctions").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("no snapshots stored yet"), "per-kind empty state");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Pinning resolves (latest without an id), and malformed links are client
+/// errors: unknown ids are 404, ids from another target/kind are 400.
+#[tokio::test]
+async fn browse_page_resolves_latest_pins_and_rejects_mismatches() {
+    let (state, root) = test_state(None);
+    let older = seed_snapshot(&state, PayloadKind::Commodities, 1_000_000, &[]);
+    let newer = seed_snapshot(&state, PayloadKind::Commodities, 1_001_000, &[]);
+    let auctions = seed_snapshot(&state, PayloadKind::Auctions, 1_002_000, &[]);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (_, body) = get(router.clone(), "/browse?target=t1&kind=commodities").await;
+    assert!(
+        body.contains(&format!("snapshot {newer}")),
+        "without an id the newest snapshot serves"
+    );
+    assert!(!body.contains(&format!("snapshot {older} —")), "the older snapshot does not");
+
+    let (_, body) =
+        get(router.clone(), &format!("/browse?target=t1&kind=commodities&snapshot={older}")).await;
+    assert!(body.contains(&format!("snapshot {older}")), "an explicit id pins history");
+
+    let (status, _) =
+        get(router.clone(), &format!("/browse?target=t1&kind=commodities&snapshot={auctions}"))
+            .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "a real id from another kind is 400");
+
+    let (status, _) = get(router.clone(), "/browse?target=t1&kind=commodities&snapshot=999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown ids are 404");
+
+    let (status, _) = get(router.clone(), "/browse?target=t1&kind=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown kinds are 400");
+
+    let (status, _) = get(router.clone(), "/browse?target=t1&kind=commodities&snapshot=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "junk snapshot ids are 400");
+
+    let (status, _) = get(router, "/browse?target=t1&kind=commodities&item=abc").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "junk item ids are 400");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The JSON twin serves the same resolution and rows as the page, with the
+/// wire spellings the `OpenAPI` document promises.
+#[tokio::test]
+async fn browse_api_mirrors_the_page() {
+    let (state, root) = test_state_with_info(None, Arc::new(StaticItemInfo));
+    let listings = [
+        listing(100, &ItemRef::Item { item_id: 2589 }, 300),
+        listing(101, &ItemRef::Item { item_id: 2589 }, 100),
+    ];
+    let snapshot_id = seed_snapshot(&state, PayloadKind::Commodities, 1_000_000, &listings);
+    let router = build_router_arc(Arc::clone(&state));
+    let (_, _) = get(router.clone(), "/items/t1/2589").await; // enrich
+
+    let (status, body) =
+        get(router.clone(), "/api/browse?target=t1&kind=commodities&sort=price&dir=desc").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json.get("snapshot").and_then(|s| s.get("id")), Some(&Value::from(snapshot_id)));
+    let rows = json.get("listings").and_then(Value::as_array).expect("listings array");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].get("unitPrice"), Some(&Value::from(300)), "desc sort applied");
+    assert_eq!(rows[0].get("auctionID"), Some(&Value::from(100)));
+    assert_eq!(
+        rows[0].pointer("/item/type"),
+        Some(&Value::from("item")),
+        "identity rides in the alerts/watch wire shape"
+    );
+    assert_eq!(rows[0].get("name"), Some(&Value::from("Named Item 2589")));
+    assert_eq!(rows[0].get("level"), Some(&Value::from(5)));
+    let page = json.get("page").expect("page block");
+    assert_eq!(page.get("total"), Some(&Value::from(2)));
+    assert_eq!(page.get("pages"), Some(&Value::from(1)));
+    assert_eq!(page.get("size"), Some(&Value::from(50)));
+
+    let (status, _) = get(router, "/api/browse?target=t1&kind=commodities&snapshot=999").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "unknown pins are 404 on the API too");
+    std::fs::remove_dir_all(&root).ok();
 }
 
 /// Tables link resolved catalog names (the raw id rides in the data-tip for

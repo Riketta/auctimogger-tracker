@@ -19,10 +19,15 @@ use amtracker_core::{
         BrowseCursor,
         CatalogCounts,
         Category,
+        ClassSummary,
         Flavor,
         ItemDayRow,
         ItemRef,
         ListingKind,
+        ListingPage,
+        ListingQuery,
+        ListingRow,
+        ListingSortKey,
         MetricBlock,
         NameRecord,
         NewSnapshot,
@@ -36,7 +41,9 @@ use amtracker_core::{
         SnapshotStatus,
         Span,
         TargetId,
+        TimeLeftBand,
         WatchlistEntry,
+        LISTING_PAGE_SIZE,
     },
     error::StoreError,
     fold::{
@@ -71,7 +78,10 @@ use rusqlite::Connection;
 /// be split faithfully (a merged fold row carries no category), so they are
 /// dropped and the day folds are rebuilt exactly from the retained raw
 /// listings (see `rebuild_category_folds`); sale and cache rows re-accumulate.
-const SCHEMA_VERSION: i64 = 7;
+/// Version 8 added the snapshot-viewer read surface: catalog item levels,
+/// the per-snapshot class-summary cache, and snapshot-leading listing
+/// indexes for the browse page queries (all idempotent ALTER/CREATE steps).
+const SCHEMA_VERSION: i64 = 8;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
 /// primary keys to `(flavor, id)` keys and gain the enrichment columns.
@@ -206,6 +216,18 @@ CREATE TABLE IF NOT EXISTS listing (
 CREATE INDEX IF NOT EXISTS idx_listing_day ON listing(target_id, day);
 CREATE INDEX IF NOT EXISTS idx_listing_item ON listing(target_id, item_ref_id, snapshot_id);
 
+CREATE TABLE IF NOT EXISTS snapshot_class_summary (
+    snapshot_id INTEGER NOT NULL,
+    flavor TEXT NOT NULL,
+    item_class TEXT NOT NULL,
+    listings INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, flavor, item_class)
+);
+CREATE INDEX IF NOT EXISTS idx_listing_snapshot_price
+    ON listing(snapshot_id, unit_price, auction_id);
+CREATE INDEX IF NOT EXISTS idx_listing_snapshot_qty
+    ON listing(snapshot_id, quantity, auction_id);
+
 CREATE TABLE IF NOT EXISTS item_day (
     target_id TEXT NOT NULL,
     item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
@@ -243,6 +265,7 @@ CREATE TABLE IF NOT EXISTS item_catalog (
     quality TEXT,
     icon TEXT,
     sell_price INTEGER,
+    item_level INTEGER,
     fetched_at INTEGER NOT NULL,
     PRIMARY KEY (flavor, item_id)
 );
@@ -310,6 +333,22 @@ CREATE TABLE IF NOT EXISTS alert_event (
     fired_at INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_alert_event_target ON alert_event(target_id, id DESC);
+";
+
+/// Snapshot-viewer tables for v8 (idempotent on every open below the version
+/// stamp): the class-summary cache fills lazily on first browse read.
+const SNAPSHOT_VIEWER_V8_MIGRATION: &str = "
+CREATE TABLE IF NOT EXISTS snapshot_class_summary (
+    snapshot_id INTEGER NOT NULL,
+    flavor TEXT NOT NULL,
+    item_class TEXT NOT NULL,
+    listings INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, flavor, item_class)
+);
+CREATE INDEX IF NOT EXISTS idx_listing_snapshot_price
+    ON listing(snapshot_id, unit_price, auction_id);
+CREATE INDEX IF NOT EXISTS idx_listing_snapshot_qty
+    ON listing(snapshot_id, quantity, auction_id);
 ";
 
 /// Single-connection SQLite store (WAL journal) implementing the snapshot,
@@ -414,6 +453,23 @@ impl SqliteStore {
             conn.execute_batch(CATEGORY_V7_MIGRATION)
                 .map_err(|e| backend("migrate aggregates to category keys", e))?;
             Self::rebuild_category_folds(&conn)?;
+            // v8 added the snapshot-viewer read surface. All steps are
+            // idempotent so fresh v8 files (created at the new shape by the
+            // SCHEMA batch above) pass through unchanged.
+            let catalog_has_level = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('item_catalog') WHERE name = 'item_level')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|flag| flag == 1)
+                .map_err(|e| backend("inspect item_catalog schema", e))?;
+            if !catalog_has_level {
+                conn.execute_batch("ALTER TABLE item_catalog ADD COLUMN item_level INTEGER")
+                    .map_err(|e| backend("migrate item_level", e))?;
+            }
+            conn.execute_batch(SNAPSHOT_VIEWER_V8_MIGRATION)
+                .map_err(|e| backend("migrate snapshot viewer tables", e))?;
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
         }
@@ -813,6 +869,253 @@ impl SnapshotRepository for SqliteStore {
         }
         Ok(out)
     }
+
+    fn snapshot_by_id(&self, id: i64) -> Result<Option<SnapshotMeta>, StoreError> {
+        let conn = self.open_transaction();
+        let mut statement = conn
+            .prepare(
+                "SELECT id, target_id, kind, fetched_at, source_last_modified, entry_count, dropped_count, status, drop_reasons
+                 FROM snapshots WHERE id = ?1",
+            )
+            .map_err(|e| backend("prepare snapshot_by_id", e))?;
+        let mut rows = statement
+            .query(rusqlite::params![id])
+            .map_err(|e| backend("query snapshot_by_id", e))?;
+        let Some(row) = rows.next().map_err(|e| backend("snapshot_by_id row", e))? else {
+            return Ok(None);
+        };
+        let entry_count =
+            u64::try_from(row.get::<_, i64>(5).map_err(|e| backend("entry_count", e))?)
+                .unwrap_or(0);
+        let dropped_count =
+            u64::try_from(row.get::<_, i64>(6).map_err(|e| backend("dropped_count", e))?)
+                .unwrap_or(0);
+        Ok(Some(SnapshotMeta {
+            id: row.get(0).map_err(|e| backend("snapshot_by_id id", e))?,
+            target: TargetId(
+                row.get::<_, String>(1).map_err(|e| backend("snapshot_by_id target", e))?,
+            ),
+            kind: parse_kind(
+                &row.get::<_, String>(2).map_err(|e| backend("snapshot_by_id kind", e))?,
+            )?,
+            fetched_at: row.get(3).map_err(|e| backend("snapshot_by_id fetched_at", e))?,
+            source_last_modified: row
+                .get(4)
+                .map_err(|e| backend("snapshot_by_id last_modified", e))?,
+            entry_count,
+            dropped_count,
+            dropped_reasons: parse_drop_reasons(
+                row.get(8).map_err(|e| backend("snapshot_by_id drop_reasons", e))?,
+            )?,
+            status: parse_status(
+                &row.get::<_, String>(7).map_err(|e| backend("snapshot_by_id status", e))?,
+            ),
+        }))
+    }
+
+    fn listings_page(
+        &self,
+        flavor: &Flavor,
+        snapshot_id: i64,
+        query: &ListingQuery,
+    ) -> Result<ListingPage, StoreError> {
+        let conn = self.open_transaction();
+        // Defensive clamp: a 0 page must not underflow the offset math (the
+        // service normalizes the response afterwards).
+        let page = i64::from(query.page.max(1));
+        // The name prefix is a user string: LIKE wildcards are escaped so
+        // `100%` means the literal prefix, not a wildcard.
+        let prefix_pattern = query.name_prefix.as_ref().map(|prefix| {
+            format!("{}%", prefix.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"))
+        });
+        // Sort keys are a fixed whitelist (never interpolated user data); the
+        // band rank orders the semantic Short < Medium < Long < VeryLong.
+        let sort_expr = match query.sort {
+            ListingSortKey::Price => "l.unit_price".to_string(),
+            ListingSortKey::Quantity => "l.quantity".to_string(),
+            ListingSortKey::TimeLeft => {
+                "CASE l.time_left WHEN 'SHORT' THEN 1 WHEN 'MEDIUM' THEN 2 \
+                 WHEN 'LONG' THEN 3 WHEN 'VERY_LONG' THEN 4 ELSE 5 END"
+                    .to_string()
+            }
+        };
+        let direction = if query.desc { "DESC" } else { "ASC" };
+
+        // Fixed nullable filter slots: ?3 prefix, ?4 item id, ?5 class,
+        // ?6 quality. Name/level/quality reads come from the flavor-scoped
+        // catalog; pets resolve their name from the species catalog and
+        // carry level/quality in the identity tuple.
+        let from_where = "FROM listing l
+             JOIN item_ref r ON r.id = l.item_ref_id
+             LEFT JOIN item_catalog ic ON ic.flavor = ?1 AND ic.item_id = r.item_id AND r.kind = 'item'
+             LEFT JOIN pet_catalog pc ON pc.flavor = ?1 AND pc.species_id = r.pet_species AND r.kind = 'pet'
+             WHERE l.snapshot_id = ?2
+               AND (?3 IS NULL OR COALESCE(ic.name, pc.name) LIKE ?3 ESCAPE '\\')
+               AND (?4 IS NULL OR (r.kind = 'item' AND r.item_id = ?4))
+               AND (?5 IS NULL OR ic.item_class = ?5 COLLATE NOCASE)
+               AND (?6 IS NULL OR ic.quality = ?6 COLLATE NOCASE)";
+
+        let count_sql = format!("SELECT COUNT(*) {from_where}");
+        let total = u64::try_from(
+            conn.query_row(
+                &count_sql,
+                rusqlite::params![
+                    flavor.as_str(),
+                    snapshot_id,
+                    prefix_pattern,
+                    query.item_id,
+                    query.class,
+                    query.quality,
+                ],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(|e| backend("count listings", e))?,
+        )
+        .unwrap_or(0);
+        let pages = u32::try_from(total.div_ceil(u64::try_from(LISTING_PAGE_SIZE).unwrap_or(1)))
+            .unwrap_or(u32::MAX);
+        let served_page = page.min(i64::from(pages.max(1)));
+
+        let sql = format!(
+            "SELECT l.auction_id, l.quantity, l.unit_price, l.bid, l.time_left, \
+             r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, \
+             COALESCE(ic.name, pc.name), ic.quality, ic.item_level \
+             {from_where} \
+             ORDER BY {sort_expr} {direction}, l.auction_id ASC \
+             LIMIT ?7 OFFSET ?8"
+        );
+        let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare listings", e))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![
+                    flavor.as_str(),
+                    snapshot_id,
+                    prefix_pattern,
+                    query.item_id,
+                    query.class,
+                    query.quality,
+                    i64::try_from(LISTING_PAGE_SIZE).unwrap_or(i64::MAX),
+                    (served_page - 1) * i64::try_from(LISTING_PAGE_SIZE).unwrap_or(i64::MAX),
+                ],
+                listing_row_from_row,
+            )
+            .map_err(|e| backend("query listings", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| backend("listings row", e))?);
+        }
+        Ok(ListingPage {
+            rows: out,
+            total,
+            page: u32::try_from(served_page).unwrap_or(u32::MAX),
+            pages,
+        })
+    }
+
+    fn snapshot_class_summary(
+        &self,
+        flavor: &Flavor,
+        snapshot_id: i64,
+    ) -> Result<Vec<ClassSummary>, StoreError> {
+        let conn = self.open_transaction();
+        let read = |conn: &Connection| -> Result<Vec<ClassSummary>, StoreError> {
+            let mut statement = conn
+                .prepare(
+                    "SELECT item_class, listings FROM snapshot_class_summary \
+                     WHERE snapshot_id = ?1 AND flavor = ?2 ORDER BY listings DESC, item_class ASC",
+                )
+                .map_err(|e| backend("prepare class summary", e))?;
+            let rows = statement
+                .query_map(rusqlite::params![snapshot_id, flavor.as_str()], |row| {
+                    Ok(ClassSummary {
+                        class: row.get(0)?,
+                        listings: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                    })
+                })
+                .map_err(|e| backend("query class summary", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| backend("class summary row", e))?);
+            }
+            Ok(out)
+        };
+        let cached = read(&conn)?;
+        if !cached.is_empty() {
+            return Ok(cached);
+        }
+        // First read for this snapshot/flavor: aggregate from the listings
+        // and cache. One ingest-time-classified snapshot later re-reads the
+        // cached table instead of re-aggregating per request.
+        let aggregate_sql = "SELECT ic.item_class, COUNT(*) \
+             FROM listing l \
+             JOIN item_ref r ON r.id = l.item_ref_id \
+             JOIN item_catalog ic ON ic.flavor = ?1 AND ic.item_id = r.item_id \
+             WHERE l.snapshot_id = ?2 AND r.kind = 'item' AND ic.item_class IS NOT NULL \
+             GROUP BY ic.item_class";
+        let mut statement =
+            conn.prepare(aggregate_sql).map_err(|e| backend("prepare class aggregate", e))?;
+        let rows = statement
+            .query_map(rusqlite::params![flavor.as_str(), snapshot_id], |row| {
+                Ok(ClassSummary {
+                    class: row.get(0)?,
+                    listings: u64::try_from(row.get::<_, i64>(1)?).unwrap_or(0),
+                })
+            })
+            .map_err(|e| backend("query class aggregate", e))?;
+        let mut computed = Vec::new();
+        for row in rows {
+            computed.push(row.map_err(|e| backend("class aggregate row", e))?);
+        }
+        drop(statement);
+        if !computed.is_empty() {
+            let tx = conn.unchecked_transaction().map_err(|e| backend("begin", e))?;
+            for summary in &computed {
+                tx.execute(
+                    "INSERT INTO snapshot_class_summary (snapshot_id, flavor, item_class, listings) \
+                     VALUES (?1, ?2, ?3, ?4) \
+                     ON CONFLICT (snapshot_id, flavor, item_class) DO UPDATE SET listings = excluded.listings",
+                    rusqlite::params![
+                        snapshot_id,
+                        flavor.as_str(),
+                        summary.class,
+                        i64::try_from(summary.listings).unwrap_or(i64::MAX),
+                    ],
+                )
+                .map_err(|e| backend("cache class summary", e))?;
+            }
+            tx.commit().map_err(|e| backend("commit class summary", e))?;
+            computed.sort_by(|a, b| b.listings.cmp(&a.listings).then(a.class.cmp(&b.class)));
+            return Ok(computed);
+        }
+        Ok(Vec::new())
+    }
+}
+
+/// Maps one `listings_page` row (listing + `item_ref` + both catalogs) into
+/// the viewer's read model.
+fn listing_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ListingRow> {
+    let kind_text: String = row.get(5)?;
+    let item = if kind_text == "pet" {
+        ItemRef::Pet {
+            species: row.get(7)?,
+            level: i32::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+            quality: i32::try_from(row.get::<_, i64>(9)?).unwrap_or(0),
+            breed: i32::try_from(row.get::<_, i64>(10)?).unwrap_or(0),
+        }
+    } else {
+        ItemRef::Item { item_id: row.get(6)? }
+    };
+    Ok(ListingRow {
+        auction_id: row.get(0)?,
+        item,
+        quantity: row.get(1)?,
+        unit_price: row.get(2)?,
+        bid: row.get(3)?,
+        time_left: TimeLeftBand::parse(&row.get::<_, String>(4)?),
+        name: row.get(11)?,
+        quality: row.get(12)?,
+        item_level: row.get(13)?,
+    })
 }
 
 impl SalesRepository for SqliteStore {
@@ -2173,8 +2476,8 @@ impl ItemCatalogRepository for SqliteStore {
             conn.execute(
                 "INSERT INTO item_catalog
                      (flavor, item_id, name, item_class, item_subclass, inventory_slot,
-                      quality, icon, sell_price, fetched_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                      quality, icon, sell_price, item_level, fetched_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
                  ON CONFLICT (flavor, item_id) DO UPDATE SET
                      name = excluded.name,
                      item_class = COALESCE(excluded.item_class, item_class),
@@ -2183,6 +2486,7 @@ impl ItemCatalogRepository for SqliteStore {
                      quality = COALESCE(excluded.quality, quality),
                      icon = COALESCE(excluded.icon, icon),
                      sell_price = COALESCE(excluded.sell_price, sell_price),
+                     item_level = COALESCE(excluded.item_level, item_level),
                      fetched_at = excluded.fetched_at",
                 rusqlite::params![
                     flavor.as_str(),
@@ -2194,6 +2498,7 @@ impl ItemCatalogRepository for SqliteStore {
                     record.quality,
                     record.icon,
                     record.sell_price,
+                    record.item_level,
                     self.clock.now(),
                 ],
             )
@@ -2272,7 +2577,7 @@ impl ItemCatalogRepository for SqliteStore {
         let row = conn
             .query_row(
                 "SELECT item_id, name, item_class, item_subclass, inventory_slot, quality,
-                        icon, sell_price, fetched_at
+                        icon, sell_price, item_level, fetched_at
                  FROM item_catalog WHERE flavor = ?1 AND item_id = ?2",
                 rusqlite::params![flavor.as_str(), item_id],
                 |row| {
@@ -2285,7 +2590,8 @@ impl ItemCatalogRepository for SqliteStore {
                         quality: row.get(5)?,
                         icon: row.get(6)?,
                         sell_price: row.get(7)?,
-                        fetched_at: row.get(8)?,
+                        item_level: row.get(8)?,
+                        fetched_at: row.get(9)?,
                     })
                 },
             )
@@ -2415,6 +2721,7 @@ fn catalog_hit_from_row(row: &rusqlite::Row<'_>) -> Result<SearchHit, StoreError
             quality: row.get(4).map_err(|e| backend("catalog hit quality", e))?,
             icon: None,
             sell_price: None,
+            item_level: None,
             fetched_at: 0,
         })),
         "pet" => Ok(SearchHit::Pet(PetNameRecord {

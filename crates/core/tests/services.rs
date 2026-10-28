@@ -24,11 +24,15 @@ use amtracker_core::{
     },
     domain::{
         utc_day,
+        BrowseError,
         Category,
         FetchOutcome,
         ItemDayRow,
         ItemRef,
         ListingKind,
+        ListingQuery,
+        ListingSortKey,
+        NewSnapshot,
         NewWatchlistEntry,
         PayloadKind,
         SnapshotMeta,
@@ -63,6 +67,7 @@ use amtracker_core::{
             OpportunityService,
             OpportunitySort,
         },
+        snapshot_browse::SnapshotBrowseService,
         watchlist::WatchlistService,
     },
 };
@@ -150,6 +155,10 @@ struct FakeSnapshotsInner {
     /// Newest snapshot per (target, kind) — the freshness gate is per kind,
     /// so the fake must scope its reads the way the real store does.
     latest: HashMap<(TargetId, PayloadKind), SnapshotMeta>,
+    /// Every recorded snapshot by id (the browse viewer's pinned reads).
+    metas: HashMap<i64, SnapshotMeta>,
+    /// Recorded listings per snapshot id, in record order.
+    listings: HashMap<i64, Vec<amtracker_core::domain::NormalizedListing>>,
     raws: Vec<Vec<u8>>,
     listing_counts: Vec<u64>,
     next_id: i64,
@@ -186,7 +195,9 @@ impl SnapshotRepository for FakeSnapshots {
             dropped_reasons: snapshot.dropped_reasons.clone(),
             status: snapshot.status,
         };
-        inner.latest.insert((snapshot.target.clone(), snapshot.kind), meta);
+        inner.latest.insert((snapshot.target.clone(), snapshot.kind), meta.clone());
+        inner.metas.insert(id, meta);
+        inner.listings.insert(id, listings.to_vec());
         inner.raws.push(raw.to_vec());
         inner.listing_counts.push(listings.len() as u64);
         Ok(id)
@@ -208,6 +219,80 @@ impl SnapshotRepository for FakeSnapshots {
     ) -> Result<Vec<SnapshotMeta>, StoreError> {
         let inner = self.inner.lock().unwrap();
         Ok(inner.latest.values().take(limit).cloned().collect())
+    }
+
+    fn snapshot_by_id(&self, id: i64) -> Result<Option<SnapshotMeta>, StoreError> {
+        Ok(self.inner.lock().unwrap().metas.get(&id).cloned())
+    }
+
+    fn listings_page(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        snapshot_id: i64,
+        query: &amtracker_core::domain::ListingQuery,
+    ) -> Result<amtracker_core::domain::ListingPage, StoreError> {
+        use amtracker_core::domain::{
+            ListingPage,
+            ListingRow,
+            ListingSortKey,
+            LISTING_PAGE_SIZE,
+        };
+        let inner = self.inner.lock().unwrap();
+        let mut rows: Vec<ListingRow> = inner
+            .listings
+            .get(&snapshot_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|listing| ListingRow {
+                auction_id: listing.auction_id,
+                item: listing.item_ref,
+                quantity: listing.quantity,
+                unit_price: listing.unit_price,
+                bid: listing.bid,
+                time_left: listing.time_left,
+                name: None,
+                quality: None,
+                item_level: None,
+            })
+            .collect();
+        rows.retain(|row| {
+            query.item_id.is_none_or(|id| match &row.item {
+                ItemRef::Item { item_id } => *item_id == id,
+                ItemRef::Pet { .. } => false,
+            })
+        });
+        let total = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        let sort_key = |row: &ListingRow| match query.sort {
+            ListingSortKey::Price => row.unit_price,
+            ListingSortKey::Quantity => row.quantity,
+            ListingSortKey::TimeLeft => row.time_left.lower_bound_secs(),
+        };
+        rows.sort_by(|a, b| {
+            let ord = (sort_key(a), a.auction_id).cmp(&(sort_key(b), b.auction_id));
+            if query.desc {
+                ord.reverse()
+            } else {
+                ord
+            }
+        });
+        let pages = u32::try_from(total.div_ceil(u64::try_from(LISTING_PAGE_SIZE).unwrap_or(1)))
+            .unwrap_or(u32::MAX);
+        let page = query.page.max(1).min(pages.max(1));
+        let skip = usize::try_from(
+            u64::from(page - 1) * u64::try_from(LISTING_PAGE_SIZE).unwrap_or(u64::MAX),
+        )
+        .unwrap_or(usize::MAX);
+        let rows = rows.into_iter().skip(skip).take(LISTING_PAGE_SIZE).collect();
+        Ok(ListingPage { rows, total, page, pages })
+    }
+
+    fn snapshot_class_summary(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        _snapshot_id: i64,
+    ) -> Result<Vec<amtracker_core::domain::ClassSummary>, StoreError> {
+        Ok(Vec::new())
     }
 }
 
@@ -2252,4 +2337,140 @@ fn feed_export_attributes_every_span_to_its_own_item_across_many_singles() {
         let d7 = entry.metrics.get(&Span::D7).unwrap_or_else(|| panic!("item {id} d7 missing"));
         assert_eq!((d7.n, d7.median), (d7_n, d7_median), "item {id} d7 block");
     }
+}
+
+// ------------------------------------------------------- snapshot browsing
+
+fn browse_snapshot(target: &TargetId, kind: PayloadKind, at: i64) -> NewSnapshot {
+    NewSnapshot {
+        target: target.clone(),
+        kind,
+        fetched_at: at,
+        source_last_modified: None,
+        entry_count: 3,
+        dropped_count: 0,
+        dropped_reasons: BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    }
+}
+
+fn browse_listing(
+    auction_id: i64,
+    item: &ItemRef,
+    price: i64,
+) -> amtracker_core::domain::NormalizedListing {
+    amtracker_core::domain::NormalizedListing {
+        auction_id,
+        item_ref: item.clone(),
+        kind: ListingKind::Commodity,
+        quantity: 1,
+        unit_price: price,
+        bid: None,
+        time_left: TimeLeftBand::Long,
+        context: None,
+        bonus_lists: Vec::new(),
+    }
+}
+
+/// The viewer's snapshot resolution: absent id serves the newest snapshot of
+/// the pair, an explicit id must exist AND match the pair, and missing data
+/// is a distinct error from a malformed link.
+#[test]
+fn snapshot_browse_resolves_latest_and_validates_pins() {
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let t1 = TargetId("us-4".into());
+    let t2 = TargetId("eu-9".into());
+    let first = snapshots
+        .record(&browse_snapshot(&t1, PayloadKind::Commodities, 1_000), &[], b"a")
+        .expect("record first");
+    let second = snapshots
+        .record(&browse_snapshot(&t1, PayloadKind::Commodities, 2_000), &[], b"b")
+        .expect("record second");
+    snapshots
+        .record(&browse_snapshot(&t2, PayloadKind::Auctions, 3_000), &[], b"c")
+        .expect("record other pair");
+    let service = SnapshotBrowseService::new(snapshots);
+
+    let latest = service.resolve(&t1, PayloadKind::Commodities, None).expect("latest");
+    assert_eq!(latest.id, second, "absent id serves the newest snapshot");
+
+    let pinned = service.resolve(&t1, PayloadKind::Commodities, Some(first)).expect("pinned");
+    assert_eq!(pinned.id, first, "an explicit id pins the historical view");
+
+    assert_eq!(
+        service.resolve(&t1, PayloadKind::Commodities, Some(999)),
+        Err(BrowseError::UnknownSnapshot),
+        "unknown ids are their own error"
+    );
+    assert_eq!(
+        service.resolve(&t1, PayloadKind::Auctions, Some(first)),
+        Err(BrowseError::SnapshotMismatch),
+        "a real id for another pair is a malformed link"
+    );
+    assert_eq!(
+        service.resolve(&TargetId("bogus".into()), PayloadKind::Commodities, None),
+        Err(BrowseError::NoSnapshots),
+        "no data is distinct from a bad link"
+    );
+}
+
+/// The service clamps pages into the non-empty range (stale next links land
+/// on real data) and passes filters/sort/direction through to the port.
+#[test]
+fn snapshot_browse_clamps_pages_and_passes_the_query_through() {
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let t1 = TargetId("us-4".into());
+    let item = ItemRef::Item { item_id: 2589 };
+    let pet = ItemRef::Pet { species: 42, level: 3, quality: 2, breed: 5 };
+    let listings = [
+        browse_listing(1, &item, 300),
+        browse_listing(2, &item, 100),
+        browse_listing(3, &pet, 200),
+    ];
+    let snapshot_id = snapshots
+        .record(&browse_snapshot(&t1, PayloadKind::Commodities, 1_000), &listings, b"a")
+        .expect("record");
+    let service = SnapshotBrowseService::new(snapshots);
+
+    let default_query = ListingQuery {
+        name_prefix: None,
+        item_id: None,
+        class: None,
+        quality: None,
+        sort: ListingSortKey::Price,
+        desc: false,
+        page: 1,
+    };
+
+    let page = service
+        .page(&amtracker_core::domain::Flavor::default(), snapshot_id, default_query.clone())
+        .expect("page");
+    let prices: Vec<i64> = page.rows.iter().map(|row| row.unit_price).collect();
+    assert_eq!(prices, [100, 200, 300], "price ascending is the default order");
+
+    let desc_query = ListingQuery { desc: true, ..default_query.clone() };
+    let page = service
+        .page(&amtracker_core::domain::Flavor::default(), snapshot_id, desc_query)
+        .expect("desc");
+    let prices: Vec<i64> = page.rows.iter().map(|row| row.unit_price).collect();
+    assert_eq!(prices, [300, 200, 100], "descending flips the order");
+
+    let far_query = ListingQuery { page: 99, ..default_query.clone() };
+    let page = service
+        .page(&amtracker_core::domain::Flavor::default(), snapshot_id, far_query)
+        .expect("far page");
+    assert_eq!(page.page, 1, "a page beyond the end clamps to the last page");
+    assert_eq!(page.rows.len(), 3, "the clamped page still serves rows");
+
+    let zero_query = ListingQuery { page: 0, ..default_query.clone() };
+    let page = service
+        .page(&amtracker_core::domain::Flavor::default(), snapshot_id, zero_query)
+        .expect("zero page");
+    assert_eq!(page.page, 1, "page 0 clamps to page 1");
+
+    let pet_query = ListingQuery { item_id: Some(42), ..default_query };
+    let page = service
+        .page(&amtracker_core::domain::Flavor::default(), snapshot_id, pet_query)
+        .expect("item filter");
+    assert_eq!(page.total, 0, "an item-id filter never matches pet identities");
 }

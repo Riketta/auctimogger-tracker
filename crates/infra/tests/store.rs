@@ -926,6 +926,7 @@ fn pet_catalog_round_trips_through_search_browse_and_counts() {
                 quality: Some("Common".into()),
                 icon: None,
                 sell_price: None,
+                item_level: None,
                 fetched_at: 0,
             }],
         )
@@ -1005,6 +1006,7 @@ fn search_offset_pages_through_hits() {
         quality: None,
         icon: None,
         sell_price: None,
+        item_level: None,
         fetched_at: 0,
     };
     store
@@ -1062,6 +1064,7 @@ fn catalog_rows_are_scoped_per_flavor() {
         quality: None,
         icon: None,
         sell_price: None,
+        item_level: None,
         fetched_at: 0,
     };
 
@@ -1649,7 +1652,7 @@ fn v7_category_migration_rebuilds_folds_from_retained_listings() {
         }
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 7, "the file is stamped at the new schema version");
+        assert_eq!(version, 8, "the file is stamped at the new schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();

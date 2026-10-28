@@ -296,6 +296,25 @@ fn spec_paths_market(target: &Value) -> Value {
                 ok_json_ref("OverviewResponse"),
             ),
         },
+        "/api/browse": {
+            "get": get_op(
+                "Snapshot viewer",
+                "One page of a stored snapshot's listings joined to their catalog identity. Without snapshot, the newest snapshot of the (target, kind) pair serves. sort is price|qty|time (default price, cheapest first); dir=desc flips it. q is a case-insensitive name prefix, item an exact item id; class/quality match catalog labels case-insensitively. Pages are 50 rows.",
+                vec![
+                    target.clone(),
+                    json!({ "name": "kind", "in": "query", "required": false, "description": "commodities|auctions; commodities when absent.", "schema": { "type": "string", "enum": ["commodities", "auctions"] } }),
+                    json!({ "name": "snapshot", "in": "query", "required": false, "description": "Pin one stored snapshot id; absent = newest for the pair.", "schema": { "type": "integer" } }),
+                    json!({ "name": "q", "in": "query", "required": false, "description": "Case-insensitive catalog name prefix.", "schema": { "type": "string" } }),
+                    json!({ "name": "item", "in": "query", "required": false, "description": "Exact item id.", "schema": { "type": "integer" } }),
+                    json!({ "name": "class", "in": "query", "required": false, "description": "Catalog item-class label (case-insensitive).", "schema": { "type": "string" } }),
+                    json!({ "name": "quality", "in": "query", "required": false, "description": "Catalog quality label (case-insensitive).", "schema": { "type": "string" } }),
+                    json!({ "name": "sort", "in": "query", "required": false, "description": "price|qty|time.", "schema": { "type": "string", "enum": ["price", "qty", "time"] } }),
+                    json!({ "name": "dir", "in": "query", "required": false, "description": "desc flips the sort column.", "schema": { "type": "string", "enum": ["desc"] } }),
+                    json!({ "name": "page", "in": "query", "required": false, "description": "1-based page index; out-of-range pages clamp to the last page.", "schema": { "type": "integer", "default": 1, "minimum": 1 } }),
+                ],
+                ok_json(json!({ "type": "object" })),
+            ),
+        },
         "/api/snapshots": {
             "get": get_op(
                 "Snapshot metadata",

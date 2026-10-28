@@ -566,6 +566,7 @@ mod tests {
                     quality: Some("common".into()),
                     icon: None,
                     sell_price: None,
+                    item_level: None,
                     fetched_at: 0,
                 })),
                 FakeAnswer::Missing => Ok(None),
@@ -616,6 +617,7 @@ mod tests {
             quality: Some("common".into()),
             icon: None,
             sell_price: None,
+            item_level: None,
             fetched_at,
         }
     }
@@ -677,6 +679,7 @@ mod tests {
                 quality: None,
                 icon: None,
                 sell_price: None,
+                item_level: None,
                 fetched_at: 0,
             },
         );
