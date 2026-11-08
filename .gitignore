@@ -2,6 +2,7 @@
 /data
 /feeds
 .env
+config.toml
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
