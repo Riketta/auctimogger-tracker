@@ -388,6 +388,17 @@ pub enum FileTargetKind {
         /// Blizzard connected-realm ID.
         connected_realm_id: i64,
     },
+    /// Blizzard "Forever" API (undocumented, realmless): one faction
+    /// auction house of one ruleset.
+    BlizzardForever {
+        /// Region slug (`us`, `eu`, `kr`, `tw`; CN has no Forever API).
+        region: String,
+        /// Blizzard ruleset ID (the realm replacement).
+        ruleset_id: i64,
+        /// Auction house ID within the ruleset (from the auctions index;
+        /// use the `forever-rulesets` command to list them).
+        house_id: i64,
+    },
     /// Fixed JSON endpoints, as served by private-server emulators.
     StaticUrls {
         /// URL of the commodities JSON dump.
@@ -496,6 +507,9 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             FileTargetKind::BlizzardConnectedRealm { region, connected_realm_id } => {
                 TargetKind::BlizzardConnectedRealm { region, connected_realm_id }
             }
+            FileTargetKind::BlizzardForever { region, ruleset_id, house_id } => {
+                TargetKind::BlizzardForever { region, ruleset_id, house_id }
+            }
             FileTargetKind::StaticUrls { commodities_url, auctions_url } => {
                 TargetKind::StaticUrls { commodities_url, auctions_url }
             }
@@ -511,9 +525,17 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             .or_else(|| match &kind {
                 // Blizzard targets default to the OAuth client-credential
                 // env names; static endpoints stay unauthenticated.
-                TargetKind::BlizzardConnectedRealm { .. } => Some(AuthConfig::default_blizzard()),
+                TargetKind::BlizzardConnectedRealm { .. } | TargetKind::BlizzardForever { .. } => {
+                    Some(AuthConfig::default_blizzard())
+                }
                 TargetKind::StaticUrls { .. } => None,
             });
+        // Forever targets are named for the Forever game flavor unless the
+        // config says otherwise: the catalog namespace maps 1:1.
+        let default_flavor = match &kind {
+            TargetKind::BlizzardForever { .. } => "forever",
+            _ => amtracker_core::domain::Flavor::RETAIL,
+        };
         targets.push(TargetConfig {
             id: amtracker_core::domain::TargetId(target.id),
             kind,
@@ -525,11 +547,7 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             // Flavor keys are catalog namespaces: normalize case and
             // whitespace so "Retail" or "retail " cannot fork the catalog.
             flavor: amtracker_core::domain::Flavor(
-                target
-                    .flavor
-                    .unwrap_or_else(|| amtracker_core::domain::Flavor::RETAIL.into())
-                    .trim()
-                    .to_ascii_lowercase(),
+                target.flavor.unwrap_or_else(|| default_flavor.into()).trim().to_ascii_lowercase(),
             ),
         });
     }
@@ -741,6 +759,8 @@ fn check_target_keys(targets: &[toml::Value], unknown: &mut Vec<String>) {
                 "flavor",
                 "region",
                 "connected_realm_id",
+                "ruleset_id",
+                "house_id",
                 "commodities_url",
                 "auctions_url",
             ],

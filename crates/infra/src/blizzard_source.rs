@@ -143,6 +143,24 @@ fn build_url(target: &TargetConfig, kind: PayloadKind) -> String {
         ) => format!(
             "https://{region}.api.blizzard.com/data/wow/connected-realm/{connected_realm_id}/auctions?namespace=dynamic-{region}&locale=en_US"
         ),
+        // The Forever endpoints are undocumented and have already flipped
+        // their routing once (the auctions INDEX needs a trailing slash,
+        // the house endpoints reject it) — keep every Forever URL in this
+        // one place so a drift is a one-line fix. House commodities reuse
+        // the retail commodity row shape (`unit_price`), house auctions
+        // the retail item-AH row shape (`buyout`/`bid`).
+        (
+            TargetKind::BlizzardForever { region, ruleset_id, house_id },
+            PayloadKind::Commodities,
+        ) => format!(
+            "https://{region}.api.blizzard.com/data/wow/ruleset/{ruleset_id}/auctions/{house_id}/commodities?namespace=dynamic-forever-{region}&locale=en_US"
+        ),
+        (
+            TargetKind::BlizzardForever { region, ruleset_id, house_id },
+            PayloadKind::Auctions,
+        ) => format!(
+            "https://{region}.api.blizzard.com/data/wow/ruleset/{ruleset_id}/auctions/{house_id}?namespace=dynamic-forever-{region}&locale=en_US"
+        ),
         (TargetKind::StaticUrls { commodities_url, auctions_url }, kind) => match kind {
             PayloadKind::Commodities => commodities_url.clone(),
             PayloadKind::Auctions => auctions_url.clone(),
@@ -165,7 +183,8 @@ impl BlizzardSource {
             .entry(target.id.clone())
             .or_insert_with(|| {
                 let region = match &target.kind {
-                    TargetKind::BlizzardConnectedRealm { region, .. } => Some(region.as_str()),
+                    TargetKind::BlizzardConnectedRealm { region, .. }
+                    | TargetKind::BlizzardForever { region, .. } => Some(region.as_str()),
                     TargetKind::StaticUrls { .. } => None,
                 };
                 Arc::new(OAuthTokenSource::new(
@@ -293,10 +312,14 @@ pub(crate) fn read_capped(
 }
 
 /// Terminal status handling + strict payload parse for one response.
+/// `parse` selects the wire shape: retail dumps are strict (a missing
+/// `auctions` key is structural drift), Forever house documents are lenient
+/// (some faction houses legitimately carry no `auctions` field).
 fn read_payload(
     response: ureq::Response,
     kind: PayloadKind,
     url: &str,
+    parse: fn(PayloadKind, &[u8]) -> Result<ParsedPayload, SourceError>,
 ) -> Result<FetchOutcome, SourceError> {
     let status = response.status();
     if status == 304 {
@@ -335,7 +358,7 @@ fn read_payload(
                 .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
         });
     let bytes = read_capped(response.into_reader(), MAX_PAYLOAD_BYTES, "payload")?;
-    let (listings, dropped_count, dropped_reasons) = parse_payload(kind, &bytes)?;
+    let (listings, dropped_count, dropped_reasons) = parse(kind, &bytes)?;
     tracing::info!(
         kind = ?kind,
         bytes = bytes.len(),
@@ -360,8 +383,15 @@ impl AuctionSourcePort for BlizzardSource {
         kind: PayloadKind,
         if_modified_since: Option<i64>,
     ) -> Result<FetchOutcome, SourceError> {
+        // Forever house documents may omit `auctions` entirely (verified on
+        // the live API: houses 112/115/118 carry no field); every other
+        // shape keeps the strict single-key contract.
+        let parse = match &target.kind {
+            TargetKind::BlizzardForever { .. } => parse_forever_payload,
+            _ => parse_payload,
+        };
         let response = self.send_request(target, kind, if_modified_since)?;
-        read_payload(response, kind, &build_url(target, kind))
+        read_payload(response, kind, &build_url(target, kind), parse)
     }
 }
 
@@ -448,10 +478,47 @@ pub type ParsedPayload = (Vec<NormalizedListing>, u64, BTreeMap<String, u64>);
 pub fn parse_payload(kind: PayloadKind, bytes: &[u8]) -> Result<ParsedPayload, SourceError> {
     let payload: WirePayload = serde_json::from_slice(bytes)
         .map_err(|e| SourceError::Parse(format!("{kind:?} payload rejected: {e}")))?;
-    let mut listings = Vec::with_capacity(payload.auctions.len());
+    Ok(map_rows(kind, payload.auctions))
+}
+
+/// Forever wire shape: one auction-house document. Unlike the retail dumps,
+/// the `auctions` array is OPTIONAL — verified on the live API, some faction
+/// houses (e.g. 112/115/118) carry no `auctions` field at all, which reads
+/// as a healthy empty market rather than a broken payload. The same lenient
+/// shape covers both endpoints: the house document (`auctions` key, item-AH
+/// rows) and the per-house commodities document (`auctions` key,
+/// `unit_price` rows). Unknown sibling fields (`id`, `name`, `commodities`,
+/// `ruleset`, ...) are ignored.
+#[derive(Deserialize)]
+struct WireForeverDocument {
+    #[serde(default)]
+    auctions: Option<Vec<WireAuction>>,
+}
+
+/// Lenient Forever parse (see [`WireForeverDocument`]).
+///
+/// # Errors
+///
+/// Returns [`SourceError::Parse`] when `bytes` is not a complete, structurally
+/// valid JSON document of the Forever house shape.
+pub fn parse_forever_payload(
+    kind: PayloadKind,
+    bytes: &[u8],
+) -> Result<ParsedPayload, SourceError> {
+    let payload: WireForeverDocument = serde_json::from_slice(bytes)
+        .map_err(|e| SourceError::Parse(format!("{kind:?} payload rejected: {e}")))?;
+    Ok(map_rows(kind, payload.auctions.unwrap_or_default()))
+}
+
+/// Shared ACL pass over decoded auction rows (see [`parse_payload`]): rows
+/// whose identity cannot be represented are dropped here — cage rows without
+/// any species signal, bid-only rows, degenerate prices — and counted, never
+/// fatal.
+fn map_rows(kind: PayloadKind, auctions: Vec<WireAuction>) -> ParsedPayload {
+    let mut listings = Vec::with_capacity(auctions.len());
     let mut dropped = 0u64;
     let mut by_reason = BTreeMap::<&'static str, u64>::new();
-    for auction in payload.auctions {
+    for auction in auctions {
         match map_auction(kind, auction) {
             Ok(listing) => listings.push(listing),
             Err(reason) => {
@@ -466,7 +533,7 @@ pub fn parse_payload(kind: PayloadKind, bytes: &[u8]) -> Result<ParsedPayload, S
         tracing::debug!(kind = ?kind, dropped, reasons = ?by_reason, "degenerate rows dropped");
     }
     let reasons = by_reason.into_iter().map(|(k, v)| (k.to_string(), v)).collect();
-    Ok((listings, dropped, reasons))
+    (listings, dropped, reasons)
 }
 
 /// Why a degenerate row was dropped. Diagnostics only: drops are expected
@@ -697,17 +764,26 @@ mod tests {
     #[test]
     fn a_304_answer_passes_through_as_not_modified() {
         let response = ureq::Response::new(304, "Not Modified", "").expect("synthetic response");
-        let outcome =
-            read_payload(response, PayloadKind::Commodities, "https://source.example/c.json")
-                .expect("304 is a valid outcome");
+        let outcome = read_payload(
+            response,
+            PayloadKind::Commodities,
+            "https://source.example/c.json",
+            parse_payload,
+        )
+        .expect("304 is a valid outcome");
         assert!(matches!(outcome, FetchOutcome::NotModified));
     }
 
     #[test]
     fn a_non_200_answer_is_a_terminal_error_carrying_the_status() {
         let response = ureq::Response::new(503, "Service Unavailable", "busy").expect("synthetic");
-        let error = read_payload(response, PayloadKind::Commodities, "https://source.example/c")
-            .expect_err("503 must fail");
+        let error = read_payload(
+            response,
+            PayloadKind::Commodities,
+            "https://source.example/c",
+            parse_payload,
+        )
+        .expect_err("503 must fail");
         assert!(error.to_string().contains("unexpected status 503"), "{error}");
     }
 
@@ -715,8 +791,13 @@ mod tests {
     fn a_429_answer_is_a_rate_limit_not_a_terminal_error() {
         let response =
             ureq::Response::new(429, "Too Many Requests", "slow down").expect("synthetic");
-        let error = read_payload(response, PayloadKind::Commodities, "https://source.example/c")
-            .expect_err("429 must fail");
+        let error = read_payload(
+            response,
+            PayloadKind::Commodities,
+            "https://source.example/c",
+            parse_payload,
+        )
+        .expect_err("429 must fail");
         assert!(
             matches!(error, SourceError::RateLimited { retry_after: None }),
             "429 maps to the rate-limit variant: {error:?}"
@@ -727,9 +808,13 @@ mod tests {
     #[test]
     fn a_200_answer_parses_into_a_payload() {
         let response = ureq::Response::new(200, "OK", AUCTIONS_SAMPLE).expect("synthetic response");
-        let outcome =
-            read_payload(response, PayloadKind::Auctions, "https://source.example/a.json")
-                .expect("sample parses");
+        let outcome = read_payload(
+            response,
+            PayloadKind::Auctions,
+            "https://source.example/a.json",
+            parse_payload,
+        )
+        .expect("sample parses");
         match outcome {
             FetchOutcome::Payload(payload) => {
                 assert_eq!(payload.listings.len(), 60);
@@ -775,6 +860,108 @@ mod tests {
             auctions_url: "https://wf.example/a.json".into(),
         });
         assert_eq!(build_url(&custom, PayloadKind::Auctions), "https://wf.example/a.json");
+    }
+
+    #[test]
+    fn forever_urls_route_per_house_and_kind() {
+        let forever = target(TargetKind::BlizzardForever {
+            region: "eu".into(),
+            ruleset_id: 1,
+            house_id: 113,
+        });
+        assert_eq!(
+            build_url(&forever, PayloadKind::Commodities),
+            "https://eu.api.blizzard.com/data/wow/ruleset/1/auctions/113/commodities?namespace=dynamic-forever-eu&locale=en_US"
+        );
+        // No trailing slash on the house endpoint: the live API routes the
+        // slashed form to nothing (the inverse of the index quirk).
+        assert_eq!(
+            build_url(&forever, PayloadKind::Auctions),
+            "https://eu.api.blizzard.com/data/wow/ruleset/1/auctions/113?namespace=dynamic-forever-eu&locale=en_US"
+        );
+    }
+
+    #[test]
+    fn forever_house_rows_map_like_retail() {
+        // One plain item row + one pet-cage row; the house-document
+        // siblings (`id`, `name`, `ruleset`) must be ignored, not rejected.
+        let doc = r#"{
+            "id": 113,
+            "name": "Alliance Auction House",
+            "ruleset": {"id": 1, "name": "PvP"},
+            "auctions": [
+                {"id": 5001, "item": {"id": 720, "context": 3, "bonus_lists": [1679]}, "buyout": 1234500, "bid": 1200000, "quantity": 1, "time_left": "LONG"},
+                {"id": 5002, "item": {"id": 82800, "modifiers": [{"type": 6, "value": 264}]}, "buyout": 990000, "quantity": 1, "time_left": "VERY_LONG"}
+            ]
+        }"#;
+        let (listings, dropped, reasons) =
+            parse_forever_payload(PayloadKind::Auctions, doc.as_bytes()).expect("house doc parses");
+        assert_eq!(dropped, 0);
+        assert!(reasons.is_empty());
+        assert_eq!(listings.len(), 2);
+        assert_eq!(listings[0].auction_id, 5001);
+        assert_eq!(listings[0].item_ref, ItemRef::Item { item_id: 720 });
+        assert_eq!(listings[0].unit_price, 1_234_500);
+        assert_eq!(listings[0].bid, Some(1_200_000));
+        assert_eq!(listings[0].context, Some(3));
+        assert_eq!(listings[0].bonus_lists, vec![1679]);
+        assert_eq!(
+            listings[1].item_ref,
+            ItemRef::Pet { species: 264, level: 0, quality: 0, breed: 0 },
+            "the cage convention must carry over to forever rows"
+        );
+    }
+
+    #[test]
+    fn forever_empty_house_is_healthy_empty_not_broken() {
+        // Houses 112/115/118 carry no `auctions` field at all (verified on
+        // the live API): that is an empty market, not structural drift —
+        // unlike the retail dumps, where a missing key fails the snapshot.
+        let doc = r#"{"id": 112, "name": "Horde Auction House"}"#;
+        let (listings, dropped, reasons) =
+            parse_forever_payload(PayloadKind::Auctions, doc.as_bytes()).expect("empty house");
+        assert!(listings.is_empty());
+        assert_eq!(dropped, 0);
+        assert!(reasons.is_empty());
+    }
+
+    #[test]
+    fn forever_commodities_price_per_unit() {
+        let doc = r#"{
+            "auctions": [
+                {"id": 9001, "item": {"id": 232490}, "quantity": 200, "unit_price": 55000, "time_left": "SHORT"}
+            ]
+        }"#;
+        let (listings, dropped, _) =
+            parse_forever_payload(PayloadKind::Commodities, doc.as_bytes()).expect("commodities");
+        assert_eq!(dropped, 0);
+        assert_eq!(listings.len(), 1);
+        assert_eq!(listings[0].unit_price, 55_000, "unit_price is already per unit");
+        assert_eq!(listings[0].bid, None, "commodity rows carry no bid");
+    }
+
+    #[test]
+    fn forever_bid_only_rows_drop_counted() {
+        let doc = r#"{
+            "auctions": [
+                {"id": 9002, "item": {"id": 720}, "bid": 10000, "quantity": 1, "time_left": "SHORT"},
+                {"id": 9003, "item": {"id": 720}, "buyout": 20000, "quantity": 2, "time_left": "SHORT"}
+            ]
+        }"#;
+        let (listings, dropped, reasons) =
+            parse_forever_payload(PayloadKind::Auctions, doc.as_bytes()).expect("doc parses");
+        assert_eq!(listings.len(), 1, "the bid-only row is dropped");
+        assert_eq!(listings[0].auction_id, 9003);
+        assert_eq!(listings[0].unit_price, 10_000);
+        assert_eq!(dropped, 1);
+        assert_eq!(reasons.get("missing-price"), Some(&1));
+    }
+
+    #[test]
+    fn forever_broken_json_still_fails_loudly() {
+        let error = parse_forever_payload(PayloadKind::Auctions, b"{")
+            .expect_err("truncated JSON must fail the snapshot");
+        assert!(error.to_string().contains("rejected"), "{error}");
     }
 
     #[test]

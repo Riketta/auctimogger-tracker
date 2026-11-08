@@ -99,7 +99,8 @@ impl BlizzardItemInfo {
             .targets
             .iter()
             .find_map(|target| match &target.kind {
-                TargetKind::BlizzardConnectedRealm { region, .. } => Some(region.clone()),
+                TargetKind::BlizzardConnectedRealm { region, .. }
+                | TargetKind::BlizzardForever { region, .. } => Some(region.clone()),
                 TargetKind::StaticUrls { .. } => None,
             })
             .unwrap_or_else(|| "us".into());
@@ -142,12 +143,15 @@ impl BlizzardItemInfo {
     /// servers with retail-compatible ids, beta keys) resolve through the
     /// retail namespace. The classic slugs follow Blizzard's namespace
     /// naming; they should be verified against the live API the first time a
-    /// classic flavor is actually deployed.
+    /// classic flavor is actually deployed. Forever follows the
+    /// undocumented live API (`static-forever-{region}`, unpinned — item
+    /// data drift is accepted by design; pinning would need a config knob).
     fn flavor_namespace(&self, flavor: &Flavor) -> String {
         match flavor.as_str() {
             "classic-era" => format!("static-classic-era-{}", self.region),
             "classic" => format!("static-classic-{}", self.region),
             "mop-classic" => format!("static-mop-classic-{}", self.region),
+            "forever" => format!("static-forever-{}", self.region),
             _ => format!("static-{}", self.region),
         }
     }

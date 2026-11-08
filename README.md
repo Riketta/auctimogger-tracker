@@ -40,13 +40,14 @@ normal for this item, and how do I know this deal is real?"*.
 ## What it does
 
 - **Multi-target polling** — any number of targets: Blizzard connected realms
-  (`region` + `connected_realm_id`) or raw `static-urls` (any endpoint that
-  serves the same JSON shape, e.g. mainline-tracking emulators). Conditional
-  GET via `If-Modified-Since` (a 304 costs nothing); malformed or truncated
-  rows are dropped **and counted** (per-reason breakdown persisted with the
-  snapshot and shown on the snapshots page/API),
-  never silently ingested; rate-limit answers back the poller off with their
-  `Retry-After` hint.
+  (`region` + `connected_realm_id`), the undocumented Blizzard "Forever" API
+  (`blizzard-forever`: one faction auction house of one ruleset), or raw
+  `static-urls` (any endpoint that serves the same JSON shape, e.g.
+  mainline-tracking emulators). Conditional GET via `If-Modified-Since` (a
+  304 costs nothing); malformed or truncated rows are dropped **and counted**
+  (per-reason breakdown persisted with the snapshot and shown on the
+  snapshots page/API), never silently ingested; rate-limit answers back the
+  poller off with their `Retry-After` hint.
 - **Self-healing scheduler** — a panicking ingest cycle is caught, logged
   (panic hook feeds the file log and Sentry) and retried on the next
   interval; the web UI can never outlive ingestion silently. Failed store
@@ -159,6 +160,42 @@ above. A static token is still available for endpoints that want one:
 `static-urls` targets set `commodities_url` / `auctions_url` instead and have
 optional `auth` — that is the seam a non-Blizzard server will plug into.
 
+### Forever targets (undocumented Blizzard API, realmless)
+
+`blizzard-forever` tracks **one faction auction house of one ruleset** —
+rulesets replace realms in the Forever API, and each ruleset exposes
+faction-separate Alliance/Horde houses plus the neutral Blackwater ones.
+Faction AHs are separate markets (an Alliance bidder cannot see Horde
+auctions), so track one target per house and never merge across houses or
+rulesets — the API currently returns identical data for every ruleset, and
+counting it several times would corrupt the aggregates.
+
+```toml
+[[targets]]
+id = "forever-eu-pvp-alliance"
+kind = "blizzard-forever"
+region = "eu"         # us | eu | kr | tw (CN has no Forever API)
+ruleset_id = 1        # the realm replacement
+house_id = 113        # one house within the ruleset
+poll = { commodities_secs = 3600, auctions_secs = 1800 }
+```
+
+Auth defaults to the same Blizzard client credentials as connected-realm
+targets. `flavor` defaults to `"forever"`: item names resolve through
+`static-forever-{region}` with Wowhead first in the chain covering the ids
+the Forever item API does not have (~40% of Classic-era items). Caveats of
+an undocumented, still-moving API: some houses carry no `auctions` field at
+all (a healthy empty market, not an error), bid-only rows are dropped and
+counted like retail, and the endpoint shapes can change — a parse drift
+fails the cycle loudly rather than ingesting nothing silently.
+
+Discover rulesets and house ids empirically (needs the credentials in your
+current config):
+
+```sh
+auctimogger-tracker --config config.toml forever-rulesets
+```
+
 Unknown keys anywhere in the file abort startup naming the offending path
 (`unknown config keys: sentry.environment2`): a typo like `enviroment` must
 fail loudly rather than silently disable the setting it was meant to set.
@@ -173,6 +210,7 @@ fail loudly rather than silently disable the setting it was meant to set.
 | `serve --config <p>` | poll scheduler + web UI/API (the service mode) |
 | `metrics --config <p> --target <id> --item <id> [--span d1]` | print one analytics block (debug aid) |
 | `export-feed --config <p> [--target <id>] [--out feeds] [--slim]` | write feed.lua + feed.json without serving |
+| `forever-rulesets --config <p>` | list Forever rulesets + auction houses via the config's credentials (discovery aid for `blizzard-forever` targets) |
 
 ## Web UI & JSON API
 

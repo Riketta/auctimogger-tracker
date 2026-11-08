@@ -42,7 +42,7 @@ fn parses_the_committed_example_config() {
             assert_eq!(region, "us");
             assert_eq!(*connected_realm_id, 4);
         }
-        other @ TargetKind::StaticUrls { .. } => {
+        other @ (TargetKind::BlizzardForever { .. } | TargetKind::StaticUrls { .. }) => {
             panic!("expected blizzard-connected-realm, got {other:?}")
         }
     }
@@ -197,6 +197,51 @@ fn implicit_blizzard_auth_defaults_to_client_credentials() {
     let loaded = parse_config_str(&text).expect("parses");
     let auth = loaded.tracker.targets[2].auth.as_ref().expect("default auth");
     assert_eq!(auth, &amtracker_core::config::AuthConfig::default_blizzard());
+}
+
+#[test]
+fn forever_target_parses_with_forever_flavor_and_default_auth() {
+    let text = format!(
+        "{EXAMPLE}\n[[targets]]\nid = \"forever-eu-pvp-alliance\"\
+         \nkind = \"blizzard-forever\"\nregion = \"eu\"\nruleset_id = 1\nhouse_id = 113\
+         \npoll = {{ commodities_secs = 3600, auctions_secs = 1800 }}\n"
+    );
+    let loaded = parse_config_str(&text).expect("forever target must parse");
+    let last = loaded.tracker.targets.last().expect("target");
+    assert_eq!(last.id.as_str(), "forever-eu-pvp-alliance");
+    assert_eq!(last.flavor.as_str(), "forever", "the kind defaults its flavor");
+    let auth = last.auth.as_ref().expect("default blizzard auth");
+    assert_eq!(auth, &amtracker_core::config::AuthConfig::default_blizzard());
+    match &last.kind {
+        TargetKind::BlizzardForever { region, ruleset_id, house_id } => {
+            assert_eq!(region, "eu");
+            assert_eq!(*ruleset_id, 1);
+            assert_eq!(*house_id, 113);
+        }
+        other => panic!("expected blizzard-forever, got {other:?}"),
+    }
+}
+
+#[test]
+fn forever_target_rejects_non_positive_ids() {
+    let text = format!(
+        "{EXAMPLE}\n[[targets]]\nid = \"forever-eu-pvp-alliance\"\
+         \nkind = \"blizzard-forever\"\nregion = \"eu\"\nruleset_id = 0\nhouse_id = 113\
+         \npoll = {{ commodities_secs = 60, auctions_secs = 60 }}\n"
+    );
+    let error = parse_config_str(&text).expect_err("ruleset_id 0 must fail");
+    assert!(error.to_string().contains("ruleset_id must be positive"), "{error}");
+}
+
+#[test]
+fn forever_unknown_target_key_is_rejected() {
+    let text = format!(
+        "{EXAMPLE}\n[[targets]]\nid = \"forever-eu-pvp-alliance\"\
+         \nkind = \"blizzard-forever\"\nregion = \"eu\"\nruleset_id = 1\nhouse_ids = 113\
+         \npoll = {{ commodities_secs = 60, auctions_secs = 60 }}\n"
+    );
+    let error = parse_config_str(&text).expect_err("house_ids typo must fail");
+    assert!(error.to_string().contains("targets[2].house_ids"), "{error}");
 }
 
 #[test]

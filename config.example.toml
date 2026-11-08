@@ -128,10 +128,27 @@ poll = { commodities_secs = 3600, auctions_secs = 1800 }
 id = "wowforever-main" # future: any conforming endpoint, world-wide
 kind = "static-urls"
 # Game flavor for catalog naming: "retail" (default), "classic-era",
-# "classic", "mop-classic", or a custom key for retail-compatible private
-# servers (custom keys resolve through the retail endpoints).
+# "classic", "mop-classic", "forever", or a custom key for
+# retail-compatible private servers (custom keys resolve through the retail
+# endpoints).
 flavor = "forever"
 commodities_url = "https://example.org/api/commodities.json"
 auctions_url = "https://example.org/api/auctions.json"
 # auth = { type = "bearer", env = "AMT_WF_TOKEN" } # optional
 poll = { commodities_secs = 3600, auctions_secs = 3600 }
+
+# Blizzard "Forever" API (undocumented, realmless): one faction auction
+# house of one ruleset. Track ONE target per house — faction AHs are
+# separate markets (Alliance cannot bid on Horde; Blackwater is the neutral
+# cross-faction house). Discover rulesets and house ids with:
+#   auctimogger-tracker --config config.toml forever-rulesets
+# Flavor defaults to "forever" (names resolve via static-forever, with
+# Wowhead covering the ids the Forever item API does not have — about 40%
+# of Classic-era items).
+# [[targets]]
+# id = "forever-eu-pvp-alliance"
+# kind = "blizzard-forever"
+# region = "eu"
+# ruleset_id = 1
+# house_id = 113
+# poll = { commodities_secs = 3600, auctions_secs = 1800 }

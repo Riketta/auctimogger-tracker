@@ -6,6 +6,7 @@
 
 pub mod alert_discord;
 pub mod alert_telegram;
+pub mod blizzard_forever;
 pub mod blizzard_item_info;
 pub mod blizzard_oauth;
 pub mod blizzard_source;

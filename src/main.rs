@@ -123,6 +123,14 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// List the Blizzard "Forever" rulesets and their auction houses via
+    /// the configured credentials — the discovery aid for choosing
+    /// `ruleset_id`/`house_id` in `blizzard-forever` targets. Needs at
+    /// least one such target (for region + credentials) in the config.
+    ForeverRulesets {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn main() {
@@ -148,6 +156,9 @@ fn main() {
         }
         Commands::Vacuum { config } => {
             with_observability(&config, |loaded| run_vacuum(&loaded.tracker))
+        }
+        Commands::ForeverRulesets { config } => {
+            with_observability(&config, |loaded| run_forever_rulesets(&loaded.tracker))
         }
     };
     exit(code);
@@ -291,6 +302,70 @@ fn run_vacuum(config: &amtracker_core::config::TrackerConfig) -> i32 {
         percent_of(before.total_bytes().saturating_sub(after.total_bytes()), before.total_bytes()),
         after.freelist_count
     );
+    0
+}
+
+/// Lists the Forever rulesets (and each one's auction houses) using the
+/// region + credentials of the config's first `blizzard-forever` target —
+/// the discovery aid behind `ruleset_id`/`house_id`. Per-ruleset house
+/// failures are printed and skipped: one broken ruleset must not hide the
+/// rest. Never touches the store.
+fn run_forever_rulesets(config: &amtracker_core::config::TrackerConfig) -> i32 {
+    let Some(target) = config.targets.iter().find(|target| {
+        matches!(target.kind, amtracker_core::config::TargetKind::BlizzardForever { .. })
+    }) else {
+        eprintln!(
+            "error: no blizzard-forever target configured (add one to supply region + credentials)"
+        );
+        return 1;
+    };
+    let (region, ruleset_id) = match &target.kind {
+        amtracker_core::config::TargetKind::BlizzardForever { region, ruleset_id, .. } => {
+            (region.as_str(), *ruleset_id)
+        }
+        _ => unreachable!("filtered above"),
+    };
+    let auth =
+        target.auth.clone().unwrap_or_else(amtracker_core::config::AuthConfig::default_blizzard);
+
+    let rulesets = match amtracker_infra::blizzard_forever::fetch_rulesets(region, &auth) {
+        Ok(rulesets) if rulesets.is_empty() => {
+            eprintln!("error: ruleset index returned no rulesets (region '{region}')");
+            return 1;
+        }
+        Ok(rulesets) => rulesets,
+        Err(error) => {
+            eprintln!("error: ruleset index fetch failed: {error}");
+            return 1;
+        }
+    };
+    println!("region {region}: {} ruleset(s)", rulesets.len());
+    let mut failures = 0u32;
+    for ruleset in &rulesets {
+        let name = ruleset.name.as_deref().unwrap_or("?");
+        let status = ruleset.status.as_deref().unwrap_or("?");
+        let marker = if ruleset.id == ruleset_id { "  <-- config" } else { "" };
+        println!("ruleset {} {name} status={status}{marker}", ruleset.id);
+        match amtracker_infra::blizzard_forever::fetch_auction_houses(region, ruleset.id, &auth) {
+            Ok(houses) => {
+                for house in &houses {
+                    let name = house.name.as_deref().unwrap_or("?");
+                    let key = house.key.as_deref().unwrap_or("-");
+                    println!("  house {} {name} (key: {key})", house.id);
+                }
+                if houses.is_empty() {
+                    println!("  (no houses indexed)");
+                }
+            }
+            Err(error) => {
+                failures += 1;
+                eprintln!("  house index fetch failed: {error}");
+            }
+        }
+    }
+    if failures > 0 {
+        eprintln!("warning: {failures} ruleset house index(es) could not be read");
+    }
     0
 }
 

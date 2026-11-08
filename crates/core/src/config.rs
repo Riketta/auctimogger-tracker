@@ -238,6 +238,19 @@ pub enum TargetKind {
         /// The connected realm's id in the Blizzard API.
         connected_realm_id: i64,
     },
+    /// Blizzard "Forever" API (undocumented, realmless): one faction
+    /// auction house of one ruleset. Houses are the realm replacement —
+    /// each ruleset exposes faction-separate Alliance/Horde houses plus
+    /// the neutral Blackwater houses. Wire shapes match the retail dumps.
+    BlizzardForever {
+        /// API region slug (`us`, `eu`, `kr`, `tw`; CN has no Forever API).
+        region: String,
+        /// The ruleset's id in the Blizzard API (the realm replacement).
+        ruleset_id: i64,
+        /// The auction house's id within the ruleset (from the
+        /// `/data/wow/ruleset/{id}/auctions/` index).
+        house_id: i64,
+    },
     /// Explicit conforming endpoint URLs (self-hosted proxies, caches).
     StaticUrls {
         /// URL of the commodity AH endpoint.
@@ -316,6 +329,9 @@ impl TargetConfig {
             TargetKind::BlizzardConnectedRealm { region, connected_realm_id } => {
                 format!("blizzard-connected-realm (region {region}, realm {connected_realm_id})")
             }
+            TargetKind::BlizzardForever { region, ruleset_id, house_id } => format!(
+                "blizzard-forever (region {region}, ruleset {ruleset_id}, house {house_id})"
+            ),
             TargetKind::StaticUrls { .. } => "static-urls".to_string(),
         }
     }
@@ -394,6 +410,61 @@ fn validate_target_poll(target: &TargetConfig) -> Result<(), ConfigError> {
     Ok(())
 }
 
+/// Kind-specific structural rules: Blizzard regions non-empty, ids positive,
+/// static URLs non-empty. Extracted so `TrackerConfig::validate` stays under
+/// the function-length lint.
+fn validate_target_kind(target: &TargetConfig) -> Result<(), ConfigError> {
+    match &target.kind {
+        TargetKind::BlizzardConnectedRealm { region, connected_realm_id } => {
+            if region.trim().is_empty() {
+                return Err(ConfigError(format!(
+                    "target '{}' region must not be empty",
+                    target.id
+                )));
+            }
+            if *connected_realm_id <= 0 {
+                return Err(ConfigError(format!(
+                    "target '{}' connected_realm_id must be positive",
+                    target.id
+                )));
+            }
+        }
+        TargetKind::BlizzardForever { region, ruleset_id, house_id } => {
+            if region.trim().is_empty() {
+                return Err(ConfigError(format!(
+                    "target '{}' region must not be empty",
+                    target.id
+                )));
+            }
+            if *ruleset_id <= 0 {
+                return Err(ConfigError(format!(
+                    "target '{}' ruleset_id must be positive",
+                    target.id
+                )));
+            }
+            if *house_id <= 0 {
+                return Err(ConfigError(format!(
+                    "target '{}' house_id must be positive",
+                    target.id
+                )));
+            }
+        }
+        TargetKind::StaticUrls { commodities_url, auctions_url } => {
+            for (name, url) in
+                [("commodities_url", commodities_url), ("auctions_url", auctions_url)]
+            {
+                if url.trim().is_empty() {
+                    return Err(ConfigError(format!(
+                        "target '{}' {name} must not be empty",
+                        target.id
+                    )));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 impl TrackerConfig {
     /// The configured target with the given id, if any.
     #[must_use]
@@ -411,7 +482,8 @@ impl TrackerConfig {
     /// id is empty, not `[a-z0-9][a-z0-9._-]*`, or duplicated, a poll
     /// interval is zero or exceeds the 30-day cap (`[server].
     /// feed_publish_secs` included), an auth env name
-    /// or source URL/region is blank, `connected_realm_id` is not positive,
+    /// or source URL/region is blank, `connected_realm_id`/`ruleset_id`/
+    /// `house_id` are not positive,
     /// `[metrics].spans` is empty, a score weight is negative/non-finite or
     /// the weights sum to zero, `[opportunities].min_samples` is zero, the
     /// `[catalog]` `source/locale/wowhead_base` are invalid, or a target
@@ -447,34 +519,7 @@ impl TrackerConfig {
                     )));
                 }
             }
-            match &target.kind {
-                TargetKind::BlizzardConnectedRealm { region, connected_realm_id } => {
-                    if region.trim().is_empty() {
-                        return Err(ConfigError(format!(
-                            "target '{}' region must not be empty",
-                            target.id
-                        )));
-                    }
-                    if *connected_realm_id <= 0 {
-                        return Err(ConfigError(format!(
-                            "target '{}' connected_realm_id must be positive",
-                            target.id
-                        )));
-                    }
-                }
-                TargetKind::StaticUrls { commodities_url, auctions_url } => {
-                    for (name, url) in
-                        [("commodities_url", commodities_url), ("auctions_url", auctions_url)]
-                    {
-                        if url.trim().is_empty() {
-                            return Err(ConfigError(format!(
-                                "target '{}' {name} must not be empty",
-                                target.id
-                            )));
-                        }
-                    }
-                }
-            }
+            validate_target_kind(target)?;
         }
         if self.server.feed_publish_secs > MAX_INTERVAL_SECS {
             return Err(ConfigError(format!(
@@ -536,7 +581,9 @@ impl TrackerConfig {
         self.targets
             .iter()
             .find_map(|target| match &target.kind {
-                TargetKind::BlizzardConnectedRealm { .. } => Some(target.auth.clone()),
+                TargetKind::BlizzardConnectedRealm { .. } | TargetKind::BlizzardForever { .. } => {
+                    Some(target.auth.clone())
+                }
                 TargetKind::StaticUrls { .. } => None,
             })
             .flatten()
