@@ -221,6 +221,12 @@ th[data-sortable]::after { content: "⇅"; margin-left: .3rem; color: var(--fain
 th[data-sortable][aria-sort="ascending"]::after { content: "↑"; color: var(--accent); }
 th[data-sortable][aria-sort="descending"]::after { content: "↓"; color: var(--accent); }
 
+/* The compare page's best-paying market cell per row. */
+td.best {
+  color: var(--accent);
+  font-weight: 650;
+}
+
 /* ---------------------------------------------------------------- badges */
 
 .badge {

@@ -224,7 +224,9 @@ columns, page arrows; unpinned = newest snapshot, pinned = frozen history) ·
 `/opportunities` (filter/sort/CSV) · `/overview` (movers with real 30-day
 sparklines) · `/watchlist` · `/priorities` (the watchlist ranked best sell
 first: 50% liquidity + 30% momentum + 20% recency, components in tooltips,
-thin-data ranks marked `~`) · `/help` (terminology).
+thin-data ranks marked `~`) · `/compare` (one watched identity across all
+targets, best-paying market highlighted — answers "sell here or there?") ·
+`/help` (terminology).
 
 Every page is complete server-rendered HTML; a small embedded script
 (`app.js`) adds table sorting, search completions, the interactive price-band
@@ -249,6 +251,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` | every watchlist entry joined to its metric blocks, sale rate and 30-day trend — one batched read (the live watchlist page's contract) |
 | `GET /api/priorities?target=&category=` | the watchlist ranked best sell first: score (50% liquidity + 30% momentum + 20% recency) with components, current-day median, week block and trend rows (the `/priorities` page's contract; default category `item`) |
+| `GET /api/watchlist/compare?category=` | the union of all configured targets' watchlists as a matrix: one row per identity, one cell per target (`watched`/`now`/`weekMedian`), `best` = index of the highest-paying market per row (the `/compare` page's contract; default category `item`) |
 | `GET /api/alerts?target=&events=` | a target's alert rules + newest fired events |
 | `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"sale-rate-above","rate":0.3}` \| `{"type":"days-since-last-sale-above","days":14}` |
 | `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |

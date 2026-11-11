@@ -2311,6 +2311,126 @@ pub(crate) async fn priorities_page(
     page("sell priorities", "priorities", &body, Some(switcher))
 }
 
+// ------------------------------------------------------------------- compare
+
+/// `GET /compare?category=` — the union of all targets' watchlists as a
+/// matrix: one row per identity, one cell per target (now + Δ vs week),
+/// best-paying market highlighted per row. "Sell here or there?" in one
+/// view — the forever faction houses participate like any other target.
+pub(crate) async fn compare_page(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let category = match category_param(&params, Category::Item) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
+    let targets: Vec<TargetId> =
+        state.config.targets.iter().map(|target| target.id.clone()).collect();
+    if targets.is_empty() {
+        return page(
+            "compare markets",
+            "compare",
+            "<div class=\"empty\">no targets configured</div>",
+            None,
+        );
+    }
+    let report = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let targets = targets.clone();
+        move || state.sell_priority.compare(&targets, category)
+    });
+    let report = match report.await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => return render::store_error_page(error).await,
+        Err(error) => {
+            return render::store_error_page(StoreError::Backend(error.to_string())).await
+        }
+    };
+    let names = resolve_names(
+        &state,
+        &state.config.targets.first().map_or_else(Flavor::default, |target| target.flavor.clone()),
+        &report.rows.iter().map(|row| row.item.clone()).collect::<Vec<_>>(),
+    )
+    .await;
+    let switcher = render::category_switcher("/compare", &[], category);
+
+    let mut body = format!(
+        "<p class=\"muted\">{} · {} <code>{}</code> · {}</p>",
+        tip(
+            "compare markets",
+            "Every watched identity across all configured targets."
+        ),
+        tip("bold cell", "The highest-paying market for that row right now."),
+        html_escape(category.as_str()),
+        tip("·", "That target's own watchlist does not include the identity — the market numbers show anyway."),
+    );
+    if report.rows.is_empty() {
+        body.push_str(
+            "<div class=\"empty\">nothing watched on any target yet — add favourites on the \
+             watchlist or item pages first</div>",
+        );
+    } else {
+        body.push_str("<div class=\"scroll-x\"><table id=\"compare\"><thead><tr><th>item</th>");
+        for target in &report.targets {
+            let _ = write!(
+                body,
+                "<th>{}</th>",
+                tip(&html_escape(target.as_str()), "now (Δ vs the 7-day median) on this target")
+            );
+        }
+        body.push_str("</tr></thead><tbody>");
+        for row in &report.rows {
+            let _ = write!(
+                body,
+                "<tr>{}",
+                item_cell(
+                    &report.targets.first().cloned().unwrap_or_else(|| TargetId(String::new())),
+                    &row.item,
+                    &names
+                )
+            );
+            for (i, cell) in row.cells.iter().enumerate() {
+                let best_attr = if row.best == Some(i) { " class=\"best\"" } else { "" };
+                let now = match cell.now {
+                    Some(now) => money(now),
+                    None => "—".to_string(),
+                };
+                let delta = match (cell.now, cell.week_median) {
+                    (Some(now), Some(week)) if week > 0 => {
+                        #[allow(clippy::cast_precision_loss)]
+                        let pct = (now - week) as f64 / week as f64 * 100.0;
+                        format!(" <span class=\"num\">{pct:+.0}%</span>")
+                    }
+                    _ => String::new(),
+                };
+                let unwatched = if cell.watched { "" } else { " <span class=\"muted\">·</span>" };
+                let _ = write!(
+                    body,
+                    "<td{best_attr}><span class=\"num\" data-v=\"{}\">{}</span>{delta}{unwatched}</td>",
+                    cell.now.unwrap_or(0),
+                    now,
+                );
+            }
+            body.push_str("</tr>");
+        }
+        body.push_str("</tbody></table></div>");
+        let _ = write!(
+            body,
+            "<p class=\"muted\">{} · {}</p>",
+            tip(
+                "·",
+                "Unwatched on that target: its market numbers still render, so a row can win on a market nobody watches.",
+            ),
+            tip(
+                "best",
+                "Highest now price; when nothing trades today, the highest 7-day median wins."
+            ),
+        );
+    }
+    page("compare markets", "compare", &body, Some(switcher))
+}
+
 // -------------------------------------------------------------------- alerts
 
 /// Human one-liner for a stored alert condition.

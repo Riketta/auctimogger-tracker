@@ -8,13 +8,17 @@
 //! contract; both consumers share this service so page and API can never
 //! disagree about the order.
 
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::Arc,
+};
 
 use crate::{
     domain::{
         utc_day,
         Category,
         ItemDayRow,
+        ItemRef,
         MetricBlock,
         Span,
         TargetId,
@@ -196,4 +200,151 @@ fn priority_score(now: Option<&MetricBlock>, week: Option<&MetricBlock>) -> Opti
             + WEIGHT_MOMENTUM * momentum.max(0.0)
             + WEIGHT_RECENCY * recency);
     Some(PriorityScore { value, liquidity, momentum, recency })
+}
+
+// ------------------------------------------------------------------ compare
+
+/// One watched identity's cell in the cross-target matrix: the market
+/// numbers on one target and whether that target actually watches it.
+#[derive(Clone, Copy, Debug)]
+pub struct CompareCell {
+    /// The target watches this identity (the `only on X` marker).
+    pub watched: bool,
+    /// Current-day median unit price on this target, when any fold exists.
+    pub now: Option<i64>,
+    /// Trailing-7-day median unit price on this target.
+    pub week_median: Option<i64>,
+}
+
+/// One identity across all targets: cells align with the report's targets.
+#[derive(Clone, Debug)]
+pub struct CompareRow {
+    /// The identity (item id, or full pet variant).
+    pub item: ItemRef,
+    /// How many of the compared targets watch this identity — the rows
+    /// sort by this descending, so the broadly-watched fish surface first.
+    pub coverage: usize,
+    /// Cells aligned with [`CompareReport::targets`].
+    pub cells: Vec<CompareCell>,
+    /// Index of the best sell market: the highest current-day median,
+    /// falling back to the 7-day median when nothing trades today. `None`
+    /// when no target has any data for the identity.
+    pub best: Option<usize>,
+}
+
+/// The cross-target comparison behind the `/compare` page and the
+/// `/api/watchlist/compare` contract.
+#[derive(Clone, Debug)]
+pub struct CompareReport {
+    /// The compared targets, aligned with every row's `cells`.
+    pub targets: Vec<TargetId>,
+    /// The market category the numbers come from.
+    pub category: Category,
+    /// The union of all compared watchlists, broadest coverage first.
+    pub rows: Vec<CompareRow>,
+}
+
+impl SellPriorityService {
+    /// Compares every watched identity across all given targets: one
+    /// watchlist read and two batched block reads per target, cells aligned
+    /// to the `targets` order. A target without the identity in its own
+    /// watchlist still gets market cells (the market exists regardless of
+    /// who watches it) with `watched = false`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when any of the joined reads fails.
+    pub fn compare(
+        &self,
+        targets: &[TargetId],
+        category: Category,
+    ) -> Result<CompareReport, StoreError> {
+        // Union of watched identities, in stable first-seen order.
+        let mut items: Vec<ItemRef> = Vec::new();
+        let mut seen: HashSet<ItemRef> = HashSet::new();
+        let mut watched: Vec<HashSet<ItemRef>> = Vec::with_capacity(targets.len());
+        for target in targets {
+            let entries = self.watchlist.list(target)?;
+            let set: HashSet<ItemRef> = entries.into_iter().map(|entry| entry.item).collect();
+            for item in &set {
+                if seen.insert(item.clone()) {
+                    items.push(item.clone());
+                }
+            }
+            watched.push(set);
+        }
+
+        // One batched d1/d7 read per target over the whole union, then the
+        // per-row transpose below — T×2 reads, not T×N×2.
+        let mut per_target: Vec<TargetBlocks> = Vec::with_capacity(targets.len());
+        for target in targets {
+            per_target.push(TargetBlocks {
+                now: self.metrics.blocks(target, &items, category, Span::D1)?,
+                week: self.metrics.blocks(target, &items, category, Span::D7)?,
+            });
+        }
+
+        let mut rows: Vec<CompareRow> = Vec::with_capacity(items.len());
+        for (index, item) in items.iter().enumerate() {
+            let mut cells = Vec::with_capacity(targets.len());
+            let mut coverage = 0;
+            for ((_, watched_set), blocks) in targets.iter().zip(&watched).zip(&per_target) {
+                let is_watched = watched_set.contains(item);
+                if is_watched {
+                    coverage += 1;
+                }
+                cells.push(CompareCell {
+                    watched: is_watched,
+                    now: blocks.now.get(index).cloned().flatten().map(|block| block.median),
+                    week_median: blocks
+                        .week
+                        .get(index)
+                        .cloned()
+                        .flatten()
+                        .map(|block| block.median),
+                });
+            }
+            let best = argmax_price(&cells);
+            rows.push(CompareRow { item: item.clone(), coverage, cells, best });
+        }
+        // Broadest coverage first, then a stable identity order so pages
+        // and API agree byte-for-byte.
+        rows.sort_by(|a, b| {
+            b.coverage
+                .cmp(&a.coverage)
+                .then_with(|| identity_key(&a.item).cmp(&identity_key(&b.item)))
+        });
+        Ok(CompareReport { targets: targets.to_vec(), category, rows })
+    }
+}
+
+/// One target's batched d1/d7 block lists over the union of items — the
+/// `now`/`week` vectors align with the union order.
+struct TargetBlocks {
+    now: Vec<Option<MetricBlock>>,
+    week: Vec<Option<MetricBlock>>,
+}
+
+/// Highest current-day median, falling back to the 7-day median when
+/// nothing trades today; ties prefer the earlier target (deterministic).
+fn argmax_price(cells: &[CompareCell]) -> Option<usize> {
+    let price = |cell: &CompareCell| cell.now.or(cell.week_median);
+    let mut best: Option<(usize, i64)> = None;
+    for (index, cell) in cells.iter().enumerate() {
+        if let Some(value) = price(cell) {
+            best = match best {
+                Some((_, best_value)) if best_value >= value => best,
+                _ => Some((index, value)),
+            };
+        }
+    }
+    best.map(|(index, _)| index)
+}
+
+/// Deterministic identity ordering: items by id before pets by species.
+fn identity_key(item: &ItemRef) -> (i64, i64) {
+    match item {
+        ItemRef::Item { item_id } => (*item_id, 0),
+        ItemRef::Pet { species, .. } => (*species, 1),
+    }
 }

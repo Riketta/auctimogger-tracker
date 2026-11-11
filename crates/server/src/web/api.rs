@@ -1114,6 +1114,49 @@ fn days_param(params: &HashMap<String, String>, key: &str, default: i64) -> i64 
     params.get(key).and_then(|v| v.parse::<i64>().ok()).map_or(default, |v| v.clamp(1, 90))
 }
 
+/// `GET /api/watchlist/compare?category=` — the union of all configured
+/// targets' watchlists as a matrix: one row per identity, one cell per
+/// target (current-day median, 7-day median, watched flag), `best` pointing
+/// at the highest-paying market per row.
+pub(crate) async fn api_watchlist_compare(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let category = match category_option(&params) {
+        Ok(Some(category)) => category,
+        Ok(None) => Category::Item,
+        Err(response) => return *response,
+    };
+    let targets: Vec<amtracker_core::domain::TargetId> =
+        state.config.targets.iter().map(|target| target.id.clone()).collect();
+    let report = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let targets = targets.clone();
+        move || state.sell_priority.compare(&targets, category)
+    });
+    match report.await {
+        Ok(Ok(report)) => Json(serde_json::json!({
+            "category": category.as_str(),
+            "targets": report.targets.iter().map(amtracker_core::domain::TargetId::as_str).collect::<Vec<_>>(),
+            "rows": report.rows.iter().map(|row| serde_json::json!({
+                "item": item_json(&row.item),
+                "coverage": row.coverage,
+                "best": row.best,
+                "cells": row.cells.iter().map(|cell| serde_json::json!({
+                    "watched": cell.watched,
+                    "now": cell.now,
+                    "weekMedian": cell.week_median,
+                }))
+                .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("watchlist-compare", &error),
+        Err(error) => internal_error("watchlist-compare-join", &error),
+    }
+}
+
 /// `GET /api/priorities?target=&category=` — the watchlist ranked for
 /// selling: score + components, current-day median, the week block and the
 /// trend rows. Same service as the `/priorities` page, so page and API can

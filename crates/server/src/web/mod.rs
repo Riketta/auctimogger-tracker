@@ -218,6 +218,7 @@ pub fn api_routes() -> Vec<ApiRoute> {
                 .delete(api::api_watchlist_delete),
         ),
         ("/api/watchlist/metrics", &["get"], get(api::api_watchlist_metrics)),
+        ("/api/watchlist/compare", &["get"], get(api::api_watchlist_compare)),
         ("/api/priorities", &["get"], get(api::api_priorities)),
         ("/api/snapshots", &["get"], get(api::api_snapshots)),
         ("/api/schedule", &["get"], get(api::api_schedule)),
@@ -249,6 +250,7 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/overview", get(pages::overview_page))
         .route("/watchlist", get(pages::watchlist_page))
         .route("/priorities", get(pages::priorities_page))
+        .route("/compare", get(pages::compare_page))
         .route("/alerts", get(pages::alerts_page))
         .route("/help", get(pages::help_page))
         .route("/assets/app.css", get(assets::asset_css))

@@ -2622,3 +2622,74 @@ fn sell_priority_empty_watchlist_is_empty_and_score_survives_a_missing_week() {
     assert!((score.value - 0.0).abs() < 1e-6, "flat price, no sales: score 0");
     assert!(ranked[0].thin_data, "a single auction is thin evidence");
 }
+
+#[test]
+fn sell_priority_compare_spans_targets_and_marks_the_best_market() {
+    use amtracker_core::services::sell_priority::SellPriorityService;
+
+    let today = 1_000_000; // utc day 11
+    let alpha = TargetId("alpha".into());
+    let beta = TargetId("beta".into());
+    let fish = item(1);
+    let other = item(2);
+
+    let history = Arc::new(FakeHistory::default());
+    // `fish` trades on BOTH targets; pays double on beta today.
+    for (target, price) in [(&alpha, 100_i64), (&beta, 200_i64)] {
+        let mut fold = DayFold::new(fish.clone());
+        fold.apply(&[listing(1, &fish, price, 1)]);
+        history
+            .save_fold(target, &fish, utc_day(today), Category::Commodity, &fold)
+            .expect("save fold");
+    }
+    // `other` trades on alpha only; beta has no fold for it.
+    let mut fold = DayFold::new(other.clone());
+    fold.apply(&[listing(2, &other, 50, 1)]);
+    history
+        .save_fold(&alpha, &other, utc_day(today), Category::Commodity, &fold)
+        .expect("save fold");
+
+    // alpha watches only `fish`; beta watches both.
+    let watchlist = Arc::new(FakeWatchlist::default());
+    watchlist
+        .add(&NewWatchlistEntry { target: alpha.clone(), item: fish.clone(), note: None })
+        .expect("watch fish on alpha");
+    watchlist
+        .add(&NewWatchlistEntry { target: beta.clone(), item: fish.clone(), note: None })
+        .expect("watch fish on beta");
+    watchlist
+        .add(&NewWatchlistEntry { target: beta.clone(), item: other.clone(), note: None })
+        .expect("watch other on beta");
+
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history.clone(),
+        Arc::new(FakeCache::default()),
+        Arc::new(FakeSales::default()),
+        Arc::new(FixedClock(today)),
+    ));
+    let service =
+        SellPriorityService::new(watchlist, metrics, history.clone(), Arc::new(FixedClock(today)));
+
+    let report =
+        service.compare(&[alpha.clone(), beta.clone()], Category::Commodity).expect("compare");
+
+    assert_eq!(report.targets, vec![alpha.clone(), beta.clone()]);
+    assert_eq!(report.rows.len(), 2, "union of both watchlists");
+
+    // Broadest coverage first: `fish` (watched on both) outranks `other`.
+    let fish_row = &report.rows[0];
+    assert_eq!(fish_row.item, fish);
+    assert_eq!(fish_row.coverage, 2);
+    assert_eq!(fish_row.cells[0].now, Some(100));
+    assert_eq!(fish_row.cells[1].now, Some(200));
+    assert!(fish_row.cells[0].watched);
+    assert_eq!(fish_row.best, Some(1), "beta pays double: best sell market");
+
+    let other_row = &report.rows[1];
+    assert_eq!(other_row.item, other);
+    assert_eq!(other_row.coverage, 1, "only beta watches it");
+    assert_eq!(other_row.cells[0].now, Some(50), "market cells exist even unwatched");
+    assert!(!other_row.cells[0].watched);
+    assert!(other_row.cells[1].now.is_none(), "no fold on beta");
+    assert_eq!(other_row.best, Some(0), "alpha is the only market with data");
+}

@@ -1006,6 +1006,68 @@ async fn priorities_api_and_page_rank_the_watchlist() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The compare API matrices the union of both targets' watchlists and marks
+/// the best-paying market per row; the page twin renders it.
+#[tokio::test]
+async fn compare_api_and_page_matrix_two_targets() {
+    let (mut state, root) = test_state(None);
+    let target_a = TargetId("t1".into());
+    let target_b = TargetId("t2".into());
+    // Second target so the matrix has two columns.
+    let mut config = state.config.clone();
+    config.targets.push(amtracker_core::config::TargetConfig {
+        id: target_b.clone(),
+        kind: amtracker_core::config::TargetKind::StaticUrls {
+            commodities_url: "http://example.test/c.json".into(),
+            auctions_url: "http://example.test/a.json".into(),
+        },
+        auth: None,
+        poll: amtracker_core::config::PollConfig { commodities_secs: 1, auctions_secs: 1 },
+        flavor: amtracker_core::domain::Flavor::default(),
+    });
+    Arc::get_mut(&mut state).expect("exclusive test state").config = config;
+
+    let today = utc_day(state.clock.now());
+    let fish = ItemRef::Item { item_id: 2589 };
+    // Fish pays double on t2 today.
+    for (target, price) in [(&target_a, 100_i64), (&target_b, 200_i64)] {
+        let mut fold = DayFold::new(fish.clone());
+        let rows: Vec<NormalizedListing> =
+            (0..2).map(|n| listing(3000 + n, &fish, price)).collect();
+        fold.apply(&rows);
+        state
+            .history
+            .save_fold(target, &fish, today, Category::Commodity, &fold)
+            .expect("save fold");
+    }
+    state.watchlist.add(&target_a, fish.clone(), None).expect("watch on t1");
+    state.watchlist.add(&target_b, fish.clone(), None).expect("watch on t2");
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/watchlist/compare?category=commodity")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let targets = json.get("targets").and_then(Value::as_array).expect("targets");
+    assert_eq!(targets.len(), 2, "both configured targets compare");
+    let rows = json.get("rows").and_then(Value::as_array).expect("rows");
+    assert_eq!(rows.len(), 1, "the union is one identity");
+    let row = &rows[0];
+    assert_eq!(row.get("coverage").and_then(Value::as_u64), Some(2));
+    assert_eq!(row.get("best").and_then(Value::as_u64), Some(1), "t2 pays double");
+    let cells = row.get("cells").and_then(Value::as_array).expect("cells");
+    assert_eq!(cells[0].get("now").and_then(Value::as_i64), Some(100));
+    assert_eq!(cells[1].get("now").and_then(Value::as_i64), Some(200));
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/compare?category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("2589"), "the compare page links the identity");
+    assert!(body.contains("t2"), "both target columns render");
+    assert!(body.contains("class=\"best\""), "the best cell carries the highlight");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Pet metrics need the full identity tuple: partial queries are rejected,
 /// complete ones serve the (possibly empty) span map.
 #[tokio::test]
