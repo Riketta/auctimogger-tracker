@@ -1908,15 +1908,14 @@ fn commodity_partial_fills_book_units_without_listing_counts() {
 
     // Cycle 3: another 60 units fill.
     let partial2 = [listing(7, &item1, 100, 90)];
-    store.record(&snap(&target, PayloadKind::Commodities, 12_000, 1), &partial2, b"f3").expect("f3");
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 12_000, 1), &partial2, b"f3")
+        .expect("f3");
     store.observe(&target, PayloadKind::Commodities, &partial2, 3, 12_000).expect("observe f3");
     assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(110));
 
     // Fills never touch the listing-rate ledger: one listing, no credits.
-    assert_eq!(
-        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
-        Some(0.0)
-    );
+    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(0.0));
 
     // The remainder vanishes early (VERY_LONG, 1h gap): credited, and its
     // remaining 90 units book on the close — the original 200 fully
@@ -1925,10 +1924,7 @@ fn commodity_partial_fills_book_units_without_listing_counts() {
     let credits = store.close_missing(&target, PayloadKind::Commodities, 4, 13_000).expect("close");
     assert_eq!(credits.len(), 1);
     assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(200));
-    assert_eq!(
-        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
-        Some(1.0)
-    );
+    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(1.0));
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1976,18 +1972,17 @@ fn sale_rate_denominator_counts_only_credit_eligible_closes() {
     let target = TargetId("us-4".into());
     let item1 = item(1);
     let item2 = item(2);
-    let banded =
-        |id: i64, owner: &ItemRef, band: TimeLeftBand| NormalizedListing {
-            auction_id: id,
-            item_ref: owner.clone(),
-            kind: ListingKind::Commodity,
-            quantity: 1,
-            unit_price: 100,
-            bid: None,
-            time_left: band,
-            context: None,
-            bonus_lists: vec![],
-        };
+    let banded = |id: i64, owner: &ItemRef, band: TimeLeftBand| NormalizedListing {
+        auction_id: id,
+        item_ref: owner.clone(),
+        kind: ListingKind::Commodity,
+        quantity: 1,
+        unit_price: 100,
+        bid: None,
+        time_left: band,
+        context: None,
+        bonus_lists: vec![],
+    };
     // Four listings: a1 sells fast (credit), a2 dies out of MEDIUM
     // (structurally unable to credit at the hourly cadence), a3 expires
     // slowly out of LONG (eligible no-credit), a4 sells fast.
@@ -1997,13 +1992,16 @@ fn sale_rate_denominator_counts_only_credit_eligible_closes() {
         banded(3, &item2, TimeLeftBand::Long),
         banded(4, &item2, TimeLeftBand::VeryLong),
     ];
-    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 4), &s1_batch, b"e1").expect("e1");
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 10_000, 4), &s1_batch, b"e1")
+        .expect("e1");
     store.observe(&target, PayloadKind::Commodities, &s1_batch, 1, 10_000).expect("observe e1");
 
     // Cycle 2: a1 and a4 gone within the hour — both credit. a2/a3 stay.
-    let s2_batch =
-        [banded(2, &item1, TimeLeftBand::Medium), banded(3, &item2, TimeLeftBand::Long)];
-    store.record(&snap(&target, PayloadKind::Commodities, 11_000, 2), &s2_batch, b"e2").expect("e2");
+    let s2_batch = [banded(2, &item1, TimeLeftBand::Medium), banded(3, &item2, TimeLeftBand::Long)];
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 11_000, 2), &s2_batch, b"e2")
+        .expect("e2");
     store.observe(&target, PayloadKind::Commodities, &s2_batch, 2, 11_000).expect("observe e2");
     let credits =
         store.close_missing(&target, PayloadKind::Commodities, 2, 11_000).expect("close e2");
@@ -2070,10 +2068,7 @@ fn reopen_reverses_eligible_and_units_alongside_the_credit() {
     store.record(&snap(&target, PayloadKind::Commodities, 12_000, 1), &first, b"r3").expect("r3");
     store.observe(&target, PayloadKind::Commodities, &first, 3, 12_000).expect("reobserve r3");
     assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(0));
-    assert_eq!(
-        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
-        Some(0.0)
-    );
+    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(0.0));
     {
         let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect");
         let (eligible, credited, closed): (i64, i64, i64) = conn
@@ -2101,7 +2096,9 @@ fn v10_migration_readds_eligible_preserving_ledger_rows() {
         let target = TargetId("us-4".into());
         let item1 = item(1);
         let first = [listing(5, &item1, 100, 2)];
-        store.record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &first, b"m1").expect("m1");
+        store
+            .record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &first, b"m1")
+            .expect("m1");
         store.observe(&target, PayloadKind::Commodities, &first, 1, 10_000).expect("observe m1");
     }
     // Downgrade the file to v9 shape: drop the eligible column, stamp v9.
@@ -2129,10 +2126,7 @@ fn v10_migration_readds_eligible_preserving_ledger_rows() {
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
         assert_eq!(version, 10);
     }
-    assert_eq!(
-        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
-        Some(0.0)
-    );
+    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(0.0));
 
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -221,11 +221,8 @@ impl MetricsService {
         // today's units, d30 the month's).
         let units = self.sales.qty_sold_each(target, items, span.days(), category)?;
         let mut blocks = Vec::with_capacity(items.len());
-        for (((per_item, rate), rate_slow), (recency, units)) in folds
-            .into_iter()
-            .zip(rates)
-            .zip(rates_slow)
-            .zip(recencies.into_iter().zip(units))
+        for (((per_item, rate), rate_slow), (recency, units)) in
+            folds.into_iter().zip(rates).zip(rates_slow).zip(recencies.into_iter().zip(units))
         {
             let mut histograms = Vec::new();
             for (_, fold) in per_item {
@@ -296,7 +293,8 @@ impl MetricsService {
                 self.sales.sale_rate_multi(target, group, SALE_RATE_SLOW_WINDOW_DAYS, category)?;
             let recency = self.sales.sale_recency_multi(target, group, category)?;
             let units = self.sales.qty_sold_multi(target, group, span.days(), category)?;
-            let ledger = BlockLedger::from_recency(sale_rate, sale_rate_slow, units, recency, today);
+            let ledger =
+                BlockLedger::from_recency(sale_rate, sale_rate_slow, units, recency, today);
             out.push(block_from_histograms(std::slice::from_ref(&merged), ledger));
         }
         Ok(out)

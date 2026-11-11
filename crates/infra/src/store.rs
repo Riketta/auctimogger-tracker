@@ -1428,9 +1428,10 @@ impl SalesRepository for SqliteStore {
             )
             .map_err(|e| backend("prepare observe open qty", e))?;
         let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
-        let mut new_sights: HashMap<(i64, Category), i64> = HashMap::new(); // (ref, category) -> count
-        // Commodity partial fills: (ref, category) -> units bought off live
-        // listings this cycle.
+        // New sights per (ref, category), booked as listing counts after the
+        // loop. Commodity partial fills: (ref, category) -> units bought off
+        // live listings this cycle.
+        let mut new_sights: HashMap<(i64, Category), i64> = HashMap::new();
         let mut partial_fills: HashMap<(i64, Category), i64> = HashMap::new();
         for listing in listings {
             let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
@@ -1453,11 +1454,7 @@ impl SalesRepository for SqliteStore {
             if matches!(kind, PayloadKind::Commodities) {
                 let prior_qty: Option<i64> = select_open_qty
                     .query_row(
-                        rusqlite::params![
-                            target.as_str(),
-                            listing.auction_id,
-                            kind.as_str()
-                        ],
+                        rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()],
                         |row| row.get(0),
                     )
                     .map(Some)
@@ -1784,77 +1781,74 @@ impl SalesRepository for SqliteStore {
                 })
             })
             .collect())
-}
+    }
 
-fn qty_sold(
-    &self,
-    target: &TargetId,
-    item: &ItemRef,
-    days: i64,
-    category: Category,
-) -> Result<Option<i64>, StoreError> {
-    let conn = self.open_transaction();
-    let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
-        return Ok(None);
-    };
-    let now_day = utc_day(self.clock.now());
-    let cutoff_day = now_day - days + 1;
-    // SUM is NULL over an empty window — "no sales rows" reads as None,
-    // distinct from a genuine zero.
-    conn.query_row(
-        "SELECT SUM(qty_sold) FROM sales
+    fn qty_sold(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        days: i64,
+        category: Category,
+    ) -> Result<Option<i64>, StoreError> {
+        let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(None);
+        };
+        let now_day = utc_day(self.clock.now());
+        let cutoff_day = now_day - days + 1;
+        // SUM is NULL over an empty window — "no sales rows" reads as None,
+        // distinct from a genuine zero.
+        conn.query_row(
+            "SELECT SUM(qty_sold) FROM sales
          WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3 AND category = ?4",
-        rusqlite::params![target.as_str(), item_ref_id, cutoff_day, category.as_str()],
-        |row| row.get(0),
-    )
-    .map_err(|e| backend("qty_sold", e))
-}
-
-fn qty_sold_each(
-    &self,
-    target: &TargetId,
-    items: &[ItemRef],
-    days: i64,
-    category: Category,
-) -> Result<Vec<Option<i64>>, StoreError> {
-    let conn = self.open_transaction();
-    // Positional resolution (None = unknown item), so the result stays
-    // aligned with `items`.
-    let ids = item_ids_in_order(&conn, items)?;
-    let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
-    if known.is_empty() {
-        return Ok(vec![None; items.len()]);
+            rusqlite::params![target.as_str(), item_ref_id, cutoff_day, category.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|e| backend("qty_sold", e))
     }
-    let now_day = utc_day(self.clock.now());
-    let units = qty_solds_by_id(&conn, target, &known, now_day - days + 1, category)?;
-    Ok(ids
-        .iter()
-        .map(|id| id.and_then(|id| units.get(&id)).copied())
-        .collect())
-}
 
-fn qty_sold_multi(
-    &self,
-    target: &TargetId,
-    items: &[ItemRef],
-    days: i64,
-    category: Category,
-) -> Result<Option<i64>, StoreError> {
-    let conn = self.open_transaction();
-    let ids = resolve_item_ids(&conn, items)?;
-    if ids.is_empty() {
-        return Ok(None);
+    fn qty_sold_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Vec<Option<i64>>, StoreError> {
+        let conn = self.open_transaction();
+        // Positional resolution (None = unknown item), so the result stays
+        // aligned with `items`.
+        let ids = item_ids_in_order(&conn, items)?;
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        if known.is_empty() {
+            return Ok(vec![None; items.len()]);
+        }
+        let now_day = utc_day(self.clock.now());
+        let units = qty_solds_by_id(&conn, target, &known, now_day - days + 1, category)?;
+        Ok(ids.iter().map(|id| id.and_then(|id| units.get(&id)).copied()).collect())
     }
-    let now_day = utc_day(self.clock.now());
-    let units = qty_solds_by_id(&conn, target, &ids, now_day - days + 1, category)?;
-    if units.is_empty() {
-        return Ok(None);
-    }
-    // Saturating: one absurd day must not overflow the species sum.
-    Ok(Some(units.values().fold(0i64, |sum, units| sum.saturating_add(*units))))
-}
 
-fn sale_recency(
+    fn qty_sold_multi(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Option<i64>, StoreError> {
+        let conn = self.open_transaction();
+        let ids = resolve_item_ids(&conn, items)?;
+        if ids.is_empty() {
+            return Ok(None);
+        }
+        let now_day = utc_day(self.clock.now());
+        let units = qty_solds_by_id(&conn, target, &ids, now_day - days + 1, category)?;
+        if units.is_empty() {
+            return Ok(None);
+        }
+        // Saturating: one absurd day must not overflow the species sum.
+        Ok(Some(units.values().fold(0i64, |sum, units| sum.saturating_add(*units))))
+    }
+
+    fn sale_recency(
         &self,
         target: &TargetId,
         item: &ItemRef,
@@ -2053,7 +2047,9 @@ fn sale_rates_by_id(
             .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| backend("sale_rates row", e))?;
-        out.extend(rows.into_iter().map(|(id, credited, denominator)| (id, (credited, denominator))));
+        out.extend(
+            rows.into_iter().map(|(id, credited, denominator)| (id, (credited, denominator))),
+        );
     }
     Ok(out)
 }
@@ -2319,25 +2315,22 @@ fn observe_new_or_reopen(
         i64,
         String,
     )> = select_prior
-        .query_row(
-            rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()],
-            |row| {
-                Ok((
-                    row.get(0)?,
-                    row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
-                    row.get(6)?,
-                    row.get(7)?,
-                    row.get(8)?,
-                    row.get(9)?,
-                    row.get(10)?,
-                    row.get(11)?,
-                ))
-            },
-        )
+        .query_row(rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+                row.get(7)?,
+                row.get(8)?,
+                row.get(9)?,
+                row.get(10)?,
+                row.get(11)?,
+            ))
+        })
         .map(Some)
         .or_else(|e| match e {
             rusqlite::Error::QueryReturnedNoRows => Ok(None),
