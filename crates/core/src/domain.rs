@@ -215,6 +215,19 @@ impl TimeLeftBand {
         }
         vanished_at - last_seen_at < self.lower_bound_secs()
     }
+
+    /// Credit eligibility: whether a close of a listing last seen in this
+    /// band belongs in the sale-rate denominator. At the one-hour poll
+    /// cadence (the Blizzard APIs' rotation) MEDIUM's and SHORT's lower
+    /// bounds sit at or below one poll gap, so their listings can
+    /// structurally never credit — counting them in the denominator dilutes
+    /// rate. `LONG` (2 h) and `VERY_LONG` (12 h) clear the cadence with
+    /// margin. A close that actually credits is always eligible regardless
+    /// of band (the credit itself proves the listing could have credited).
+    #[must_use]
+    pub fn is_credit_eligible(&self) -> bool {
+        matches!(self, TimeLeftBand::Long | TimeLeftBand::VeryLong)
+    }
 }
 
 /// One clean listing row — the ACL output every downstream stage consumes.
@@ -672,8 +685,9 @@ pub struct MetricBlock {
     pub qty_sum: i64,
     /// Unique auctions folded into the window (not snapshot sightings).
     pub listing_count: i64,
-    /// Fraction of vanished listings credited as sold over the trailing
-    /// 14 days; `None` when no sightings exist.
+    /// Fraction of credit-eligible listings credited as sold over the
+    /// trailing 14 days (eligible = last seen in a band that can clear the
+    /// poll cadence, or actually credited); `None` when no sightings exist.
     pub sale_rate: Option<f64>,
     /// Same estimator over the trailing 180 days — the slow, stable demand
     /// signal behind fast-window spikes; `None` when no sightings exist in
@@ -688,6 +702,12 @@ pub struct MetricBlock {
     /// reversals); `None` for the same reason as `days_since_last_sale` —
     /// the "stopped selling" churn signal.
     pub closures_since_last_sale: Option<i64>,
+    /// Estimated units sold over the span window — credited vanish
+    /// quantities plus commodity partial-fill deltas, each booked on the day
+    /// the units left the market; `None` when the ledger has no sales rows
+    /// for the identity at all ("no evidence" stays distinct from a
+    /// genuine zero).
+    pub qty_sold: Option<i64>,
 }
 
 /// Ledger-derived recency for one identity: the last day a sale was credited
@@ -714,6 +734,9 @@ pub struct BlockLedger {
     pub sale_rate: Option<f64>,
     /// Trailing 180-day sale rate (the slow demand window).
     pub sale_rate_slow: Option<f64>,
+    /// Units sold over the block's span window; `None` when the identity
+    /// has no sales rows.
+    pub qty_sold: Option<i64>,
     /// Days since the last credited sale; `None` = never sold in the ledger.
     pub days_since_last_sale: Option<i64>,
     /// Net closures after the last credited sale; `None` alongside
@@ -727,6 +750,7 @@ impl BlockLedger {
     pub const NONE: Self = Self {
         sale_rate: None,
         sale_rate_slow: None,
+        qty_sold: None,
         days_since_last_sale: None,
         closures_since_last_sale: None,
     };
@@ -737,14 +761,16 @@ impl BlockLedger {
     pub fn from_recency(
         sale_rate: Option<f64>,
         sale_rate_slow: Option<f64>,
+        qty_sold: Option<i64>,
         recency: Option<SaleRecency>,
         today: i64,
     ) -> Self {
         match recency {
-            None => Self { sale_rate, sale_rate_slow, ..Self::NONE },
+            None => Self { sale_rate, sale_rate_slow, qty_sold, ..Self::NONE },
             Some(recency) => Self {
                 sale_rate,
                 sale_rate_slow,
+                qty_sold,
                 days_since_last_sale: Some(today - recency.last_sale_day),
                 closures_since_last_sale: Some(recency.closures_since),
             },

@@ -89,6 +89,7 @@ fn sample_block_holder(n: i64) -> MetricBlock {
         sale_rate_180d: None,
         days_since_last_sale: None,
         closures_since_last_sale: None,
+        qty_sold: None,
     }
 }
 

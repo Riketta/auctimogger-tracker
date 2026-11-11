@@ -217,9 +217,15 @@ impl MetricsService {
         let rates_slow =
             self.sales.sale_rate_each(target, items, SALE_RATE_SLOW_WINDOW_DAYS, category)?;
         let recencies = self.sales.sale_recency_each(target, items, category)?;
+        // Units sold over the BLOCK's span (a volume, not a rate: d1 reads
+        // today's units, d30 the month's).
+        let units = self.sales.qty_sold_each(target, items, span.days(), category)?;
         let mut blocks = Vec::with_capacity(items.len());
-        for ((per_item, rate), (rate_slow, recency)) in
-            folds.into_iter().zip(rates).zip(rates_slow.into_iter().zip(recencies))
+        for (((per_item, rate), rate_slow), (recency, units)) in folds
+            .into_iter()
+            .zip(rates)
+            .zip(rates_slow)
+            .zip(recencies.into_iter().zip(units))
         {
             let mut histograms = Vec::new();
             for (_, fold) in per_item {
@@ -228,7 +234,7 @@ impl MetricsService {
                     histograms.push(histogram);
                 }
             }
-            let ledger = BlockLedger::from_recency(rate, rate_slow, recency, today);
+            let ledger = BlockLedger::from_recency(rate, rate_slow, units, recency, today);
             blocks.push(block_from_histograms(&histograms, ledger));
         }
         self.cache.put_many(target, category, span, items, &blocks, now)?;
@@ -289,7 +295,8 @@ impl MetricsService {
             let sale_rate_slow =
                 self.sales.sale_rate_multi(target, group, SALE_RATE_SLOW_WINDOW_DAYS, category)?;
             let recency = self.sales.sale_recency_multi(target, group, category)?;
-            let ledger = BlockLedger::from_recency(sale_rate, sale_rate_slow, recency, today);
+            let units = self.sales.qty_sold_multi(target, group, span.days(), category)?;
+            let ledger = BlockLedger::from_recency(sale_rate, sale_rate_slow, units, recency, today);
             out.push(block_from_histograms(std::slice::from_ref(&merged), ledger));
         }
         Ok(out)

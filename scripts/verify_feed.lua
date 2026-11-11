@@ -37,7 +37,7 @@ local function validSpan(span)
 	if type(span.median) ~= "number" or span.median <= 0 then
 		return false
 	end
-	for _, field in ipairs({ "min", "p05", "p25", "p75", "p95", "max", "mad", "vwap", "qtySum", "listingCount", "saleRate" }) do
+	for _, field in ipairs({ "min", "p05", "p25", "p75", "p95", "max", "mad", "vwap", "qtySum", "listingCount", "saleRate", "qtySold" }) do
 		local v = span[field]
 		if v ~= nil and (type(v) ~= "number" or v < 0) then
 			return false

@@ -73,7 +73,7 @@ pub struct Opportunity {
     /// `1 - p05(newest day) / median7`, clamped to [0, 1] for scoring — the
     /// robust floor keeps one outlier listing from faking a deep discount.
     pub discount: f64,
-    /// 14-day sale rate: share of vanished listings credited as sold.
+    /// 14-day sale rate: share of credit-eligible listings credited as sold.
     pub reliability: f64,
     /// Average unique listings per day across the whole window — days the
     /// item did not appear count as zero, so a single-day spike cannot read

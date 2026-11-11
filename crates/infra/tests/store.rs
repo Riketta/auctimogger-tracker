@@ -658,6 +658,7 @@ fn metrics_cache_round_trips_and_invalidates() {
         sale_rate_180d: None,
         days_since_last_sale: None,
         closures_since_last_sale: None,
+        qty_sold: Some(750),
     };
     store.put(&target, &item, Category::Commodity, Span::D1, &block, 1234).expect("put");
 
@@ -702,6 +703,7 @@ fn metrics_cache_invalidation_targets_only_named_items() {
         sale_rate_180d: None,
         days_since_last_sale: None,
         closures_since_last_sale: None,
+        qty_sold: None,
     };
     store.put(&target, &item_a, Category::Commodity, Span::D1, &block, 1234).expect("put a d1");
     store.put(&target, &item_b, Category::Commodity, Span::D1, &block, 1234).expect("put b d1");
@@ -1118,6 +1120,7 @@ fn metrics_cache_get_many_aligns_blocks_with_identities() {
         sale_rate_180d: None,
         days_since_last_sale: None,
         closures_since_last_sale: None,
+        qty_sold: None,
     };
 
     store.put(&target, &item1, Category::Item, Span::D7, &block(100), 999).expect("put item1");
@@ -1658,7 +1661,7 @@ fn v7_category_migration_rebuilds_folds_from_retained_listings() {
         }
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 9, "the file is stamped at the new schema version");
+        assert_eq!(version, 10, "the file is stamped at the new schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1873,6 +1876,263 @@ fn id_reuse_reversal_books_on_the_prior_identity_and_reopens_under_the_new_one()
     assert_eq!(credits.first().map(|c| c.item.clone()), Some(item(2)));
     let rate2 = store.sale_rate(&target, &item(2), 14, Category::Commodity).expect("rate2");
     assert_eq!(rate2, Some(1.0), "item 2: 1 credit against its own 1 listing");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Commodity partial fills: a quantity drop on a live commodity auction id
+/// is fill evidence (sellers cannot shrink a live listing), so the dropped
+/// units book as sold volume without touching the listing-count rate ledger.
+#[test]
+fn commodity_partial_fills_book_units_without_listing_counts() {
+    let dir = temp_dir("partial-fills");
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+
+    // Cycle 1: auction 7 posts 200 units.
+    let full = [listing(7, &item1, 100, 200)];
+    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &full, b"f1").expect("f1");
+    store.observe(&target, PayloadKind::Commodities, &full, 1, 10_000).expect("observe f1");
+    // The listing row exists but nothing sold yet: Some(0), not None —
+    // "no evidence" stays distinct from a genuine zero.
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(0));
+
+    // Cycle 2: the SAME live auction offers 150 — 50 units left the market
+    // between the fetches. A quantity drop on an open commodity sight is a
+    // partial fill, not a new listing event.
+    let partial = [listing(7, &item1, 100, 150)];
+    store.record(&snap(&target, PayloadKind::Commodities, 11_000, 1), &partial, b"f2").expect("f2");
+    store.observe(&target, PayloadKind::Commodities, &partial, 2, 11_000).expect("observe f2");
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(50));
+
+    // Cycle 3: another 60 units fill.
+    let partial2 = [listing(7, &item1, 100, 90)];
+    store.record(&snap(&target, PayloadKind::Commodities, 12_000, 1), &partial2, b"f3").expect("f3");
+    store.observe(&target, PayloadKind::Commodities, &partial2, 3, 12_000).expect("observe f3");
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(110));
+
+    // Fills never touch the listing-rate ledger: one listing, no credits.
+    assert_eq!(
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
+        Some(0.0)
+    );
+
+    // The remainder vanishes early (VERY_LONG, 1h gap): credited, and its
+    // remaining 90 units book on the close — the original 200 fully
+    // accounted.
+    store.record(&snap(&target, PayloadKind::Commodities, 13_000, 0), &[], b"f4").expect("f4");
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 4, 13_000).expect("close");
+    assert_eq!(credits.len(), 1);
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(200));
+    assert_eq!(
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
+        Some(1.0)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Item-AH stacks sell atomically: a quantity change under the same id must
+/// never book partial-fill units (only the commodities payload credits
+/// fills).
+#[test]
+fn item_auction_quantity_changes_are_not_partial_fills() {
+    let dir = temp_dir("no-item-fills");
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let gear = |qty: i64| NormalizedListing {
+        auction_id: 9,
+        item_ref: item1.clone(),
+        kind: ListingKind::Item,
+        quantity: qty,
+        unit_price: 5_000,
+        bid: Some(4_000),
+        time_left: TimeLeftBand::VeryLong,
+        context: None,
+        bonus_lists: vec![],
+    };
+    let first = [gear(10)];
+    store.record(&snap(&target, PayloadKind::Auctions, 10_000, 1), &first, b"g1").expect("g1");
+    store.observe(&target, PayloadKind::Auctions, &first, 1, 10_000).expect("observe g1");
+    let changed = [gear(4)];
+    store.record(&snap(&target, PayloadKind::Auctions, 11_000, 1), &changed, b"g2").expect("g2");
+    store.observe(&target, PayloadKind::Auctions, &changed, 2, 11_000).expect("observe g2");
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Item).expect("units"), Some(0));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The sale-rate denominator counts only credit-eligible closes: a MEDIUM
+/// last sighting can structurally never clear the hourly poll cadence and
+/// must not dilute the rate, while a slow LONG vanish is expiry evidence
+/// that belongs in it. Pre-v10 rows (eligible = 0) keep the listings
+/// denominator.
+#[test]
+fn sale_rate_denominator_counts_only_credit_eligible_closes() {
+    let dir = temp_dir("eligible-denominator");
+    let store = open_store(&dir, 100_000);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let item2 = item(2);
+    let banded =
+        |id: i64, owner: &ItemRef, band: TimeLeftBand| NormalizedListing {
+            auction_id: id,
+            item_ref: owner.clone(),
+            kind: ListingKind::Commodity,
+            quantity: 1,
+            unit_price: 100,
+            bid: None,
+            time_left: band,
+            context: None,
+            bonus_lists: vec![],
+        };
+    // Four listings: a1 sells fast (credit), a2 dies out of MEDIUM
+    // (structurally unable to credit at the hourly cadence), a3 expires
+    // slowly out of LONG (eligible no-credit), a4 sells fast.
+    let s1_batch = [
+        banded(1, &item1, TimeLeftBand::VeryLong),
+        banded(2, &item1, TimeLeftBand::Medium),
+        banded(3, &item2, TimeLeftBand::Long),
+        banded(4, &item2, TimeLeftBand::VeryLong),
+    ];
+    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 4), &s1_batch, b"e1").expect("e1");
+    store.observe(&target, PayloadKind::Commodities, &s1_batch, 1, 10_000).expect("observe e1");
+
+    // Cycle 2: a1 and a4 gone within the hour — both credit. a2/a3 stay.
+    let s2_batch =
+        [banded(2, &item1, TimeLeftBand::Medium), banded(3, &item2, TimeLeftBand::Long)];
+    store.record(&snap(&target, PayloadKind::Commodities, 11_000, 2), &s2_batch, b"e2").expect("e2");
+    store.observe(&target, PayloadKind::Commodities, &s2_batch, 2, 11_000).expect("observe e2");
+    let credits =
+        store.close_missing(&target, PayloadKind::Commodities, 2, 11_000).expect("close e2");
+    assert_eq!(credits.len(), 2, "a1 and a4 vanish early: both credit");
+
+    // Cycle 3 (exactly the LONG bound after a2/a3's last sighting): both
+    // close uncredited. a2's MEDIUM band stays out of the denominator; a3's
+    // LONG band counts in it.
+    store.record(&snap(&target, PayloadKind::Commodities, 18_200, 0), &[], b"e3").expect("e3");
+    store.close_missing(&target, PayloadKind::Commodities, 3, 18_200).expect("close e3");
+
+    // Item 1: 1 credit / 1 eligible (the MEDIUM close is excluded) = 1.0,
+    // where the listings denominator would read 0.5.
+    assert_eq!(
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate1"),
+        Some(1.0)
+    );
+    // Item 2: 1 credit / 2 eligible (the LONG expiry counts) = 0.5.
+    assert_eq!(
+        store.sale_rate(&target, &item2, 14, Category::Commodity).expect("rate2"),
+        Some(0.5)
+    );
+
+    // Pre-v10 rows (eligible = 0) fall back to the listings denominator.
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("seed");
+        conn.execute("INSERT OR IGNORE INTO item_ref (kind, item_id) VALUES ('item', 3)", [])
+            .expect("seed item_ref");
+        conn.execute(
+            "INSERT INTO sales (target_id, item_ref_id, day, category, listings, closed, credited, qty_sold, eligible)\n             VALUES ('us-4', (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 3), 0, 'commodity', 4, 4, 1, 3, 0)",
+            [],
+        )
+        .expect("seed pre-v10 row");
+    }
+    assert_eq!(
+        store.sale_rate(&target, &item(3), 14, Category::Commodity).expect("rate3"),
+        Some(0.25)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A phantom close's eligible booking and credited units reverse alongside
+/// the credit itself when the listing returns.
+#[test]
+fn reopen_reverses_eligible_and_units_alongside_the_credit() {
+    let dir = temp_dir("reverse-eligible");
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+
+    // Auction 5 (VERY_LONG, 500 units) vanishes within the hour: credit,
+    // eligible close, 500 units on the close day.
+    let first = [listing(5, &item1, 100, 500)];
+    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &first, b"r1").expect("r1");
+    store.observe(&target, PayloadKind::Commodities, &first, 1, 10_000).expect("observe r1");
+    store.record(&snap(&target, PayloadKind::Commodities, 11_000, 0), &[], b"r2").expect("r2");
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 2, 11_000).expect("close");
+    assert_eq!(credits.len(), 1);
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(500));
+
+    // The listing returns: phantom close, phantom credit, phantom units and
+    // the eligible booking all reverse.
+    store.record(&snap(&target, PayloadKind::Commodities, 12_000, 1), &first, b"r3").expect("r3");
+    store.observe(&target, PayloadKind::Commodities, &first, 3, 12_000).expect("reobserve r3");
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(0));
+    assert_eq!(
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
+        Some(0.0)
+    );
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect");
+        let (eligible, credited, closed): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COALESCE(SUM(eligible), 0), COALESCE(SUM(credited), 0), COALESCE(SUM(closed), 0)\n                 FROM sales WHERE category = 'commodity'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("ledger sums");
+        assert_eq!((eligible, credited, closed), (0, 0, 0), "full reversal, no negative residue");
+    }
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// v10 re-adds `sales.eligible` to downgraded files without disturbing the
+/// ledger rows; legacy rows keep eligible = 0 and the rate falls back to the
+/// listings denominator.
+#[test]
+fn v10_migration_readds_eligible_preserving_ledger_rows() {
+    let dir = temp_dir("v10-eligible");
+    let db = dir.join("db.sqlite3");
+    {
+        let store = open_store(&dir, 20_000);
+        let target = TargetId("us-4".into());
+        let item1 = item(1);
+        let first = [listing(5, &item1, 100, 2)];
+        store.record(&snap(&target, PayloadKind::Commodities, 10_000, 1), &first, b"m1").expect("m1");
+        store.observe(&target, PayloadKind::Commodities, &first, 1, 10_000).expect("observe m1");
+    }
+    // Downgrade the file to v9 shape: drop the eligible column, stamp v9.
+    {
+        let conn = rusqlite::Connection::open(&db).expect("downgrade");
+        conn.execute("ALTER TABLE sales DROP COLUMN eligible", []).expect("drop eligible");
+        conn.pragma_update(None, "user_version", 9).expect("stamp v9");
+    }
+    // Reopening migrates back; the ledger row survives with eligible = 0
+    // (legacy), so the rate falls back to the listings denominator.
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect");
+        let has_eligible: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sales') WHERE name = 'eligible')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column check");
+        assert_eq!(has_eligible, 1, "migration restored the column");
+        let version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
+        assert_eq!(version, 10);
+    }
+    assert_eq!(
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
+        Some(0.0)
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

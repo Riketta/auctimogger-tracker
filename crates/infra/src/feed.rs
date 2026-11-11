@@ -63,6 +63,9 @@ fn metric_fields_lua(block: &MetricBlock) -> String {
     if let Some(closures) = block.closures_since_last_sale {
         let _ = write!(out, ", closuresSinceLastSale = {closures}");
     }
+    if let Some(units) = block.qty_sold {
+        let _ = write!(out, ", qtySold = {units}");
+    }
     out
 }
 
@@ -128,6 +131,7 @@ fn metric_json(block: &MetricBlock) -> serde_json::Value {
         "saleRate180d": block.sale_rate_180d,
         "daysSinceLastSale": block.days_since_last_sale,
         "closuresSinceLastSale": block.closures_since_last_sale,
+        "qtySold": block.qty_sold,
     })
 }
 
@@ -294,6 +298,7 @@ mod tests {
             sale_rate_180d: Some(0.2),
             days_since_last_sale: Some(9),
             closures_since_last_sale: Some(14),
+            qty_sold: Some(220),
         };
         let mut metrics = BTreeMap::new();
         metrics.insert(Span::D1, block.clone());
@@ -327,7 +332,7 @@ mod tests {
         let text = String::from_utf8(lua).expect("utf-8");
         let expected = "AuctiMoggerTrackerFeed = {\n  \
             version = 3,\n  generatedAt = 1760000000,\n  items = {\n    \
-            { itemID = 194784, category = \"commodity\", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000, daysSinceLastSale = 9, closuresSinceLastSale = 14 } } }\n  },\n}\n";
+            { itemID = 194784, category = \"commodity\", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000, daysSinceLastSale = 9, closuresSinceLastSale = 14, qtySold = 220 } } }\n  },\n}\n";
         assert_eq!(text, expected);
     }
 
@@ -345,6 +350,7 @@ mod tests {
                 sale_rate_180d: None,
                 days_since_last_sale: None,
                 closures_since_last_sale: None,
+                qty_sold: None,
                 ..d1
             },
         );
@@ -354,6 +360,7 @@ mod tests {
         assert!(!lua.contains("saleRate180d"), "{lua}");
         assert!(!lua.contains("daysSinceLastSale"), "{lua}");
         assert!(!lua.contains("closuresSinceLastSale"), "{lua}");
+        assert!(!lua.contains("qtySold"), "{lua}");
     }
 
     /// JSON pins the same absence as explicit `null`s: the keys are always
@@ -370,6 +377,7 @@ mod tests {
                 sale_rate_180d: None,
                 days_since_last_sale: None,
                 closures_since_last_sale: None,
+                qty_sold: None,
                 ..d1
             },
         );
@@ -380,6 +388,7 @@ mod tests {
         assert_eq!(d1["saleRate180d"], serde_json::Value::Null);
         assert_eq!(d1["daysSinceLastSale"], serde_json::Value::Null);
         assert_eq!(d1["closuresSinceLastSale"], serde_json::Value::Null);
+        assert_eq!(d1["qtySold"], serde_json::Value::Null);
     }
 
     #[test]
@@ -413,6 +422,7 @@ mod tests {
         assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate180d"], 0.2);
         assert_eq!(value["items"][0]["metrics"]["d1"]["daysSinceLastSale"], 9);
         assert_eq!(value["items"][0]["metrics"]["d1"]["closuresSinceLastSale"], 14);
+        assert_eq!(value["items"][0]["metrics"]["d1"]["qtySold"], 220);
         assert_eq!(value["items"][1]["kind"], "pet");
         assert_eq!(value["items"][1]["category"], "pet");
         assert_eq!(value["items"][1]["speciesID"], 2546);

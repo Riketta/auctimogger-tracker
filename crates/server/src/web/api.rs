@@ -582,6 +582,7 @@ fn metric_block_json(block: &amtracker_core::domain::MetricBlock) -> serde_json:
         "saleRate180d": block.sale_rate_180d,
         "daysSinceLastSale": block.days_since_last_sale,
         "closuresSinceLastSale": block.closures_since_last_sale,
+        "qtySold": block.qty_sold,
     })
 }
 

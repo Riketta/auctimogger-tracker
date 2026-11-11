@@ -94,9 +94,10 @@ use rusqlite::Connection;
 /// Version 9 added the expression index behind the time-left sort (the
 /// semantic band rank): the CASE sort temp-b-treed the snapshot's whole
 /// listing set on every page view (~360 ms at 400k listings); the index
-/// turns it into a covering-index read. The CREATE is idempotent, so v8
-/// files upgrade in place.
-const SCHEMA_VERSION: i64 = 9;
+/// Current schema shape. v10 added `sales.eligible` (the credit-eligible
+/// sale-rate denominator); the ALTER is shape-guarded at the call site, so
+/// upgraded files converge with fresh ones.
+const SCHEMA_VERSION: i64 = 10;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
 /// primary keys to `(flavor, id)` keys and gain the enrichment columns.
@@ -187,6 +188,7 @@ CREATE TABLE sales (
     closed INTEGER NOT NULL DEFAULT 0,
     credited INTEGER NOT NULL DEFAULT 0,
     qty_sold INTEGER NOT NULL DEFAULT 0,
+    eligible INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (target_id, item_ref_id, day, category)
 );
 COMMIT;
@@ -327,6 +329,7 @@ CREATE TABLE IF NOT EXISTS sales (
     closed INTEGER NOT NULL DEFAULT 0,
     credited INTEGER NOT NULL DEFAULT 0,
     qty_sold INTEGER NOT NULL DEFAULT 0,
+    eligible INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (target_id, item_ref_id, day, category)
 );
 
@@ -603,6 +606,29 @@ impl SqliteStore {
                  ON listing(snapshot_id, {TIME_RANK_EXPR}, auction_id)"
             ))
             .map_err(|e| backend("migrate time rank index", e))?;
+            // v10 added the credit-eligible sale-rate denominator. Historical
+            // rows keep `eligible = 0` and fall back to the listings
+            // denominator (see `sale_rates_by_id`), so no rebuild is needed.
+            let sales_has_eligible = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sales') WHERE name = 'eligible')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .map(|flag| flag == 1)
+                .map_err(|e| backend("inspect sales schema", e))?;
+            if !sales_has_eligible {
+                if !fresh {
+                    tracing::debug!(
+                        from_version = version,
+                        "migrating: adding sales.eligible (v10)"
+                    );
+                }
+                conn.execute_batch(
+                    "ALTER TABLE sales ADD COLUMN eligible INTEGER NOT NULL DEFAULT 0",
+                )
+                .map_err(|e| backend("migrate sales.eligible", e))?;
+            }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
             if !fresh {
@@ -1354,6 +1380,7 @@ fn listing_row_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ListingRow>
 }
 
 impl SalesRepository for SqliteStore {
+    #[allow(clippy::too_many_lines)]
     fn observe(
         &self,
         target: &TargetId,
@@ -1375,7 +1402,7 @@ impl SalesRepository for SqliteStore {
         let mut select_prior = tx
             .prepare(
                 "SELECT s.closed_at, s.credited, s.quantity, s.first_seen_at, s.item_ref_id,
-                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
+                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, s.band
                  FROM sight s JOIN item_ref r ON r.id = s.item_ref_id
                  WHERE s.target_id = ?1 AND s.auction_id = ?2 AND s.kind = ?3",
             )
@@ -1394,8 +1421,17 @@ impl SalesRepository for SqliteStore {
                  WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
             )
             .map_err(|e| backend("prepare observe reopen", e))?;
+        let mut select_open_qty = tx
+            .prepare(
+                "SELECT quantity FROM sight
+                 WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3 AND closed_at IS NULL",
+            )
+            .map_err(|e| backend("prepare observe open qty", e))?;
         let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
         let mut new_sights: HashMap<(i64, Category), i64> = HashMap::new(); // (ref, category) -> count
+        // Commodity partial fills: (ref, category) -> units bought off live
+        // listings this cycle.
+        let mut partial_fills: HashMap<(i64, Category), i64> = HashMap::new();
         for listing in listings {
             let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
                 *id
@@ -1407,6 +1443,33 @@ impl SalesRepository for SqliteStore {
             // The payload kind fixes the category for every listing in this
             // batch; the identity shape splits item-AH rows into item/pet.
             let category = Category::derive(listing.kind, &listing.item_ref);
+            // A live commodity auction id persists across partial buys (the
+            // unit price is fixed at post), and a seller cannot shrink a
+            // live listing - cancels and reposts vanish and return under a
+            // new id - so a quantity drop on the SAME open sight is fill
+            // evidence, more direct than the vanish rule. Item-AH stacks
+            // sell atomically, so only the commodities payload pays this
+            // extra indexed read.
+            if matches!(kind, PayloadKind::Commodities) {
+                let prior_qty: Option<i64> = select_open_qty
+                    .query_row(
+                        rusqlite::params![
+                            target.as_str(),
+                            listing.auction_id,
+                            kind.as_str()
+                        ],
+                        |row| row.get(0),
+                    )
+                    .map(Some)
+                    .or_else(|e| match e {
+                        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                        other => Err(backend("observe open qty", other)),
+                    })?;
+                if let Some(prior_qty) = prior_qty.filter(|prior| *prior > listing.quantity) {
+                    *partial_fills.entry((item_ref_id, category)).or_insert(0) +=
+                        prior_qty - listing.quantity;
+                }
+            }
             // A listing sighted in a previous kind cycle must never match
             // here: commodity and item auction ids are separate namespaces.
             let updated = update_open
@@ -1448,7 +1511,20 @@ impl SalesRepository for SqliteStore {
                 item_ref_id,
                 utc_day(at),
                 category,
-                &SalesDelta { listings: count, closed: 0, credited: 0, qty_sold: 0 },
+                &SalesDelta { listings: count, closed: 0, credited: 0, qty_sold: 0, eligible: 0 },
+            )?;
+        }
+        // Partial-fill volume books on the observation day - the day the
+        // units left the market - exactly like credited vanish quantities
+        // book on their close day.
+        for ((item_ref_id, category), units) in partial_fills {
+            bump_sales_row(
+                &tx,
+                target,
+                item_ref_id,
+                utc_day(at),
+                category,
+                &SalesDelta { listings: 0, closed: 0, credited: 0, qty_sold: units, eligible: 0 },
             )?;
         }
         // Statements borrow `tx`; release them before the commit move.
@@ -1456,6 +1532,7 @@ impl SalesRepository for SqliteStore {
         drop(select_prior);
         drop(insert_sight);
         drop(reopen_sight);
+        drop(select_open_qty);
         tx.commit().map_err(|e| backend("commit observe", e))?;
         Ok(())
     }
@@ -1519,6 +1596,12 @@ impl SalesRepository for SqliteStore {
         {
             let band = amtracker_core::domain::TimeLeftBand::parse(&band);
             let credited = band.credits_sale(last_seen_at, at);
+            // Credit eligibility: LONG/VERY_LONG last-seen bands can clear
+            // the one-hour poll cadence, so their closes belong in the
+            // denominator whether or not they credited (a slow vanish is
+            // expiry evidence). A close that credited is always eligible -
+            // the credit itself proves it could have.
+            let eligible = credited || band.is_credit_eligible();
             // The payload kind fixes this close's category; the identity
             // shape splits item-AH sightings into item/pet sale rows.
             let item = join_item_ref(
@@ -1563,29 +1646,43 @@ impl SalesRepository for SqliteStore {
             if changed == 0 {
                 continue;
             }
-            // The close event books on its close day. The credit, however,
-            // books on the sight's OPEN day - the same day its `listings`
-            // denominator was booked - so a sale rate over a trailing window
-            // always compares a day's credits against that same day's opens.
-            // Booking credits on the close day instead would let sights
-            // opened before the window inflate the ratio past 1.0.
+            // The close event and the sold units book on the close day (the
+            // day the volume left the market). The credit and its eligible
+            // denominator book on the sight's OPEN day - the same day its
+            // `listings` denominator was booked - so a sale rate over a
+            // trailing window always compares a day's credits against that
+            // same day's opens. Booking credits on the close day instead
+            // would let sights opened before the window inflate the ratio
+            // past 1.0.
             bump_sales_row(
                 &tx,
                 target,
                 item_ref_id,
                 utc_day(at),
                 category,
-                &SalesDelta { listings: 0, closed: 1, credited: 0, qty_sold: 0 },
+                &SalesDelta {
+                    listings: 0,
+                    closed: 1,
+                    credited: 0,
+                    qty_sold: if credited { quantity } else { 0 },
+                    eligible: 0,
+                },
+            )?;
+            bump_sales_row(
+                &tx,
+                target,
+                item_ref_id,
+                utc_day(first_seen_at),
+                category,
+                &SalesDelta {
+                    listings: 0,
+                    closed: 0,
+                    credited: i64::from(credited),
+                    qty_sold: 0,
+                    eligible: i64::from(eligible),
+                },
             )?;
             if credited {
-                bump_sales_row(
-                    &tx,
-                    target,
-                    item_ref_id,
-                    utc_day(first_seen_at),
-                    category,
-                    &SalesDelta { listings: 0, closed: 0, credited: 1, qty_sold: quantity },
-                )?;
                 credits.push(SaleCredit { auction_id, item, quantity, at });
             }
         }
@@ -1606,22 +1703,26 @@ impl SalesRepository for SqliteStore {
         };
         let now_day = utc_day(self.clock.now());
         let cutoff_day = now_day - days + 1;
-        let (credited, listings): (i64, i64) = conn
+        // Denominator: credit-eligible closes (v10), falling back to all
+        // listings for rows booked before the upgrade (eligible = 0).
+        let (credited, denominator): (i64, i64) = conn
             .query_row(
-                "SELECT COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
+                "SELECT COALESCE(SUM(credited), 0),
+                        COALESCE(NULLIF(SUM(eligible), 0), COALESCE(SUM(listings), 0))
+                 FROM sales
                  WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3 AND category = ?4",
                 rusqlite::params![target.as_str(), item_ref_id, cutoff_day, category.as_str()],
                 |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .map_err(|e| backend("sale_rate", e))?;
-        if listings == 0 {
+        if denominator == 0 {
             return Ok(None);
         }
         // Daily counts are far below f64's exact-integer range (2^53), and the
         // ratio is a display metric; precision loss on giant inputs is
         // acceptable by design.
         #[allow(clippy::cast_precision_loss)]
-        Ok(Some(credited as f64 / listings as f64))
+        Ok(Some(credited as f64 / denominator as f64))
     }
 
     fn sale_rate_multi(
@@ -1639,17 +1740,17 @@ impl SalesRepository for SqliteStore {
         let now_day = utc_day(self.clock.now());
         let rates = sale_rates_by_id(&conn, target, &ids, now_day - days + 1, category)?;
         let mut credited = 0i64;
-        let mut listings = 0i64;
-        for (c, l) in rates.values() {
+        let mut denominator = 0i64;
+        for (c, d) in rates.values() {
             credited += *c;
-            listings += *l;
+            denominator += *d;
         }
-        if listings == 0 {
+        if denominator == 0 {
             return Ok(None);
         }
         // Same display-metric precision trade as `sale_rate`.
         #[allow(clippy::cast_precision_loss)]
-        Ok(Some(credited as f64 / listings as f64))
+        Ok(Some(credited as f64 / denominator as f64))
     }
 
     fn sale_rate_each(
@@ -1672,20 +1773,88 @@ impl SalesRepository for SqliteStore {
         Ok(ids
             .iter()
             .map(|id| {
-                id.and_then(|id| rates.get(&id)).and_then(|(credited, listings)| {
-                    if *listings == 0 {
+                id.and_then(|id| rates.get(&id)).and_then(|(credited, denominator)| {
+                    if *denominator == 0 {
                         None
                     } else {
                         // Same display-metric precision trade as `sale_rate`.
                         #[allow(clippy::cast_precision_loss)]
-                        Some(*credited as f64 / *listings as f64)
+                        Some(*credited as f64 / *denominator as f64)
                     }
                 })
             })
             .collect())
-    }
+}
 
-    fn sale_recency(
+fn qty_sold(
+    &self,
+    target: &TargetId,
+    item: &ItemRef,
+    days: i64,
+    category: Category,
+) -> Result<Option<i64>, StoreError> {
+    let conn = self.open_transaction();
+    let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+        return Ok(None);
+    };
+    let now_day = utc_day(self.clock.now());
+    let cutoff_day = now_day - days + 1;
+    // SUM is NULL over an empty window — "no sales rows" reads as None,
+    // distinct from a genuine zero.
+    conn.query_row(
+        "SELECT SUM(qty_sold) FROM sales
+         WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3 AND category = ?4",
+        rusqlite::params![target.as_str(), item_ref_id, cutoff_day, category.as_str()],
+        |row| row.get(0),
+    )
+    .map_err(|e| backend("qty_sold", e))
+}
+
+fn qty_sold_each(
+    &self,
+    target: &TargetId,
+    items: &[ItemRef],
+    days: i64,
+    category: Category,
+) -> Result<Vec<Option<i64>>, StoreError> {
+    let conn = self.open_transaction();
+    // Positional resolution (None = unknown item), so the result stays
+    // aligned with `items`.
+    let ids = item_ids_in_order(&conn, items)?;
+    let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+    if known.is_empty() {
+        return Ok(vec![None; items.len()]);
+    }
+    let now_day = utc_day(self.clock.now());
+    let units = qty_solds_by_id(&conn, target, &known, now_day - days + 1, category)?;
+    Ok(ids
+        .iter()
+        .map(|id| id.and_then(|id| units.get(&id)).copied())
+        .collect())
+}
+
+fn qty_sold_multi(
+    &self,
+    target: &TargetId,
+    items: &[ItemRef],
+    days: i64,
+    category: Category,
+) -> Result<Option<i64>, StoreError> {
+    let conn = self.open_transaction();
+    let ids = resolve_item_ids(&conn, items)?;
+    if ids.is_empty() {
+        return Ok(None);
+    }
+    let now_day = utc_day(self.clock.now());
+    let units = qty_solds_by_id(&conn, target, &ids, now_day - days + 1, category)?;
+    if units.is_empty() {
+        return Ok(None);
+    }
+    // Saturating: one absurd day must not overflow the species sum.
+    Ok(Some(units.values().fold(0i64, |sum, units| sum.saturating_add(*units))))
+}
+
+fn sale_recency(
         &self,
         target: &TargetId,
         item: &ItemRef,
@@ -1861,8 +2030,12 @@ fn sale_rates_by_id(
     let mut out: HashMap<i64, (i64, i64)> = HashMap::new();
     for chunk in ids.chunks(SALE_RATE_CHUNK) {
         let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        // The denominator prefers credit-eligible closes (v10); rows booked
+        // before the upgrade carry eligible = 0 and fall back to all
+        // listings, so mixed-history windows keep a meaningful rate.
         let sql = format!(
-            "SELECT item_ref_id, COALESCE(SUM(credited), 0), COALESCE(SUM(listings), 0) FROM sales
+            "SELECT item_ref_id, COALESCE(SUM(credited), 0),
+                    COALESCE(NULLIF(SUM(eligible), 0), COALESCE(SUM(listings), 0)) FROM sales
              WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ? AND category = ?
              GROUP BY item_ref_id"
         );
@@ -1880,7 +2053,47 @@ fn sale_rates_by_id(
             .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?)))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| backend("sale_rates row", e))?;
-        out.extend(rows.into_iter().map(|(id, credited, listings)| (id, (credited, listings))));
+        out.extend(rows.into_iter().map(|(id, credited, denominator)| (id, (credited, denominator))));
+    }
+    Ok(out)
+}
+
+/// Units credited as sold per `item_ref` id over the window, in one chunked
+/// grouped query per batch (the batched fuel for `qty_sold_each` and
+/// `qty_sold_multi`). Ids with no sales rows at all are absent from the
+/// result — "no evidence" stays distinct from a genuine zero.
+fn qty_solds_by_id(
+    conn: &Connection,
+    target: &TargetId,
+    ids: &[i64],
+    cutoff_day: i64,
+    category: Category,
+) -> Result<HashMap<i64, i64>, StoreError> {
+    /// Same chunking rationale as [`sale_rates_by_id`].
+    const QTY_SOLD_CHUNK: usize = 500;
+    let mut out: HashMap<i64, i64> = HashMap::new();
+    for chunk in ids.chunks(QTY_SOLD_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT item_ref_id, SUM(qty_sold) FROM sales
+             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ? AND category = ?
+             GROUP BY item_ref_id"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Integer(cutoff_day));
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
+        let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare qty_solds", e))?;
+        let rows = statement
+            .query(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| backend("query qty_solds", e))?
+            .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("qty_solds row", e))?;
+        out.extend(rows);
     }
     Ok(out)
 }
@@ -2029,6 +2242,7 @@ struct SalesDelta {
     closed: i64,
     credited: i64,
     qty_sold: i64,
+    eligible: i64,
 }
 
 /// Sales-aggregate upsert: `listings` is the denominator (unique sights
@@ -2042,13 +2256,14 @@ fn bump_sales_row(
     delta: &SalesDelta,
 ) -> Result<(), StoreError> {
     tx.execute(
-        "INSERT INTO sales (target_id, item_ref_id, day, category, listings, closed, credited, qty_sold)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+        "INSERT INTO sales (target_id, item_ref_id, day, category, listings, closed, credited, qty_sold, eligible)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
          ON CONFLICT (target_id, item_ref_id, day, category) DO UPDATE SET
            listings = listings + ?5,
            closed = closed + ?6,
            credited = credited + ?7,
-           qty_sold = qty_sold + ?8",
+           qty_sold = qty_sold + ?8,
+           eligible = eligible + ?9",
         rusqlite::params![
             target.as_str(),
             item_ref_id,
@@ -2057,7 +2272,8 @@ fn bump_sales_row(
             delta.listings,
             delta.closed,
             delta.credited,
-            delta.qty_sold
+            delta.qty_sold,
+            delta.eligible
         ],
     )
     .map_err(|e| backend("bump sales", e))?;
@@ -2089,31 +2305,44 @@ fn observe_new_or_reopen(
     at: i64,
 ) -> Result<bool, StoreError> {
     #[allow(clippy::type_complexity)]
-    let prior: Option<(Option<i64>, i64, i64, i64, i64, String, i64, i64, i64, i64, i64)> =
-        select_prior
-            .query_row(
-                rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                        row.get(7)?,
-                        row.get(8)?,
-                        row.get(9)?,
-                        row.get(10)?,
-                    ))
-                },
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(backend("observe prior", other)),
-            })?;
+    let prior: Option<(
+        Option<i64>,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+        i64,
+        i64,
+        i64,
+        i64,
+        i64,
+        String,
+    )> = select_prior
+        .query_row(
+            rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()],
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                    row.get(5)?,
+                    row.get(6)?,
+                    row.get(7)?,
+                    row.get(8)?,
+                    row.get(9)?,
+                    row.get(10)?,
+                    row.get(11)?,
+                ))
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(backend("observe prior", other)),
+        })?;
     let Some((
         closed_at,
         credited,
@@ -2126,6 +2355,7 @@ fn observe_new_or_reopen(
         prior_level,
         prior_quality,
         prior_breed,
+        prior_band,
     )) = prior
     else {
         insert_sight
@@ -2145,6 +2375,9 @@ fn observe_new_or_reopen(
     if let Some(closed_at) = closed_at {
         // The prior close's ledger entries live under the sight's stored
         // identity and on the days they were booked - reverse exactly there.
+        // The stored band is the band the close evaluated (nothing rewrites
+        // it between close and reopen), so eligibility recomputes to the
+        // same verdict the close booked.
         let prior_item = join_item_ref(
             &prior_kind,
             prior_item_id,
@@ -2154,24 +2387,36 @@ fn observe_new_or_reopen(
             prior_breed,
         );
         let prior_category = Category::derive(listing.kind, &prior_item);
+        let prior_eligible = credited == 1
+            || amtracker_core::domain::TimeLeftBand::parse(&prior_band).is_credit_eligible();
         bump_sales_row(
             tx,
             target,
             prior_item_ref_id,
             utc_day(closed_at),
             prior_category,
-            &SalesDelta { listings: 0, closed: -1, credited: 0, qty_sold: 0 },
+            &SalesDelta {
+                listings: 0,
+                closed: -1,
+                credited: 0,
+                qty_sold: if credited == 1 { -prior_qty } else { 0 },
+                eligible: 0,
+            },
         )?;
-        if credited == 1 {
-            bump_sales_row(
-                tx,
-                target,
-                prior_item_ref_id,
-                utc_day(prior_first_seen_at),
-                prior_category,
-                &SalesDelta { listings: 0, closed: 0, credited: -1, qty_sold: -prior_qty },
-            )?;
-        }
+        bump_sales_row(
+            tx,
+            target,
+            prior_item_ref_id,
+            utc_day(prior_first_seen_at),
+            prior_category,
+            &SalesDelta {
+                listings: 0,
+                closed: 0,
+                credited: -credited,
+                qty_sold: 0,
+                eligible: -i64::from(prior_eligible),
+            },
+        )?;
     }
     reopen_sight
         .execute(rusqlite::params![
@@ -3521,6 +3766,8 @@ struct SerMetricBlock {
     days_since_last_sale: Option<i64>,
     #[serde(default)]
     closures_since_last_sale: Option<i64>,
+    #[serde(default)]
+    qty_sold: Option<i64>,
 }
 
 impl From<&MetricBlock> for SerMetricBlock {
@@ -3542,6 +3789,7 @@ impl From<&MetricBlock> for SerMetricBlock {
             sale_rate_180d: block.sale_rate_180d,
             days_since_last_sale: block.days_since_last_sale,
             closures_since_last_sale: block.closures_since_last_sale,
+            qty_sold: block.qty_sold,
         }
     }
 }
@@ -3565,6 +3813,7 @@ impl From<SerMetricBlock> for MetricBlock {
             sale_rate_180d: ser.sale_rate_180d,
             days_since_last_sale: ser.days_since_last_sale,
             closures_since_last_sale: ser.closures_since_last_sale,
+            qty_sold: ser.qty_sold,
         }
     }
 }

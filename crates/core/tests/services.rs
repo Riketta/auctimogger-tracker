@@ -422,6 +422,8 @@ struct FakeSales {
     credits: Mutex<Vec<amtracker_core::domain::SaleCredit>>,
     /// Optional per-item rates served by `sale_rate` (default: none).
     rates: Mutex<HashMap<ItemRef, f64>>,
+    /// Optional per-item units served by `qty_sold` (default: none).
+    units: Mutex<HashMap<ItemRef, i64>>,
     /// Optional per-item ledger recency served by `sale_recency` (default:
     /// none — never sold).
     recencies: Mutex<HashMap<ItemRef, amtracker_core::domain::SaleRecency>>,
@@ -434,6 +436,7 @@ impl FakeSales {
             closes: Mutex::new(0),
             credits: Mutex::new(credits),
             rates: Mutex::new(HashMap::new()),
+            units: Mutex::new(HashMap::new()),
             recencies: Mutex::new(HashMap::new()),
         }
     }
@@ -471,6 +474,16 @@ impl SalesRepository for FakeSales {
         _category: amtracker_core::domain::Category,
     ) -> Result<Option<f64>, StoreError> {
         Ok(self.rates.lock().unwrap().get(item).copied())
+    }
+
+    fn qty_sold(
+        &self,
+        _target: &TargetId,
+        item: &ItemRef,
+        _days: i64,
+        _category: amtracker_core::domain::Category,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(self.units.lock().unwrap().get(item).copied())
     }
 
     fn sale_recency(
@@ -1797,6 +1810,16 @@ impl SalesRepository for CountingSales {
             return Err(StoreError::Backend("sales store unavailable".into()));
         }
         Ok(items.iter().map(|i| if *i == item(1) { Some(0.25) } else { None }).collect())
+    }
+
+    fn qty_sold(
+        &self,
+        _target: &TargetId,
+        _item: &ItemRef,
+        _days: i64,
+        _category: amtracker_core::domain::Category,
+    ) -> Result<Option<i64>, StoreError> {
+        Ok(None)
     }
 }
 

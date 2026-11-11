@@ -415,6 +415,68 @@ pub trait SalesRepository: Send + Sync {
         }
         Ok(rates)
     }
+    /// Units credited as sold within the trailing day window, for one
+    /// identity and category — credited vanish quantities plus commodity
+    /// partial-fill deltas. `Ok(None)` when the identity has no sales rows
+    /// at all; `Ok(Some(0))` means rows exist but nothing sold.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the ledger cannot be read.
+    fn qty_sold(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        days: i64,
+        category: Category,
+    ) -> Result<Option<i64>, StoreError>;
+    /// Units sold for EACH of the given identities, positionally aligned
+    /// (`units[i]` belongs to `items[i]`); `None` entries have no sales
+    /// rows. Batched twin of [`SalesRepository::qty_sold`]. Scoped to one
+    /// category.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the ledger cannot be read.
+    fn qty_sold_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Vec<Option<i64>>, StoreError> {
+        // Correct-by-default fallback: one query per identity.
+        let mut units = Vec::with_capacity(items.len());
+        for item in items {
+            units.push(self.qty_sold(target, item, days, category)?);
+        }
+        Ok(units)
+    }
+    /// Units sold summed over several item identities (pet variants of one
+    /// species share their market) within one category. `Ok(None)` when
+    /// none of the items has sales rows.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the ledger cannot be read.
+    fn qty_sold_multi(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Option<i64>, StoreError> {
+        // Correct-by-default fallback: pool the per-identity readings.
+        let mut total = 0i64;
+        let mut any = false;
+        for units in self.qty_sold_each(target, items, days, category)?.into_iter().flatten() {
+            any = true;
+            // Saturating: one absurd day must not overflow the species
+            // sum (debug builds panic on overflow).
+            total = total.saturating_add(units);
+        }
+        Ok(if any { Some(total) } else { None })
+    }
     /// Ledger recency for one identity: the last credited-sale day and the
     /// net closures since, in one category. `Ok(None)` when no sale was ever
     /// credited (items with sales rows but zero credits read as `None` too —

@@ -302,7 +302,7 @@ AuctiMoggerTrackerFeed = {
     { itemID = 194784, category = "commodity", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200,
       median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366,
       qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000,
-      daysSinceLastSale = 9, closuresSinceLastSale = 14 } } },
+      daysSinceLastSale = 9, closuresSinceLastSale = 14, qtySold = 220 } } },
     { kind = "pet", speciesID = 2546, level = 1, qualityID = 3, breedID = 11,
       category = "pet",
       metrics = { /* same block shape */ } },
@@ -322,7 +322,15 @@ days — the slow demand window), and the ledger-recency pair
 credited a sale, and how many listings closed after it — the "stopped
 selling" churn signal; the TSM `NumExpires` analog; counted from the sold
 listing's first-sighting day, so it includes the listing's time on market).
-In the Lua feed all three are **absent when the ledger has no evidence** —
+`qtySold` (estimated units sold over the span window — credited vanish
+quantities plus commodity partial fills, booked on the day the units left
+the market; the direct "how fast does this market absorb stock" volume
+signal; `null`/absent when the identity has no sales rows at all — never
+confused with a genuine zero). `saleRate`'s denominator counts only
+credit-eligible listings (last seen in a band whose lower bound clears the
+one-hour poll cadence, or actually credited): SHORT/MEDIUM last sightings
+can never produce a credit at that cadence and would dilute the rate.
+In the Lua feed all four are **absent when the ledger has no evidence** —
 never zero, so "missing" and "genuinely zero" stay distinguishable; the
 JSON feed and the metrics API serialize the same absence as explicit
 `null`s. The executable source of truth:

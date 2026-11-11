@@ -556,9 +556,11 @@ fn spec_schemas_market() -> Value {
         "MetricBlock": {
             "description": concat!("Nearest-rank price statistics over one span window; all price fields are integer copper. ",
                                    "n is unique auctions folded (dedup'd per day), vwap is the quantity-weighted mean ",
-                                   "(median fallback when qty is 0), saleRate is the trailing-14d sell-through fraction and ",
-                                   "saleRate180d the same estimator over 180 days (the slow demand window). ",
-                                   "daysSinceLastSale/closuresSinceLastSale are ledger recency (null = no credited sale ever)."),
+                                   "(median fallback when qty is 0), saleRate is the trailing-14d sell-through fraction ",
+                                   "over credit-eligible listings and saleRate180d the same estimator over 180 days ",
+                                   "(the slow demand window). daysSinceLastSale/closuresSinceLastSale are ledger recency ",
+                                   "(null = no credited sale ever); qtySold is the estimated units sold in the span ",
+                                   "window (null = no sales rows at all)."),
             "type": "object",
             "properties": {
                 "n": { "type": "integer" },
@@ -576,7 +578,8 @@ fn spec_schemas_market() -> Value {
                 "saleRate": { "type": ["number", "null"], "description": "0..1; null when no sightings exist." },
                 "saleRate180d": { "type": ["number", "null"], "description": "0..1 over 180 days; null when the window has no sighting evidence." },
                 "daysSinceLastSale": { "type": ["integer", "null"], "description": "Whole days since the ledger last credited a sale; null = never sold." },
-                "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale; null alongside daysSinceLastSale." }
+                "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale; null alongside daysSinceLastSale." },
+                "qtySold": { "type": ["integer", "null"], "description": "Estimated units sold in the span window (credited vanishes + commodity partial fills); null = no sales rows at all." }
             }
         },
         "Opportunity": {

@@ -1522,8 +1522,9 @@ async fn item_detail_page(
         ("mad", "Median absolute deviation — how spread prices are around the median (low = stable market)."),
         ("vwap", "Volume-weighted average price: Σ(price × qty) ÷ Σqty over the window."),
         ("qty", "Summed quantity across the window's auctions."),
-        ("sale rate", "Estimated sell-through over 14 days: fraction of daily sightings that vanish and stay gone long enough to count as sold. “—” = no sell-through evidence yet."),
+        ("sale rate", "Estimated sell-through over 14 days: fraction of credit-eligible listings (last seen with ≥2h left) that vanish early enough to count as sold. Listings whose last sighting was a SHORT/MEDIUM band cannot clear the hourly poll cadence and stay out of both numerator and denominator. “—” = no sell-through evidence yet."),
         ("sale rate 180d", "The same estimator over 180 days — the slow, stable demand signal that validates (or discounts) a hot 14-day rate. “—” = the ledger has no 180-day sighting evidence yet."),
+        ("units sold", "Estimated units the market absorbed over the span window: credited vanish quantities plus commodity partial fills, booked on the day units left the market. The direct “how fast will it be bought” volume signal. “—” = no sales rows at all."),
         ("days since sale", "Whole days since the ledger last credited a sale (the quiet-stretch clock; TSM's NumExpires analog). “—” = no sale ever credited — a young ledger is not evidence of a stalled market."),
         ("closures", "Listings that closed after that last credited sale — how long the quiet stretch has been running."),
     ] {
@@ -1538,6 +1539,7 @@ async fn item_detail_page(
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
              <td class=\"num\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+             <td class=\"num\" data-v=\"{}\">{}</td>\
              <td class=\"num\" data-v=\"{}\">{}</td>\
              <td class=\"num\" data-v=\"{}\">{}</td>\
              <td class=\"num\" data-v=\"{}\">{}</td>\
@@ -1558,6 +1560,8 @@ async fn item_detail_page(
             block.sale_rate.map_or_else(|| "—".into(), |rate| format!("{rate:.2}")),
             block.sale_rate_180d.unwrap_or(-1.0),
             block.sale_rate_180d.map_or_else(|| "—".into(), |rate| format!("{rate:.2}")),
+            block.qty_sold.unwrap_or(-1),
+            block.qty_sold.map_or_else(|| "—".into(), |units| format!("{units}")),
             block.days_since_last_sale.unwrap_or(-1),
             block.days_since_last_sale.map_or_else(|| "—".into(), |days| format!("{days}")),
             block.closures_since_last_sale.unwrap_or(-1),

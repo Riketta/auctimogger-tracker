@@ -101,6 +101,7 @@ pub fn block_from_histograms(
         listing_count: n,
         sale_rate: ledger.sale_rate,
         sale_rate_180d: ledger.sale_rate_slow,
+        qty_sold: ledger.qty_sold,
         days_since_last_sale: ledger.days_since_last_sale,
         closures_since_last_sale: ledger.closures_since_last_sale,
     })
