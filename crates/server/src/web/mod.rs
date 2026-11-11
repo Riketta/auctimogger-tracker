@@ -97,6 +97,9 @@ pub struct AppState {
     /// Whole-watchlist market reports (blocks, sale rates, trends) behind
     /// the live watchlist page and `/api/watchlist/metrics`.
     pub watchlist_report: Arc<amtracker_core::services::watchlist_report::WatchlistReportService>,
+    /// Sell-priority ranking over the watchlist behind the `/priorities`
+    /// page and `/api/priorities`.
+    pub sell_priority: Arc<amtracker_core::services::sell_priority::SellPriorityService>,
     /// Alert rule evaluation + CRUD behind the scheduler's post-cycle pass
     /// and the `/alerts` page/API.
     pub alerts: Arc<amtracker_core::services::alert::AlertEvaluationService>,
@@ -215,6 +218,7 @@ pub fn api_routes() -> Vec<ApiRoute> {
                 .delete(api::api_watchlist_delete),
         ),
         ("/api/watchlist/metrics", &["get"], get(api::api_watchlist_metrics)),
+        ("/api/priorities", &["get"], get(api::api_priorities)),
         ("/api/snapshots", &["get"], get(api::api_snapshots)),
         ("/api/schedule", &["get"], get(api::api_schedule)),
         (
@@ -244,6 +248,7 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/opportunities", get(pages::opportunities_page))
         .route("/overview", get(pages::overview_page))
         .route("/watchlist", get(pages::watchlist_page))
+        .route("/priorities", get(pages::priorities_page))
         .route("/alerts", get(pages::alerts_page))
         .route("/help", get(pages::help_page))
         .route("/assets/app.css", get(assets::asset_css))

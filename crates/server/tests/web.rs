@@ -311,6 +311,12 @@ fn test_state_with_config(
                 clock.clone(),
             ),
         ),
+        sell_priority: Arc::new(amtracker_core::services::sell_priority::SellPriorityService::new(
+            store.clone(),
+            metrics.clone(),
+            store.clone(),
+            clock.clone(),
+        )),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),
             store.clone(),
@@ -939,6 +945,63 @@ async fn watchlist_metrics_api_joins_entries_to_market_numbers() {
 
     let (status, _) =
         get(build_router_arc(Arc::clone(&state)), "/api/watchlist/metrics?target=bogus").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown target rejected");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The sell-priority API ranks the watchlist best-first; the page twin
+/// renders the same order.
+#[tokio::test]
+async fn priorities_api_and_page_rank_the_watchlist() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    let target = TargetId(TARGET.into());
+    // A second, flat fish: fold only yesterday at 100 — momentum 0, no
+    // sales ledger entries → score 0, ranked behind the hot item.
+    let flat = ItemRef::Item { item_id: 300 };
+    let mut fold = DayFold::new(flat.clone());
+    let listings: Vec<NormalizedListing> = (0..4).map(|n| listing(2000 + n, &flat, 100)).collect();
+    fold.apply(&listings);
+    state
+        .history
+        .save_fold(&target, &flat, utc_day(state.clock.now()) - 1, Category::Commodity, &fold)
+        .expect("save fold");
+    state.watchlist.add(&target, flat.clone(), Some("stale".into())).expect("watch flat");
+    state.watchlist.add(&target, ItemRef::Item { item_id: 2589 }, None).expect("watch hot");
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/api/priorities?target=t1&category=commodity")
+            .await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let entries = json.get("entries").and_then(Value::as_array).expect("entries array");
+    assert_eq!(entries.len(), 2, "both watchlist entries rank");
+    let first = &entries[0];
+    assert_eq!(first.pointer("/item/itemID").and_then(Value::as_i64), Some(2589), "hot first");
+    let score = first.get("score").expect("scored entry");
+    let value = score.get("value").and_then(Value::as_f64).expect("score value");
+    // d7 pools 8 listings (100×4, 200×4 → median 150): momentum +1/3,
+    // liquidity/recency 0 → 100 · 0.3 · 1/3 = 10.
+    assert!((value - 10.0).abs() < 1e-6, "score {value}");
+    assert_eq!(first.get("thinData").and_then(Value::as_bool), Some(true));
+    let second = &entries[1];
+    assert_eq!(second.pointer("/item/itemID").and_then(Value::as_i64), Some(300));
+    let flat_score = second.get("score").and_then(|s| s.get("value")).and_then(Value::as_f64);
+    assert_eq!(flat_score, Some(0.0), "flat price, no sales: score 0");
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/priorities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("2589"), "the ranked page links the hot item");
+    assert!(body.contains("300"), "the ranked page links the flat item");
+    assert!(body.contains("score"), "the score column renders");
+    // Hot item ranks first: its row must appear before the flat one.
+    let hot_at = body.find("2589").expect("hot present");
+    let flat_at = body.find("300").expect("flat present");
+    assert!(hot_at < flat_at, "page order matches the API order");
+
+    let (status, _) =
+        get(build_router_arc(Arc::clone(&state)), "/api/priorities?target=bogus").await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "unknown target rejected");
     std::fs::remove_dir_all(&root).ok();
 }

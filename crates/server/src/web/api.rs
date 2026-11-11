@@ -1114,6 +1114,63 @@ fn days_param(params: &HashMap<String, String>, key: &str, default: i64) -> i64 
     params.get(key).and_then(|v| v.parse::<i64>().ok()).map_or(default, |v| v.clamp(1, 90))
 }
 
+/// `GET /api/priorities?target=&category=` — the watchlist ranked for
+/// selling: score + components, current-day median, the week block and the
+/// trend rows. Same service as the `/priorities` page, so page and API can
+/// never disagree about the order.
+pub(crate) async fn api_priorities(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let category = match category_option(&params) {
+        Ok(Some(category)) => category,
+        Ok(None) => Category::Item,
+        Err(response) => return *response,
+    };
+    let ranked = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.sell_priority.ranked(&target, category)
+    });
+    match ranked.await {
+        Ok(Ok(entries)) => Json(serde_json::json!({
+            "target": target.as_str(),
+            "category": category.as_str(),
+            "entries": entries.iter().map(|entry| serde_json::json!({
+                "item": item_json(&entry.entry.item),
+                "note": entry.entry.note,
+                "addedAt": entry.entry.added_at,
+                "score": entry.score.as_ref().map(|score| serde_json::json!({
+                    "value": score.value,
+                    "liquidity": score.liquidity,
+                    "momentum": score.momentum,
+                    "recency": score.recency,
+                })),
+                "thinData": entry.thin_data,
+                "now": entry.now,
+                "week": entry.week.as_ref().map(metric_block_json),
+                "trend": entry.trend.iter().map(|row| serde_json::json!({
+                    "day": row.day,
+                    "listingCount": row.listing_count,
+                    "qtySum": row.qty_sum,
+                    "min": row.min,
+                    "median": row.median,
+                    "mad": row.mad,
+                }))
+                .collect::<Vec<_>>(),
+            }))
+            .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Ok(Err(error)) => internal_error("priorities", &error),
+        Err(error) => internal_error("priorities-join", &error),
+    }
+}
+
 #[derive(Deserialize)]
 pub(crate) struct WatchlistPost {
     target: String,

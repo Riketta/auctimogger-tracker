@@ -566,6 +566,12 @@ fn build_app_state(
                 clock.clone(),
             ),
         ),
+        sell_priority: Arc::new(amtracker_core::services::sell_priority::SellPriorityService::new(
+            store.clone(),
+            metrics.clone(),
+            store.clone(),
+            clock.clone(),
+        )),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),
             store.clone(),

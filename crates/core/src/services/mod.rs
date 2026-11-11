@@ -10,6 +10,7 @@ pub mod health;
 pub mod metrics;
 pub mod opportunity;
 pub mod search;
+pub mod sell_priority;
 pub mod snapshot_browse;
 pub mod watchlist;
 pub mod watchlist_report;

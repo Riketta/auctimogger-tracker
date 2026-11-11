@@ -298,6 +298,7 @@ pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> 
         ("/opportunities", "opportunities", "opportunities"),
         ("/overview", "overview", "overview"),
         ("/watchlist", "watchlist", "watchlist"),
+        ("/priorities", "priorities", "priorities"),
         ("/alerts", "alerts", "alerts"),
         ("/snapshots", "snapshots", "snapshots"),
     ];

@@ -460,6 +460,17 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
                 ok_json(json!({ "type": "object" })),
             ),
         },
+        "/api/priorities": {
+            "get": get_op(
+                "Sell priorities",
+                "The target's watchlist ranked best sell first: score (50% liquidity + 30% momentum + 20% recency) with its components, current-day median, week block and trend rows. Best sell first; entries without fold data last with a null score.",
+                vec![
+                    target.clone(),
+                    json!({ "name": "category", "in": "query", "required": false, "description": "One market category; default item. Unknown names are rejected with 400.", "schema": { "type": "string" } }),
+                ],
+                ok_json(json!({ "type": "object" })),
+            ),
+        },
         "/api/alerts": {
             "get": get_op(
                 "Alert rules and events",

@@ -2475,3 +2475,150 @@ fn snapshot_browse_clamps_pages_and_passes_the_query_through() {
         .expect("item filter");
     assert_eq!(page.total, 0, "an item-id filter never matches pet identities");
 }
+
+// ------------------------------------------------------------- sell priority
+
+#[test]
+fn sell_priority_ranks_hot_first_and_flags_thin_data() {
+    use amtracker_core::services::sell_priority::SellPriorityService;
+
+    let today = 1_000_000; // utc day 11
+    let target = TargetId("us-4".into());
+    let hot = item(1);
+    let dead = item(2);
+    let unseen = item(3);
+
+    let watchlist = Arc::new(FakeWatchlist::default());
+    for (item, note) in [
+        (&dead, Some("stale".to_string())),
+        (&hot, Some("prime fish".to_string())),
+        (&unseen, None),
+    ] {
+        watchlist
+            .add(&NewWatchlistEntry {
+                target: target.clone(),
+                item: item.clone(),
+                note: note.clone(),
+            })
+            .expect("add entry");
+    }
+
+    let history = Arc::new(FakeHistory::default());
+    // `hot`: folds yesterday at 100, today at 150 (momentum +50%).
+    for (offset, price) in [(1_i64, 100_i64), (0, 150)] {
+        let mut fold = DayFold::new(hot.clone());
+        fold.apply(&[listing(10 + offset, &hot, price, 1)]);
+        history
+            .save_fold(&target, &hot, utc_day(today) - offset, Category::Commodity, &fold)
+            .expect("save fold");
+    }
+    // `dead`: fold only in the week window (yesterday), flat price.
+    let mut fold = DayFold::new(dead.clone());
+    fold.apply(&[listing(20, &dead, 100, 1)]);
+    history
+        .save_fold(&target, &dead, utc_day(today) - 1, Category::Commodity, &fold)
+        .expect("save fold");
+
+    // `unseen` stays on the watchlist but never gets folds.
+
+    // Trend rows (the fake's separate store): one per fold day, in-window,
+    // plus one far outside it that the ranking must exclude.
+    let day_row = |item: &ItemRef, offset: i64, median: i64| ItemDayRow {
+        item: item.clone(),
+        category: Category::Commodity,
+        day: utc_day(today) - offset,
+        listing_count: 1,
+        qty_sum: 1,
+        min: median,
+        p05: median,
+        median,
+        mad: 0,
+    };
+    *history.item_rows.lock().unwrap() =
+        vec![day_row(&hot, 0, 150), day_row(&hot, 1, 100), day_row(&hot, 40, 500)];
+
+    let sales = Arc::new(FakeSales::default());
+    sales.rates.lock().unwrap().insert(hot.clone(), 0.8);
+    sales.rates.lock().unwrap().insert(dead.clone(), 0.0);
+    // `hot` sold today (recency 1.0); `dead` never sold (recency 0).
+    sales.recencies.lock().unwrap().insert(
+        hot.clone(),
+        amtracker_core::domain::SaleRecency { last_sale_day: utc_day(today), closures_since: 0 },
+    );
+
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history.clone(),
+        Arc::new(FakeCache::default()),
+        sales.clone(),
+        Arc::new(FixedClock(today)),
+    ));
+    let service =
+        SellPriorityService::new(watchlist, metrics, history.clone(), Arc::new(FixedClock(today)));
+
+    let ranked = service.ranked(&target, Category::Commodity).expect("ranked");
+
+    assert_eq!(ranked.len(), 3, "all watchlist entries rank, unscored last");
+    assert_eq!(ranked[0].entry.item, hot, "hot fish sells first");
+    assert_eq!(ranked[1].entry.item, dead);
+    assert_eq!(ranked[2].entry.item, unseen, "no-data entries rank last");
+
+    let score = ranked[0].score.as_ref().expect("hot has data");
+    // d7 pools the week's listings (100, 150 → median 125), so momentum is
+    // +0.2 and the score is 100 * (0.5*0.8 + 0.3*0.2 + 0.2*1.0) = 66.
+    assert!((score.value - 66.0).abs() < 1e-6, "score {}", score.value);
+    assert!((score.liquidity - 0.8).abs() < 1e-6);
+    assert!((score.momentum - 0.2).abs() < 1e-6);
+    assert!((score.recency - 1.0).abs() < 1e-6);
+    assert!(ranked[0].thin_data, "one fold per day is thin evidence");
+    assert_eq!(ranked[0].now, Some(150));
+    assert_eq!(ranked[0].trend.len(), 2, "both fold days sit in the window");
+    assert_eq!(ranked[0].trend[0].day, utc_day(today) - 1, "trend rows sort by day");
+    assert_eq!(ranked[0].trend[1].median, 150, "the 40-day-old row is outside");
+
+    let dead_score = ranked[1].score.as_ref().expect("dead has fold data");
+    assert!((dead_score.value - 0.0).abs() < 1e-6, "no liquidity, no momentum, never sold");
+    assert!((dead_score.recency - 0.0).abs() < 1e-6);
+
+    assert!(ranked[2].score.is_none(), "unseen identity cannot be scored");
+    assert_eq!(ranked[2].trend.len(), 0);
+}
+
+#[test]
+fn sell_priority_empty_watchlist_is_empty_and_score_survives_a_missing_week() {
+    use amtracker_core::services::sell_priority::SellPriorityService;
+
+    let today = 1_000_000;
+    let target = TargetId("us-4".into());
+    let watched = item(7);
+
+    let history = Arc::new(FakeHistory::default());
+    let mut fold = DayFold::new(watched.clone());
+    fold.apply(&[listing(1, &watched, 200, 1)]);
+    history.save_fold(&target, &watched, utc_day(today), Category::Item, &fold).expect("save fold");
+
+    let watchlist = Arc::new(FakeWatchlist::default());
+    watchlist
+        .add(&NewWatchlistEntry { target: target.clone(), item: watched.clone(), note: None })
+        .expect("add entry");
+
+    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
+        history.clone(),
+        Arc::new(FakeCache::default()),
+        Arc::new(FakeSales::default()),
+        Arc::new(FixedClock(today)),
+    ));
+    let service =
+        SellPriorityService::new(watchlist, metrics, history.clone(), Arc::new(FixedClock(today)));
+
+    let empty = service.ranked(&TargetId("other".into()), Category::Item).expect("other target");
+    assert!(empty.is_empty(), "a target without a watchlist ranks nothing");
+
+    // Today-only fold: d1 exists, d7 is the same 7-day window (so it has
+    // data too on this clock) — but a sale-less block still scores with
+    // liquidity 0 and recency 0: momentum 0 (flat), all from real blocks.
+    let ranked = service.ranked(&target, Category::Item).expect("ranked");
+    assert_eq!(ranked.len(), 1);
+    let score = ranked[0].score.as_ref().expect("d1 data exists");
+    assert!((score.value - 0.0).abs() < 1e-6, "flat price, no sales: score 0");
+    assert!(ranked[0].thin_data, "a single auction is thin evidence");
+}

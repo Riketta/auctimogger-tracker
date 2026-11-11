@@ -37,6 +37,7 @@ use amtracker_core::{
     },
     error::StoreError,
     metrics::block_from_histograms,
+    services::sell_priority::PriorityScore,
 };
 use axum::{
     extract::{
@@ -2147,6 +2148,167 @@ pub(crate) async fn watchlist_page(
         );
     }
     page("watchlist", "watchlist", &body, Some(switcher))
+}
+
+// ---------------------------------------------------------------- priorities
+
+/// `GET /priorities?target=&category=` — the watchlist ranked for selling:
+/// score = 50% liquidity + 30% momentum + 20% recency, all from the same
+/// cached metric blocks the watchlist page shows. The dashboard companion
+/// to the watchlist management table — "what do I sell first".
+pub(crate) async fn priorities_page(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let category = match category_param(&params, Category::Item) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
+    let ranked = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.sell_priority.ranked(&target, category)
+    });
+    let ranked = match ranked.await {
+        Ok(Ok(ranked)) => ranked,
+        Ok(Err(error)) => return render::store_error_page(error).await,
+        Err(error) => {
+            return render::store_error_page(StoreError::Backend(error.to_string())).await
+        }
+    };
+    let names = resolve_names(
+        &state,
+        &super::target_flavor(&state.config, &target),
+        &ranked.iter().map(|row| row.entry.item.clone()).collect::<Vec<_>>(),
+    )
+    .await;
+    let switcher = format!(
+        "{}{}",
+        target_switcher(&state.config, "/priorities", &target, &[("category", category.as_str())]),
+        render::category_switcher("/priorities", &[("target", target.as_str())], category)
+    );
+
+    let score_tip = "50% liquidity (14d sale rate) + 30% momentum (today vs the 7-day median, \
+                     negatives count 0) + 20% recency (1/(1+days since last sale))";
+    let mut body = format!(
+        "<p class=\"muted\">{} <code>{}</code> — {}</p>",
+        tip("sell priorities", "Your watchlist ranked for selling."),
+        html_escape(target.as_str()),
+        tip("score", score_tip)
+    );
+    if ranked.is_empty() {
+        let _ = write!(
+            body,
+            "<div class=\"empty\">nothing watched on this target yet — rank your favourites \
+             from the {} first</div>",
+            html_escape("watchlist")
+        );
+    } else {
+        body.push_str("<div class=\"scroll-x\"><table id=\"priorities\"><thead><tr>");
+        for (label, tip_text) in [
+            ("#", "Rank: best sell first (score descending)."),
+            ("item", "Watched item or pet variant."),
+            (
+                "score",
+                "Sell priority 0–100: liquidity + momentum + recency (components in the tooltip; \
+                 a ~ marks a thin-data rank).",
+            ),
+            (
+                "now (d1)",
+                "Median unit price of the current UTC day-to-date — thin right after midnight.",
+            ),
+            (
+                "median d7",
+                "Median unit price over the trailing 7 days: what this item normally sells for.",
+            ),
+            (
+                "Δ vs d7",
+                "How today's median compares to the 7-day median: positive means trading above \
+                 its weekly norm — sell now.",
+            ),
+            (
+                "sale rate 14d",
+                "Share of this item's listings credited as sold within the last 14 days.",
+            ),
+            (
+                "last sale",
+                "Whole days since the ledger last credited a sale — the 'stopped selling' churn \
+                 signal. — = no sale ever credited.",
+            ),
+            ("trend 30d", "Daily medians over the last 30 days."),
+            ("note", "Your free-form note."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        for (rank, row) in ranked.iter().enumerate() {
+            let week = row.week.as_ref();
+            let delta = match (row.now, week) {
+                (Some(now), Some(week)) if week.median > 0 => {
+                    #[allow(clippy::cast_precision_loss)]
+                    let pct = (now - week.median) as f64 / week.median as f64 * 100.0;
+                    format!("<span class=\"num\" data-v=\"{pct:.1}\">{pct:+.1}%</span>")
+                }
+                _ => "—".to_string(),
+            };
+            let score = match row.score {
+                Some(score) => {
+                    let thin = if row.thin_data { " <span class=\"muted\">~</span>" } else { "" };
+                    let PriorityScore { value, liquidity, momentum, recency } = score;
+                    format!(
+                        "<span class=\"num\" data-v=\"{value:.1}\" data-tip=\"liquidity {liquidity:.2} · momentum {momentum:+.2} · recency {recency:.2}\">{value:.0}</span>{thin}"
+                    )
+                }
+                None => "—".to_string(),
+            };
+            let days = row.week.as_ref().and_then(|block| block.days_since_last_sale);
+            let _ = write!(
+                body,
+                "<td class=\"num\" data-v=\"{}\">{}</td>{}{}\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td>{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td>{}</td>\
+                 <td class=\"muted\">{}</td>",
+                rank + 1,
+                rank + 1,
+                render::item_cell(&target, &row.entry.item, &names),
+                score,
+                row.now.map_or(String::new(), |v| v.to_string()),
+                row.now.map_or("—".to_string(), money),
+                week.map_or(String::new(), |w| w.median.to_string()),
+                week.map_or("—".to_string(), |w| money(w.median)),
+                delta,
+                week.and_then(|w| w.sale_rate).map_or(String::new(), |rate| format!("{rate:.2}")),
+                week.and_then(|w| w.sale_rate)
+                    .map_or("—".to_string(), |rate| format!("{:.0}%", rate * 100.0)),
+                days.map_or("—".to_string(), |d| d.to_string()),
+                html_escape(row.entry.note.as_deref().unwrap_or("")),
+            );
+            let medians: Vec<i64> = {
+                let mut days: Vec<&amtracker_core::domain::ItemDayRow> = row.trend.iter().collect();
+                days.sort_unstable_by_key(|day| day.day);
+                days.iter().map(|day| day.median).collect()
+            };
+            let _ = write!(body, "<td>{}</td></tr>", sparkline(&medians));
+        }
+        body.push_str("</tbody></table></div>");
+        let _ = write!(
+            body,
+            "<p class=\"muted\">{} · {}</p>",
+            tip("~", "Thin data: fewer than 30 auctions in a window — treat the rank as a guess."),
+            tip(
+                "component tooltips",
+                "Hover the score to see the liquidity/momentum/recency split behind it."
+            )
+        );
+    }
+    page("sell priorities", "priorities", &body, Some(switcher))
 }
 
 // -------------------------------------------------------------------- alerts
