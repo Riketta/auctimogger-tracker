@@ -240,9 +240,9 @@ pub fn fetch_auction_houses(
 
 #[cfg(test)]
 mod tests {
-    // Test assertions may unwrap/expect: fixture-driven, deterministic inputs
-    // (the blizzard_item_info precedent).
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    // Test assertions may unwrap/expect/panic and index: fixed synthetic
+    // inputs, not hostile data (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
 
     use super::*;
 
