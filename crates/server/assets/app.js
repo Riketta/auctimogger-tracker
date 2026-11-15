@@ -1,7 +1,8 @@
 /* auctimogger-tracker UI enhancement layer.
    Everything works without this file (server-rendered HTML is complete);
    the script adds sorting, completions, the interactive chart, target
-   switching and — in open-mutation mode — watchlist/fetch actions.
+   switching and mutation actions (live in open mode; on protected
+   instances the API key button unlocks them for the tab session).
    No dependencies, no build step. */
 "use strict";
 
@@ -273,8 +274,9 @@
   }
 
   // ------------------------------------------------------ mutation buttons
-  // Rendered only in open-mutation mode (no API token configured); when a
-  // token is required these elements are absent from the page entirely.
+  // Open instances render these live. Protected instances render them
+  // disabled with data-auth; the API key section below enables them once a
+  // token is stored for the tab session.
   $all("[data-watch-add]").forEach(function (button) {
     button.addEventListener("click", function () {
       act(button, "/api/watchlist", "POST", button.getAttribute("data-watch-add"));
@@ -325,25 +327,134 @@
     });
   });
 
-  function act(button, url, method, body) {
-    if (button.disabled) return;
-    button.disabled = true;
+  // ---------------------------------------------------------- API key layer
+  // Protected instances render mutation controls disabled (data-auth). The
+  // key button collects the instance's API token, keeps it in sessionStorage
+  // (per tab session: never persisted to disk, never sent anywhere but this
+  // origin) and attaches it as the Authorization header on mutations. A
+  // rejected (stale) token is cleared and re-asked on the next mutation.
+  var TOKEN_KEY = "amt_api_token";
+  function token() {
+    try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch (error) { return ""; }
+  }
+  function saveToken(value) {
+    try { sessionStorage.setItem(TOKEN_KEY, value); } catch (error) { /* private mode: keys stay unset */ }
+  }
+  function forgetToken() {
+    try { sessionStorage.removeItem(TOKEN_KEY); } catch (error) { /* same */ }
+  }
+
+  var keyButton = null;
+  function applyAuthState() {
+    var keyed = !!token();
+    $all("[data-auth]").forEach(function (control) {
+      if (keyed) control.removeAttribute("disabled");
+      else control.setAttribute("disabled", "disabled");
+    });
+    if (keyButton) {
+      keyButton.textContent = keyed ? "api key active" : "set api key";
+      keyButton.title = keyed
+        ? "API key stored for this tab — click to clear it"
+        : "mutations need the API token; click to enter it";
+      keyButton.classList.toggle("btn-danger", keyed);
+    }
+  }
+
+  if (document.querySelector("[data-auth]")) {
+    keyButton = document.createElement("button");
+    keyButton.className = "btn btn-sm key-affordance";
+    keyButton.addEventListener("click", function () {
+      if (token()) {
+        forgetToken();
+        applyAuthState();
+        return;
+      }
+      keyDialog("mutations on this instance need the API token", null);
+    });
+    document.body.appendChild(keyButton);
+    applyAuthState();
+  }
+
+  var dialog = null;
+  function closeKeyDialog() {
+    if (dialog) {
+      dialog.remove();
+      dialog = null;
+    }
+  }
+  function keyDialog(message, onSaved) {
+    if (dialog) return;
+    dialog = document.createElement("div");
+    dialog.className = "key-dialog";
+    dialog.innerHTML =
+      '<div class="card"><h3>api key</h3>' +
+      '<p class="muted">' + message + "</p>" +
+      '<input type="password" placeholder="bearer token" aria-label="API token">' +
+      '<div class="key-dialog-actions">' +
+      '<button class="btn btn-sm" type="button" data-save>save</button>' +
+      '<button class="btn btn-sm" type="button" data-cancel>cancel</button></div></div>';
+    var input = dialog.querySelector("input");
+    function save() {
+      var value = input.value.trim();
+      closeKeyDialog();
+      if (!value) return;
+      saveToken(value);
+      applyAuthState();
+      if (onSaved) onSaved();
+    }
+    dialog.querySelector("[data-save]").addEventListener("click", save);
+    dialog.querySelector("[data-cancel]").addEventListener("click", closeKeyDialog);
+    input.addEventListener("keydown", function (event) {
+      if (event.key === "Enter") save();
+      if (event.key === "Escape") closeKeyDialog();
+    });
+    document.body.appendChild(dialog);
+    input.focus();
+  }
+
+  function send(url, method, body, done) {
     var options = { method: method, headers: { "Content-Type": "application/json" } };
+    var key = token();
+    if (key) options.headers["Authorization"] = "Bearer " + key;
     if (body) options.body = body;
     fetch(url, options)
       .then(function (response) {
-        if (!response.ok) {
-          return response.text().then(function (text) {
-            throw new Error(text || ("HTTP " + response.status));
-          });
+        if (response.ok) {
+          done(null);
+          return;
         }
-        return response;
+        return response.text().then(function (text) {
+          if (response.status === 401) {
+            done(401, text);
+            return;
+          }
+          throw new Error(text || "HTTP " + response.status);
+        });
       })
-      .then(function () { window.location.reload(); })
-      .catch(function (error) {
-        window.alert("request failed: " + error.message);
-        button.disabled = false;
-      });
+      .catch(function (error) { done(0, error.message); });
+  }
+
+  function act(button, url, method, body) {
+    if (button.disabled) return;
+    button.disabled = true;
+    send(url, method, body, function (status, text) {
+      if (status === null) {
+        window.location.reload();
+        return;
+      }
+      if (status === 401) {
+        // Missing or stale key: clear it, ask once, retry the request.
+        forgetToken();
+        applyAuthState();
+        keyDialog("token rejected — enter the API key", function () {
+          button.disabled = false;
+          act(button, url, method, body);
+        });
+        return;
+      }
+      window.alert("request failed: " + (text || "HTTP " + status));
+      button.disabled = false;
+    });
   }
 
   // ------------------------------------------------------------ CSV export

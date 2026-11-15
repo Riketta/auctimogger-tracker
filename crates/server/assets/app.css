@@ -271,6 +271,12 @@ td.best {
 .btn:hover { background: var(--surface-3); border-color: var(--faint); text-decoration: none; }
 .btn:active { transform: translateY(1px); }
 .btn[disabled] { opacity: .55; cursor: wait; }
+.btn[disabled][data-auth] { cursor: not-allowed; }
+.key-affordance { position: fixed; right: 1rem; bottom: 1rem; z-index: 40; }
+.key-dialog { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: rgba(0, 0, 0, .45); }
+.key-dialog .card { width: min(24rem, calc(100vw - 2rem)); margin: 0; }
+.key-dialog input { width: 100%; margin-top: .4rem; }
+.key-dialog-actions { display: flex; gap: .4rem; margin-top: .6rem; }
 .btn-primary { background: var(--accent-soft); border-color: transparent; color: var(--accent); }
 .btn-primary:hover { background: rgba(90, 162, 255, 0.24); }
 .btn-danger { color: var(--bad); }

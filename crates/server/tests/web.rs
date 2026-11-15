@@ -901,6 +901,45 @@ async fn protected_mode_rejects_unauthenticated_mutations() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Protected instances render the mutation controls disabled (not absent):
+/// the browser key layer enables them once a token is stored for the tab.
+/// The server side stays token-blind — only the `data-auth` marker ships.
+#[tokio::test]
+async fn protected_pages_render_disabled_mutation_controls() {
+    const TOKEN_ENV: &str = "AMT_WEB_TEST_TOKEN_UI";
+    std::env::set_var(TOKEN_ENV, "s3cret");
+    let (state, root) = test_state(Some(TOKEN_ENV.into()));
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, dashboard) = get(router.clone(), "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(dashboard.contains("data-fetch-now="), "fetch-now always renders");
+    assert!(dashboard.contains("data-auth=\"1\" disabled"), "fetch-now disabled until keyed");
+
+    let (status, alerts) = get(router.clone(), "/alerts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(alerts.contains("data-alert-form"), "the rule form always renders");
+    assert!(alerts.contains("data-auth=\"1\" disabled"), "add-rule submit disabled until keyed");
+
+    let (status, item) = get(router.clone(), "/items/t1/2589").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item.contains("data-watch-add="), "watch button always renders");
+    assert!(item.contains("data-auth=\"1\" disabled"), "watch disabled until keyed");
+    assert!(!item.contains("amt_api_token"), "the storage key name never ships server-side");
+
+    std::env::remove_var(TOKEN_ENV);
+    std::fs::remove_dir_all(&root).ok();
+
+    // Open mode: the same controls render live, with no auth markers at all.
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, item) = get(router, "/items/t1/2589").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(item.contains("data-watch-add="));
+    assert!(!item.contains("data-auth"), "open instances render no auth markers");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The live watchlist report: entries join to metric blocks, sale rates and
 /// trend rows, positionally in watchlist order — the JSON contract behind the
 /// watchlist page columns.

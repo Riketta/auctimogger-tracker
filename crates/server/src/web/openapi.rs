@@ -741,8 +741,9 @@ fn build_docs_body() -> String {
     let mut body = String::from(
         "<p class=\"muted\">Machine-readable: <a href=\"/api/openapi.json\">/api/openapi.json</a> \
          (OpenAPI 3.1) · <a href=\"/api\">/api</a> (endpoint directory). \
-         Reads are unauthenticated; mutations need <code>Authorization: Bearer &lt;token&gt;</code> \
-         when token authentication is active. No rate limiting. \
+         Reads are unauthenticated; mutations need <code>Authorization: Bearer &lt;token&gt;</code> 
+         when token authentication is active (the web UI collects the token via its key 
+         button — held in sessionStorage for the browser tab, never persisted). No rate limiting. 
          All prices are integers in <strong>copper</strong> (10,000 copper = 1 gold); \
          <code>day</code> values are UTC day numbers (days since 1970-01-01).</p>\
          <div class=\"card\"><h3>python quickstart</h3>\

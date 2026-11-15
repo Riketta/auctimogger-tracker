@@ -120,21 +120,21 @@ fn watch_payload(target: &TargetId, item: &ItemRef) -> String {
     value.to_string()
 }
 
-/// Watch/unwatch button (open-mutation mode only — protected instances never
-/// render mutation controls).
+/// Watch/unwatch button. Open instances render it live; protected instances
+/// render it disabled for the browser key layer to enable (`app.js` unlocks
+/// `data-auth` controls once a token is stored — the token itself never
+/// reaches the server-rendered HTML).
 fn watch_button(open: bool, watched: bool, target: &TargetId, item: &ItemRef) -> String {
-    if !open {
-        return String::new();
-    }
+    let auth = if open { "" } else { " data-auth=\"1\" disabled" };
     let payload = html_escape(&watch_payload(target, item));
     if watched {
         format!(
-            "<button class=\"btn btn-sm btn-danger\" data-watch-remove='{payload}' \
+            "<button class=\"btn btn-sm btn-danger\" data-watch-remove='{payload}'{auth} \
              title=\"remove from watchlist (drives feed-slim.lua)\">unwatch</button>"
         )
     } else {
         format!(
-            "<button class=\"btn btn-sm\" data-watch-add='{payload}' \
+            "<button class=\"btn btn-sm\" data-watch-add='{payload}'{auth} \
              title=\"add to watchlist (drives feed-slim.lua)\">watch</button>"
         )
     }
@@ -285,15 +285,12 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
                 }
             }
         }
-        let fetch_button = if open {
-            format!(
-                "<button class=\"btn btn-sm\" data-fetch-now=\"{}\" \
-                 title=\"run one ingest cycle for this target right now\">fetch now</button>",
-                html_escape(target.id.as_str())
-            )
-        } else {
-            String::new()
-        };
+        let fetch_button = format!(
+            "<button class=\"btn btn-sm\" data-fetch-now=\"{}\"{} \
+             title=\"run one ingest cycle for this target right now\">fetch now</button>",
+            html_escape(target.id.as_str()),
+            if open { "" } else { " data-auth=\"1\" disabled" }
+        );
         let _ = write!(
             body,
             "<div style=\"margin-top:.6rem;display:flex;gap:.4rem;flex-wrap:wrap\">{fetch_button}</div>"
@@ -1570,9 +1567,9 @@ async fn item_detail_page(
     }
     body.push_str("</tbody></table></div>");
 
-    // Watch action (open mode only).
+    // Watch action: live in open mode, disabled-until-keyed in protected mode.
     let open = mutations_open(&state.config);
-    if open {
+    {
         let watched = tokio::task::spawn_blocking({
             let state = Arc::clone(&state);
             let target = target.clone();
@@ -1589,7 +1586,7 @@ async fn item_detail_page(
                 let _ = write!(
                     body,
                     "<p style=\"margin-top:1rem\">{}</p>",
-                    watch_button(true, watched, &target, &item)
+                    watch_button(open, watched, &target, &item)
                 );
             }
             Ok(Err(error)) => return render::store_error_page(error).await,
@@ -2545,42 +2542,45 @@ pub(crate) async fn alerts_page(
         }
         body.push_str("</tbody></table></div>");
     }
-    if open {
-        let _ = write!(
-            body,
-            "<h2>add rule</h2>\
-             <form data-alert-form data-target=\"{}\" class=\"alert-form\">\
-             <input name=\"itemID\" type=\"number\" min=\"1\" placeholder=\"item id\" aria-label=\"item id\">\
-             <input name=\"speciesID\" type=\"number\" min=\"1\" placeholder=\"pet species (optional)\" aria-label=\"pet species id\">\
-             <input name=\"level\" type=\"number\" placeholder=\"pet level\" aria-label=\"pet level\">\
-             <input name=\"qualityID\" type=\"number\" placeholder=\"pet quality\" aria-label=\"pet quality id\">\
-             <input name=\"breedID\" type=\"number\" placeholder=\"pet breed\" aria-label=\"pet breed id\">\
-             <select name=\"type\" aria-label=\"condition\">\
-             <option value=\"price-below\">d1 median ≤ copper</option>\
-             <option value=\"below-floor\">median ≤ floor percentile</option>\
-             <option value=\"sale-rate-above\">14d sale rate ≥ rate</option>\
-             <option value=\"days-since-last-sale-above\">days since last sale ≥ days</option>\
-             </select>\
-             <input name=\"copper\" type=\"number\" min=\"1\" placeholder=\"copper\" aria-label=\"copper threshold\">\
-             <select name=\"span\" aria-label=\"span\">\
-             <option value=\"d7\">d7</option><option value=\"d14\">d14</option>\
-             <option value=\"d30\">d30</option><option value=\"d1\">d1</option>\
-             </select>\
-             <select name=\"percentile\" aria-label=\"floor percentile\">\
-             <option value=\"p05\">p05</option><option value=\"p25\">p25</option>\
-             </select>\
-             <input name=\"rate\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" placeholder=\"rate\" aria-label=\"sale rate threshold\">\
-             <input name=\"days\" type=\"number\" min=\"1\" step=\"1\" placeholder=\"days\" aria-label=\"days since last sale threshold\">\
-             <input name=\"note\" placeholder=\"note (optional)\" aria-label=\"rule note\">\
-             <button class=\"btn btn-sm\" type=\"submit\">add rule</button>\
-             </form>\
-             <p class=\"muted\">pets: fill species + level + quality + breed (they share one market per species).</p>",
-            html_escape(target.as_str()),
-        );
-    } else {
+    // The form renders in both modes: protected instances render the submit
+    // button disabled until the browser key layer enables it (`app.js`).
+    let auth = if open { "" } else { " data-auth=\"1\" disabled" };
+    let _ = write!(
+        body,
+        "<h2>add rule</h2>\
+         <form data-alert-form data-target=\"{}\" class=\"alert-form\">\
+         <input name=\"itemID\" type=\"number\" min=\"1\" placeholder=\"item id\" aria-label=\"item id\">\
+         <input name=\"speciesID\" type=\"number\" min=\"1\" placeholder=\"pet species (optional)\" aria-label=\"pet species id\">\
+         <input name=\"level\" type=\"number\" placeholder=\"pet level\" aria-label=\"pet level\">\
+         <input name=\"qualityID\" type=\"number\" placeholder=\"pet quality\" aria-label=\"pet quality id\">\
+         <input name=\"breedID\" type=\"number\" placeholder=\"pet breed\" aria-label=\"pet breed id\">\
+         <select name=\"type\" aria-label=\"condition\">\
+         <option value=\"price-below\">d1 median ≤ copper</option>\
+         <option value=\"below-floor\">median ≤ floor percentile</option>\
+         <option value=\"sale-rate-above\">14d sale rate ≥ rate</option>\
+         <option value=\"days-since-last-sale-above\">days since last sale ≥ days</option>\
+         </select>\
+         <input name=\"copper\" type=\"number\" min=\"1\" placeholder=\"copper\" aria-label=\"copper threshold\">\
+         <select name=\"span\" aria-label=\"span\">\
+         <option value=\"d7\">d7</option><option value=\"d14\">d14</option>\
+         <option value=\"d30\">d30</option><option value=\"d1\">d1</option>\
+         </select>\
+         <select name=\"percentile\" aria-label=\"floor percentile\">\
+         <option value=\"p05\">p05</option><option value=\"p25\">p25</option>\
+         </select>\
+         <input name=\"rate\" type=\"number\" min=\"0\" max=\"1\" step=\"0.01\" placeholder=\"rate\" aria-label=\"sale rate threshold\">\
+         <input name=\"days\" type=\"number\" min=\"1\" step=\"1\" placeholder=\"days\" aria-label=\"days since last sale threshold\">\
+         <input name=\"note\" placeholder=\"note (optional)\" aria-label=\"rule note\">\
+         <button class=\"btn btn-sm\" type=\"submit\"{auth}>add rule</button>\
+         </form>\
+         <p class=\"muted\">pets: fill species + level + quality + breed (they share one market per species).</p>",
+        html_escape(target.as_str()),
+    );
+    if !open {
         body.push_str(
-            "<p class=\"muted\">this instance requires an API token, so rules are \
-             API-only: POST/DELETE /api/alerts with the bearer token</p>",
+            "<p class=\"muted\">this instance requires an API token: use the key button \
+             (bottom right) to enable these actions, or POST/DELETE /api/alerts with the \
+             bearer token directly</p>",
         );
     }
 
@@ -2616,13 +2616,12 @@ pub(crate) async fn alerts_page(
     page("alerts", "alerts", &body, Some(switcher))
 }
 
-/// Removal button for one alert rule (open mutation mode only).
+/// Removal button for one alert rule (disabled-until-keyed on protected
+/// instances, same contract as [`watch_button`]).
 fn alert_remove_button(open: bool, rule_id: i64) -> String {
-    if !open {
-        return String::new();
-    }
+    let auth = if open { "" } else { " data-auth=\"1\" disabled" };
     format!(
-        "<button class=\"btn btn-sm btn-danger\" data-alert-remove='{rule_id}' \
+        "<button class=\"btn btn-sm btn-danger\" data-alert-remove='{rule_id}'{auth} \
          title=\"remove this rule (its history stays)\">remove</button>"
     )
 }
@@ -2677,8 +2676,11 @@ pub(crate) async fn help_page() -> Response {
         let _ = write!(body, "<dt>{}</dt><dd>{}</dd>", html_escape(term), html_escape(definition));
     }
     body.push_str("</dl><h2>mutating API</h2><p class=\"muted\">When no API token is configured \
-         (open mode, localhost), the UI offers watchlist buttons and “fetch now”. With a token set, \
-         those actions stay API-only: <code>POST/DELETE /api/watchlist</code> and \
+         (open mode, localhost), the UI offers watchlist buttons and “fetch now” live. With a token set, \
+         those controls render disabled and the key button (bottom right) unlocks them: it asks for the \
+         bearer token once per browser tab session (sessionStorage — never persisted, never sent to \
+         anything but this origin) and attaches it as the <code>Authorization</code> header on mutations. \
+         Scripting stays equivalent: <code>POST/DELETE /api/watchlist</code> and \
          <code>POST /api/fetch?target=…</code> with the bearer token.</p>");
     page("help", "", &body, None)
 }
