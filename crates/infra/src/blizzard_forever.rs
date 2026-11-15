@@ -131,22 +131,64 @@ fn decode_list<T: serde::de::DeserializeOwned>(
         .map_err(|e| SourceError::Parse(format!("{what} row rejected: {e}")))
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct WireRuleset {
     id: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     status: Option<String>,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct WireHouse {
     id: i64,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     name: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_string")]
     key: Option<String>,
+}
+
+/// Decodes the string-ish fields of the unpublished Forever payloads
+/// leniently: a plain string passes through; a localized map
+/// (`{"en_US": …}`) or a Blizzard key object (`{"href": …}`) yields the
+/// `href`/`en_US` entry, falling back to the first string value; `null`
+/// yields `None`. Anything else is real shape drift and fails the row
+/// loudly instead of printing a wrong table.
+fn lenient_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::de::Error as _;
+
+    match Option::<serde_json::Value>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(serde_json::Value::String(text)) => Ok(Some(text)),
+        Some(serde_json::Value::Object(map)) => {
+            let picked = ["href", "en_US"]
+                .iter()
+                .find_map(|preferred| map.get(*preferred))
+                .or_else(|| map.values().find(|value| value.is_string()))
+                .and_then(|value| value.as_str());
+            match picked {
+                Some(text) => Ok(Some(text.to_owned())),
+                None => Err(D::Error::custom("string field object carried no string value")),
+            }
+        }
+        // `Value::unexpected` is private in serde_json, so classify here.
+        // Null cannot reach this arm: `Option<Value>` maps it to `None` above.
+        Some(other) => {
+            let found = match &other {
+                serde_json::Value::Bool(_) => "a boolean",
+                serde_json::Value::Number(_) => "a number",
+                serde_json::Value::Array(_) => "an array",
+                serde_json::Value::Null
+                | serde_json::Value::String(_)
+                | serde_json::Value::Object(_) => unreachable!("handled above"),
+            };
+            Err(D::Error::custom(format!("expected a string or object, found {found}")))
+        }
+    }
 }
 
 /// All rulesets of one region (`/data/wow/ruleset/index`).
@@ -194,4 +236,43 @@ pub fn fetch_auction_houses(
         .into_iter()
         .map(|house| ForeverHouse { id: house.id, name: house.name, key: house.key })
         .collect())
+}
+
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect: fixture-driven, deterministic inputs
+    // (the blizzard_item_info precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use super::*;
+
+    #[test]
+    fn key_objects_and_localized_name_maps_decode() {
+        // The live `/ruleset/{id}/auctions/` shape: Blizzard key objects and
+        // localized name maps, which the plain-`String` decoder rejected
+        // with "invalid type: map, expected a string".
+        let payload = br#"{"auctions": [
+            {"id": 2, "name": {"en_US": "Horde Auction House"}, "key": {"href": "https://eu.api.blizzard.com/data/wow/ruleset/1/auctions/2?namespace=dynamic-forever-eu"}},
+            {"id": 1, "name": "Alliance Auction House"}
+        ]}"#;
+        let houses = decode_list::<WireHouse>(payload, &["auctions"], "auction-house index")
+            .unwrap()
+            .into_iter()
+            .map(|house| ForeverHouse { id: house.id, name: house.name, key: house.key })
+            .collect::<Vec<_>>();
+        assert_eq!(houses.len(), 2);
+        assert_eq!(houses[0].id, 2);
+        assert_eq!(houses[0].name.as_deref(), Some("Horde Auction House"));
+        assert!(houses[0].key.as_deref().is_some_and(|key| key.starts_with("https://")));
+        assert_eq!(houses[1].name.as_deref(), Some("Alliance Auction House"));
+        assert_eq!(houses[1].key, None);
+    }
+
+    #[test]
+    fn scalar_shape_drift_still_fails_loudly() {
+        let payload = br#"{"auctions": [{"id": 1, "name": 42}]}"#;
+        let error = decode_list::<WireHouse>(payload, &["auctions"], "auction-house index")
+            .expect_err("a numeric name is drift, not a decodable row");
+        assert!(error.to_string().contains("row rejected"));
+    }
 }
