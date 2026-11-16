@@ -15,6 +15,7 @@ use amtracker_core::{
     config::TrackerConfig,
     domain::{
         Category,
+        Flavor,
         ItemRef,
         PriceBucket,
         TargetId,
@@ -284,6 +285,33 @@ pub fn item_cell(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String
         format!(" data-export=\"{}\"", html_escape(&identity))
     };
     format!("<td{export}>{}</td>", item_link(target, item, names))
+}
+
+/// Outbound Wowhead deep link for one identity under one game flavor — the
+/// reference page for the id traders quote in-game. Section slugs follow the
+/// PUBLIC site's per-game URLs (they differ from the data API's `nether`
+/// prefixes): retail is unprefixed, the progressive classic generations carry
+/// their slug, the era family (`classic`, `classic-era`, `forever`) shares
+/// `/classic`, and unknown custom flavors fall through to retail exactly like
+/// the item-info adapter's id-compatibility rule. Pets link to their species
+/// page (`pet-species=`); every URL component is a constant or a numeric id,
+/// so no escaping is needed.
+#[must_use]
+pub fn wowhead_link(flavor: &Flavor, item: &ItemRef) -> String {
+    let section = match flavor.as_str() {
+        "classic" | "classic-era" | "forever" => "/classic",
+        "cata-classic" => "/cata",
+        "mop-classic" => "/mop",
+        _ => "",
+    };
+    let page = match item {
+        ItemRef::Item { item_id } => format!("item={item_id}"),
+        ItemRef::Pet { species, .. } => format!("pet-species={species}"),
+    };
+    format!(
+        "<a href=\"https://www.wowhead.com{section}/{page}\" \
+         target=\"_blank\" rel=\"noopener noreferrer\">wowhead ↗</a>"
+    )
 }
 
 /// The shared page shell: topbar, nav (active marker), optional target

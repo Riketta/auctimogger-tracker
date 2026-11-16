@@ -1432,11 +1432,12 @@ async fn item_detail_page(
     let fallback = sparkline(&medians);
 
     let mut body = format!(
-        "<h2>{title}</h2><p class=\"muted\">target <a href=\"/opportunities?target={}\">{}</a> · {} · {}</p>{note}",
+        "<h2>{title}</h2><p class=\"muted\">target <a href=\"/opportunities?target={}\">{}</a> · {} · {} · {}</p>{note}",
         html_escape(target.as_str()),
         html_escape(target.as_str()),
         tip("identity", "The exact identity tuple the metrics engine keys on: items by id, pets by species + level + quality + breed."),
         html_escape(&id_label),
+        render::wowhead_link(&super::target_flavor(&state.config, &target), &item),
     );
 
     body.push_str("<h2>30-day price history</h2><div class=\"chart-card\">");

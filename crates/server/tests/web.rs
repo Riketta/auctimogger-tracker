@@ -1519,6 +1519,39 @@ async fn watchlist_names_every_row_from_a_warmed_catalog() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Item/pet detail pages link out to the right Wowhead page per flavor:
+/// retail ids unprefixed, the era family (`forever`) under `/classic`, pets
+/// by species page.
+#[tokio::test]
+async fn item_pages_link_out_to_wowhead_per_flavor() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, body) = get(router.clone(), "/items/t1/2589").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("href=\"https://www.wowhead.com/item=2589\""),
+        "retail items deep-link to the unprefixed wowhead page"
+    );
+
+    let (_, body) = get(router, "/items/t1/pet/264?level=1&quality=3&breed=11").await;
+    assert!(
+        body.contains("href=\"https://www.wowhead.com/pet-species=264\""),
+        "pets deep-link to the species page"
+    );
+    std::fs::remove_dir_all(&root).ok();
+
+    let (state, root) = test_state_with_config(None, Arc::new(NoItemInfo), |config| {
+        config.targets[0].flavor = Flavor("forever".into());
+    });
+    let (status, body) = get(build_router_arc(Arc::clone(&state)), "/items/t1/2589").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        body.contains("href=\"https://www.wowhead.com/classic/item=2589\""),
+        "forever items deep-link to the classic-era section"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The background warm-up consults the PET table for pets: a cataloged item
 /// with the same numeric id must not make the pet look known (regression:
 /// pets used to be skipped forever on id collisions).
