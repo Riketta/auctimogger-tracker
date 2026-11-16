@@ -128,9 +128,11 @@ pub struct CatalogConfig {
     /// Locale tag for resolved names (e.g. `"enUS"`), in the game's
     /// locale-code spelling; adapters map it to their wire formats.
     pub locale: String,
-    /// How many not-yet-named ids one table render may resolve inline,
-    /// synchronously (the rest keep their id fallback labels until the next
-    /// view). `0` disables inline resolution entirely.
+    /// How many not-yet-named ids one table render may resolve inline from
+    /// the source, synchronously. Names already held in the catalog store
+    /// always render (unbounded local reads); ids beyond the budget keep
+    /// their id fallback labels until a later view or the background
+    /// warmer names them. `0` disables inline source resolution only.
     pub render_resolve_max: u32,
     /// Source lookups one background warmer pass may make. The warmer is a
     /// dedicated thread that continuously resolves every id ever seen in a

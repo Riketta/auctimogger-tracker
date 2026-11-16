@@ -1450,9 +1450,12 @@ async fn a_failing_name_source_renders_raw_labels() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The render lane's budget: only the first `render_resolve_max` distinct
-/// identities resolve inline; the rest keep raw labels, and `0` disables
-/// inline resolution entirely.
+/// The render lane's budget: with a cold catalog only the first
+/// `render_resolve_max` distinct identities resolve inline from the source;
+/// the rest keep raw labels — and the NEXT view names the backlog (the
+/// store pass covers what the earlier render cached, the budget lane takes
+/// the next miss). `0` disables the inline source lane only: cataloged
+/// names still render through the store pass.
 #[tokio::test]
 async fn resolve_budget_limits_inline_name_resolution() {
     let (state, root) = test_state_with_config(None, Arc::new(StaticItemInfo), |config| {
@@ -1460,24 +1463,59 @@ async fn resolve_budget_limits_inline_name_resolution() {
     });
     seed_history(&state);
     seed_second_item(&state);
-    let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1&category=commodity")
-            .await;
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, body) = get(router.clone(), "/opportunities?target=t1&category=commodity").await;
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains(">Named Item 2589<"), "the first identity resolves inline");
     assert!(!body.contains("Named Item 2592"), "beyond-budget ids keep raw labels");
     assert!(body.contains(">item 2592<"), "the beyond-budget raw label stays visible");
+    let (_, body) = get(router, "/opportunities?target=t1&category=commodity").await;
+    assert!(
+        body.contains(">Named Item 2592<"),
+        "the next view resolves the previous render's beyond-budget id"
+    );
     std::fs::remove_dir_all(&root).ok();
 
     let (state, root) = test_state_with_config(None, Arc::new(StaticItemInfo), |config| {
         config.catalog.render_resolve_max = 0;
     });
     seed_history(&state);
-    let (status, body) =
-        get(build_router_arc(Arc::clone(&state)), "/opportunities?target=t1&category=commodity")
-            .await;
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, body) = get(router.clone(), "/opportunities?target=t1&category=commodity").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(!body.contains("Named Item"), "budget 0 disables inline resolution");
+    assert!(!body.contains("Named Item"), "budget 0 skips the inline source lane");
+    // Warm the catalog, then re-render: the store pass still names the row —
+    // `0` bounds source lookups, not local reads.
+    state.catalog.ensure(&Flavor::default(), 2589).expect("warm the catalog");
+    let (_, body) = get(router, "/opportunities?target=t1&category=commodity").await;
+    assert!(body.contains(">Named Item 2589<"), "cataloged names render even at budget 0");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Regression for the watchlist showing raw ids past the render budget with
+/// a fully warmed catalog: the store pass is unbounded, so a watchlist
+/// longer than `render_resolve_max` renders every row's name (the warmer
+/// had already filled the catalog — the page just never read past the
+/// budget).
+#[tokio::test]
+async fn watchlist_names_every_row_from_a_warmed_catalog() {
+    let (state, root) = test_state_with_config(None, Arc::new(StaticItemInfo), |config| {
+        config.catalog.render_resolve_max = 2; // far below the entry count
+    });
+    let flavor = Flavor::default();
+    let target = TargetId(TARGET.into());
+    for item_id in 1..=5_i64 {
+        state.watchlist.add(&target, ItemRef::Item { item_id }, None).expect("watch item");
+        state.catalog.ensure(&flavor, item_id).expect("warm the catalog row");
+    }
+    let (status, body) = get(build_router_arc(Arc::clone(&state)), "/watchlist?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    for item_id in 1..=5_i64 {
+        assert!(
+            body.contains(&format!("Named Item {item_id}")),
+            "watchlist row {item_id} renders its catalog name"
+        );
+    }
     std::fs::remove_dir_all(&root).ok();
 }
 

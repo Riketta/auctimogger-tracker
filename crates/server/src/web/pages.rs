@@ -1227,39 +1227,76 @@ async fn resolve_pet_name(
 /// the next view (or the background warm-up) finds them cached.
 const RENDER_RESOLVE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
 
-/// The render lane's bounded name resolution for one table page: the first
-/// `[catalog].render_resolve_max` distinct ids/species of `items` resolve
-/// concurrently off the async runtime — cached ids cost one local read,
-/// uncached ones hit the source once ever (the catalog caches). Ids beyond
-/// the budget keep their raw labels until a later view; `0` disables inline
-/// resolution (the background warm-up still fills the catalog over time).
+/// The render lane's name resolution for one table page, in two phases:
+/// first an UNBOUNDED store pass names every id the catalog already holds
+/// (local reads, no source, no deadline — a warmed catalog names the whole
+/// table however long it is); then the first `[catalog].render_resolve_max`
+/// still-unnamed ids resolve concurrently off the async runtime, where an
+/// uncached id hits the source once ever (the catalog caches). `0`
+/// disables that inline source lane only; the background warm-up still
+/// fills the catalog over time.
 async fn resolve_names(
     state: &Arc<AppState>,
     flavor: &Flavor,
     items: &[ItemRef],
 ) -> render::ItemNames {
     let mut names = render::ItemNames::default();
-    let budget = usize::try_from(state.config.catalog.render_resolve_max).unwrap_or(0);
-    if budget == 0 {
-        return names;
-    }
     // Distinct identities in first-appearance order (the table's top rows
-    // are the ones worth the inline wait), capped at the budget.
+    // are the ones worth the inline wait).
     let mut seen_items = HashSet::new();
     let mut seen_pets = HashSet::new();
-    let mut pending: Vec<ItemRef> = Vec::new();
+    let mut distinct: Vec<ItemRef> = Vec::new();
     for item in items {
         let fresh = match item {
             ItemRef::Item { item_id } => seen_items.insert(*item_id),
             ItemRef::Pet { species, .. } => seen_pets.insert(*species),
         };
         if fresh {
-            pending.push(item.clone());
-            if pending.len() >= budget {
-                break;
-            }
+            distinct.push(item.clone());
         }
     }
+    // Phase 1 — the store pass. Warm rows cost one local read each, so it
+    // runs for the whole table, whatever the inline budget; only its misses
+    // reach the budgeted source lane below.
+    let stored = {
+        let state = Arc::clone(state);
+        let flavor = flavor.clone();
+        let distinct = distinct.clone();
+        tokio::task::spawn_blocking(move || state.catalog.cached_names(&flavor, &distinct))
+    };
+    let stored = match stored.await {
+        Ok(inner) => inner.map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    let mut pending: Vec<ItemRef> = Vec::new();
+    match stored {
+        Ok(stored) => {
+            for (item, name) in distinct.iter().zip(stored) {
+                match name {
+                    Some(name) => match item {
+                        ItemRef::Item { item_id } => {
+                            names.items.insert(*item_id, name);
+                        }
+                        ItemRef::Pet { species, .. } => {
+                            names.pets.insert(*species, name);
+                        }
+                    },
+                    None => pending.push(item.clone()),
+                }
+            }
+        }
+        Err(error) => {
+            tracing::warn!(error, "catalog store pass failed; falling back to the inline lane");
+            pending = distinct;
+        }
+    }
+    // Phase 2 — the bounded source lane: only not-yet-named ids may reach a
+    // source here, capped at the budget in first-appearance order.
+    let budget = usize::try_from(state.config.catalog.render_resolve_max).unwrap_or(0);
+    if budget == 0 {
+        return names;
+    }
+    pending.truncate(budget);
     let lookups = pending
         .into_iter()
         .map(|item| {

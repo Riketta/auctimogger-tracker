@@ -440,7 +440,8 @@ pub struct FileCatalog {
     /// Locale tag for resolved names (e.g. `"enUS"`). Defaults to `"enUS"`.
     #[serde(default)]
     pub locale: Option<String>,
-    /// Inline item-name budget per table render; `0` disables inline
+    /// Inline source-lookup budget per table render for not-yet-named ids
+    /// (cataloged names always render); `0` disables inline source
     /// resolution. Defaults to 8.
     #[serde(default)]
     pub render_resolve_max: Option<u32>,

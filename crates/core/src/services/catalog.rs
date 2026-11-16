@@ -18,6 +18,7 @@ use crate::{
         BrowseCursor,
         CatalogCounts,
         Flavor,
+        ItemRef,
         NameRecord,
         PetNameRecord,
         SearchHit,
@@ -271,6 +272,35 @@ impl CatalogService {
     pub fn deferred_pet(&self, flavor: &Flavor, species_id: i64) -> bool {
         let key = (flavor.as_str().to_owned(), species_id);
         Self::remembered(&self.negative_pets, &key) || Self::remembered(&self.errors_pets, &key)
+    }
+
+    /// Names the catalog store already holds, positionally aligned with
+    /// `items` (pets resolve through the PET table). A store-only read —
+    /// no source fetch, no negative-cache side effects — so the render
+    /// lane can name every warm row for the cost of local reads, whatever
+    /// its inline source budget. Misses stay `None` for the budgeted
+    /// [`Self::ensure`] lane and the background warmer.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    pub fn cached_names(
+        &self,
+        flavor: &Flavor,
+        items: &[ItemRef],
+    ) -> Result<Vec<Option<String>>, StoreError> {
+        items
+            .iter()
+            .map(|item| match item {
+                ItemRef::Item { item_id } => {
+                    self.catalog.by_id(flavor, *item_id).map(|record| record.map(|r| r.name))
+                }
+                ItemRef::Pet { species, .. } => self
+                    .catalog
+                    .pet_by_species(flavor, *species)
+                    .map(|record| record.map(|r| r.name)),
+            })
+            .collect()
     }
 
     /// Returns the pet-species catalog record for `(flavor, species_id)`,
@@ -769,5 +799,34 @@ mod tests {
         let warmed = service.ensure_pet(&Flavor::default(), 264).expect("ensure_pet");
         assert_eq!(warmed.map(|r| r.name).as_deref(), Some("Fresh Pet"));
         assert_eq!(service.known_pet(&Flavor::default(), 264), Ok(true));
+    }
+
+    /// The render lane's store pass: `cached_names` answers positionally
+    /// from the ITEM and PET tables, never touches the source (even for
+    /// misses), and keeps the item/pet namespaces split.
+    #[test]
+    fn cached_names_reads_the_store_without_touching_the_source() {
+        let catalog = Arc::new(FakeCatalog::new());
+        catalog.seed_item("retail", sparse_record(2589, 0));
+        catalog
+            .upsert_pets(
+                &Flavor::default(),
+                &[PetNameRecord { species_id: 264, name: "Pet From Store".into() }],
+            )
+            .expect("seed pet");
+        let info = down_item_info(); // any lookup would fail the test via calls()
+        let service = service(catalog, info.clone(), Arc::new(FakeClock(AtomicI64::new(0))));
+        let items = vec![
+            ItemRef::Item { item_id: 2589 },
+            ItemRef::Item { item_id: 4242 }, // uncataloged: stays a miss
+            ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 11 },
+        ];
+        let names = service.cached_names(&Flavor::default(), &items).expect("cached_names");
+        assert_eq!(
+            names,
+            vec![Some("Stale Name".to_string()), None, Some("Pet From Store".to_string()),],
+            "warm rows answer positionally, misses stay None"
+        );
+        assert_eq!(info.calls(), 0, "the store pass never reaches the source");
     }
 }
