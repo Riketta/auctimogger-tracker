@@ -37,7 +37,10 @@ use amtracker_core::{
     },
     error::StoreError,
     metrics::block_from_histograms,
-    services::sell_priority::PriorityScore,
+    services::{
+        buy_timing,
+        sell_priority::PriorityScore,
+    },
 };
 use axum::{
     extract::{
@@ -92,6 +95,10 @@ type ItemPageData = (
     std::collections::BTreeMap<i64, amtracker_core::domain::PriceBucket>,
     // Same identity on the other configured targets: (target, d7 block).
     Vec<(TargetId, Option<MetricBlock>)>,
+    // When-to-buy fuel: day rows over the weekday range and the raw working
+    // set's per-snapshot cheapest-listing samples (intraday horizon).
+    Vec<amtracker_core::domain::ItemDayRow>,
+    Vec<amtracker_core::domain::SnapshotSample>,
 );
 
 /// Watchlist membership key: kind-prefixed identity string, so items and
@@ -1139,7 +1146,18 @@ pub(crate) async fn item_page(
     let item = ItemRef::Item { item_id };
     let name =
         resolve_item_name(&state, &super::target_flavor(&state.config, &target), item_id).await;
-    item_detail_page(state, target, item, name, item_id.to_string(), String::new(), category).await
+    item_detail_page(
+        state,
+        target,
+        item,
+        name,
+        item_id.to_string(),
+        String::new(),
+        category,
+        weeks_param(&params),
+        days_param(&params),
+    )
+    .await
 }
 
 /// `GET /items/{target_id}/pet/{species_id}?level=&quality=&breed=` — one
@@ -1175,7 +1193,18 @@ pub(crate) async fn pet_page(
     } else {
         String::new()
     };
-    item_detail_page(state, target, item, name, format!("pet {species_id}"), note, category).await
+    item_detail_page(
+        state,
+        target,
+        item,
+        name,
+        format!("pet {species_id}"),
+        note,
+        category,
+        weeks_param(&params),
+        days_param(&params),
+    )
+    .await
 }
 
 /// Resolves an item's display name (catalog first, then the item API) for
@@ -1340,6 +1369,9 @@ async fn resolve_names(
 /// per-span metric blocks and the watch action — all within one market
 /// category (the tabs switch between them; merged views would mix two
 /// markets' evidence).
+// Linear HTML builder over a wide page surface; the argument count is the
+// page's natural inputs (the module's too_many_lines precedent).
+#[allow(clippy::too_many_arguments)]
 async fn item_detail_page(
     state: Arc<AppState>,
     target: TargetId,
@@ -1348,6 +1380,8 @@ async fn item_detail_page(
     id_label: String,
     note: String,
     category: Category,
+    weeks: u32,
+    days: u32,
 ) -> Response {
     let title_raw = name.unwrap_or_else(|| format!("{} (name unknown)", render::item_label(&item)));
     let title = html_escape(&title_raw);
@@ -1360,6 +1394,11 @@ async fn item_detail_page(
     // drift. Day labels stay numeric and become UTC dates after the await.
     let today = utc_day(state.clock.now());
     let since = today - 29;
+    // Aliased before the chart's `days` vector shadows the param names below.
+    let when_weeks = weeks;
+    let when_days = days;
+    let weekday_since = today - i64::from(weeks * 7 - 1);
+    let sample_since = today - i64::from(days) + 1;
     let page_data = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
@@ -1397,9 +1436,20 @@ async fn item_detail_page(
                 }
             }
             let mut blocks = Vec::with_capacity(4);
-            for span in [Span::D1, Span::D7, Span::D14, Span::D30] {
-                blocks.push((span, state.metrics.block(&target, &item, category, span)?));
+            for span in &[Span::D1, Span::D7, Span::D14, Span::D30] {
+                blocks.push((*span, state.metrics.block(&target, &item, category, *span)?));
             }
+            // When-to-buy fuel: the weekday range's day rows (folds — any
+            // horizon) and the intraday samples (raw working set — bounded
+            // by raw retention, so the horizon stays short on purpose).
+            let weekday_rows =
+                state.history.item_day_rows_for_item(&target, &item, weekday_since, category)?;
+            let samples = state.history.snapshot_min_prices(
+                &target,
+                &item,
+                category.payload_kind(),
+                sample_since,
+            )?;
             // Cross-target comparison: the same identity + category on every
             // other configured target (cached d7 blocks — cheap by design).
             let mut peers = Vec::new();
@@ -1407,16 +1457,17 @@ async fn item_detail_page(
                 let block = state.metrics.block(&other.id, &item, category, Span::D7)?;
                 peers.push((other.id.clone(), block));
             }
-            Ok((rows, blocks, chart_rows, distribution, peers))
+            Ok((rows, blocks, chart_rows, distribution, peers, weekday_rows, samples))
         }
     });
-    let (rows, blocks, mut chart_rows, distribution, peers) = match page_data.await {
-        Ok(Ok(data)) => data,
-        Ok(Err(error)) => return render::store_error_page(error).await,
-        Err(error) => {
-            return render::store_error_page(StoreError::Backend(error.to_string())).await
-        }
-    };
+    let (rows, blocks, mut chart_rows, distribution, peers, weekday_rows, samples) =
+        match page_data.await {
+            Ok(Ok(data)) => data,
+            Ok(Err(error)) => return render::store_error_page(error).await,
+            Err(error) => {
+                return render::store_error_page(StoreError::Backend(error.to_string())).await
+            }
+        };
     for row in &mut chart_rows {
         if let Some(day) = row.get("label").and_then(serde_json::Value::as_i64) {
             if let Some(obj) = row.as_object_mut() {
@@ -1463,6 +1514,37 @@ async fn item_detail_page(
         );
     }
     body.push_str("</div>");
+
+    // When to buy: the weekday shape comes from the folds (any horizon), the
+    // intraday shape from the raw working set (retention-bounded on
+    // purpose). Buckets are UTC server-side; the browser layer re-buckets
+    // into local time from the island's raw (day, hour) pairs.
+    let base_path = match &item {
+        ItemRef::Item { item_id } => format!("/items/{}/{}", target.as_str(), item_id),
+        ItemRef::Pet { species, .. } => {
+            format!("/items/{}/pet/{}", target.as_str(), species)
+        }
+    };
+    let mut query_extra = format!("&category={}", category.as_str());
+    if let ItemRef::Pet { level, quality, breed, .. } = &item {
+        let _ = write!(query_extra, "&level={level}&quality={quality}&breed={breed}");
+    }
+    let buckets = buy_timing::hour_buckets(&samples);
+    let weekdays = buy_timing::weekday_stats(&weekday_rows);
+    let verdict = buy_timing::cheapest_window(&weekdays, &buckets);
+    let day_medians: std::collections::BTreeMap<i64, i64> =
+        rows.iter().map(|row| (row.day, row.median)).collect();
+    body.push_str(&when_to_buy_section(
+        &weekdays,
+        &buckets,
+        &day_medians,
+        &verdict,
+        &weekday_rows,
+        when_weeks,
+        when_days,
+        &base_path,
+        &query_extra,
+    ));
 
     // Today's price distribution (server-rendered; no JS required); the
     // buckets arrived with the same store pass as everything else above.
@@ -1639,12 +1721,6 @@ async fn item_detail_page(
     // single-escaped copy for the body <h2> above. The category tabs ride
     // next to the target switcher; a pet's variant tuple is preserved as
     // hidden fields (a GET form replaces the action's query string).
-    let base_path = match &item {
-        ItemRef::Item { item_id } => format!("/items/{}/{}", target.as_str(), item_id),
-        ItemRef::Pet { species, .. } => {
-            format!("/items/{}/pet/{}", target.as_str(), species)
-        }
-    };
     let preserve: Vec<(&str, String)> = match &item {
         ItemRef::Item { .. } => Vec::new(),
         ItemRef::Pet { level, quality, breed, .. } => {
@@ -1672,6 +1748,185 @@ async fn item_detail_page(
 /// that while staying valid JSON.
 fn json_island(value: &serde_json::Value) -> String {
     value.to_string().replace('<', "\\u003c")
+}
+
+/// The when-to-buy weekday range (`w`, weeks). Presets 4/8/12, default 8,
+/// clamped to 1..=12 — plain numeric param, links only.
+fn weeks_param(params: &HashMap<String, String>) -> u32 {
+    params.get("w").and_then(|v| v.parse().ok()).unwrap_or(8).clamp(1, 12)
+}
+
+/// The when-to-buy intraday horizon (`d`, days). Presets 1/3/7, default 3,
+/// clamped to 1..=7 (raw retention bounds the useful horizon anyway).
+fn days_param(params: &HashMap<String, String>) -> u32 {
+    params.get("d").and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 7)
+}
+
+/// Preset link row for one when-to-buy parameter: plain links (the whole
+/// section works without JS), the active preset marked. `query_extra`
+/// carries preserved params (category, pet variant) already encoded; every
+/// interpolated piece is a constant or a number.
+fn preset_links(
+    base: &str,
+    param: &str,
+    presets: &[(&str, u32)],
+    current: u32,
+    query_extra: &str,
+) -> String {
+    let mut out = String::new();
+    for (label, value) in presets {
+        let active = if *value == current { " class=\"active\"" } else { "" };
+        let _ = write!(out, "<a href=\"{base}?{param}={value}{query_extra}\"{active}>{label}</a>");
+        out.push(' ');
+    }
+    out
+}
+
+/// Full weekday names by the 0 = Sunday convention.
+fn weekday_name(weekday: usize) -> &'static str {
+    match weekday {
+        0 => "sunday",
+        1 => "monday",
+        2 => "tuesday",
+        3 => "wednesday",
+        4 => "thursday",
+        5 => "friday",
+        _ => "saturday",
+    }
+}
+
+/// Renders the when-to-buy section: weekday bars and intraday lines (UTC
+/// server-SVG fallbacks both), the verdict line, and the `#when-data`
+/// island whose raw `(day, hour)` pairs let the browser layer re-bucket
+/// everything into the viewer's local timezone.
+// Display-only percentage math in f64 (rendering, not decisions); a linear
+// builder over the section's natural inputs.
+#[allow(clippy::cast_precision_loss, clippy::too_many_arguments)]
+fn when_to_buy_section(
+    weekdays: &[buy_timing::WeekdayStat],
+    buckets: &[buy_timing::HourBucket],
+    day_medians: &std::collections::BTreeMap<i64, i64>,
+    verdict: &buy_timing::BuyVerdict,
+    weekday_rows: &[amtracker_core::domain::ItemDayRow],
+    weeks: u32,
+    days: u32,
+    base_path: &str,
+    query_extra: &str,
+) -> String {
+    let pct = |value: i64, base: i64| -> String {
+        if base > 0 {
+            format!("{:+.1}%", value as f64 / base as f64 * 100.0 - 100.0)
+        } else {
+            "—".into()
+        }
+    };
+    let mut verdict_text = String::from("no buy-timing evidence yet");
+    if let Some((weekday, median)) = verdict.weekday {
+        let _ = write!(
+            verdict_text,
+            "cheapest weekday: {} ({})",
+            weekday_name(weekday),
+            pct(median, verdict.week_median)
+        );
+    }
+    if let Some((hour, typical)) = verdict.hour {
+        if verdict.weekday.is_some() {
+            verdict_text.push_str(" · ");
+        }
+        let _ = write!(
+            verdict_text,
+            "cheapest hour: {:02}:00 UTC ({})",
+            hour,
+            pct(typical, verdict.hour_median)
+        );
+    }
+    let mut body = format!(
+        "<h2>{}</h2>\
+         <p class=\"muted\">weekday range: {} · hours: {}</p>\
+         <p id=\"when-verdict\">{}</p>",
+        tip(
+            "when to buy",
+            "Weekday bars come from the day folds (median per weekday, notch = p05 floor). Hour lines come from the raw listing working set: typical = median of each hour's cheapest ask, dashed = the hour's outright floor, both as % of that day's median. Times are UTC server-side; with JS the view re-buckets into your local time."
+        ),
+        preset_links(base_path, "w", &[("4w", 4), ("8w", 8), ("12w", 12)], weeks, query_extra),
+        preset_links(base_path, "d", &[("24h", 1), ("3d", 3), ("7d", 7)], days, query_extra),
+        html_escape(&verdict_text),
+    );
+    body.push_str("<div class=\"chart-card\" id=\"when-weekday\">");
+    if weekdays.is_empty() {
+        body.push_str(
+            "<div class=\"empty\">no fold history yet — weekday bars appear as days accumulate</div>",
+        );
+    } else {
+        let _ = write!(
+            body,
+            "<p class=\"muted\">median by weekday · notch = p05 floor · last {weeks} weeks</p>{}",
+            render::weekday_bars_svg(weekdays)
+        );
+    }
+    body.push_str("</div>");
+    body.push_str("<div class=\"chart-card\" id=\"when-intraday\">");
+    if buckets.is_empty() {
+        let _ = write!(
+            body,
+            "<div class=\"empty\">no raw listings for this identity in the last {days} days — \
+             the hourly view only covers the raw working set</div>"
+        );
+    } else {
+        let _ = write!(
+            body,
+            "<p class=\"muted\">cheapest ask by hour · % of that day's median · dashed = floor · last {days} days</p>{}",
+            render::intraday_svg(buckets, day_medians)
+        );
+    }
+    body.push_str(
+        "<p class=\"muted\">hours in UTC — the interactive view shifts to your local time</p></div>",
+    );
+    // The island mirrors the aggregates with raw (day, hour) pairs so the
+    // browser can re-bucket locally without re-deriving anything.
+    let mut days_json: Vec<serde_json::Value> = Vec::new();
+    let mut by_day: HashMap<i64, Vec<&buy_timing::HourBucket>> = HashMap::new();
+    for bucket in buckets {
+        by_day.entry(bucket.day).or_default().push(bucket);
+    }
+    let mut sorted_days: Vec<i64> = by_day.keys().copied().collect();
+    sorted_days.sort_unstable();
+    for day in sorted_days {
+        let Some(day_buckets) = by_day.get(&day) else { continue };
+        days_json.push(serde_json::json!({
+            "day": day,
+            "median": day_medians.get(&day),
+            "hours": day_buckets.iter().map(|bucket| serde_json::json!({
+                "h": bucket.hour,
+                "floor": bucket.floor,
+                "typical": bucket.typical,
+                "n": bucket.snapshots,
+            })).collect::<Vec<_>>(),
+        }));
+    }
+    let island = serde_json::json!({
+        // Raw per-day rows: the browser layer re-aggregates per LOCAL
+        // weekday, which a server-side weekday aggregate could not be
+        // un-shifted into.
+        "weekdayDays": weekday_rows.iter().map(|row| serde_json::json!({
+            "day": row.day,
+            "median": row.median,
+            "p05": row.p05,
+        })).collect::<Vec<_>>(),
+        "weekdays": weekdays.iter().map(|stat| serde_json::json!({
+            "weekday": stat.weekday,
+            "median": stat.median,
+            "p05": stat.p05,
+            "days": stat.days,
+        })).collect::<Vec<_>>(),
+        "days": days_json,
+    });
+    let _ = write!(
+        body,
+        "<script type=\"application/json\" id=\"when-data\">{}</script>",
+        json_island(&island)
+    );
+    body
 }
 
 // ----------------------------------------------------------- opportunities

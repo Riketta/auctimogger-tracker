@@ -324,6 +324,32 @@ pub trait PriceHistoryRepository: Send + Sync {
         since_day: i64,
         category: Category,
     ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
+    /// Cheapest-listing samples for one identity's snapshots on/after the
+    /// given UTC day, ordered by fetch time: one [`SnapshotSample`] per
+    /// snapshot that carried the identity (fetch time, minimum unit price,
+    /// listing count). Reads the RAW working set, so the horizon is bounded
+    /// by raw retention — long-term memory stays in the day folds. Fuel for
+    /// the intraday buy-timing view.
+    ///
+    /// The identity must match the canonical `item_ref` tuple; the payload
+    /// kind scopes the market (see [`Category::payload_kind`]).
+    ///
+    /// The default answers empty — correct for adapters without a raw
+    /// working set (the view degrades to "no intraday data").
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the samples cannot be read.
+    fn snapshot_min_prices(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        kind: PayloadKind,
+        since_day: i64,
+    ) -> Result<Vec<crate::domain::SnapshotSample>, StoreError> {
+        let _ = (target, item, kind, since_day);
+        Ok(Vec::new())
+    }
 }
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).

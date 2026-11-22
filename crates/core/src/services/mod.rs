@@ -2,6 +2,7 @@
 //! domain types; driving adapters call them, driven adapters serve them.
 
 pub mod alert;
+pub mod buy_timing;
 pub mod catalog;
 pub mod chain;
 pub mod cycle;

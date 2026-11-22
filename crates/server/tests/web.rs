@@ -1519,6 +1519,52 @@ async fn watchlist_names_every_row_from_a_warmed_catalog() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The when-to-buy section: weekday bars from the folds, hourly lines from
+/// the raw working set, preset links, mounts + island for the local-time JS
+/// re-bucketing — and the price-distribution block still in place below it.
+#[tokio::test]
+async fn item_page_when_to_buy_section() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    let now = state.clock.now();
+    let item = ItemRef::Item { item_id: 2589 };
+    // Two commodity snapshots today at different hours: cheapest asks 90
+    // and 150 (the per-snapshot minima feed the hourly view).
+    seed_snapshot(
+        &state,
+        PayloadKind::Commodities,
+        now - 3 * 3_600,
+        &[listing(101, &item, 300), listing(102, &item, 90), listing(103, &item, 500)],
+    );
+    seed_snapshot(
+        &state,
+        PayloadKind::Commodities,
+        now - 3_600,
+        &[listing(104, &item, 150), listing(105, &item, 220)],
+    );
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, body) = get(router.clone(), "/items/t1/2589?category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("when to buy"), "section heading present");
+    assert!(body.contains("id=\"when-data\""), "JSON island for the JS layer");
+    assert!(body.contains("id=\"when-weekday\""), "weekday mount");
+    assert!(body.contains("id=\"when-intraday\""), "intraday mount");
+    assert!(body.contains("id=\"when-verdict\""), "verdict line mount");
+    assert!(body.contains("w=12"), "weekday preset links");
+    assert!(body.contains("d=7"), "intraday preset links");
+    assert!(body.contains("category=commodity"), "presets preserve the category");
+    assert!(
+        body.contains("price distribution"),
+        "the distribution block stays (kept deliberately)"
+    );
+
+    // Out-of-range presets clamp instead of erroring.
+    let (status, body) = get(router, "/items/t1/2589?category=commodity&w=99&d=0").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("when to buy"), "clamped render stays healthy");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Item/pet detail pages link out to the right Wowhead page per flavor:
 /// retail ids unprefixed, the era family (`forever`) under `/classic`, pets
 /// by species page.

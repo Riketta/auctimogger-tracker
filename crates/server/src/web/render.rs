@@ -21,6 +21,10 @@ use amtracker_core::{
         TargetId,
     },
     error::StoreError,
+    services::buy_timing::{
+        HourBucket,
+        WeekdayStat,
+    },
 };
 use axum::{
     http::StatusCode,
@@ -502,6 +506,170 @@ pub fn distribution_svg(buckets: &BTreeMap<i64, PriceBucket>) -> String {
             80.0 - bar_height,
         );
     }
+    svg.push_str("</svg>");
+    svg
+}
+
+/// Monday-first slot (0..=6) → axis label.
+fn weekday_label(slot: usize) -> &'static str {
+    match slot {
+        0 => "mon",
+        1 => "tue",
+        2 => "wed",
+        3 => "thu",
+        4 => "fri",
+        5 => "sat",
+        _ => "sun",
+    }
+}
+/// Monday-first slot → `0 = Sunday` weekday index.
+const WEEKDAY_ORDER: [usize; 7] = [1, 2, 3, 4, 5, 6, 0];
+
+/// Server-rendered weekday-price bars (the no-JS fallback of the when-to-buy
+/// view; the browser layer re-buckets into local weekdays). Bar height ∝
+/// the weekday's median; the notch marks its p05 floor. Weekdays without
+/// evidence render a dim placeholder so the week's shape stays readable.
+// SVG coordinates: integer→float rounding loss is invisible at this scale.
+#[allow(clippy::cast_precision_loss)]
+#[must_use]
+pub fn weekday_bars_svg(stats: &[WeekdayStat]) -> String {
+    let by_weekday = |weekday: usize| stats.iter().find(|stat| stat.weekday == weekday);
+    let max = stats.iter().map(|stat| stat.median).max().unwrap_or(0);
+    if max <= 0 {
+        return String::new();
+    }
+    let (width, height) = (7 * 40 + 8, 116);
+    let mut svg = format!(
+        "<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"price by weekday\" \
+         style=\"max-width:{width}px\">"
+    );
+    for (slot, weekday) in WEEKDAY_ORDER.into_iter().enumerate() {
+        let x = slot * 40 + 8;
+        match by_weekday(weekday) {
+            Some(stat) => {
+                let bar = f64::max(stat.median as f64 / max as f64 * 72.0, 2.0);
+                let floor = f64::max(stat.p05 as f64 / max as f64 * 72.0, 2.0);
+                let _ = write!(
+                    svg,
+                    "<g class=\"tip\" tabindex=\"0\" data-tip=\"{} · median {} · floor {} · {} days\">\
+                     <rect x=\"{x}\" y=\"{:.1}\" width=\"26\" height=\"{bar:.1}\" rx=\"3\" fill=\"#5aa2ff\" opacity=\"0.75\"/>\
+                     <rect x=\"{x}\" y=\"{:.1}\" width=\"26\" height=\"2\" fill=\"#1b2233\"/></g>",
+                    weekday_label(slot),
+                    money(stat.median),
+                    money(stat.p05),
+                    stat.days,
+                    86.0 - bar,
+                    86.0 - floor,
+                );
+            }
+            None => {
+                let _ = write!(
+                    svg,
+                    "<text x=\"{}\" y=\"86\" class=\"muted\" text-anchor=\"middle\">—</text>",
+                    x + 13
+                );
+            }
+        }
+        let _ = write!(
+            svg,
+            "<text x=\"{}\" y=\"{height}\" text-anchor=\"middle\" class=\"muted\">{}</text>",
+            x + 13,
+            weekday_label(slot)
+        );
+    }
+    svg.push_str("</svg>");
+    svg
+}
+
+/// Server-rendered intraday lines (the no-JS fallback; UTC hours — the note
+/// beside it says so, and the browser layer re-buckets into local time).
+/// Two polylines over hour-of-day: typical (median of the hour's per-snapshot
+/// minima) and the fainter floor (min of minima), both normalized to each
+/// day's fold median so days at different price levels stay comparable.
+/// Hours without evidence break the line instead of dropping to zero.
+// SVG coordinates + percentage math: display-only f64 rounding is invisible
+// at this scale. Direct indexing is safe in `value_of`: the entry's vector
+// is non-empty and `mid` lies in `1..=n` (the `price_stats_sorted`
+// precedent).
+#[allow(clippy::cast_precision_loss, clippy::indexing_slicing)]
+#[must_use]
+pub fn intraday_svg(buckets: &[HourBucket], day_medians: &BTreeMap<i64, i64>) -> String {
+    // (hour → (typical pct, floor pct)) aggregated across days: per-hour
+    // median of typicals / min of floors.
+    let mut typicals: HashMap<i64, Vec<f64>> = HashMap::new();
+    let mut floors: HashMap<i64, Vec<f64>> = HashMap::new();
+    for bucket in buckets {
+        let Some(median) = day_medians.get(&bucket.day).filter(|median| **median > 0) else {
+            continue;
+        };
+        let typical = bucket.typical as f64 / *median as f64 * 100.0;
+        let floor = bucket.floor as f64 / *median as f64 * 100.0;
+        typicals.entry(bucket.hour).or_default().push(typical);
+        floors.entry(bucket.hour).or_default().push(floor);
+    }
+    let mut hours: Vec<i64> = typicals.keys().copied().collect();
+    hours.sort_unstable();
+    if hours.is_empty() {
+        return String::new();
+    }
+    let value_of = |hour: i64| -> Option<(f64, f64)> {
+        let typicals = typicals.get(&hour)?;
+        let floors = floors.get(&hour)?;
+        let mut sorted = typicals.clone();
+        sorted.sort_by(f64::total_cmp);
+        let mid = sorted.len().div_ceil(2);
+        let typical = if sorted.len() % 2 == 1 {
+            sorted[mid - 1]
+        } else {
+            sorted[mid - 1].midpoint(sorted[mid])
+        };
+        let floor = floors.iter().copied().fold(f64::INFINITY, f64::min);
+        Some((typical, floor))
+    };
+    let values: Vec<(i64, f64, f64)> =
+        hours.iter().filter_map(|hour| value_of(*hour).map(|(t, f)| (*hour, t, f))).collect();
+    let all: Vec<f64> = values.iter().flat_map(|(_, typical, floor)| [*typical, *floor]).collect();
+    let low = all.iter().copied().fold(f64::INFINITY, f64::min).floor();
+    let high = all.iter().copied().fold(f64::NEG_INFINITY, f64::max).ceil();
+    let span = f64::max(high - low, 1.0);
+    let (width, height, pad_t, pad_b) = (560.0_f64, 120.0, 14.0, 22.0);
+    let x = |hour: i64| 12.0 + hour as f64 / 23.0 * (width - 24.0);
+    let y = |value: f64| pad_t + (1.0 - (value - low) / span) * (height - pad_t - pad_b);
+    let polyline = |pick: fn(&(i64, f64, f64)) -> f64| -> String {
+        let mut points = String::new();
+        let mut last_hour: Option<i64> = None;
+        for entry in &values {
+            if last_hour.is_some_and(|last| entry.0 - last > 1) {
+                points.push(' '); // gap: hours without evidence break the line
+            }
+            let _ = write!(points, "{:.1},{:.1}", x(entry.0), y(pick(entry)));
+            points.push(' ');
+            last_hour = Some(entry.0);
+        }
+        points
+    };
+    let mut svg = format!(
+        "<svg viewBox=\"0 0 {width} {height}\" role=\"img\" aria-label=\"price by hour of day\" \
+         style=\"max-width:{width}px\">"
+    );
+    let _ = write!(
+        svg,
+        "<polyline points=\"{}\" fill=\"none\" stroke=\"#7f8ba3\" stroke-width=\"1\" \
+         stroke-dasharray=\"3,3\"/>",
+        polyline(|entry| entry.2)
+    );
+    let _ = write!(
+        svg,
+        "<polyline points=\"{}\" fill=\"none\" stroke=\"#5aa2ff\" stroke-width=\"2\"/>",
+        polyline(|entry| entry.1)
+    );
+    let _ = write!(
+        svg,
+        "<text x=\"12\" y=\"{pad_t}\" class=\"muted\">{low:.0}%</text>\
+         <text x=\"12\" y=\"{}\" class=\"muted\">{high:.0}%</text>\
+         <text x=\"{width}\" y=\"{height}\" text-anchor=\"end\" class=\"muted\">UTC hour</text>",
+        height - 4.0
+    );
     svg.push_str("</svg>");
     svg
 }

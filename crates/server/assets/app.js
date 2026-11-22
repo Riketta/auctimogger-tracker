@@ -273,6 +273,213 @@
     });
   }
 
+  // --------------------------------------------------------- when to buy
+  // The server renders the when-to-buy section in UTC. With JS the section
+  // re-buckets everything into the VIEWER's local timezone: weekday stats
+  // re-aggregate from the raw per-day rows, hour cells re-key by the local
+  // hour of each (UTC day, UTC hour) pair — a 23:00 UTC sample belongs to
+  // the next local day where it belongs.
+  (function () {
+    var island = $("#when-data");
+    if (!island) return;
+    var data;
+    try { data = JSON.parse(island.textContent); } catch (_error) { return; }
+    if (!data) return;
+
+    var WEEKDAYS = ["sun", "mon", "tue", "wed", "thu", "fri", "sat"];
+    var WEEKDAYS_FULL =
+      ["sunday", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday"];
+    // Monday-first display order (weekday indexing is 0 = Sunday).
+    var DISPLAY_ORDER = [1, 2, 3, 4, 5, 6, 0];
+
+    function medianOf(values) {
+      if (!values.length) return null;
+      var sorted = values.slice().sort(function (a, b) { return a - b; });
+      var mid = Math.ceil(sorted.length / 2);
+      if (sorted.length % 2) return sorted[mid - 1];
+      return Math.floor((sorted[mid - 1] + sorted[mid]) / 2);
+    }
+    function pad2(value) { return (value < 10 ? "0" : "") + value; }
+    function pctText(value, base) {
+      return base > 0 ? (value / base * 100 - 100).toFixed(1) + "% vs typical" : "—";
+    }
+
+    var NS = "http://www.w3.org/2000/svg";
+    function svgEl(tag, attrs) {
+      var node = document.createElementNS(NS, tag);
+      for (var key in attrs) node.setAttribute(key, attrs[key]);
+      return node;
+    }
+
+    // ---- weekday view: re-aggregate the raw day rows by LOCAL weekday.
+    var stats = null, weekMedian = null, weekdayBest = null;
+    var weekdayMount = $("#when-weekday");
+    if (weekdayMount && data.weekdayDays && data.weekdayDays.length) {
+      var byWeekday = {};
+      data.weekdayDays.forEach(function (row) {
+        var weekday = new Date(row.day * 86400000).getDay();
+        if (!byWeekday[weekday]) byWeekday[weekday] = { medians: [], p05s: [] };
+        byWeekday[weekday].medians.push(row.median);
+        byWeekday[weekday].p05s.push(row.p05);
+      });
+      stats = {};
+      Object.keys(byWeekday).forEach(function (weekday) {
+        var group = byWeekday[weekday];
+        if (group.medians.length < 2) return; // one day is not a pattern
+        stats[weekday] = {
+          median: medianOf(group.medians),
+          p05: medianOf(group.p05s),
+          days: group.medians.length
+        };
+      });
+      var keys = Object.keys(stats);
+      if (keys.length) {
+        keys.forEach(function (weekday) {
+          if (weekdayBest === null || stats[weekday].median < stats[weekdayBest].median) {
+            weekdayBest = Number(weekday);
+          }
+        });
+        weekMedian = medianOf(keys.map(function (weekday) { return stats[weekday].median; }));
+
+        var W = 7 * 40 + 8, H = 116;
+        var max = Math.max.apply(null, keys.map(function (w) { return stats[w].median; }));
+        var svg = svgEl("svg", {
+          viewBox: "0 0 " + W + " " + H, role: "img",
+          "aria-label": "price by weekday (local time)", style: "max-width:" + W + "px"
+        });
+        DISPLAY_ORDER.forEach(function (weekday, slot) {
+          var x = slot * 40 + 8;
+          var stat = stats[weekday];
+          if (stat) {
+            var bar = Math.max(stat.median / max * 72, 2);
+            var floor = Math.max(stat.p05 / max * 72, 2);
+            var g = svgEl("g", {
+              class: "tip", tabindex: "0",
+              "data-tip": WEEKDAYS_FULL[weekday] + " · median " + copperToText(stat.median) +
+                " · floor " + copperToText(stat.p05) + " · " + stat.days + " days"
+            });
+            g.appendChild(svgEl("rect", { x: x, y: 86 - bar, width: 26, height: bar, rx: 3, fill: "#5aa2ff", opacity: 0.75 }));
+            g.appendChild(svgEl("rect", { x: x, y: 86 - floor, width: 26, height: 2, fill: "#1b2233" }));
+            svg.appendChild(g);
+          } else {
+            var dash = svgEl("text", { x: x + 13, y: 86, "text-anchor": "middle", class: "muted" });
+            dash.textContent = "—";
+            svg.appendChild(dash);
+          }
+          var label = svgEl("text", { x: x + 13, y: H, "text-anchor": "middle", class: "muted" });
+          label.textContent = WEEKDAYS[weekday];
+          svg.appendChild(label);
+        });
+        weekdayMount.textContent = "";
+        var caption = document.createElement("p");
+        caption.className = "muted";
+        caption.textContent = "median by weekday · notch = p05 floor · your local weekdays";
+        weekdayMount.appendChild(caption);
+        weekdayMount.appendChild(svg);
+      }
+    }
+
+    // ---- intraday view: re-key the (UTC day, UTC hour) cells by local hour.
+    var hourTypicals = null, hourMedian = null, hourBest = null;
+    var intradayMount = $("#when-intraday");
+    if (intradayMount && data.days && data.days.length) {
+      var byHour = {};      // local hour -> typicals as % of the day's median
+      var floorByHour = {}; // local hour -> floors as %
+      var perDay = [];      // faint single-day lines
+      data.days.forEach(function (dayEntry) {
+        if (!dayEntry.hours || !dayEntry.hours.length) return;
+        var dayMedian = dayEntry.median;
+        if (!(typeof dayMedian === "number" && dayMedian > 0)) return;
+        var points = [];
+        dayEntry.hours.forEach(function (cell) {
+          var local = new Date((dayEntry.day * 86400 + cell.h * 3600) * 1000);
+          var hour = local.getHours();
+          var typical = cell.typical / dayMedian * 100;
+          var floor = cell.floor / dayMedian * 100;
+          if (!byHour[hour]) byHour[hour] = [];
+          if (!floorByHour[hour]) floorByHour[hour] = [];
+          byHour[hour].push(typical);
+          floorByHour[hour].push(floor);
+          points.push({ hour: hour, pct: typical });
+        });
+        if (points.length >= 2) {
+          perDay.push({ label: new Date(dayEntry.day * 86400000).toLocaleDateString(), points: points });
+        }
+      });
+      var hourKeys = Object.keys(byHour).map(Number).sort(function (a, b) { return a - b; });
+      if (hourKeys.length) {
+        hourTypicals = hourKeys.map(function (hour) {
+          return { hour: hour, typical: medianOf(byHour[hour]), floor: Math.min.apply(null, floorByHour[hour]) };
+        });
+        hourMedian = medianOf(hourTypicals.map(function (entry) { return entry.typical; }));
+        hourTypicals.forEach(function (entry, index) {
+          if (hourBest === null || entry.typical < hourTypicals[hourBest].typical) hourBest = index;
+        });
+
+        var W = 560, H = 130, PAD_T = 14, PAD_B = 24;
+        var values = [];
+        hourTypicals.forEach(function (entry) { values.push(entry.typical, entry.floor); });
+        perDay.forEach(function (line) {
+          line.points.forEach(function (point) { values.push(point.pct); });
+        });
+        var low = Math.floor(Math.min.apply(null, values));
+        var high = Math.ceil(Math.max.apply(null, values));
+        var span = Math.max(high - low, 1);
+        function x(hour) { return 14 + hour / 23 * (W - 28); }
+        function y(pct) { return PAD_T + (1 - (pct - low) / span) * (H - PAD_T - PAD_B); }
+        var svg = svgEl("svg", {
+          viewBox: "0 0 " + W + " " + H, role: "img",
+          "aria-label": "price by hour of day (local time)", style: "max-width:" + W + "px"
+        });
+        perDay.forEach(function (line) {
+          var points = line.points.map(function (point) { return x(point.hour) + "," + y(point.pct); }).join(" ");
+          svg.appendChild(svgEl("polyline", { points: points, fill: "none", stroke: "#5aa2ff", "stroke-width": 1, opacity: 0.18 }));
+        });
+        svg.appendChild(svgEl("polyline", {
+          points: hourTypicals.map(function (entry) { return x(entry.hour) + "," + y(entry.floor); }).join(" "),
+          fill: "none", stroke: "#7f8ba3", "stroke-width": 1, "stroke-dasharray": "3,3"
+        }));
+        svg.appendChild(svgEl("polyline", {
+          points: hourTypicals.map(function (entry) { return x(entry.hour) + "," + y(entry.typical); }).join(" "),
+          fill: "none", stroke: "#5aa2ff", "stroke-width": 2
+        }));
+        [0, 6, 12, 18, 23].forEach(function (hour) {
+          var label = svgEl("text", {
+            x: x(hour), y: H - 6,
+            "text-anchor": hour === 0 ? "start" : hour === 23 ? "end" : "middle",
+            class: "muted"
+          });
+          label.textContent = pad2(hour);
+          svg.appendChild(label);
+        });
+        var hi = svgEl("text", { x: 14, y: PAD_T, class: "muted" });
+        hi.textContent = high + "%";
+        svg.appendChild(hi);
+        intradayMount.textContent = "";
+        var caption = document.createElement("p");
+        caption.className = "muted";
+        caption.textContent = "typical ask by hour of your local day · % of that day's median · faint = single days · dashed = floor";
+        intradayMount.appendChild(caption);
+        intradayMount.appendChild(svg);
+      }
+    }
+
+    // ---- verdict line, recomputed for local time.
+    var verdict = $("#when-verdict");
+    if (verdict) {
+      var parts = [];
+      if (stats && weekdayBest !== null && weekMedian !== null) {
+        parts.push("cheapest weekday: " + WEEKDAYS_FULL[weekdayBest] + " (" +
+          pctText(stats[weekdayBest].median, weekMedian) + ")");
+      }
+      if (hourTypicals && hourBest !== null && hourMedian !== null) {
+        parts.push("cheapest hour: " + pad2(hourTypicals[hourBest].hour) + ":00 your time (" +
+          pctText(hourTypicals[hourBest].typical, hourMedian) + ")");
+      }
+      if (parts.length) verdict.textContent = parts.join(" · ");
+    }
+  })();
+
   // ------------------------------------------------------ mutation buttons
   // Open instances render these live. Protected instances render them
   // disabled with data-auth; the API key section below enables them once a

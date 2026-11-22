@@ -39,6 +39,7 @@ use amtracker_core::{
         SaleCredit,
         SearchHit,
         SnapshotMeta,
+        SnapshotSample,
         SnapshotStatus,
         Span,
         TargetId,
@@ -3559,6 +3560,55 @@ impl PriceHistoryRepository for SqliteStore {
         )?;
         day_rows_from_stored(rows, category)
     }
+
+    fn snapshot_min_prices(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        kind: PayloadKind,
+        since_day: i64,
+    ) -> Result<Vec<SnapshotSample>, StoreError> {
+        let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(Vec::new());
+        };
+        // The inner aggregate collapses the item's raw rows to one row per
+        // snapshot (MIN + COUNT) before anything leaves SQLite — a hot
+        // commodity's millions of listing rows never cross the port. The
+        // index (target_id, item_ref_id, snapshot_id) serves the filter and
+        // hands the GROUP BY pre-sorted by snapshot; the join then fetches
+        // timestamps and scopes the payload kind.
+        let mut statement = conn
+            .prepare(
+                "SELECT s.fetched_at, m.min_price, m.listings
+                 FROM (SELECT snapshot_id, MIN(unit_price) AS min_price,
+                              COUNT(*) AS listings
+                       FROM listing
+                       WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3
+                       GROUP BY snapshot_id) m
+                 JOIN snapshots s ON s.id = m.snapshot_id
+                 WHERE s.kind = ?4
+                 ORDER BY s.fetched_at",
+            )
+            .map_err(|e| backend("prepare snapshot_min_prices", e))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![target.as_str(), item_ref_id, since_day, kind.as_str()],
+                |row| {
+                    Ok(SnapshotSample {
+                        fetched_at: row.get(0)?,
+                        min_price: row.get(1)?,
+                        listings: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                    })
+                },
+            )
+            .map_err(|e| backend("query snapshot_min_prices", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row.map_err(|e| backend("read snapshot_min_prices", e))?);
+        }
+        Ok(out)
+    }
 }
 
 /// Nearest-rank p05/p25/p75/p95 helper for display tables.
@@ -3985,6 +4035,99 @@ mod tests {
         assert!(folds[1].is_empty(), "unknown identity loads empty");
         assert!(folds[2].is_empty(), "out-of-window fold filtered");
         assert_eq!(folds[3].len(), 1, "last chunk entry loaded");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Seeds one snapshot row with its listings (the snapshot-min test's
+    /// fixture writer; target and day are the test's constants).
+    fn seed_snapshot_min(
+        conn: &Connection,
+        item_ref_id: i64,
+        snapshot_id: i64,
+        fetched_at: i64,
+        kind: &str,
+        rows: &[(i64, i64)],
+    ) {
+        conn.execute(
+            "INSERT INTO snapshots (id, target_id, kind, fetched_at, sha256, entry_count, dropped_count, status)
+             VALUES (?1, 'eu-1602', ?2, ?3, ?4, ?5, 0, 'ok')",
+            rusqlite::params![
+                snapshot_id,
+                kind,
+                fetched_at,
+                format!("sha-{snapshot_id}"),
+                i64::try_from(rows.len()).unwrap_or(0)
+            ],
+        )
+        .expect("seed snapshot");
+        for (auction_id, price) in rows {
+            conn.execute(
+                "INSERT INTO listing (snapshot_id, target_id, day, auction_id, item_ref_id, quantity, unit_price, time_left)
+                 VALUES (?1, 'eu-1602', 500, ?2, ?3, 1, ?4, 'LONG')",
+                rusqlite::params![snapshot_id, auction_id, item_ref_id, price],
+            )
+            .expect("seed listing");
+        }
+    }
+
+    #[test]
+    fn snapshot_min_prices_collapse_to_one_row_per_snapshot() {
+        let (dir, store) = test_store("snapshot-min");
+        let target = TargetId("eu-1602".into());
+        let item = ItemRef::Item { item_id: 77 };
+        let day = 500_i64;
+        {
+            let conn = store.open_transaction();
+            let item_ref_id = get_or_create_item_ref(&conn, &item).expect("item ref");
+            // Snapshot 3 carries the identity in the WRONG payload kind — the
+            // market scoping must exclude it.
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                1,
+                day * 86_400 + 2 * 3_600,
+                "commodities",
+                &[(10, 300), (11, 120), (12, 500)],
+            );
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                2,
+                day * 86_400 + 2 * 3_600 + 60,
+                "commodities",
+                &[(13, 150)],
+            );
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                3,
+                day * 86_400 + 5 * 3_600,
+                "auctions",
+                &[(14, 90)],
+            );
+        }
+        let samples = store
+            .snapshot_min_prices(&target, &item, PayloadKind::Commodities, day)
+            .expect("samples");
+        assert_eq!(samples.len(), 2, "wrong-kind snapshot stays out of the market");
+        assert_eq!(samples[0].fetched_at, day * 86_400 + 2 * 3_600, "ordered by fetch time");
+        assert_eq!(samples[0].min_price, 120, "min across the snapshot's listings");
+        assert_eq!(samples[0].listings, 3);
+        assert_eq!(samples[1].min_price, 150);
+        assert_eq!(samples[1].listings, 1);
+        let beyond = store
+            .snapshot_min_prices(&target, &item, PayloadKind::Commodities, day + 1)
+            .expect("samples");
+        assert!(beyond.is_empty(), "the since-day cutoff prunes old snapshots");
+        let unknown = store
+            .snapshot_min_prices(
+                &target,
+                &ItemRef::Item { item_id: 9_999 },
+                PayloadKind::Commodities,
+                day,
+            )
+            .expect("samples");
+        assert!(unknown.is_empty(), "unseen identity answers empty, not an error");
         std::fs::remove_dir_all(&dir).ok();
     }
 
