@@ -242,15 +242,30 @@ pub struct ItemNames {
 /// `data-tip` so the floating tooltip layer can show the id traders quote
 /// in-game — without JS the label simply stays the name.
 #[must_use]
-pub fn item_link(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String {
-    let href = match item {
-        ItemRef::Item { item_id } => {
-            format!("/items/{}/{}", target.as_str(), item_id)
-        }
-        ItemRef::Pet { species, level, quality, breed } => format!(
-            "/items/{t}/pet/{species}?level={level}&quality={quality}&breed={breed}",
-            t = target.as_str()
+pub fn item_link(
+    target: &TargetId,
+    item: &ItemRef,
+    names: &ItemNames,
+    category: Option<Category>,
+) -> String {
+    // A known market category rides in the query so a link from a commodity
+    // context lands on the commodity tab (the item tab is empty for
+    // commodity-only identities, and vice versa). `None` links bare and the
+    // item page's auto-landing picks the tab that holds data.
+    let (path, has_query) = match item {
+        ItemRef::Item { item_id } => (format!("/items/{}/{}", target.as_str(), item_id), false),
+        ItemRef::Pet { species, level, quality, breed } => (
+            format!(
+                "/items/{t}/pet/{species}?level={level}&quality={quality}&breed={breed}",
+                t = target.as_str()
+            ),
+            true,
         ),
+    };
+    let href = match category {
+        Some(category) if has_query => format!("{path}&category={}", category.as_str()),
+        Some(category) => format!("{path}?category={}", category.as_str()),
+        None => path,
     };
     let (label, identity) = match item {
         ItemRef::Item { item_id } => match names.items.get(item_id) {
@@ -275,7 +290,12 @@ pub fn item_link(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String
 /// identity when a catalog name resolved — the CSV exporter reads ids (what
 /// traders quote in-game), not display names.
 #[must_use]
-pub fn item_cell(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String {
+pub fn item_cell(
+    target: &TargetId,
+    item: &ItemRef,
+    names: &ItemNames,
+    category: Option<Category>,
+) -> String {
     let identity = match item {
         ItemRef::Item { item_id } if names.items.contains_key(item_id) => format!("item {item_id}"),
         ItemRef::Pet { species, .. } if names.pets.contains_key(species) => {
@@ -288,7 +308,7 @@ pub fn item_cell(target: &TargetId, item: &ItemRef, names: &ItemNames) -> String
     } else {
         format!(" data-export=\"{}\"", html_escape(&identity))
     };
-    format!("<td{export}>{}</td>", item_link(target, item, names))
+    format!("<td{export}>{}</td>", item_link(target, item, names, category))
 }
 
 /// Outbound Wowhead deep link for one identity under one game flavor — the

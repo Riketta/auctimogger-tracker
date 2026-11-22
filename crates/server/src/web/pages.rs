@@ -51,6 +51,7 @@ use axum::{
     http::StatusCode,
     response::{
         IntoResponse,
+        Redirect,
         Response,
     },
 };
@@ -549,10 +550,16 @@ fn band_label(band: TimeLeftBand) -> &'static str {
 /// The viewer's name cell: the catalog name when enriched, the raw identity
 /// when sparse, linked into the item/pet detail page. Rows carry their name
 /// from the store's catalog join — no second resolution pass.
-fn browse_item_cell(target: &TargetId, row: &ListingRow) -> String {
+fn browse_item_cell(target: &TargetId, row: &ListingRow, kind: PayloadKind) -> String {
     let target_slug = html_escape(target.as_str());
     let (href, label, export) = match &row.item {
         ItemRef::Item { item_id } => {
+            // The dump's kind picks the tab the link lands on (the other
+            // market's tab would be empty for dump-only identities).
+            let category = match kind {
+                PayloadKind::Commodities => Category::Commodity,
+                PayloadKind::Auctions => Category::Item,
+            };
             // CSV keeps the stable identity first, then the resolved name
             // when the catalog has one (the raw label exports bare).
             let export = match &row.name {
@@ -560,7 +567,7 @@ fn browse_item_cell(target: &TargetId, row: &ListingRow) -> String {
                 None => format!("item {item_id}"),
             };
             (
-                format!("/items/{target_slug}/{item_id}"),
+                format!("/items/{target_slug}/{item_id}?category={}", category.as_str()),
                 row.name.clone().unwrap_or_else(|| format!("item {item_id}")),
                 export,
             )
@@ -576,7 +583,7 @@ fn browse_item_cell(target: &TargetId, row: &ListingRow) -> String {
             };
             (
                 format!(
-                    "/items/{target_slug}/pet/{species}?level={level}&quality={quality}&breed={breed}"
+                    "/items/{target_slug}/pet/{species}?level={level}&quality={quality}&breed={breed}&category=pet"
                 ),
                 row.name.clone().unwrap_or_else(|| format!("pet {species}")),
                 export,
@@ -890,7 +897,7 @@ pub(crate) async fn browse_page(
                  <td class=\"num\"{}>{}</td></tr>",
                 row.unit_price,
                 money(row.unit_price),
-                browse_item_cell(&target, row),
+                browse_item_cell(&target, row, kind),
                 level.map_or_else(|| "—".to_string(), |level| level.to_string()),
                 row.quantity,
                 row.quantity,
@@ -1144,6 +1151,43 @@ pub(crate) async fn item_page(
         Err(response) => return *response,
     };
     let item = ItemRef::Item { item_id };
+    // Auto-landing: a bare URL (no ?category=) defaults to the item tab, but
+    // a commodity-only identity would open on an empty page — "no price
+    // history". Probe the two plain-item markets and redirect to the one
+    // that actually holds folds. Explicit tab choices are always respected,
+    // and probe errors degrade to the normal page instead of failing.
+    if !params.contains_key("category") {
+        let probe = tokio::task::spawn_blocking({
+            let state = Arc::clone(&state);
+            let target = target.clone();
+            let item = item.clone();
+            move || -> Option<Category> {
+                let since = utc_day(state.clock.now()) - 29;
+                let has_folds = |category: Category| {
+                    state
+                        .history
+                        .item_day_rows_for_item(&target, &item, since, category)
+                        .is_ok_and(|rows| !rows.is_empty())
+                };
+                if has_folds(Category::Item) {
+                    None
+                } else if has_folds(Category::Commodity) {
+                    Some(Category::Commodity)
+                } else {
+                    None
+                }
+            }
+        });
+        if let Ok(Some(category_with_data)) = probe.await {
+            return Redirect::to(&format!(
+                "/items/{}/{}?category={}",
+                target.as_str(),
+                item_id,
+                category_with_data.as_str()
+            ))
+            .into_response();
+        }
+    }
     let name =
         resolve_item_name(&state, &super::target_flavor(&state.config, &target), item_id).await;
     item_detail_page(
@@ -1599,15 +1643,20 @@ async fn item_detail_page(
                 ),
                 _ => "—".to_string(),
             };
+            // The peer link keeps this page's market category (a pet's
+            // variant query is already present, so the joiner differs).
+            let cat_join = if matches!(&item, ItemRef::Pet { .. }) { "&" } else { "?" };
             let _ = write!(
                 body,
-                "<tr><td><a href=\"/items/{}/{}\">{}</a></td>\
+                "<tr><td><a href=\"/items/{}{}{}category={}\">{}</a></td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td></tr>",
                 html_escape(peer_target.as_str()),
                 peer_item_path(&item),
+                cat_join,
+                category.as_str(),
                 html_escape(peer_target.as_str()),
                 block.median,
                 money(block.median),
@@ -2100,7 +2149,7 @@ pub(crate) async fn opportunities_page(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td>{}</td></tr>",
-                item_cell(&target, &o.item, &names),
+                item_cell(&target, &o.item, &names, Some(category)),
                 o.score,
                 o.score,
                 o.confidence,
@@ -2146,6 +2195,7 @@ fn mover_table(
     series: &HashMap<String, Vec<i64>>,
     names: &render::ItemNames,
     table_id: &str,
+    category: Category,
 ) -> String {
     // Display-only conversion: the f64 median feeds the i64 `money` +
     // sparkline helpers (the original rendering did the same cast).
@@ -2155,6 +2205,7 @@ fn mover_table(
         target: &TargetId,
         series: &HashMap<String, Vec<i64>>,
         names: &render::ItemNames,
+        category: Category,
     ) -> String {
         let mut out = String::new();
         for m in rows {
@@ -2167,7 +2218,7 @@ fn mover_table(
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"{change_class}\" data-v=\"{:.4}\">{:+.1}%</td>\
                  <td class=\"num\" data-v=\"{:.2}\">{:.1}</td><td>{trend}</td></tr>",
-                item_cell(target, &m.item, names),
+                item_cell(target, &m.item, names, Some(category)),
                 m.median_now,
                 money(m.median_now),
                 m.median_prev,
@@ -2190,7 +2241,7 @@ fn mover_table(
         tip("churn/day", "Average unique listings per day."),
         tip("30d", "Actual 30-day median series (real data, not a two-point sketch).")
     );
-    out.push_str(&body_rows(rows, target, series, names));
+    out.push_str(&body_rows(rows, target, series, names, category));
     out.push_str("</tbody></table></div>");
     out
 }
@@ -2267,19 +2318,33 @@ pub(crate) async fn overview_page(
     if data.movers_up.is_empty() {
         body.push_str("<div class=\"empty\">no rising movers yet</div>");
     } else {
-        body.push_str(&mover_table(&data.movers_up, &target, &series, &names, "rising"));
+        body.push_str(&mover_table(&data.movers_up, &target, &series, &names, "rising", category));
     }
     body.push_str("<h2>falling</h2>");
     if data.movers_down.is_empty() {
         body.push_str("<div class=\"empty\">no falling movers yet</div>");
     } else {
-        body.push_str(&mover_table(&data.movers_down, &target, &series, &names, "falling"));
+        body.push_str(&mover_table(
+            &data.movers_down,
+            &target,
+            &series,
+            &names,
+            "falling",
+            category,
+        ));
     }
     body.push_str("<h2>most active</h2>");
     if data.most_active.is_empty() {
         body.push_str("<div class=\"empty\">no churn data yet</div>");
     } else {
-        body.push_str(&mover_table(&data.most_active, &target, &series, &names, "active"));
+        body.push_str(&mover_table(
+            &data.most_active,
+            &target,
+            &series,
+            &names,
+            "active",
+            category,
+        ));
     }
     page("market overview", "overview", &body, Some(switcher))
 }
@@ -2414,7 +2479,7 @@ pub(crate) async fn watchlist_page(
                  <td>{}</td>\
                  <td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td><td>{}</td></tr>",
-                item_cell(&target, &row.entry.item, &names),
+                item_cell(&target, &row.entry.item, &names, Some(category)),
                 now.map_or(String::new(), |v| v.to_string()),
                 now.map_or("—".to_string(), money),
                 week.map_or(String::new(), |w| w.median.to_string()),
@@ -2571,7 +2636,7 @@ pub(crate) async fn priorities_page(
                  <td class=\"muted\">{}</td>",
                 rank + 1,
                 rank + 1,
-                render::item_cell(&target, &row.entry.item, &names),
+                render::item_cell(&target, &row.entry.item, &names, Some(category)),
                 score,
                 row.now.map_or(String::new(), |v| v.to_string()),
                 row.now.map_or("—".to_string(), money),
@@ -2681,7 +2746,8 @@ pub(crate) async fn compare_page(
                 item_cell(
                     &report.targets.first().cloned().unwrap_or_else(|| TargetId(String::new())),
                     &row.item,
-                    &names
+                    &names,
+                    Some(category)
                 )
             );
             for (i, cell) in row.cells.iter().enumerate() {
@@ -2824,7 +2890,7 @@ pub(crate) async fn alerts_page(
                 "<tr>{}<td>{}</td><td class=\"muted\">{}</td>\
                  <td title=\"{}\">{}</td>\
                  <td>{}</td><td>{}</td></tr>",
-                item_cell(&target, &rule.item, &names),
+                item_cell(&target, &rule.item, &names, None),
                 condition_label(&rule.condition),
                 html_escape(rule.note.as_deref().unwrap_or("")),
                 html_escape(&human_time(rule.created_at)),

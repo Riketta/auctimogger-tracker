@@ -1519,6 +1519,57 @@ async fn watchlist_names_every_row_from_a_warmed_catalog() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Item links carry the row's market category, and a bare item URL
+/// auto-lands on the category that actually holds folds (commodity-only
+/// identities used to open on the empty item tab — "no price history").
+#[tokio::test]
+async fn item_links_carry_category_and_bare_urls_auto_land() {
+    let (state, root) = test_state(None);
+    seed_history(&state); // commodity folds only, item 2589
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Item { item_id: 2589 };
+
+    // Bare URL: only commodity folds exist → redirected to the commodity tab.
+    let router = build_router_arc(Arc::clone(&state));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder().method("GET").uri("/items/t1/2589").body(Body::empty()).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER, "bare URL auto-lands");
+    assert_eq!(
+        response.headers().get("location").and_then(|value| value.to_str().ok()),
+        Some("/items/t1/2589?category=commodity")
+    );
+
+    // Explicit tabs are respected — no redirect loop.
+    let (status, _) = get(router.clone(), "/items/t1/2589?category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _) = get(router.clone(), "/items/t1/2589?category=item").await;
+    assert_eq!(status, StatusCode::OK, "an explicit empty tab stays viewable");
+
+    // Item-category folds appear → the bare URL stays on the default tab.
+    let mut fold = DayFold::new(item.clone());
+    fold.apply(&[listing(2000, &item, 150)]);
+    state
+        .history
+        .save_fold(&target, &item, utc_day(state.clock.now()), Category::Item, &fold)
+        .expect("save item fold");
+    let (status, _) = get(router.clone(), "/items/t1/2589").await;
+    assert_eq!(status, StatusCode::OK, "item-tab data keeps the default landing");
+
+    // Table links land on the row's own market tab.
+    state.watchlist.add(&target, item, None).expect("watch");
+    let (_, body) = get(router, "/watchlist?target=t1&category=commodity").await;
+    assert!(
+        body.contains("href=\"/items/t1/2589?category=commodity\""),
+        "watchlist rows carry the market category"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The when-to-buy section: weekday bars from the folds, hourly lines from
 /// the raw working set, preset links, mounts + island for the local-time JS
 /// re-bucketing — and the price-distribution block still in place below it.
