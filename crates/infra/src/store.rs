@@ -23,6 +23,7 @@ use amtracker_core::{
         ClassSummary,
         Flavor,
         ItemDayRow,
+        ItemHourRow,
         ItemRef,
         ListingKind,
         ListingPage,
@@ -39,7 +40,6 @@ use amtracker_core::{
         SaleCredit,
         SearchHit,
         SnapshotMeta,
-        SnapshotSample,
         SnapshotStatus,
         Span,
         TargetId,
@@ -259,6 +259,17 @@ CREATE TABLE IF NOT EXISTS item_day (
     category TEXT NOT NULL,
     fold_json TEXT NOT NULL,
     PRIMARY KEY (target_id, item_ref_id, day, category)
+);
+
+CREATE TABLE IF NOT EXISTS item_hour (
+    target_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    day INTEGER NOT NULL,
+    hour INTEGER NOT NULL,
+    mins TEXT NOT NULL,
+    floor INTEGER NOT NULL,
+    PRIMARY KEY (target_id, kind, item_ref_id, day, hour)
 );
 
 CREATE TABLE IF NOT EXISTS metrics_cache (
@@ -951,6 +962,9 @@ impl SnapshotRepository for SqliteStore {
             let snapshot_id = tx.last_insert_rowid();
 
             let mut item_ref_ids: HashMap<&ItemRef, i64> = HashMap::new();
+            // This snapshot's cheapest unit price per item — the intraday
+            // fold's one value per (item, hour cell) below.
+            let mut hour_mins: HashMap<i64, i64> = HashMap::new();
             let mut insert_listing = tx
             .prepare(
                 "INSERT INTO listing (snapshot_id, target_id, day, auction_id, item_ref_id, quantity, unit_price, bid, time_left, context, bonus_lists)
@@ -965,6 +979,10 @@ impl SnapshotRepository for SqliteStore {
                     item_ref_ids.insert(&listing.item_ref, id);
                     id
                 };
+                let seen_min = hour_mins.entry(item_ref_id).or_insert(listing.unit_price);
+                if listing.unit_price < *seen_min {
+                    *seen_min = listing.unit_price;
+                }
                 insert_listing
                     .execute(rusqlite::params![
                         snapshot_id,
@@ -983,6 +1001,11 @@ impl SnapshotRepository for SqliteStore {
                     .map_err(|e| backend("insert listing", e))?;
             }
             drop(insert_listing);
+            // Permanent intraday fold: one upsert per item seen in this
+            // snapshot — the when-to-buy hour view reads this fold and
+            // outlives raw-listing retention by its own knob.
+            let hour = snapshot.fetched_at.rem_euclid(86_400) / 3_600;
+            upsert_item_hours(&tx, &snapshot.target, snapshot.kind, day, hour, &hour_mins)?;
             tx.commit().map_err(|e| backend("commit", e))?;
             Ok(snapshot_id)
         })();
@@ -3561,53 +3584,105 @@ impl PriceHistoryRepository for SqliteStore {
         day_rows_from_stored(rows, category)
     }
 
-    fn snapshot_min_prices(
+    fn item_hour_cells(
         &self,
         target: &TargetId,
         item: &ItemRef,
         kind: PayloadKind,
         since_day: i64,
-    ) -> Result<Vec<SnapshotSample>, StoreError> {
+    ) -> Result<Vec<ItemHourRow>, StoreError> {
         let conn = self.open_transaction();
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
             return Ok(Vec::new());
         };
-        // The inner aggregate collapses the item's raw rows to one row per
-        // snapshot (MIN + COUNT) before anything leaves SQLite — a hot
-        // commodity's millions of listing rows never cross the port. The
-        // index (target_id, item_ref_id, snapshot_id) serves the filter and
-        // hands the GROUP BY pre-sorted by snapshot; the join then fetches
-        // timestamps and scopes the payload kind.
+        // The PK (target, kind, item, day, hour) serves the whole filter and
+        // hands rows sorted; only one row per observed hour cell crosses the
+        // port (the fold pre-collapses the raw rows at ingest/backfill).
         let mut statement = conn
             .prepare(
-                "SELECT s.fetched_at, m.min_price, m.listings
-                 FROM (SELECT snapshot_id, MIN(unit_price) AS min_price,
-                              COUNT(*) AS listings
-                       FROM listing
-                       WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3
-                       GROUP BY snapshot_id) m
-                 JOIN snapshots s ON s.id = m.snapshot_id
-                 WHERE s.kind = ?4
-                 ORDER BY s.fetched_at",
+                "SELECT day, hour, floor, mins FROM item_hour
+                 WHERE target_id = ?1 AND item_ref_id = ?2 AND kind = ?3 AND day >= ?4
+                 ORDER BY day, hour",
             )
-            .map_err(|e| backend("prepare snapshot_min_prices", e))?;
+            .map_err(|e| backend("prepare item_hour_cells", e))?;
         let rows = statement
             .query_map(
-                rusqlite::params![target.as_str(), item_ref_id, since_day, kind.as_str()],
+                rusqlite::params![target.as_str(), item_ref_id, kind.as_str(), since_day],
                 |row| {
-                    Ok(SnapshotSample {
-                        fetched_at: row.get(0)?,
-                        min_price: row.get(1)?,
-                        listings: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
-                    })
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
                 },
             )
-            .map_err(|e| backend("query snapshot_min_prices", e))?;
+            .map_err(|e| backend("query item_hour_cells", e))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row.map_err(|e| backend("read snapshot_min_prices", e))?);
+            let (day, hour, floor, mins_json) =
+                row.map_err(|e| backend("read item_hour_cells", e))?;
+            let mins: Vec<i64> =
+                serde_json::from_str(&mins_json).map_err(|e| backend("parse item_hour mins", e))?;
+            out.push(ItemHourRow { day, hour, floor, mins });
         }
         Ok(out)
+    }
+
+    fn prune_item_hours_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
+        let conn = self.open_transaction();
+        conn.execute(
+            "DELETE FROM item_hour WHERE target_id = ?1 AND day < ?2",
+            rusqlite::params![target.as_str(), day],
+        )
+        .map(|removed| removed as u64)
+        .map_err(|e| backend("prune item hours", e))
+    }
+
+    fn backfill_item_hours(&self) -> Result<u64, StoreError> {
+        // One (target, day) pair at a time: each single-statement INSERT
+        // scans only that pair's raw rows (idx_listing_day), and the per-pair
+        // autocommit keeps the store mutex short for concurrent readers.
+        // OR REPLACE rebuilds every touched cell from ALL its raw-retained
+        // snapshots — exact even for cells a partial earlier pass wrote.
+        let pairs: Vec<(String, i64)> = {
+            let conn = self.open_transaction();
+            let mut statement = conn
+                .prepare("SELECT DISTINCT target_id, day FROM listing")
+                .map_err(|e| backend("prepare backfill pairs", e))?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
+                .map_err(|e| backend("query backfill pairs", e))?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row.map_err(|e| backend("read backfill pairs", e))?);
+            }
+            out.sort_unstable();
+            out
+        };
+        let mut written = 0u64;
+        for (target, day) in pairs {
+            let conn = self.open_transaction();
+            let cells = conn
+                .execute(
+                    "INSERT OR REPLACE INTO item_hour
+                       (target_id, kind, item_ref_id, day, hour, mins, floor)
+                     SELECT ?1, s.kind, m.item_ref_id, m.day,
+                            (s.fetched_at % 86400) / 3600,
+                            json_group_array(m.min_price), MIN(m.min_price)
+                     FROM (SELECT l.snapshot_id, l.item_ref_id, l.day,
+                                  MIN(l.unit_price) AS min_price
+                           FROM listing l
+                           WHERE l.target_id = ?2 AND l.day = ?3
+                           GROUP BY l.snapshot_id, l.item_ref_id) m
+                     JOIN snapshots s ON s.id = m.snapshot_id
+                     GROUP BY s.kind, m.item_ref_id, m.day, (s.fetched_at % 86400) / 3600",
+                    rusqlite::params![target, target, day],
+                )
+                .map_err(|e| backend("backfill item hours", e))?;
+            written += u64::try_from(cells).unwrap_or(0);
+        }
+        Ok(written)
     }
 }
 
@@ -3704,6 +3779,44 @@ fn lookup_item_ref(conn: &Connection, item: &ItemRef) -> Result<Option<i64>, Sto
         Some(row) => Ok(Some(row.get(0).map_err(|e| backend("item_ref id", e))?)),
         None => Ok(None),
     }
+}
+
+/// Upserts the snapshot's per-item minimums into the permanent intraday hour
+/// fold (`record`'s write path): fresh cells start as the one-element array
+/// `[min]`; an existing cell appends the new minimum to its JSON array and
+/// keeps `floor` exact, so the fold holds every per-snapshot minimum for the
+/// hour — exactly what the when-to-buy view's typical/floor math needs.
+fn upsert_item_hours(
+    conn: &Connection,
+    target: &TargetId,
+    kind: PayloadKind,
+    day: i64,
+    hour: i64,
+    hour_mins: &HashMap<i64, i64>,
+) -> Result<(), StoreError> {
+    let mut upsert = conn
+        .prepare(
+            "INSERT INTO item_hour (target_id, kind, item_ref_id, day, hour, mins, floor)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT (target_id, kind, item_ref_id, day, hour) DO UPDATE SET
+               mins = json_insert(item_hour.mins, '$[#]', ?7),
+               floor = MIN(item_hour.floor, ?7)",
+        )
+        .map_err(|e| backend("prepare item_hour", e))?;
+    for (item_ref_id, min) in hour_mins {
+        upsert
+            .execute(rusqlite::params![
+                target.as_str(),
+                kind.as_str(),
+                item_ref_id,
+                day,
+                hour,
+                format!("[{min}]"),
+                min,
+            ])
+            .map_err(|e| backend("upsert item_hour", e))?;
+    }
+    Ok(())
 }
 
 fn get_or_create_item_ref(conn: &Connection, item: &ItemRef) -> Result<i64, StoreError> {
@@ -4071,7 +4184,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_min_prices_collapse_to_one_row_per_snapshot() {
+    fn item_hour_backfill_builds_cells_from_raw_rows() {
         let (dir, store) = test_store("snapshot-min");
         let target = TargetId("eu-1602".into());
         let item = ItemRef::Item { item_id: 77 };
@@ -4080,7 +4193,7 @@ mod tests {
             let conn = store.open_transaction();
             let item_ref_id = get_or_create_item_ref(&conn, &item).expect("item ref");
             // Snapshot 3 carries the identity in the WRONG payload kind — the
-            // market scoping must exclude it.
+            // market scoping must keep it in its own kind's cell.
             seed_snapshot_min(
                 &conn,
                 item_ref_id,
@@ -4106,27 +4219,39 @@ mod tests {
                 &[(14, 90)],
             );
         }
-        let samples = store
-            .snapshot_min_prices(&target, &item, PayloadKind::Commodities, day)
-            .expect("samples");
-        assert_eq!(samples.len(), 2, "wrong-kind snapshot stays out of the market");
-        assert_eq!(samples[0].fetched_at, day * 86_400 + 2 * 3_600, "ordered by fetch time");
-        assert_eq!(samples[0].min_price, 120, "min across the snapshot's listings");
-        assert_eq!(samples[0].listings, 3);
-        assert_eq!(samples[1].min_price, 150);
-        assert_eq!(samples[1].listings, 1);
+        // Raw rows predate the fold: one backfill pass turns them into the
+        // permanent hour cells, exactly once per (kind, item, hour).
+        let written = store.backfill_item_hours().expect("backfill");
+        assert_eq!(written, 2, "one commodities cell + one auctions cell");
+        let rerun = store.backfill_item_hours().expect("backfill again");
+        assert_eq!(rerun, written, "idempotent: the same cells rebuild");
+
+        let cells =
+            store.item_hour_cells(&target, &item, PayloadKind::Commodities, day).expect("cells");
+        assert_eq!(cells.len(), 1, "both hour-2 snapshots collapse into one cell");
+        assert_eq!((cells[0].day, cells[0].hour), (day, 2));
+        assert_eq!(cells[0].floor, 120, "min across the day's snapshots");
+        let mut mins = cells[0].mins.clone();
+        mins.sort_unstable();
+        assert_eq!(mins, [120, 150]);
+
+        let auctions =
+            store.item_hour_cells(&target, &item, PayloadKind::Auctions, day).expect("cells");
+        assert_eq!(auctions.len(), 1, "wrong-kind snapshot stays out of the market");
+        assert_eq!(auctions[0].mins, [90]);
+
         let beyond = store
-            .snapshot_min_prices(&target, &item, PayloadKind::Commodities, day + 1)
-            .expect("samples");
-        assert!(beyond.is_empty(), "the since-day cutoff prunes old snapshots");
+            .item_hour_cells(&target, &item, PayloadKind::Commodities, day + 1)
+            .expect("cells");
+        assert!(beyond.is_empty(), "the since-day cutoff prunes old cells");
         let unknown = store
-            .snapshot_min_prices(
+            .item_hour_cells(
                 &target,
                 &ItemRef::Item { item_id: 9_999 },
                 PayloadKind::Commodities,
                 day,
             )
-            .expect("samples");
+            .expect("cells");
         assert!(unknown.is_empty(), "unseen identity answers empty, not an error");
         std::fs::remove_dir_all(&dir).ok();
     }

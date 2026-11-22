@@ -593,18 +593,24 @@ pub struct ItemDayRow {
     pub mad: i64,
 }
 
-/// Cheapest-listing sample of one snapshot: the raw working set's per-poll
-/// floor that the day folds (once-per-day, last-observation-wins) cannot
-/// answer. Fuel for the intraday buy-timing view — "what could you actually
-/// buy at, at which hour".
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct SnapshotSample {
-    /// Snapshot fetch time (unix seconds).
-    pub fetched_at: i64,
-    /// Cheapest unit price observed in that snapshot (copper).
-    pub min_price: i64,
-    /// Listings of this identity in that snapshot.
-    pub listings: u64,
+/// One UTC `(day, hour)` cell of the permanent intraday fold: everything the
+/// buy-timing view needs about an identity's cheapest asks in that hour.
+/// `mins` keeps the exact per-snapshot minimums (chronological append
+/// order), so the typical (median) stays recomputable — and re-bucketable
+/// into any timezone — forever, long after the raw working set that produced
+/// it was pruned.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemHourRow {
+    /// UTC day number the cell belongs to.
+    pub day: i64,
+    /// Hour of the UTC day, `0..=23`.
+    pub hour: i64,
+    /// Cheapest of the hour's per-snapshot minimum unit prices (copper) —
+    /// the outright deal floor seen that hour.
+    pub floor: i64,
+    /// The hour's per-snapshot minimum unit prices (copper), one entry per
+    /// snapshot that carried the identity in this hour.
+    pub mins: Vec<i64>,
 }
 
 /// A vanished sighting credited as a sale candidate (plan D7).

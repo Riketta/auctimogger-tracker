@@ -158,6 +158,7 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             database: "web-test.sqlite3".into(),
             raw_listing_days: 7,
             sight_retention_days: 0,
+            item_hour_retention_days: 45,
             archive_dir: "raw".into(),
             feed_dir: "feeds".into(),
             backup_dir: None,
@@ -1571,8 +1572,9 @@ async fn item_links_carry_category_and_bare_urls_auto_land() {
 }
 
 /// The when-to-buy section: weekday bars from the folds, hourly lines from
-/// the raw working set, preset links, mounts + island for the local-time JS
-/// re-bucketing — and the price-distribution block still in place below it.
+/// the permanent intraday hour fold (written by `record`), preset links,
+/// mounts + island for the local-time JS re-bucketing — and the
+/// price-distribution block still in place below it.
 #[tokio::test]
 async fn item_page_when_to_buy_section() {
     let (state, root) = test_state(None);
@@ -1603,7 +1605,14 @@ async fn item_page_when_to_buy_section() {
     assert!(body.contains("id=\"when-verdict\""), "verdict line mount");
     assert!(body.contains("w=12"), "weekday preset links");
     assert!(body.contains("d=7"), "intraday preset links");
+    assert!(body.contains("d=14"), "two-week intraday preset");
+    assert!(body.contains("d=30"), "30-day intraday preset");
     assert!(body.contains("category=commodity"), "presets preserve the category");
+    assert!(
+        !body.contains("no intraday observations"),
+        "the seeded snapshots feed the hourly view through the fold"
+    );
+    assert!(body.contains("cheapest ask by hour"), "the intraday SVG fallback renders");
     assert!(
         body.contains("price distribution"),
         "the distribution block stays (kept deliberately)"

@@ -56,7 +56,9 @@ normal for this item, and how do I know this deal is real?"*.
 - **SQLite storage (WAL)** — the raw listing working set is pruned after
   `storage.raw_listing_days` (default 7) and closed sell-through sightings
   after `storage.sight_retention_days` (default 0 = kept forever); day-folds,
-  snapshot metadata and the item-name catalog are kept forever.
+  the intraday hour fold, snapshot metadata and the item-name catalog are
+  kept on their own horizons (the hour fold: `storage.item_hour_retention_days`,
+  default 45, `0` = forever).
 - **Span analytics** — per item and per span (`d1`/`d7`/`d14`/`d30`):
   `n, min, p05, p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`
   plus a 14-day `saleRate`, its 180-day slow-window twin `saleRate180d`, and
@@ -123,6 +125,7 @@ only — never put secrets in this file.
 | `storage.archive_dir` | `./data/raw` | raw payload archive |
 | `storage.feed_dir` | `./feeds` | where `serve` publishes `feed.lua` / `feed.json` (CWD-relative unless absolute) |
 | `storage.raw_listing_days` | `7` | raw working-set retention; metadata/folds stay forever |
+| `storage.item_hour_retention_days` | `45` | intraday hour-fold retention (the item page's when-to-buy hour view); `0` = forever. Keep ≥ the largest intraday preset you use (30-day preset needs ≥ 30) |
 | `storage.sight_retention_days` | `0` | days closed sell-through sightings are kept (`0` = forever; aggregates live in the sales ledger regardless) |
 | `storage.backup_dir` | absent | directory for scheduled online backups; absent = off |
 | `storage.backup_secs` | `0` | minimum seconds between scheduled backups (`0` = off) |
@@ -622,9 +625,14 @@ the binary under `/opt`, and restarts the unit.
 - Keep the DB on **local disk**; NFS/CIFS mounts can corrupt WAL databases.
 - Raw listings prune after `raw_listing_days` (the scheduler applies it once
   per UTC day); folds/metadata/catalog grow slowly (multi-month DBs stay in
-  the low single-digit GB). Closed sell-through sightings are the fastest-
-  growing table on busy realms — set `sight_retention_days` (e.g. 30–60) to
-  cap them; their sale-rate aggregates live in the sales ledger regardless.
+  the low single-digit GB). The intraday hour fold (when-to-buy hour view)
+  holds ~one row per item per observed hour and prunes after
+  `item_hour_retention_days` (default 45; `0` = forever) — a busy realm's
+  fold is roughly 15–20× smaller than the raw rows it summarizes, but on
+  very item-dense realms consider capping it near 45–60 to bound growth.
+  Closed sell-through sightings are the fastest-growing table on busy
+  realms — set `sight_retention_days` (e.g. 30–60) to cap them; their
+  sale-rate aggregates live in the sales ledger regardless.
 - Feeds are published to `storage.feed_dir` (default `./feeds`) — a bare-metal
   launcher's working directory decides where that lands unless the path is
   made absolute.

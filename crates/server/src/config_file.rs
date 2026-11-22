@@ -220,6 +220,11 @@ pub struct FileStorage {
     /// defaults to 0 (kept forever).
     #[serde(default)]
     pub sight_retention_days: u32,
+    /// Days intraday hour-fold cells are kept before pruning; defaults to
+    /// 45 (covers the when-to-buy view's 30-day horizon with margin), 0 =
+    /// forever.
+    #[serde(default = "default_item_hour_retention_days")]
+    pub item_hour_retention_days: u32,
     /// Directory where raw snapshot payloads are archived.
     pub archive_dir: String,
     /// Directory feed.lua / feed.json are published to (serve mode);
@@ -245,6 +250,12 @@ pub struct FileStorage {
 
 fn default_raw_days() -> u32 {
     7
+}
+
+/// Default `[storage].item_hour_retention_days`: 45 days covers the
+/// when-to-buy view's 30-day intraday preset with margin.
+fn default_item_hour_retention_days() -> u32 {
+    45
 }
 
 fn default_feed_dir() -> String {
@@ -580,6 +591,7 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             database: file.storage.database,
             raw_listing_days: file.storage.raw_listing_days,
             sight_retention_days: file.storage.sight_retention_days,
+            item_hour_retention_days: file.storage.item_hour_retention_days,
             archive_dir: file.storage.archive_dir,
             feed_dir: file.storage.feed_dir,
             backup_dir: file.storage.backup_dir,
@@ -666,6 +678,7 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
                 "database",
                 "raw_listing_days",
                 "sight_retention_days",
+                "item_hour_retention_days",
                 "archive_dir",
                 "feed_dir",
                 "backup_dir",

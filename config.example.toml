@@ -34,6 +34,14 @@ archive_dir = "./data/raw"
 # UTC day (0 = keep forever, the default). Their sale-rate aggregates live in
 # the sales ledger regardless; pruning only caps the fastest-growing table.
 # sight_retention_days = 30
+# Intraday hour-fold retention: the item page's when-to-buy hour view reads a
+# permanent (item, UTC day, hour) fold maintained at ingest. Cells older than
+# this many days are pruned once per UTC day (0 = keep forever); keep it
+# at/above the largest intraday preset you use (the 30-day preset needs >= 30).
+# serve reconciles the fold with the raw listing window once at boot (the
+# `backfill-item-hours` subcommand does the same on demand); history older
+# than raw_listing_days was never foldable.
+# item_hour_retention_days = 45
 # Scheduled online backups: with backup_dir set and backup_secs > 0, `serve`
 # writes a consistent copy of the database (VACUUM INTO - safe while serving)
 # to amtracker-backup-<UTC timestamp>.sqlite3 in that directory and prunes

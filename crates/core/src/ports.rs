@@ -324,31 +324,60 @@ pub trait PriceHistoryRepository: Send + Sync {
         since_day: i64,
         category: Category,
     ) -> Result<Vec<crate::domain::ItemDayRow>, StoreError>;
-    /// Cheapest-listing samples for one identity's snapshots on/after the
-    /// given UTC day, ordered by fetch time: one [`SnapshotSample`] per
-    /// snapshot that carried the identity (fetch time, minimum unit price,
-    /// listing count). Reads the RAW working set, so the horizon is bounded
-    /// by raw retention — long-term memory stays in the day folds. Fuel for
-    /// the intraday buy-timing view.
+    /// Intraday hour cells for one identity on/after the given UTC day, from
+    /// the PERMANENT `item_hour` fold (not the raw working set): one
+    /// [`ItemHourRow`](crate::domain::ItemHourRow) per observed UTC
+    /// `(day, hour)` cell with the hour's per-snapshot minimums. Fuel for the
+    /// intraday buy-timing view; the horizon is bounded only by the fold's
+    /// own retention, not by raw-listing retention.
     ///
     /// The identity must match the canonical `item_ref` tuple; the payload
     /// kind scopes the market (see [`Category::payload_kind`]).
     ///
-    /// The default answers empty — correct for adapters without a raw
-    /// working set (the view degrades to "no intraday data").
+    /// The default answers empty — correct for adapters without an intraday
+    /// fold (the view degrades to "no intraday data").
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when the samples cannot be read.
-    fn snapshot_min_prices(
+    /// Returns `StoreError::Backend` when the cells cannot be read.
+    fn item_hour_cells(
         &self,
         target: &TargetId,
         item: &ItemRef,
         kind: PayloadKind,
         since_day: i64,
-    ) -> Result<Vec<crate::domain::SnapshotSample>, StoreError> {
+    ) -> Result<Vec<crate::domain::ItemHourRow>, StoreError> {
         let _ = (target, item, kind, since_day);
         Ok(Vec::new())
+    }
+    /// Drops intraday hour-fold cells older than the given UTC day; returns
+    /// the rows removed. Retention counterpart to
+    /// [`PriceHistoryRepository::prune_raw_before`] on the fold side — callers
+    /// gate it on their own config (`0` = never call).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cells cannot be deleted.
+    fn prune_item_hours_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
+        let _ = (target, day);
+        Ok(0)
+    }
+    /// Rebuilds intraday hour-fold cells from the raw listing working set
+    /// (one pass over every `(target, day)` that still has raw rows),
+    /// replacing any cell it touches with the exact aggregate of ALL its
+    /// raw-retained snapshots. Idempotent; cells whose raw rows are already
+    /// pruned stay untouched. Boot-time/CLI migration so a fresh fold starts
+    /// with the raw window's history instead of an empty chart. Returns the
+    /// number of cells written.
+    ///
+    /// The default is a no-op returning `0` — adapters without a raw working
+    /// set have nothing to backfill from.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the fold cannot be rebuilt.
+    fn backfill_item_hours(&self) -> Result<u64, StoreError> {
+        Ok(0)
     }
 }
 

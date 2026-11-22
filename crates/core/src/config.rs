@@ -82,6 +82,11 @@ pub struct StorageConfig {
     /// (their aggregates already live in the sales ledger); `0` keeps them
     /// forever — the historical default.
     pub sight_retention_days: u32,
+    /// Intraday hour-fold cells older than this many days are pruned; `0`
+    /// keeps them forever. The fold feeds the item page's when-to-buy hour
+    /// view, so keep it at/above the largest intraday preset you use (the
+    /// 30-day preset needs ≥ 30).
+    pub item_hour_retention_days: u32,
     /// Directory raw payload archives are written to.
     pub archive_dir: String,
     /// Directory feed.lua / feed.json are published to (serve mode).

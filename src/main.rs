@@ -19,6 +19,7 @@ use amtracker_core::{
     ports::{
         FeedRenderer,
         ItemInfoPort,
+        PriceHistoryRepository,
         SpaceMaintenance,
     },
     services::{
@@ -131,6 +132,13 @@ enum Commands {
         #[arg(long)]
         config: PathBuf,
     },
+    /// Rebuild the permanent intraday hour fold (the item page's when-to-buy
+    /// hour view) from the raw listing window. Idempotent and safe against a
+    /// live `serve`; `serve` also runs this once in the background at boot.
+    BackfillItemHours {
+        #[arg(long)]
+        config: PathBuf,
+    },
 }
 
 fn main() {
@@ -159,6 +167,9 @@ fn main() {
         }
         Commands::ForeverRulesets { config } => {
             with_observability(&config, |loaded| run_forever_rulesets(&loaded.tracker))
+        }
+        Commands::BackfillItemHours { config } => {
+            with_observability(&config, |loaded| run_backfill_item_hours(&loaded.tracker))
         }
     };
     exit(code);
@@ -367,6 +378,36 @@ fn run_forever_rulesets(config: &amtracker_core::config::TrackerConfig) -> i32 {
         eprintln!("warning: {failures} ruleset house index(es) could not be read");
     }
     0
+}
+
+/// Manual form of `serve`'s boot-time fold reconciliation: rebuilds the
+/// permanent intraday hour fold from the raw listing window. Idempotent and
+/// exact — every touched cell rebuilds from all its raw-retained snapshots —
+/// so it doubles as the repair tool after an interrupted automatic pass.
+fn run_backfill_item_hours(config: &amtracker_core::config::TrackerConfig) -> i32 {
+    let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
+    let store = match open_store(config, clock) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(error = %error, "store open failed");
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let started = std::time::Instant::now();
+    match store.backfill_item_hours() {
+        Ok(cells) => {
+            println!(
+                "item hour fold reconciled: {cells} cell(s) from the raw window in {:.1}s",
+                started.elapsed().as_secs_f64()
+            );
+            0
+        }
+        Err(error) => {
+            eprintln!("error: backfill failed: {error}");
+            1
+        }
+    }
 }
 
 /// Display percentage of `part` relative to `total`.

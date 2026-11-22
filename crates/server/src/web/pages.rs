@@ -96,10 +96,10 @@ type ItemPageData = (
     std::collections::BTreeMap<i64, amtracker_core::domain::PriceBucket>,
     // Same identity on the other configured targets: (target, d7 block).
     Vec<(TargetId, Option<MetricBlock>)>,
-    // When-to-buy fuel: day rows over the weekday range and the raw working
-    // set's per-snapshot cheapest-listing samples (intraday horizon).
+    // When-to-buy fuel: day rows over the weekday range and the permanent
+    // intraday hour fold (bounded only by its own retention knob).
     Vec<amtracker_core::domain::ItemDayRow>,
-    Vec<amtracker_core::domain::SnapshotSample>,
+    Vec<amtracker_core::domain::ItemHourRow>,
 );
 
 /// Watchlist membership key: kind-prefixed identity string, so items and
@@ -1484,11 +1484,11 @@ async fn item_detail_page(
                 blocks.push((*span, state.metrics.block(&target, &item, category, *span)?));
             }
             // When-to-buy fuel: the weekday range's day rows (folds — any
-            // horizon) and the intraday samples (raw working set — bounded
-            // by raw retention, so the horizon stays short on purpose).
+            // horizon) and the intraday hour cells (permanent fold — the
+            // horizon is its own retention, not raw-listing retention).
             let weekday_rows =
                 state.history.item_day_rows_for_item(&target, &item, weekday_since, category)?;
-            let samples = state.history.snapshot_min_prices(
+            let hour_cells = state.history.item_hour_cells(
                 &target,
                 &item,
                 category.payload_kind(),
@@ -1501,10 +1501,10 @@ async fn item_detail_page(
                 let block = state.metrics.block(&other.id, &item, category, Span::D7)?;
                 peers.push((other.id.clone(), block));
             }
-            Ok((rows, blocks, chart_rows, distribution, peers, weekday_rows, samples))
+            Ok((rows, blocks, chart_rows, distribution, peers, weekday_rows, hour_cells))
         }
     });
-    let (rows, blocks, mut chart_rows, distribution, peers, weekday_rows, samples) =
+    let (rows, blocks, mut chart_rows, distribution, peers, weekday_rows, hour_cells) =
         match page_data.await {
             Ok(Ok(data)) => data,
             Ok(Err(error)) => return render::store_error_page(error).await,
@@ -1559,9 +1559,9 @@ async fn item_detail_page(
     }
     body.push_str("</div>");
 
-    // When to buy: the weekday shape comes from the folds (any horizon), the
-    // intraday shape from the raw working set (retention-bounded on
-    // purpose). Buckets are UTC server-side; the browser layer re-buckets
+    // When to buy: the weekday shape comes from the day folds (any
+    // horizon), the intraday shape from the permanent hour fold (its own
+    // retention). Buckets are UTC server-side; the browser layer re-buckets
     // into local time from the island's raw (day, hour) pairs.
     let base_path = match &item {
         ItemRef::Item { item_id } => format!("/items/{}/{}", target.as_str(), item_id),
@@ -1573,7 +1573,7 @@ async fn item_detail_page(
     if let ItemRef::Pet { level, quality, breed, .. } = &item {
         let _ = write!(query_extra, "&level={level}&quality={quality}&breed={breed}");
     }
-    let buckets = buy_timing::hour_buckets(&samples);
+    let buckets = buy_timing::hour_buckets(&hour_cells);
     let weekdays = buy_timing::weekday_stats(&weekday_rows);
     let verdict = buy_timing::cheapest_window(&weekdays, &buckets);
     let day_medians: std::collections::BTreeMap<i64, i64> =
@@ -1805,10 +1805,12 @@ fn weeks_param(params: &HashMap<String, String>) -> u32 {
     params.get("w").and_then(|v| v.parse().ok()).unwrap_or(8).clamp(1, 12)
 }
 
-/// The when-to-buy intraday horizon (`d`, days). Presets 1/3/7, default 3,
-/// clamped to 1..=7 (raw retention bounds the useful horizon anyway).
+/// The when-to-buy intraday horizon (`d`, days). Presets 1/3/7/14/30,
+/// default 3, clamped to 1..=30 — the permanent hour fold keeps every cell
+/// for its own retention (`item_hour_retention_days`, default 45), so the
+/// 30-day preset works regardless of raw-listing retention.
 fn days_param(params: &HashMap<String, String>) -> u32 {
-    params.get("d").and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 7)
+    params.get("d").and_then(|v| v.parse().ok()).unwrap_or(3).clamp(1, 30)
 }
 
 /// Preset link row for one when-to-buy parameter: plain links (the whole
@@ -1895,10 +1897,10 @@ fn when_to_buy_section(
          <p id=\"when-verdict\">{}</p>",
         tip(
             "when to buy",
-            "Weekday bars come from the day folds (median per weekday, notch = p05 floor). Hour lines come from the raw listing working set: typical = median of each hour's cheapest ask, dashed = the hour's outright floor, both as % of that day's median. Times are UTC server-side; with JS the view re-buckets into your local time."
+            "Weekday bars come from the day folds (median per weekday, notch = p05 floor). Hour lines come from the permanent intraday hour fold: typical = median of each hour's cheapest ask, dashed = the hour's outright floor, both as % of that day's median. Times are UTC server-side; with JS the view re-buckets into your local time."
         ),
         preset_links(base_path, "w", &[("4w", 4), ("8w", 8), ("12w", 12)], weeks, query_extra),
-        preset_links(base_path, "d", &[("24h", 1), ("3d", 3), ("7d", 7)], days, query_extra),
+        preset_links(base_path, "d", &[("24h", 1), ("3d", 3), ("7d", 7), ("14d", 14), ("30d", 30)], days, query_extra),
         html_escape(&verdict_text),
     );
     body.push_str("<div class=\"chart-card\" id=\"when-weekday\">");
@@ -1918,8 +1920,8 @@ fn when_to_buy_section(
     if buckets.is_empty() {
         let _ = write!(
             body,
-            "<div class=\"empty\">no raw listings for this identity in the last {days} days — \
-             the hourly view only covers the raw working set</div>"
+            "<div class=\"empty\">no intraday observations for this identity in the last {days} days — \
+             cells appear as snapshots accumulate and survive raw-listing pruning</div>"
         );
     } else {
         let _ = write!(

@@ -12,7 +12,7 @@
 
 use crate::domain::{
     ItemDayRow,
-    SnapshotSample,
+    ItemHourRow,
 };
 
 /// One hour-of-day bucket over one UTC day: how cheap the identity was.
@@ -91,17 +91,17 @@ fn median_of(sorted: &mut [i64]) -> i64 {
     }
 }
 
-/// Buckets per-snapshot samples into `(UTC day, UTC hour)` cells, sorted by
-/// `(day, hour)`. Hours with no snapshots are simply absent — the renderer
-/// gaps them instead of inventing zero evidence.
+/// Picks the fold's hour cells, sorted by `(day, hour)`, deriving each
+/// cell's typical (median of its per-snapshot minimums) and evidence count.
+/// Duplicate cells (the store's PK makes them impossible; defensive here)
+/// merge by concatenating their minimums. Hours with no snapshots are simply
+/// absent — the renderer gaps them instead of inventing zero evidence.
 #[must_use]
-pub fn hour_buckets(samples: &[SnapshotSample]) -> Vec<HourBucket> {
+pub fn hour_buckets(rows: &[ItemHourRow]) -> Vec<HourBucket> {
     let mut by_cell: std::collections::BTreeMap<(i64, i64), Vec<i64>> =
         std::collections::BTreeMap::new();
-    for sample in samples {
-        let day = crate::domain::utc_day(sample.fetched_at);
-        let hour = sample.fetched_at.rem_euclid(86_400) / 3_600;
-        by_cell.entry((day, hour)).or_default().push(sample.min_price);
+    for row in rows {
+        by_cell.entry((row.day, row.hour)).or_default().extend_from_slice(&row.mins);
     }
     by_cell
         .into_iter()
@@ -190,8 +190,13 @@ mod tests {
 
     use super::*;
 
-    fn sample(fetched_at: i64, min_price: i64) -> SnapshotSample {
-        SnapshotSample { fetched_at, min_price, listings: 1 }
+    fn sample(fetched_at: i64, min_price: i64) -> ItemHourRow {
+        ItemHourRow {
+            day: crate::domain::utc_day(fetched_at),
+            hour: fetched_at.rem_euclid(86_400) / 3_600,
+            floor: min_price,
+            mins: vec![min_price],
+        }
     }
 
     fn day_row(day: i64, median: i64, p05: i64) -> ItemDayRow {

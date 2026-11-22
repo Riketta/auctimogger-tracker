@@ -1836,6 +1836,7 @@ fn opportunity_config() -> TrackerConfig {
             database: "mem.sqlite3".into(),
             raw_listing_days: 7,
             sight_retention_days: 0,
+            item_hour_retention_days: 45,
             archive_dir: "raw".into(),
             feed_dir: "feeds".into(),
             backup_dir: None,

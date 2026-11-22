@@ -306,6 +306,7 @@ pub fn spawn(
 ) -> std::io::Result<thread::JoinHandle<()>> {
     let maintenance = spawn_maintenance_worker(&state)?;
     spawn_name_warmer(&state)?;
+    spawn_item_hour_backfill(&state)?;
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
         // Prepare every configured target's opportunity scan before the first
@@ -678,6 +679,38 @@ fn spawn_name_warmer(state: &Arc<AppState>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// One-shot boot migration: rebuild the intraday hour fold from whatever raw
+/// window still exists, so a deployment that just gained the fold (or a
+/// backfill that was interrupted) starts the when-to-buy hour view with the
+/// raw window's history instead of an empty chart. The pass is idempotent
+/// and exact (every touched cell rebuilds from ALL its raw-retained
+/// snapshots), so re-running on every boot is safe — it runs on its own
+/// thread because a large raw window can take minutes, and startup must not
+/// wait for it; the per-(target, day) statements stay short so concurrent
+/// readers interleave.
+fn spawn_item_hour_backfill(state: &Arc<AppState>) -> std::io::Result<()> {
+    let worker = state.clone();
+    thread::Builder::new().name("amtracker-hour-backfill".into()).spawn(move || {
+        let started = std::time::Instant::now();
+        match worker.history.backfill_item_hours() {
+            Ok(cells) => {
+                tracing::info!(
+                    cells,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "item hour fold reconciled with the raw window"
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "item hour fold backfill failed (rerun `backfill-item-hours` to retry)"
+                );
+            }
+        }
+    })?;
+    Ok(())
+}
+
 /// The warmer thread's loop: run a [`warm_pass`], then either loop
 /// immediately (the pass fetched, or stopped on the batch cap with work
 /// left — a fresh backlog drains continuously at the pacing pace) or sleep
@@ -878,6 +911,21 @@ fn run_prune_if_due(
                     Ok(removed) => tracing::debug!(target, removed, "sight retention applied"),
                     Err(error) => {
                         tracing::warn!(target, error = %error, "sight retention failed");
+                    }
+                }
+            }
+            // The intraday hour fold ages out on its own knob too (0 = keep
+            // forever): it must merely stay at/above the largest when-to-buy
+            // intraday preset the UI should serve.
+            let hour_retention = i64::from(config.storage.item_hour_retention_days);
+            if hour_retention > 0 {
+                match state.history.prune_item_hours_before(
+                    &TargetId(target.to_string()),
+                    today - hour_retention + 1,
+                ) {
+                    Ok(removed) => tracing::debug!(target, removed, "item hour retention applied"),
+                    Err(error) => {
+                        tracing::warn!(target, error = %error, "item hour retention failed");
                     }
                 }
             }

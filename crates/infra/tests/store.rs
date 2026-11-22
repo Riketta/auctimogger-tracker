@@ -225,6 +225,157 @@ fn prune_removes_only_the_raw_working_set() {
 }
 
 #[test]
+fn item_hour_fold_written_at_record_and_survives_raw_prune() {
+    let dir = temp_dir("item-hour");
+    let store = open_store(&dir, 100 * 86_400);
+    let target = TargetId("us-4".into());
+    let identity = item(1);
+    let snap = |fetched_at: i64, kind: PayloadKind, listings: &[NormalizedListing]| NewSnapshot {
+        target: target.clone(),
+        kind,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: listings.len() as u64,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    let base = 100 * 86_400;
+    // Two commodities snapshots inside hour 2 (mins 120 then 150) and one
+    // auctions snapshot in hour 5: separate kind, separate cell.
+    let batch_a = [listing(10, &identity, 300, 1), listing(11, &identity, 120, 5)];
+    let batch_b = [listing(12, &identity, 150, 1)];
+    let batch_c = [listing(13, &identity, 90, 1)];
+    store
+        .record(
+            &snap(base + 2 * 3_600, PayloadKind::Commodities, &batch_a),
+            &batch_a,
+            b"a".as_slice(),
+        )
+        .expect("record a");
+    store
+        .record(
+            &snap(base + 2 * 3_600 + 60, PayloadKind::Commodities, &batch_b),
+            &batch_b,
+            b"b".as_slice(),
+        )
+        .expect("record b");
+    store
+        .record(&snap(base + 5 * 3_600, PayloadKind::Auctions, &batch_c), &batch_c, b"c".as_slice())
+        .expect("record c");
+
+    let cells =
+        store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
+    assert_eq!(cells.len(), 1, "both hour-2 snapshots collapse into one cell");
+    assert_eq!((cells[0].day, cells[0].hour), (100, 2));
+    assert_eq!(cells[0].floor, 120);
+    let mut mins = cells[0].mins.clone();
+    mins.sort_unstable();
+    assert_eq!(mins, [120, 150], "one entry per snapshot, exact mins");
+
+    let auctions =
+        store.item_hour_cells(&target, &identity, PayloadKind::Auctions, 100).expect("cells");
+    assert_eq!(auctions.len(), 1, "the auctions snapshot lands in its own kind");
+    assert_eq!(auctions[0].hour, 5);
+    assert_eq!(auctions[0].mins, [90]);
+
+    // The fold is permanent by design: raw retention must not touch it.
+    let removed = store.prune_raw_before(&target, 101).expect("prune raw");
+    assert!(removed > 0, "raw rows existed and were pruned");
+    let after = store
+        .item_hour_cells(&target, &identity, PayloadKind::Commodities, 100)
+        .expect("cells after prune");
+    assert_eq!(after.len(), 1, "hour cells survive raw-listing pruning");
+    assert_eq!(after[0].mins.len(), 2);
+
+    // The since-day cutoff and unknown identities behave like every read.
+    assert!(store
+        .item_hour_cells(&target, &identity, PayloadKind::Commodities, 101)
+        .expect("cells")
+        .is_empty());
+    assert!(store
+        .item_hour_cells(&target, &item(9_999), PayloadKind::Commodities, 100)
+        .expect("cells")
+        .is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn backfill_item_hours_rebuilds_touched_cells_exactly() {
+    let dir = temp_dir("hour-backfill");
+    let store = open_store(&dir, 100 * 86_400);
+    let target = TargetId("us-4".into());
+    let identity = item(1);
+    let base = 100 * 86_400;
+    for (offset, auction, price, raw) in
+        [(0_i64, 10_i64, 240_i64, b"a".as_slice()), (60, 11, 300, b"b".as_slice())]
+    {
+        store
+            .record(
+                &NewSnapshot {
+                    target: target.clone(),
+                    kind: PayloadKind::Commodities,
+                    fetched_at: base + 2 * 3_600 + offset,
+                    source_last_modified: None,
+                    entry_count: 1,
+                    dropped_count: 0,
+                    dropped_reasons: std::collections::BTreeMap::new(),
+                    status: SnapshotStatus::Ok,
+                },
+                &[listing(auction, &identity, price, 1)],
+                raw,
+            )
+            .expect("record");
+    }
+    // record() already maintains the cell; a backfill must rebuild the SAME
+    // cell exactly from the raw window (idempotent, not doubled).
+    let written = store.backfill_item_hours().expect("backfill");
+    assert_eq!(written, 1, "one (target, day) pair, one cell rebuilt");
+    let cells =
+        store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
+    assert_eq!(cells.len(), 1);
+    let mut mins = cells[0].mins.clone();
+    mins.sort_unstable();
+    assert_eq!(mins, [240, 300], "both snapshots' mins, exactly once each");
+    assert_eq!(cells[0].floor, 240);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn item_hour_prune_respects_its_own_cutoff() {
+    let dir = temp_dir("hour-prune");
+    let store = open_store(&dir, 30 * 86_400);
+    let target = TargetId("us-4".into());
+    let snap = |fetched_at: i64| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: 1,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    store
+        .record(&snap(10 * 86_400 + 3_600), &[listing(1, &item(1), 100, 1)], b"old".as_slice())
+        .expect("old record");
+    store
+        .record(&snap(30 * 86_400 + 3_600), &[listing(2, &item(1), 200, 1)], b"new".as_slice())
+        .expect("new record");
+
+    let removed = store.prune_item_hours_before(&target, 20).expect("prune hours");
+    assert_eq!(removed, 1, "only the day-10 cell is old enough");
+    let cells =
+        store.item_hour_cells(&target, &item(1), PayloadKind::Commodities, 0).expect("cells");
+    assert_eq!(cells.len(), 1);
+    assert_eq!(cells[0].day, 30, "the fresh cell stays");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
 fn sell_through_credits_band_violations_only() {
     use amtracker_core::ports::SalesRepository;
 
