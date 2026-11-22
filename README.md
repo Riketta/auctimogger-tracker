@@ -214,6 +214,7 @@ fail loudly rather than silently disable the setting it was meant to set.
 | `metrics --config <p> --target <id> --item <id> [--span d1]` | print one analytics block (debug aid) |
 | `export-feed --config <p> [--target <id>] [--out feeds] [--slim]` | write feed.lua + feed.json without serving |
 | `forever-rulesets --config <p>` | list Forever rulesets + auction houses via the config's credentials (discovery aid for `blizzard-forever` targets) |
+| `backfill-item-hours --config <p>` | rebuild the when-to-buy hour fold from the raw window (skips days already folded; repair aid for interrupted passes) |
 
 ## Web UI & JSON API
 

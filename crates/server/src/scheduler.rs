@@ -25,6 +25,10 @@ use std::{
     },
     path::Path,
     sync::{
+        atomic::{
+            AtomicBool,
+            Ordering,
+        },
         Arc,
         Condvar,
         Mutex,
@@ -173,11 +177,15 @@ pub fn schedule_view(
     out
 }
 
-/// Maintenance-worker bookkeeping: last retention-prune day and last feed
-/// publication per target (the exact state the ingest loop used to carry).
+/// Maintenance-worker bookkeeping: last retention-prune day per target and
+/// knob (each step is independent — one failing prune must not block the
+/// others' watermarks) and last feed publication per target (the exact state
+/// the ingest loop used to carry).
 #[derive(Default)]
 struct MaintenanceState {
     prune_day: HashMap<String, i64>,
+    sight_prune_day: HashMap<String, i64>,
+    hour_prune_day: HashMap<String, i64>,
     feed_publish: HashMap<String, Instant>,
     /// UTC day the store-wide space-reclamation pass last ran.
     vacuum_day: Option<i64>,
@@ -271,12 +279,22 @@ fn seed_first_fire(config: &amtracker_core::config::TrackerConfig, timers: &Mute
 /// Spawns the companion maintenance worker thread and returns its queue.
 /// The handle is dropped (the worker lives for the process like the
 /// scheduler itself; a failure to spawn fails `serve` startup).
-fn spawn_maintenance_worker(state: &Arc<AppState>) -> std::io::Result<SharedMaintenanceQueue> {
+fn spawn_maintenance_worker(
+    state: &Arc<AppState>,
+    backfill: thread::JoinHandle<()>,
+) -> std::io::Result<SharedMaintenanceQueue> {
     let queue: SharedMaintenanceQueue =
         Arc::new((Mutex::new(MaintenanceQueue::default()), Condvar::new()));
     let worker_state = state.clone();
     let worker_queue = queue.clone();
     thread::Builder::new().name("amtracker-maintenance".into()).spawn(move || {
+        // Boot ordering: retention prunes wait for the hour-fold backfill.
+        // The raw prune deletes a boundary day in batches, and a rebuild
+        // racing it would fold that day from a half-deleted raw set —
+        // permanent degradation of exactly the data the fold preserves.
+        if backfill.join().is_err() {
+            tracing::error!("item hour backfill thread panicked; retention prunes proceed anyway");
+        }
         maintenance_loop(&worker_state, &worker_queue);
     })?;
     Ok(queue)
@@ -304,9 +322,11 @@ pub fn spawn(
     state: Arc<AppState>,
     backup: Option<BackupHook>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
-    let maintenance = spawn_maintenance_worker(&state)?;
+    // Backfill first: the maintenance worker joins its handle before the
+    // first retention prune (see `spawn_maintenance_worker`).
+    let backfill = spawn_item_hour_backfill(&state)?;
+    let maintenance = spawn_maintenance_worker(&state, backfill)?;
     spawn_name_warmer(&state)?;
-    spawn_item_hour_backfill(&state)?;
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
         // Prepare every configured target's opportunity scan before the first
@@ -679,18 +699,46 @@ fn spawn_name_warmer(state: &Arc<AppState>) -> std::io::Result<()> {
     Ok(())
 }
 
+/// `true` while the one-shot hour-fold backfill runs. Retention prunes must
+/// not delete the raw rows a backfill is folding from (a day is deleted in
+/// batches, so a racing rebuild would fold it from a partial raw set). The
+/// maintenance worker avoids this by joining the backfill thread first; this
+/// latch covers the other inline prune path (`/api/fetch` →
+/// `after_cycle_now`), which defers its prune and retries later.
+static HOUR_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// RAII clear for [`HOUR_BACKFILL_RUNNING`] — dropping (including unwinding
+/// from a panic) releases the latch, so a panicking pass can never disable
+/// retention pruning forever.
+struct HourBackfillLatch;
+
+impl HourBackfillLatch {
+    fn acquire() -> Self {
+        HOUR_BACKFILL_RUNNING.store(true, Ordering::Release);
+        HourBackfillLatch
+    }
+}
+
+impl Drop for HourBackfillLatch {
+    fn drop(&mut self) {
+        HOUR_BACKFILL_RUNNING.store(false, Ordering::Release);
+    }
+}
+
 /// One-shot boot migration: rebuild the intraday hour fold from whatever raw
 /// window still exists, so a deployment that just gained the fold (or a
 /// backfill that was interrupted) starts the when-to-buy hour view with the
 /// raw window's history instead of an empty chart. The pass is idempotent
-/// and exact (every touched cell rebuilds from ALL its raw-retained
-/// snapshots), so re-running on every boot is safe — it runs on its own
-/// thread because a large raw window can take minutes, and startup must not
-/// wait for it; the per-(target, day) statements stay short so concurrent
-/// readers interleave.
-fn spawn_item_hour_backfill(state: &Arc<AppState>) -> std::io::Result<()> {
+/// and exact: days already holding cells are skipped, and every rebuilt day
+/// is one atomic statement over its complete raw set — so re-running on every
+/// boot is safe and steady-state boots pay almost nothing. It runs on its
+/// own thread because a large raw window can take minutes, and startup must
+/// not wait for it; the maintenance worker joins this handle before the
+/// first retention prune (see `spawn_maintenance_worker`).
+fn spawn_item_hour_backfill(state: &Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
     let worker = state.clone();
     thread::Builder::new().name("amtracker-hour-backfill".into()).spawn(move || {
+        let _latch = HourBackfillLatch::acquire();
         let started = std::time::Instant::now();
         match worker.history.backfill_item_hours() {
             Ok(cells) => {
@@ -707,8 +755,7 @@ fn spawn_item_hour_backfill(state: &Arc<AppState>) -> std::io::Result<()> {
                 );
             }
         }
-    })?;
-    Ok(())
+    })
 }
 
 /// The warmer thread's loop: run a [`warm_pass`], then either loop
@@ -882,56 +929,61 @@ pub fn warm_pass(
 }
 
 /// Applies retention pruning when the target has not been pruned today yet.
+/// Each knob is an independent step with its own watermark: a failing raw
+/// prune must not silently disable the sight and hour-fold prunes (the fold
+/// keeps growing at ingest), and a failed step retries on the next sweep.
 fn run_prune_if_due(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
     maintenance: &mut MaintenanceState,
     target: &str,
 ) {
-    let today = utc_day(state.clock.now());
-    if maintenance.prune_day.get(target) == Some(&today) {
+    if HOUR_BACKFILL_RUNNING.load(Ordering::Acquire) {
+        // The boot backfill is folding the raw window; pruning under it could
+        // rebuild a day from a half-deleted raw set. Deferred, not failed —
+        // the next sweep (or the next fetch's side effects) retries.
+        tracing::debug!(target, "retention deferred: hour-fold backfill running");
         return;
     }
-    match state.history.prune_raw_before(
-        &TargetId(target.to_string()),
-        today - i64::from(config.storage.raw_listing_days) + 1,
-    ) {
-        Ok(removed) => {
-            maintenance.prune_day.insert(target.to_string(), today);
-            tracing::debug!(target, removed, "raw listing retention applied");
-            // Closed sightings age out on their own knob (0 = keep forever,
-            // the historical default): their aggregates already live in the
-            // sales ledger, so only the reopen-reversal horizon is lost.
-            let retention = i64::from(config.storage.sight_retention_days);
-            if retention > 0 {
-                match state
-                    .history
-                    .prune_sights_before(&TargetId(target.to_string()), today - retention + 1)
-                {
-                    Ok(removed) => tracing::debug!(target, removed, "sight retention applied"),
-                    Err(error) => {
-                        tracing::warn!(target, error = %error, "sight retention failed");
-                    }
-                }
+    let today = utc_day(state.clock.now());
+    let target_id = TargetId(target.to_string());
+    // Raw listings: the working set behind the folds and the snapshot viewer.
+    if maintenance.prune_day.get(target) != Some(&today) {
+        match state
+            .history
+            .prune_raw_before(&target_id, today - i64::from(config.storage.raw_listing_days) + 1)
+        {
+            Ok(removed) => {
+                maintenance.prune_day.insert(target.to_string(), today);
+                tracing::debug!(target, removed, "raw listing retention applied");
             }
-            // The intraday hour fold ages out on its own knob too (0 = keep
-            // forever): it must merely stay at/above the largest when-to-buy
-            // intraday preset the UI should serve.
-            let hour_retention = i64::from(config.storage.item_hour_retention_days);
-            if hour_retention > 0 {
-                match state.history.prune_item_hours_before(
-                    &TargetId(target.to_string()),
-                    today - hour_retention + 1,
-                ) {
-                    Ok(removed) => tracing::debug!(target, removed, "item hour retention applied"),
-                    Err(error) => {
-                        tracing::warn!(target, error = %error, "item hour retention failed");
-                    }
-                }
-            }
+            Err(error) => tracing::warn!(target, error = %error, "raw listing retention failed"),
         }
-        Err(error) => {
-            tracing::warn!(target, error = %error, "raw listing retention failed");
+    }
+    // Closed sightings age out on their own knob (0 = keep forever, the
+    // historical default): their aggregates already live in the sales
+    // ledger, so only the reopen-reversal horizon is lost.
+    let sight_retention = i64::from(config.storage.sight_retention_days);
+    if sight_retention > 0 && maintenance.sight_prune_day.get(target) != Some(&today) {
+        match state.history.prune_sights_before(&target_id, today - sight_retention + 1) {
+            Ok(removed) => {
+                maintenance.sight_prune_day.insert(target.to_string(), today);
+                tracing::debug!(target, removed, "sight retention applied");
+            }
+            Err(error) => tracing::warn!(target, error = %error, "sight retention failed"),
+        }
+    }
+    // The intraday hour fold ages out on its own knob too (0 = keep
+    // forever): it must merely stay at/above the largest when-to-buy
+    // intraday preset the UI should serve.
+    let hour_retention = i64::from(config.storage.item_hour_retention_days);
+    if hour_retention > 0 && maintenance.hour_prune_day.get(target) != Some(&today) {
+        match state.history.prune_item_hours_before(&target_id, today - hour_retention + 1) {
+            Ok(removed) => {
+                maintenance.hour_prune_day.insert(target.to_string(), today);
+                tracing::debug!(target, removed, "item hour retention applied");
+            }
+            Err(error) => tracing::warn!(target, error = %error, "item hour retention failed"),
         }
     }
 }

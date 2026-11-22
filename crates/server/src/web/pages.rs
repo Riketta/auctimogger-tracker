@@ -1179,13 +1179,27 @@ pub(crate) async fn item_page(
             }
         });
         if let Ok(Some(category_with_data)) = probe.await {
-            return Redirect::to(&format!(
+            // Preserve every other query param (a hand-crafted ?d=30 must
+            // survive the landing): the Query map holds decoded values, so
+            // re-encode; sorted for deterministic redirect targets.
+            let mut extras: Vec<(&String, &String)> =
+                params.iter().filter(|(key, _)| key.as_str() != "category").collect();
+            extras.sort_unstable();
+            let mut location = format!(
                 "/items/{}/{}?category={}",
                 target.as_str(),
                 item_id,
                 category_with_data.as_str()
-            ))
-            .into_response();
+            );
+            for (key, value) in extras {
+                let _ = write!(
+                    location,
+                    "&{}={}",
+                    url_encode_component(key),
+                    url_encode_component(value)
+                );
+            }
+            return Redirect::to(&location).into_response();
         }
     }
     let name =

@@ -133,8 +133,10 @@ enum Commands {
         config: PathBuf,
     },
     /// Rebuild the permanent intraday hour fold (the item page's when-to-buy
-    /// hour view) from the raw listing window. Idempotent and safe against a
-    /// live `serve`; `serve` also runs this once in the background at boot.
+    /// hour view) from the raw listing window. Days that already hold fold
+    /// cells are skipped — each day's rebuild is atomic, so only genuinely
+    /// missing days (an interrupted pass, a fresh deployment) are rewritten.
+    /// Safe against a live `serve`; `serve` also runs this at boot.
     BackfillItemHours {
         #[arg(long)]
         config: PathBuf,
@@ -381,9 +383,10 @@ fn run_forever_rulesets(config: &amtracker_core::config::TrackerConfig) -> i32 {
 }
 
 /// Manual form of `serve`'s boot-time fold reconciliation: rebuilds the
-/// permanent intraday hour fold from the raw listing window. Idempotent and
-/// exact — every touched cell rebuilds from all its raw-retained snapshots —
-/// so it doubles as the repair tool after an interrupted automatic pass.
+/// permanent intraday hour fold from the raw listing window. Exact — every
+/// rebuilt day aggregates from all its raw-retained snapshots in one atomic
+/// statement, and days that already hold cells are skipped — so it doubles
+/// as the repair tool after an interrupted automatic pass.
 fn run_backfill_item_hours(config: &amtracker_core::config::TrackerConfig) -> i32 {
     let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
     let store = match open_store(config, clock) {
@@ -459,10 +462,19 @@ fn run_serve(config: &amtracker_core::config::TrackerConfig) -> i32 {
         feed_dir = %config.storage.feed_dir,
         raw_retention_days = config.storage.raw_listing_days,
         sight_retention_days = config.storage.sight_retention_days,
+        item_hour_retention_days = config.storage.item_hour_retention_days,
         alerts = %alert_delivery_summary(config),
         backup = %backup_summary(config),
         "serve configuration"
     );
+    // The largest intraday preset spans 30 days; a shorter fold retention
+    // silently gaps the 14d/30d charts, so say it once at boot instead.
+    if (1..30).contains(&config.storage.item_hour_retention_days) {
+        tracing::warn!(
+            item_hour_retention_days = config.storage.item_hour_retention_days,
+            "fold retention is below the 30-day when-to-buy preset; the 14d/30d intraday charts will show gapped history"
+        );
+    }
     let item_info = build_item_info(config);
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));

@@ -362,13 +362,15 @@ pub trait PriceHistoryRepository: Send + Sync {
         let _ = (target, day);
         Ok(0)
     }
-    /// Rebuilds intraday hour-fold cells from the raw listing working set
-    /// (one pass over every `(target, day)` that still has raw rows),
-    /// replacing any cell it touches with the exact aggregate of ALL its
-    /// raw-retained snapshots. Idempotent; cells whose raw rows are already
-    /// pruned stay untouched. Boot-time/CLI migration so a fresh fold starts
-    /// with the raw window's history instead of an empty chart. Returns the
-    /// number of cells written.
+    /// Rebuilds intraday hour-fold cells from the raw listing working set:
+    /// every `(target, kind, day)` that still has raw rows but no fold cell
+    /// yet is rewritten as the exact aggregate of ALL its raw-retained
+    /// snapshots (one atomic statement per day, so a day that already holds
+    /// any cell is fully reconciled and skipped — only genuinely missing
+    /// days, e.g. after an interrupted pass, pay the rebuild). Cells whose
+    /// raw rows are already pruned stay untouched. Boot-time/CLI migration
+    /// so a fresh fold starts with the raw window's history instead of an
+    /// empty chart. Returns the number of cells written.
     ///
     /// The default is a no-op returning `0` — adapters without a raw working
     /// set have nothing to backfill from.

@@ -302,43 +302,62 @@ fn item_hour_fold_written_at_record_and_survives_raw_prune() {
 }
 
 #[test]
-fn backfill_item_hours_rebuilds_touched_cells_exactly() {
+fn backfill_rebuilds_missing_days_only_and_keeps_pruned_raw_cells() {
     let dir = temp_dir("hour-backfill");
-    let store = open_store(&dir, 100 * 86_400);
+    let store = open_store(&dir, 102 * 86_400);
     let target = TargetId("us-4".into());
     let identity = item(1);
     let base = 100 * 86_400;
-    for (offset, auction, price, raw) in
-        [(0_i64, 10_i64, 240_i64, b"a".as_slice()), (60, 11, 300, b"b".as_slice())]
-    {
-        store
-            .record(
-                &NewSnapshot {
-                    target: target.clone(),
-                    kind: PayloadKind::Commodities,
-                    fetched_at: base + 2 * 3_600 + offset,
-                    source_last_modified: None,
-                    entry_count: 1,
-                    dropped_count: 0,
-                    dropped_reasons: std::collections::BTreeMap::new(),
-                    status: SnapshotStatus::Ok,
-                },
-                &[listing(auction, &identity, price, 1)],
-                raw,
-            )
-            .expect("record");
-    }
-    // record() already maintains the cell; a backfill must rebuild the SAME
-    // cell exactly from the raw window (idempotent, not doubled).
+    let snap = |fetched_at: i64| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: 1,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    // Day 100 hour 2 holds two snapshots (mins 240, 300); day 101 hour 5 one.
+    store
+        .record(&snap(base + 2 * 3_600), &[listing(10, &identity, 240, 1)], b"a".as_slice())
+        .expect("record a");
+    store
+        .record(&snap(base + 2 * 3_600 + 60), &[listing(11, &identity, 300, 1)], b"b".as_slice())
+        .expect("record b");
+    store
+        .record(&snap(base + 86_400 + 5 * 3_600), &[listing(12, &identity, 90, 1)], b"c".as_slice())
+        .expect("record c");
+
+    // Steady state: record() maintains the cells, so every (target, kind,
+    // day) is already reconciled and the pass has nothing to do.
+    assert_eq!(store.backfill_item_hours().expect("backfill"), 0, "reconciled days are skipped");
+
+    // A day that lost its cells (here: fold-pruned while the raw rows
+    // stayed) rebuilds exactly from the raw window.
+    let removed = store.prune_item_hours_before(&target, 101).expect("prune hours");
+    assert_eq!(removed, 1, "the day-100 cell goes, day-101 stays");
     let written = store.backfill_item_hours().expect("backfill");
-    assert_eq!(written, 1, "one (target, day) pair, one cell rebuilt");
+    assert_eq!(written, 1, "only the missing day-100 (commodities) day is rebuilt");
     let cells =
         store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
-    assert_eq!(cells.len(), 1);
+    assert_eq!(cells.len(), 2);
     let mut mins = cells[0].mins.clone();
     mins.sort_unstable();
     assert_eq!(mins, [240, 300], "both snapshots' mins, exactly once each");
     assert_eq!(cells[0].floor, 240);
+
+    // Permanence contract: once a day's raw rows are pruned too, the fold
+    // cell the raw window produced survives later backfills untouched.
+    let raw_removed = store.prune_raw_before(&target, 101).expect("prune raw");
+    assert!(raw_removed > 0, "the day-100 raw rows existed and were pruned");
+    assert_eq!(store.backfill_item_hours().expect("backfill"), 0);
+    let after =
+        store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
+    assert_eq!(after.len(), 2, "both fold cells survive the raw prune");
+    let mut mins = after[0].mins.clone();
+    mins.sort_unstable();
+    assert_eq!(mins, [240, 300], "the rebuilt cell keeps its exact history");
 
     std::fs::remove_dir_all(&dir).ok();
 }

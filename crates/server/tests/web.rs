@@ -1545,6 +1545,24 @@ async fn item_links_carry_category_and_bare_urls_auto_land() {
         Some("/items/t1/2589?category=commodity")
     );
 
+    // Other query params survive the landing redirect (re-encoded).
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/items/t1/2589?d=30")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get("location").and_then(|value| value.to_str().ok()),
+        Some("/items/t1/2589?category=commodity&d=30")
+    );
+
     // Explicit tabs are respected — no redirect loop.
     let (status, _) = get(router.clone(), "/items/t1/2589?category=commodity").await;
     assert_eq!(status, StatusCode::OK);
@@ -1613,6 +1631,22 @@ async fn item_page_when_to_buy_section() {
         "the seeded snapshots feed the hourly view through the fold"
     );
     assert!(body.contains("cheapest ask by hour"), "the intraday SVG fallback renders");
+    // The fallback's y-axis labels: the TOP of the chart is the high end
+    // (y grows downward) — top label value must exceed the bottom's.
+    let chart = body.split("cheapest ask by hour").nth(1).unwrap_or_default();
+    let axis_label = |y: &str| -> i64 {
+        let marker = format!("x=\"12\" y=\"{y}\" class=\"muted\">");
+        chart
+            .find(&marker)
+            .and_then(|at| {
+                chart.get(at + marker.len()..).and_then(|rest| {
+                    rest.chars().take_while(char::is_ascii_digit).collect::<String>().parse().ok()
+                })
+            })
+            .unwrap_or(-1)
+    };
+    let (top, bottom) = (axis_label("14"), axis_label("116"));
+    assert!(top > bottom, "SVG y-axis: high ({top}) above low ({bottom})");
     assert!(
         body.contains("price distribution"),
         "the distribution block stays (kept deliberately)"

@@ -403,6 +403,11 @@
           points.push({ hour: hour, pct: typical });
         });
         if (points.length >= 2) {
+          // Draw the day's path in LOCAL-hour order: cells arrive in UTC-hour
+          // order, and for any non-UTC viewer the local-hour sequence wraps
+          // once through midnight — unsorted, that wrap draws a long segment
+          // back across the whole chart.
+          points.sort(function (a, b) { return a.hour - b.hour; });
           perDay.push({ label: new Date(dayEntry.day * 86400000).toLocaleDateString(), points: points });
         }
       });

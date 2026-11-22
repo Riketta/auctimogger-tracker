@@ -685,8 +685,8 @@ pub fn intraday_svg(buckets: &[HourBucket], day_medians: &BTreeMap<i64, i64>) ->
     );
     let _ = write!(
         svg,
-        "<text x=\"12\" y=\"{pad_t}\" class=\"muted\">{low:.0}%</text>\
-         <text x=\"12\" y=\"{}\" class=\"muted\">{high:.0}%</text>\
+        "<text x=\"12\" y=\"{pad_t}\" class=\"muted\">{high:.0}%</text>\
+         <text x=\"12\" y=\"{}\" class=\"muted\">{low:.0}%</text>\
          <text x=\"{width}\" y=\"{height}\" text-anchor=\"end\" class=\"muted\">UTC hour</text>",
         height - 4.0
     );

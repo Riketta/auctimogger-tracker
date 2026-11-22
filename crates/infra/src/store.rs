@@ -97,7 +97,11 @@ use rusqlite::Connection;
 /// listing set on every page view (~360 ms at 400k listings); the index
 /// Current schema shape. v10 added `sales.eligible` (the credit-eligible
 /// sale-rate denominator); the ALTER is shape-guarded at the call site, so
-/// upgraded files converge with fresh ones.
+/// upgraded files converge with fresh ones. Post-v10 additive shapes — the
+/// `item_hour` intraday fold and its `idx_item_hour_day` retention index —
+/// ride the unconditional idempotent `SCHEMA` batch instead of a gated
+/// migration: fold rows regenerate exactly from raw listings (see
+/// `backfill_item_hours`), so an upgraded file converges by itself.
 const SCHEMA_VERSION: i64 = 10;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
@@ -271,6 +275,7 @@ CREATE TABLE IF NOT EXISTS item_hour (
     floor INTEGER NOT NULL,
     PRIMARY KEY (target_id, kind, item_ref_id, day, hour)
 );
+CREATE INDEX IF NOT EXISTS idx_item_hour_day ON item_hour(target_id, day);
 
 CREATE TABLE IF NOT EXISTS metrics_cache (
     target_id TEXT NOT NULL,
@@ -3630,38 +3635,68 @@ impl PriceHistoryRepository for SqliteStore {
     }
 
     fn prune_item_hours_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
-        let conn = self.open_transaction();
-        conn.execute(
-            "DELETE FROM item_hour WHERE target_id = ?1 AND day < ?2",
-            rusqlite::params![target.as_str(), day],
-        )
-        .map(|removed| removed as u64)
-        .map_err(|e| backend("prune item hours", e))
+        // Same batching discipline as `prune_raw_before`: every delete stays
+        // short so the store mutex is released between statements. The
+        // `idx_item_hour_day(target_id, day)` index serves the predicate —
+        // the PK cannot seek `day` (kind/item sit between), so without it
+        // each daily delete would scan the target's whole retained fold.
+        const PRUNE_BATCH: usize = 50_000;
+        const PRUNE_BATCH_I64: i64 = 50_000;
+        let mut removed = 0usize;
+        loop {
+            let conn = self.open_transaction();
+            let batch = conn
+                .execute(
+                    "DELETE FROM item_hour WHERE rowid IN (
+                         SELECT rowid FROM item_hour WHERE target_id = ?1 AND day < ?2 LIMIT ?3)",
+                    rusqlite::params![target.as_str(), day, PRUNE_BATCH_I64],
+                )
+                .map_err(|e| backend("prune item hours", e))?;
+            drop(conn);
+            removed += batch;
+            if batch < PRUNE_BATCH {
+                break;
+            }
+        }
+        Ok(removed as u64)
     }
 
     fn backfill_item_hours(&self) -> Result<u64, StoreError> {
-        // One (target, day) pair at a time: each single-statement INSERT
-        // scans only that pair's raw rows (idx_listing_day), and the per-pair
-        // autocommit keeps the store mutex short for concurrent readers.
-        // OR REPLACE rebuilds every touched cell from ALL its raw-retained
-        // snapshots — exact even for cells a partial earlier pass wrote.
-        let pairs: Vec<(String, i64)> = {
+        // One (target, kind, day) triple at a time: each single-statement
+        // INSERT scans only that day's raw rows (idx_listing_day), and the
+        // per-triple autocommit keeps the store mutex short for concurrent
+        // readers. Triples that already hold ANY fold cell are skipped up
+        // front — each rebuild is one atomic statement over the day's whole
+        // raw set, so an existing day is fully reconciled, and a day never
+        // gains raw rows retroactively (fetched_at is ingest time), so a
+        // skipped day cannot go stale. Only genuinely missing days (a fresh
+        // deployment, an interrupted pass) pay the rebuild.
+        let triples: Vec<(String, String, i64)> = {
             let conn = self.open_transaction();
             let mut statement = conn
-                .prepare("SELECT DISTINCT target_id, day FROM listing")
-                .map_err(|e| backend("prepare backfill pairs", e))?;
+                .prepare(
+                    "SELECT DISTINCT l.target_id, s.kind, l.day FROM listing l
+                     JOIN snapshots s ON s.id = l.snapshot_id
+                     WHERE NOT EXISTS (
+                         SELECT 1 FROM item_hour h
+                         WHERE h.target_id = l.target_id AND h.kind = s.kind
+                           AND h.day = l.day)",
+                )
+                .map_err(|e| backend("prepare backfill triples", e))?;
             let rows = statement
-                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))
-                .map_err(|e| backend("query backfill pairs", e))?;
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                })
+                .map_err(|e| backend("query backfill triples", e))?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(row.map_err(|e| backend("read backfill pairs", e))?);
+                out.push(row.map_err(|e| backend("read backfill triples", e))?);
             }
             out.sort_unstable();
             out
         };
         let mut written = 0u64;
-        for (target, day) in pairs {
+        for (target, kind, day) in triples {
             let conn = self.open_transaction();
             let cells = conn
                 .execute(
@@ -3676,8 +3711,9 @@ impl PriceHistoryRepository for SqliteStore {
                            WHERE l.target_id = ?2 AND l.day = ?3
                            GROUP BY l.snapshot_id, l.item_ref_id) m
                      JOIN snapshots s ON s.id = m.snapshot_id
-                     GROUP BY s.kind, m.item_ref_id, m.day, (s.fetched_at % 86400) / 3600",
-                    rusqlite::params![target, target, day],
+                     WHERE s.kind = ?4
+                     GROUP BY m.item_ref_id, m.day, (s.fetched_at % 86400) / 3600",
+                    rusqlite::params![target, target, day, kind],
                 )
                 .map_err(|e| backend("backfill item hours", e))?;
             written += u64::try_from(cells).unwrap_or(0);
@@ -4224,7 +4260,7 @@ mod tests {
         let written = store.backfill_item_hours().expect("backfill");
         assert_eq!(written, 2, "one commodities cell + one auctions cell");
         let rerun = store.backfill_item_hours().expect("backfill again");
-        assert_eq!(rerun, written, "idempotent: the same cells rebuild");
+        assert_eq!(rerun, 0, "reconciled days are skipped; their cells stay untouched");
 
         let cells =
             store.item_hour_cells(&target, &item, PayloadKind::Commodities, day).expect("cells");

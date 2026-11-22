@@ -1,9 +1,9 @@
 //! Buy-timing aggregation: pure folds answering "which weekday and which
 //! hour of day is this identity usually cheapest" for the item page's
-//! when-to-buy view. Inputs are store reads the caller already made —
-//! per-snapshot cheapest-listing samples (raw working set, intraday) and
-//! per-day aggregate rows (folds, weekday) — so everything here is
-//! deterministic and table-testable.
+//! when-to-buy view. Inputs are store reads the caller already made — the
+//! permanent intraday hour fold ([`ItemHourRow`]) and the per-day aggregate
+//! rows (folds, weekday) — so everything here is deterministic and
+//! table-testable.
 //!
 //! Buckets are UTC-shaped on purpose: the server SVG fallback renders UTC,
 //! and the browser layer re-buckets from the raw `(day, hour)` pairs into

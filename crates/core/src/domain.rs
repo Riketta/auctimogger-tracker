@@ -595,10 +595,11 @@ pub struct ItemDayRow {
 
 /// One UTC `(day, hour)` cell of the permanent intraday fold: everything the
 /// buy-timing view needs about an identity's cheapest asks in that hour.
-/// `mins` keeps the exact per-snapshot minimums (chronological append
-/// order), so the typical (median) stays recomputable — and re-bucketable
-/// into any timezone — forever, long after the raw working set that produced
-/// it was pruned.
+/// `mins` keeps the exact per-snapshot minimums (append order at ingest;
+/// backfilled cells carry them in unspecified order — every consumer reads
+/// them with order-insensitive statistics), so the typical (median) stays
+/// recomputable — and re-bucketable into any timezone — forever, long after
+/// the raw working set that produced it was pruned.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ItemHourRow {
     /// UTC day number the cell belongs to.
