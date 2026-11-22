@@ -740,6 +740,7 @@ fn spawn_item_hour_backfill(state: &Arc<AppState>) -> std::io::Result<thread::Jo
     thread::Builder::new().name("amtracker-hour-backfill".into()).spawn(move || {
         let _latch = HourBackfillLatch::acquire();
         let started = std::time::Instant::now();
+        tracing::info!("item hour fold backfill started (reconciled days are skipped)");
         match worker.history.backfill_item_hours() {
             Ok(cells) => {
                 tracing::info!(

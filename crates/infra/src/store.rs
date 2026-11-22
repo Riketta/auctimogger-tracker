@@ -3671,16 +3671,23 @@ impl PriceHistoryRepository for SqliteStore {
         // gains raw rows retroactively (fetched_at is ingest time), so a
         // skipped day cannot go stale. Only genuinely missing days (a fresh
         // deployment, an interrupted pass) pay the rebuild.
+        //
+        // Discovery reads `snapshots`, NEVER `listing`: one row per
+        // snapshot (thousands) instead of one per raw listing (tens of
+        // millions on a full window) — a listing scan would hold the store
+        // mutex for minutes at boot and stall every reader. `listing.day`
+        // is always `utc_day(fetched_at)` (record derives both from the
+        // same timestamp), so the triples are identical; a snapshot whose
+        // listings were all dropped simply yields a zero-row rebuild.
         let triples: Vec<(String, String, i64)> = {
             let conn = self.open_transaction();
             let mut statement = conn
                 .prepare(
-                    "SELECT DISTINCT l.target_id, s.kind, l.day FROM listing l
-                     JOIN snapshots s ON s.id = l.snapshot_id
+                    "SELECT DISTINCT s.target_id, s.kind, s.fetched_at / 86400 FROM snapshots s
                      WHERE NOT EXISTS (
                          SELECT 1 FROM item_hour h
-                         WHERE h.target_id = l.target_id AND h.kind = s.kind
-                           AND h.day = l.day)",
+                         WHERE h.target_id = s.target_id AND h.kind = s.kind
+                           AND h.day = s.fetched_at / 86400)",
                 )
                 .map_err(|e| backend("prepare backfill triples", e))?;
             let rows = statement
@@ -4253,6 +4260,17 @@ mod tests {
                 day * 86_400 + 5 * 3_600,
                 "auctions",
                 &[(14, 90)],
+            );
+            // A snapshot whose listings were all dropped: discovery must
+            // surface its day (it reads `snapshots`, not `listing`), and the
+            // rebuild simply writes zero cells for it.
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                4,
+                (day + 1) * 86_400 + 9 * 3_600,
+                "commodities",
+                &[],
             );
         }
         // Raw rows predate the fold: one backfill pass turns them into the
