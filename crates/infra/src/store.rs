@@ -3702,8 +3702,14 @@ impl PriceHistoryRepository for SqliteStore {
             out.sort_unstable();
             out
         };
+        // Progress is logged per day: the statements run seconds each on a
+        // full window, and an operator watching a fresh deployment must see
+        // the pass move instead of a silent multi-minute gap between the
+        // start and completion lines.
+        tracing::info!(candidate_days = triples.len(), "item hour backfill: day scan complete");
         let mut written = 0u64;
         for (target, kind, day) in triples {
+            let started = std::time::Instant::now();
             let conn = self.open_transaction();
             let cells = conn
                 .execute(
@@ -3723,7 +3729,31 @@ impl PriceHistoryRepository for SqliteStore {
                     rusqlite::params![target, target, day, kind],
                 )
                 .map_err(|e| backend("backfill item hours", e))?;
+            drop(conn);
             written += u64::try_from(cells).unwrap_or(0);
+            let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+            if cells > 0 {
+                tracing::info!(
+                    target = %target,
+                    kind = %kind,
+                    day,
+                    cells,
+                    elapsed_ms,
+                    "item hour backfill: day rebuilt"
+                );
+                // Reader fairness: each rebuild statement holds the store
+                // mutex for seconds; a short pause between days lets queued
+                // page renders and cycles interleave instead of starving for
+                // the whole pass.
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            } else {
+                tracing::debug!(
+                    target = %target,
+                    kind = %kind,
+                    day,
+                    "item hour backfill: day has no raw rows, nothing written"
+                );
+            }
         }
         Ok(written)
     }
