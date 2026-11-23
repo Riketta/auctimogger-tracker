@@ -3662,96 +3662,121 @@ impl PriceHistoryRepository for SqliteStore {
     }
 
     fn backfill_item_hours(&self) -> Result<u64, StoreError> {
-        // One (target, kind, day) triple at a time: each single-statement
-        // INSERT scans only that day's raw rows (idx_listing_day), and the
-        // per-triple autocommit keeps the store mutex short for concurrent
-        // readers. Triples that already hold ANY fold cell are skipped up
-        // front — each rebuild is one atomic statement over the day's whole
-        // raw set, so an existing day is fully reconciled, and a day never
-        // gains raw rows retroactively (fetched_at is ingest time), so a
-        // skipped day cannot go stale. Only genuinely missing days (a fresh
-        // deployment, an interrupted pass) pay the rebuild.
+        // One statement per (target, kind, day, HOUR) — see
+        // `backfill_item_hour_cells`: each statement is driven by the hour's
+        // concrete snapshot-id list through the `snapshot_id` indexes, so no
+        // rebuild ever sorts or scans a whole day's/week's listing set. The
+        // statement is atomic per hour, which keeps the skip invariant exact:
+        // an hour that holds ANY cell is complete (interrupted passes resume
+        // at hour granularity), and a day never gains raw rows retroactively
+        // (fetched_at is ingest time), so a skipped hour cannot go stale.
         //
         // Discovery reads `snapshots`, NEVER `listing`: one row per
         // snapshot (thousands) instead of one per raw listing (tens of
-        // millions on a full window) — a listing scan would hold the store
-        // mutex for minutes at boot and stall every reader. `listing.day`
-        // is always `utc_day(fetched_at)` (record derives both from the
-        // same timestamp), so the triples are identical; a snapshot whose
+        // millions on a full window). `listing.day` is always
+        // `utc_day(fetched_at)` (record derives both from the same
+        // timestamp), so the hour tuples match exactly; an hour whose
         // listings were all dropped simply yields a zero-row rebuild.
-        let triples: Vec<(String, String, i64)> = {
+        let candidates: Vec<(String, String, i64, i64)> = {
             let conn = self.open_transaction();
             let mut statement = conn
                 .prepare(
-                    "SELECT DISTINCT s.target_id, s.kind, s.fetched_at / 86400 FROM snapshots s
+                    "SELECT DISTINCT s.target_id, s.kind, s.fetched_at / 86400,
+                            (s.fetched_at % 86400) / 3600
+                     FROM snapshots s
                      WHERE NOT EXISTS (
                          SELECT 1 FROM item_hour h
                          WHERE h.target_id = s.target_id AND h.kind = s.kind
-                           AND h.day = s.fetched_at / 86400)",
+                           AND h.day = s.fetched_at / 86400
+                           AND h.hour = (s.fetched_at % 86400) / 3600)",
                 )
-                .map_err(|e| backend("prepare backfill triples", e))?;
+                .map_err(|e| backend("prepare backfill hours", e))?;
             let rows = statement
                 .query_map([], |row| {
-                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)?))
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
                 })
-                .map_err(|e| backend("query backfill triples", e))?;
+                .map_err(|e| backend("query backfill hours", e))?;
             let mut out = Vec::new();
             for row in rows {
-                out.push(row.map_err(|e| backend("read backfill triples", e))?);
+                out.push(row.map_err(|e| backend("read backfill hours", e))?);
             }
             out.sort_unstable();
             out
         };
-        // Progress is logged per day: the statements run seconds each on a
-        // full window, and an operator watching a fresh deployment must see
-        // the pass move instead of a silent multi-minute gap between the
-        // start and completion lines.
-        tracing::info!(candidate_days = triples.len(), "item hour backfill: day scan complete");
+        // Progress is logged per rebuilt hour: an operator watching a fresh
+        // deployment must see the pass move instead of a silent gap between
+        // the start and completion lines.
+        tracing::info!(
+            candidate_hours = candidates.len(),
+            "item hour backfill: hour scan complete"
+        );
         let mut written = 0u64;
-        for (target, kind, day) in triples {
+        for (target, kind, day, hour) in candidates {
+            // The hour's snapshot ids first (index-only, a handful of rows):
+            // driving the rebuild with a concrete id list lets SQLite seek
+            // listings through the snapshot_id indexes, and an hour with no
+            // snapshots left (cannot happen per discovery, guarded anyway)
+            // skips the statement entirely.
+            let ids: Vec<i64> = {
+                let conn = self.open_transaction();
+                let mut statement = conn
+                    .prepare(
+                        "SELECT id FROM snapshots
+                         WHERE target_id = ?1 AND kind = ?2
+                           AND fetched_at >= ?3 * 86400 AND fetched_at < (?3 + 1) * 86400
+                           AND (fetched_at % 86400) / 3600 = ?4",
+                    )
+                    .map_err(|e| backend("prepare backfill snapshot ids", e))?;
+                let rows = statement
+                    .query_map(rusqlite::params![target, kind, day, hour], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .map_err(|e| backend("query backfill snapshot ids", e))?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row.map_err(|e| backend("read backfill snapshot ids", e))?);
+                }
+                out
+            };
+            if ids.is_empty() {
+                continue;
+            }
             let started = std::time::Instant::now();
-            let conn = self.open_transaction();
-            let cells = conn
-                .execute(
-                    "INSERT OR REPLACE INTO item_hour
-                       (target_id, kind, item_ref_id, day, hour, mins, floor)
-                     SELECT ?1, s.kind, m.item_ref_id, m.day,
-                            (s.fetched_at % 86400) / 3600,
-                            json_group_array(m.min_price), MIN(m.min_price)
-                     FROM (SELECT l.snapshot_id, l.item_ref_id, l.day,
-                                  MIN(l.unit_price) AS min_price
-                           FROM listing l
-                           WHERE l.target_id = ?2 AND l.day = ?3
-                           GROUP BY l.snapshot_id, l.item_ref_id) m
-                     JOIN snapshots s ON s.id = m.snapshot_id
-                     WHERE s.kind = ?4
-                     GROUP BY m.item_ref_id, m.day, (s.fetched_at % 86400) / 3600",
-                    rusqlite::params![target, target, day, kind],
-                )
-                .map_err(|e| backend("backfill item hours", e))?;
-            drop(conn);
-            written += u64::try_from(cells).unwrap_or(0);
+            let cells = {
+                let conn = self.open_transaction();
+                let written = backfill_item_hour_cells(&conn, &target, &kind, day, hour, &ids)?;
+                drop(conn);
+                written
+            };
+            written += cells;
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
             if cells > 0 {
                 tracing::info!(
                     target = %target,
                     kind = %kind,
                     day,
+                    hour,
+                    snapshots = ids.len(),
                     cells,
                     elapsed_ms,
-                    "item hour backfill: day rebuilt"
+                    "item hour backfill: hour rebuilt"
                 );
-                // Reader fairness: each rebuild statement holds the store
-                // mutex for seconds; a short pause between days lets queued
-                // page renders and cycles interleave instead of starving for
-                // the whole pass.
-                std::thread::sleep(std::time::Duration::from_millis(50));
+                // Reader fairness: a short pause between rebuilt hours lets
+                // queued page renders and cycles take the store mutex
+                // between the pass's statements.
+                std::thread::sleep(std::time::Duration::from_millis(20));
             } else {
                 tracing::debug!(
                     target = %target,
                     kind = %kind,
                     day,
-                    "item hour backfill: day has no raw rows, nothing written"
+                    hour,
+                    "item hour backfill: hour has no raw rows, nothing written"
                 );
             }
         }
@@ -3890,6 +3915,44 @@ fn upsert_item_hours(
             .map_err(|e| backend("upsert item_hour", e))?;
     }
     Ok(())
+}
+
+/// One (target, kind, day, hour) rebuild for `backfill_item_hours`: rewrites
+/// every hour cell of that hour from ALL its raw-retained listings (exact,
+/// atomic, idempotent — `mins` keeps one entry per snapshot). The concrete
+/// snapshot-id list drives the scan through the `snapshot_id` indexes (a
+/// subquery instead would make SQLite bloom-filter a full `listing` table
+/// scan per statement), and the aggregation covers only that hour's rows, so
+/// no statement ever sorts a whole day's listing set. Returns the number of
+/// hour cells written.
+///
+/// The `IN` placeholder list is built from `ids.len()` only — never from
+/// data — so the formatted SQL is as parameterized as the rest.
+fn backfill_item_hour_cells(
+    conn: &Connection,
+    target: &str,
+    kind: &str,
+    day: i64,
+    hour: i64,
+    ids: &[i64],
+) -> Result<u64, StoreError> {
+    let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
+    let sql = format!(
+        "INSERT OR REPLACE INTO item_hour
+           (target_id, kind, item_ref_id, day, hour, mins, floor)
+         SELECT ?1, ?2, m.item_ref_id, ?3, ?4,
+                json_group_array(m.min_price), MIN(m.min_price)
+         FROM (SELECT l.snapshot_id, l.item_ref_id, MIN(l.unit_price) AS min_price
+               FROM listing l
+               WHERE l.snapshot_id IN ({placeholders})
+               GROUP BY l.snapshot_id, l.item_ref_id) m
+         GROUP BY m.item_ref_id"
+    );
+    let mut args: Vec<&dyn rusqlite::ToSql> = vec![&target, &kind, &day, &hour];
+    args.extend(ids.iter().map(|id| id as &dyn rusqlite::ToSql));
+    conn.execute(sql.as_str(), args.as_slice())
+        .map(|cells| u64::try_from(cells).unwrap_or(0))
+        .map_err(|e| backend("backfill item hours", e))
 }
 
 fn get_or_create_item_ref(conn: &Connection, item: &ItemRef) -> Result<i64, StoreError> {
