@@ -279,22 +279,12 @@ fn seed_first_fire(config: &amtracker_core::config::TrackerConfig, timers: &Mute
 /// Spawns the companion maintenance worker thread and returns its queue.
 /// The handle is dropped (the worker lives for the process like the
 /// scheduler itself; a failure to spawn fails `serve` startup).
-fn spawn_maintenance_worker(
-    state: &Arc<AppState>,
-    backfill: thread::JoinHandle<()>,
-) -> std::io::Result<SharedMaintenanceQueue> {
+fn spawn_maintenance_worker(state: &Arc<AppState>) -> std::io::Result<SharedMaintenanceQueue> {
     let queue: SharedMaintenanceQueue =
         Arc::new((Mutex::new(MaintenanceQueue::default()), Condvar::new()));
     let worker_state = state.clone();
     let worker_queue = queue.clone();
     thread::Builder::new().name("amtracker-maintenance".into()).spawn(move || {
-        // Boot ordering: retention prunes wait for the hour-fold backfill.
-        // The raw prune deletes a boundary day in batches, and a rebuild
-        // racing it would fold that day from a half-deleted raw set —
-        // permanent degradation of exactly the data the fold preserves.
-        if backfill.join().is_err() {
-            tracing::error!("item hour backfill thread panicked; retention prunes proceed anyway");
-        }
         maintenance_loop(&worker_state, &worker_queue);
     })?;
     Ok(queue)
@@ -322,10 +312,14 @@ pub fn spawn(
     state: Arc<AppState>,
     backup: Option<BackupHook>,
 ) -> std::io::Result<thread::JoinHandle<()>> {
-    // Backfill first: the maintenance worker joins its handle before the
-    // first retention prune (see `spawn_maintenance_worker`).
-    let backfill = spawn_item_hour_backfill(&state)?;
-    let maintenance = spawn_maintenance_worker(&state, backfill)?;
+    // Backfill first, and latched before any other thread exists: retention
+    // prunes must not delete the raw rows the backfill is folding from, and
+    // `run_prune_if_due` defers while the latch is held. Everything else the
+    // maintenance worker owns (feed publication, alerts, scan refresh) runs
+    // right away — only the prunes wait the backfill out. The handle is
+    // dropped on purpose: the pass runs detached, like the warmer.
+    spawn_item_hour_backfill(&state, HourBackfillLatch::acquire())?;
+    let maintenance = spawn_maintenance_worker(&state)?;
     spawn_name_warmer(&state)?;
     thread::Builder::new().name("amtracker-scheduler".into()).spawn(move || {
         let config = state.config.clone();
@@ -701,10 +695,13 @@ fn spawn_name_warmer(state: &Arc<AppState>) -> std::io::Result<()> {
 
 /// `true` while the one-shot hour-fold backfill runs. Retention prunes must
 /// not delete the raw rows a backfill is folding from (a day is deleted in
-/// batches, so a racing rebuild would fold it from a partial raw set). The
-/// maintenance worker avoids this by joining the backfill thread first; this
-/// latch covers the other inline prune path (`/api/fetch` →
-/// `after_cycle_now`), which defers its prune and retries later.
+/// batches, so a racing rebuild would fold it from a partial raw set), so
+/// `run_prune_if_due` — the one prune entry point behind both the
+/// maintenance worker and the manual `/api/fetch` path — defers and retries
+/// later while it is held. `spawn` acquires it before the backfill thread
+/// (or any prune caller) exists, so there is no window in which a prune can
+/// run under an unlatched backfill; the guard rides into the thread and
+/// clears it when the pass ends.
 static HOUR_BACKFILL_RUNNING: AtomicBool = AtomicBool::new(false);
 
 /// RAII clear for [`HOUR_BACKFILL_RUNNING`] — dropping (including unwinding
@@ -729,19 +726,26 @@ impl Drop for HourBackfillLatch {
 /// window still exists, so a deployment that just gained the fold (or a
 /// backfill that was interrupted) starts the when-to-buy hour view with the
 /// raw window's history instead of an empty chart. The pass is idempotent
-/// and exact: days already holding cells are skipped, and every rebuilt day
-/// is one atomic statement over its complete raw set — so re-running on every
-/// boot is safe and steady-state boots pay almost nothing. It runs on its
-/// own thread because a large raw window can take minutes, and startup must
-/// not wait for it; the maintenance worker joins this handle before the
-/// first retention prune (see `spawn_maintenance_worker`).
-fn spawn_item_hour_backfill(state: &Arc<AppState>) -> std::io::Result<thread::JoinHandle<()>> {
+/// and exact: hours already holding cells are skipped, and every rebuilt hour
+/// is one atomic statement over its complete raw set — so re-running on
+/// every boot is safe and steady-state boots pay almost nothing. Discovery is
+/// bounded to the rebuildable window (raw rows ∩ fold retention): snapshot
+/// rows live forever, and every hour beyond that window would otherwise be
+/// re-examined on every boot. It runs on its own thread because a large raw
+/// window can take minutes, and startup must not wait for it; `latch` is the
+/// guard `spawn` acquired, so retention prunes stay deferred for the pass.
+fn spawn_item_hour_backfill(
+    state: &Arc<AppState>,
+    latch: HourBackfillLatch,
+) -> std::io::Result<thread::JoinHandle<()>> {
     let worker = state.clone();
     thread::Builder::new().name("amtracker-hour-backfill".into()).spawn(move || {
-        let _latch = HourBackfillLatch::acquire();
+        let _latch = latch;
+        let since_day =
+            utc_day(worker.clock.now()) - worker.config.storage.fold_rebuild_window_days() + 1;
         let started = std::time::Instant::now();
-        tracing::info!("item hour fold backfill started (reconciled days are skipped)");
-        match worker.history.backfill_item_hours() {
+        tracing::info!(since_day, "item hour fold backfill started (reconciled hours are skipped)");
+        match worker.history.backfill_item_hours(since_day) {
             Ok(cells) => {
                 tracing::info!(
                     cells,
@@ -1331,5 +1335,20 @@ mod tests {
         // `u64::MAX` would overflow `Instant + Duration` and panic the
         // scheduler thread (the insertion site is outside `catch_unwind`).
         assert_eq!(retry_after_secs(Some(u64::MAX)), MAX_RETRY_AFTER_SECS);
+    }
+
+    #[test]
+    fn hour_backfill_latch_is_held_exactly_while_its_guard_lives() {
+        assert!(!HOUR_BACKFILL_RUNNING.load(Ordering::Acquire), "no backfill, prunes run");
+        let latch = HourBackfillLatch::acquire();
+        assert!(
+            HOUR_BACKFILL_RUNNING.load(Ordering::Acquire),
+            "prunes defer while the backfill's guard lives"
+        );
+        drop(latch);
+        assert!(
+            !HOUR_BACKFILL_RUNNING.load(Ordering::Acquire),
+            "the pass ended (or unwound): prunes resume"
+        );
     }
 }

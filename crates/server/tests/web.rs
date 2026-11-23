@@ -1563,6 +1563,26 @@ async fn item_links_carry_category_and_bare_urls_auto_land() {
         Some("/items/t1/2589?category=commodity&d=30")
     );
 
+    // A value that needs encoding comes back percent-encoded, in sorted key
+    // order — a raw `&` or a line break in the echoed param can neither
+    // inject a second parameter nor break the Location header.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("GET")
+                .uri("/items/t1/2589?q=a%20b%26c%0Ad&d=30")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::SEE_OTHER);
+    assert_eq!(
+        response.headers().get("location").and_then(|value| value.to_str().ok()),
+        Some("/items/t1/2589?category=commodity&d=30&q=a%20b%26c%0Ad")
+    );
+
     // Explicit tabs are respected — no redirect loop.
     let (status, _) = get(router.clone(), "/items/t1/2589?category=commodity").await;
     assert_eq!(status, StatusCode::OK);

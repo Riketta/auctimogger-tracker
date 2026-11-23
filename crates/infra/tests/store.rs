@@ -302,7 +302,7 @@ fn item_hour_fold_written_at_record_and_survives_raw_prune() {
 }
 
 #[test]
-fn backfill_rebuilds_missing_days_only_and_keeps_pruned_raw_cells() {
+fn backfill_rebuilds_missing_hours_only_and_keeps_pruned_raw_cells() {
     let dir = temp_dir("hour-backfill");
     let store = open_store(&dir, 102 * 86_400);
     let target = TargetId("us-4".into());
@@ -330,34 +330,122 @@ fn backfill_rebuilds_missing_days_only_and_keeps_pruned_raw_cells() {
         .expect("record c");
 
     // Steady state: record() maintains the cells, so every (target, kind,
-    // day) is already reconciled and the pass has nothing to do.
-    assert_eq!(store.backfill_item_hours().expect("backfill"), 0, "reconciled days are skipped");
+    // day, hour) is already reconciled and the pass has nothing to do.
+    assert_eq!(
+        store.backfill_item_hours(100).expect("backfill"),
+        0,
+        "reconciled hours are skipped"
+    );
 
-    // A day that lost its cells (here: fold-pruned while the raw rows
+    // An hour that lost its cells (here: fold-pruned while the raw rows
     // stayed) rebuilds exactly from the raw window.
     let removed = store.prune_item_hours_before(&target, 101).expect("prune hours");
     assert_eq!(removed, 1, "the day-100 cell goes, day-101 stays");
-    let written = store.backfill_item_hours().expect("backfill");
-    assert_eq!(written, 1, "only the missing day-100 (commodities) day is rebuilt");
+    let written = store.backfill_item_hours(100).expect("backfill");
+    assert_eq!(written, 1, "only the missing day-100 (commodities) hour is rebuilt");
     let cells =
         store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
+    // `item_hour_cells` reads `day >= since_day`: the rebuilt day-100 cell,
+    // then the day-101 cell the prune left alone.
     assert_eq!(cells.len(), 2);
+    assert_eq!((cells[0].day, cells[0].hour), (100, 2));
     let mut mins = cells[0].mins.clone();
     mins.sort_unstable();
     assert_eq!(mins, [240, 300], "both snapshots' mins, exactly once each");
     assert_eq!(cells[0].floor, 240);
+    assert_eq!(
+        (cells[1].day, cells[1].hour, cells[1].mins.clone()),
+        (101, 5, vec![90]),
+        "the day the prune kept is untouched"
+    );
 
     // Permanence contract: once a day's raw rows are pruned too, the fold
     // cell the raw window produced survives later backfills untouched.
     let raw_removed = store.prune_raw_before(&target, 101).expect("prune raw");
     assert!(raw_removed > 0, "the day-100 raw rows existed and were pruned");
-    assert_eq!(store.backfill_item_hours().expect("backfill"), 0);
+    assert_eq!(store.backfill_item_hours(100).expect("backfill"), 0);
     let after =
         store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
     assert_eq!(after.len(), 2, "both fold cells survive the raw prune");
     let mut mins = after[0].mins.clone();
     mins.sort_unstable();
     assert_eq!(mins, [240, 300], "the rebuilt cell keeps its exact history");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn backfill_horizon_bounds_discovery_and_clear_rebuilds_from_a_day() {
+    let dir = temp_dir("hour-backfill-horizon");
+    let store = open_store(&dir, 102 * 86_400);
+    let target = TargetId("us-4".into());
+    let identity = item(1);
+    let snap = |fetched_at: i64| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: 1,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    // Day 98 hour 3 and day 100 hour 7, both with raw rows and (via record)
+    // cells.
+    store
+        .record(&snap(98 * 86_400 + 3 * 3_600), &[listing(20, &identity, 111, 1)], b"d".as_slice())
+        .expect("record d");
+    store
+        .record(&snap(100 * 86_400 + 7 * 3_600), &[listing(21, &identity, 222, 1)], b"e".as_slice())
+        .expect("record e");
+    // Fold retention moved past day 98 while its raw rows are still inside
+    // the raw window (fold retention < raw retention): the cells are gone,
+    // the raw rows could rebuild them.
+    assert_eq!(store.prune_item_hours_before(&target, 99).expect("prune hours"), 1);
+
+    // A horizon starting at day 100 must not touch day 98: rebuilding it
+    // would be churn (the next retention sweep deletes it again). Without
+    // the horizon filter this pass would write the day-98 cell back.
+    assert_eq!(
+        store.backfill_item_hours(100).expect("backfill"),
+        0,
+        "day 98 is outside the horizon"
+    );
+    // `item_hour_cells` reads `day >= since_day`: only the day-100 cell is
+    // left — day 98 holds none.
+    let cells =
+        store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 98).expect("cells");
+    assert_eq!(
+        cells.iter().map(|cell| cell.day).collect::<Vec<_>>(),
+        vec![100],
+        "the out-of-horizon hour stays unfolded"
+    );
+    // The caller widening the horizon to include day 98 rebuilds it.
+    assert_eq!(
+        store.backfill_item_hours(98).expect("backfill"),
+        1,
+        "the wider horizon reaches day 98"
+    );
+
+    // Repair path: clear the fold from day 100 on — only that day's cell
+    // goes — and the next pass rebuilds exactly that range, cell for cell.
+    assert_eq!(store.clear_item_hours_from(&target, 100).expect("clear"), 1);
+    let cells =
+        store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 98).expect("cells");
+    assert_eq!(
+        cells.iter().map(|cell| (cell.day, cell.mins.clone())).collect::<Vec<_>>(),
+        vec![(98, vec![111])],
+        "the day-98 cell is before the clear range and stays; day 100 is gone"
+    );
+    assert_eq!(store.backfill_item_hours(100).expect("backfill"), 1);
+    let cells =
+        store.item_hour_cells(&target, &identity, PayloadKind::Commodities, 100).expect("cells");
+    assert_eq!(cells.len(), 1);
+    assert_eq!(
+        (cells[0].day, cells[0].hour, cells[0].mins.clone()),
+        (100, 7, vec![222]),
+        "the cleared hour comes back exact"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }

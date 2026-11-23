@@ -133,13 +133,21 @@ enum Commands {
         config: PathBuf,
     },
     /// Rebuild the permanent intraday hour fold (the item page's when-to-buy
-    /// hour view) from the raw listing window. Days that already hold fold
-    /// cells are skipped — each day's rebuild is atomic, so only genuinely
-    /// missing days (an interrupted pass, a fresh deployment) are rewritten.
-    /// Safe against a live `serve`; `serve` also runs this at boot.
+    /// hour view) from the raw window. Hours that already hold fold cells are
+    /// skipped — each hour's rebuild is atomic, so only genuinely missing
+    /// hours (an interrupted pass, a fresh deployment) are rewritten. With
+    /// `--rebuild-since <utc day>` the fold is first cleared from that day on
+    /// (clamped to the raw window) so exactly that range is rebuilt: the
+    /// repair for hours known to hold incomplete cells. Run it with `serve`
+    /// stopped — a live server's retention prune can interleave with the
+    /// rebuild. `serve` also runs the plain form at boot.
     BackfillItemHours {
         #[arg(long)]
         config: PathBuf,
+        /// UTC day number to clear the fold from before rebuilding (the
+        /// numbering the backfill logs use, e.g. `20774`).
+        #[arg(long)]
+        rebuild_since: Option<i64>,
     },
 }
 
@@ -170,8 +178,10 @@ fn main() {
         Commands::ForeverRulesets { config } => {
             with_observability(&config, |loaded| run_forever_rulesets(&loaded.tracker))
         }
-        Commands::BackfillItemHours { config } => {
-            with_observability(&config, |loaded| run_backfill_item_hours(&loaded.tracker))
+        Commands::BackfillItemHours { config, rebuild_since } => {
+            with_observability(&config, |loaded| {
+                run_backfill_item_hours(&loaded.tracker, rebuild_since)
+            })
         }
     };
     exit(code);
@@ -383,13 +393,21 @@ fn run_forever_rulesets(config: &amtracker_core::config::TrackerConfig) -> i32 {
 }
 
 /// Manual form of `serve`'s boot-time fold reconciliation: rebuilds the
-/// permanent intraday hour fold from the raw listing window. Exact — every
-/// rebuilt day aggregates from all its raw-retained snapshots in one atomic
-/// statement, and days that already hold cells are skipped — so it doubles
-/// as the repair tool after an interrupted automatic pass.
-fn run_backfill_item_hours(config: &amtracker_core::config::TrackerConfig) -> i32 {
+/// permanent intraday hour fold from the raw window, from `rebuild_since` (or
+/// the start of the rebuildable window) on. Exact — every rebuilt hour
+/// aggregates from all its raw-retained snapshots in one atomic statement,
+/// and hours that already hold cells are skipped — so it doubles as the
+/// repair tool after an interrupted automatic pass. With `rebuild_since`, the
+/// fold is cleared from that day on first, so hours holding *incomplete*
+/// cells (the hour a deployment introduced the fold in, say) are rebuilt
+/// too; the day is clamped to the raw window, because cells without raw rows
+/// cannot come back.
+fn run_backfill_item_hours(
+    config: &amtracker_core::config::TrackerConfig,
+    rebuild_since: Option<i64>,
+) -> i32 {
     let clock: Arc<dyn amtracker_core::ports::ClockPort> = Arc::new(SystemClock);
-    let store = match open_store(config, clock) {
+    let store = match open_store(config, clock.clone()) {
         Ok(store) => store,
         Err(error) => {
             tracing::error!(error = %error, "store open failed");
@@ -397,8 +415,43 @@ fn run_backfill_item_hours(config: &amtracker_core::config::TrackerConfig) -> i3
             return 1;
         }
     };
+    let window_start = amtracker_core::domain::utc_day(clock.now())
+        - config.storage.fold_rebuild_window_days()
+        + 1;
+    let since_day = match rebuild_since {
+        Some(day) => {
+            let clamped = day.max(window_start);
+            if clamped > day {
+                tracing::warn!(
+                    requested = day,
+                    clamped_to = clamped,
+                    "rebuild-since predates the raw window: cells older than it cannot be regenerated"
+                );
+            }
+            clamped
+        }
+        None => window_start,
+    };
+    if rebuild_since.is_some() {
+        for target in &config.targets {
+            let removed = match store.clear_item_hours_from(&target.id, since_day) {
+                Ok(removed) => removed,
+                Err(error) => {
+                    tracing::error!(target = %target.id.0, error = %error, "clear item hours failed");
+                    eprintln!("error: clear item hours failed: {error}");
+                    return 1;
+                }
+            };
+            tracing::info!(
+                target = %target.id.0,
+                since_day,
+                removed,
+                "item hour fold cleared for rebuild"
+            );
+        }
+    }
     let started = std::time::Instant::now();
-    match store.backfill_item_hours() {
+    match store.backfill_item_hours(since_day) {
         Ok(cells) => {
             println!(
                 "item hour fold reconciled: {cells} cell(s) from the raw window in {:.1}s",

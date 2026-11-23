@@ -105,6 +105,26 @@ pub struct StorageConfig {
     pub vacuum: VacuumPolicy,
 }
 
+impl StorageConfig {
+    /// Days back the hour-fold backfill may rebuild from: the overlap of the
+    /// raw window and the fold's own retention. Cells cannot be regenerated
+    /// without their raw rows, and fold cells past `item_hour_retention_days`
+    /// are deleted anyway — rebuilding either is work that would repeat on
+    /// every boot for as long as the snapshot rows (kept forever) exist. The
+    /// fold knob's `0` (keep forever) leaves the raw window as the only
+    /// bound; a raw window of `0` days leaves nothing to rebuild.
+    #[must_use]
+    pub fn fold_rebuild_window_days(&self) -> i64 {
+        let raw = i64::from(self.raw_listing_days);
+        let fold = i64::from(self.item_hour_retention_days);
+        if fold > 0 {
+            raw.min(fold)
+        } else {
+            raw
+        }
+    }
+}
+
 /// Analytics exposure settings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetricsConfig {
@@ -660,5 +680,40 @@ impl TrackerConfig {
             ));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StorageConfig;
+    use crate::config::VacuumPolicy;
+
+    fn storage(raw_listing_days: u32, item_hour_retention_days: u32) -> StorageConfig {
+        StorageConfig {
+            database: String::new(),
+            raw_listing_days,
+            sight_retention_days: 0,
+            item_hour_retention_days,
+            archive_dir: String::new(),
+            feed_dir: String::new(),
+            backup_dir: None,
+            backup_secs: 0,
+            backup_keep: 7,
+            vacuum: VacuumPolicy::Off,
+        }
+    }
+
+    #[test]
+    fn fold_rebuild_window_is_the_overlap_of_raw_and_fold_retention() {
+        // Defaults: the raw window is the shorter horizon.
+        assert_eq!(storage(7, 45).fold_rebuild_window_days(), 7);
+        // A fold pruned before its raw rows: the fold knob bounds the rebuild
+        // (those cells would be deleted right after the backfill anyway).
+        assert_eq!(storage(60, 30).fold_rebuild_window_days(), 30);
+        // `0` keeps the fold forever — only the raw window can bound it.
+        assert_eq!(storage(31, 0).fold_rebuild_window_days(), 31);
+        // No raw window: nothing can be rebuilt.
+        assert_eq!(storage(0, 45).fold_rebuild_window_days(), 0);
+        assert_eq!(storage(0, 0).fold_rebuild_window_days(), 0);
     }
 }

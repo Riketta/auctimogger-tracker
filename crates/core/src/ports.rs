@@ -362,15 +362,36 @@ pub trait PriceHistoryRepository: Send + Sync {
         let _ = (target, day);
         Ok(0)
     }
+    /// Clears every intraday hour-fold cell of the target from the given UTC
+    /// day on (the repair counterpart of
+    /// [`PriceHistoryRepository::prune_item_hours_before`], which drops the
+    /// days *before* its cutoff): a subsequent [`Self::backfill_item_hours`]
+    /// rebuilds exactly those hours from the raw window. Callers must pass a
+    /// day inside the raw window — cells without raw rows cannot come back.
+    /// Returns the rows removed.
+    ///
+    /// The default is a no-op returning `0`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cells cannot be deleted.
+    fn clear_item_hours_from(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
+        let _ = (target, day);
+        Ok(0)
+    }
     /// Rebuilds intraday hour-fold cells from the raw listing working set:
-    /// every `(target, kind, day)` that still has a snapshot but no fold
-    /// cell yet is rewritten as the exact aggregate of ALL its raw-retained
-    /// listings (one atomic statement per day, so a day that already holds
-    /// any cell is fully reconciled and skipped — only genuinely missing
-    /// days, e.g. after an interrupted pass, pay the rebuild). Cells whose
-    /// raw rows are already pruned stay untouched. Boot-time/CLI migration
-    /// so a fresh fold starts with the raw window's history instead of an
-    /// empty chart. Returns the number of cells written.
+    /// every `(target, kind, day, hour)` with `day >= since_day` that still
+    /// has a snapshot but no fold cell yet is rewritten as the exact
+    /// aggregate of ALL its raw-retained listings (one atomic statement per
+    /// hour, so an hour that already holds any cell is reconciled and skipped
+    /// — only genuinely missing hours, e.g. after an interrupted pass, pay
+    /// the rebuild). Hours before `since_day` are never visited: snapshot
+    /// rows outlive their listings, so without the horizon every hour past
+    /// the raw window would be re-examined on every call, forever. Callers
+    /// pass the first day of the rebuildable window
+    /// (`today - storage.fold_rebuild_window_days() + 1`). Boot-time/CLI
+    /// migration so a fresh fold starts with the raw window's history instead
+    /// of an empty chart. Returns the number of cells written.
     ///
     /// The default is a no-op returning `0` — adapters without a raw working
     /// set have nothing to backfill from.
@@ -378,7 +399,8 @@ pub trait PriceHistoryRepository: Send + Sync {
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the fold cannot be rebuilt.
-    fn backfill_item_hours(&self) -> Result<u64, StoreError> {
+    fn backfill_item_hours(&self, since_day: i64) -> Result<u64, StoreError> {
+        let _ = since_day;
         Ok(0)
     }
 }

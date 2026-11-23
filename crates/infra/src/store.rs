@@ -95,13 +95,16 @@ use rusqlite::Connection;
 /// Version 9 added the expression index behind the time-left sort (the
 /// semantic band rank): the CASE sort temp-b-treed the snapshot's whole
 /// listing set on every page view (~360 ms at 400k listings); the index
+/// serves the order instead.
+///
 /// Current schema shape. v10 added `sales.eligible` (the credit-eligible
 /// sale-rate denominator); the ALTER is shape-guarded at the call site, so
 /// upgraded files converge with fresh ones. Post-v10 additive shapes — the
 /// `item_hour` intraday fold and its `idx_item_hour_day` retention index —
 /// ride the unconditional idempotent `SCHEMA` batch instead of a gated
-/// migration: fold rows regenerate exactly from raw listings (see
-/// `backfill_item_hours`), so an upgraded file converges by itself.
+/// migration: fold cells inside the raw window regenerate exactly from raw
+/// listings (see `backfill_item_hours`), so an upgraded file converges by
+/// itself.
 const SCHEMA_VERSION: i64 = 10;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
@@ -3635,150 +3638,104 @@ impl PriceHistoryRepository for SqliteStore {
     }
 
     fn prune_item_hours_before(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
-        // Same batching discipline as `prune_raw_before`: every delete stays
-        // short so the store mutex is released between statements. The
-        // `idx_item_hour_day(target_id, day)` index serves the predicate —
+        // The `idx_item_hour_day(target_id, day)` index serves the range —
         // the PK cannot seek `day` (kind/item sit between), so without it
         // each daily delete would scan the target's whole retained fold.
-        const PRUNE_BATCH: usize = 50_000;
-        const PRUNE_BATCH_I64: i64 = 50_000;
-        let mut removed = 0usize;
-        loop {
-            let conn = self.open_transaction();
-            let batch = conn
-                .execute(
-                    "DELETE FROM item_hour WHERE rowid IN (
-                         SELECT rowid FROM item_hour WHERE target_id = ?1 AND day < ?2 LIMIT ?3)",
-                    rusqlite::params![target.as_str(), day, PRUNE_BATCH_I64],
-                )
-                .map_err(|e| backend("prune item hours", e))?;
-            drop(conn);
-            removed += batch;
-            if batch < PRUNE_BATCH {
-                break;
-            }
-        }
-        Ok(removed as u64)
+        delete_item_hours_batched(self, "prune item hours", "day < ?2", target, day)
     }
 
-    fn backfill_item_hours(&self) -> Result<u64, StoreError> {
+    fn clear_item_hours_from(&self, target: &TargetId, day: i64) -> Result<u64, StoreError> {
+        // The repair mirror of `prune_item_hours_before` (same index, same
+        // batching): drop the cells from `day` on so the next backfill
+        // rebuilds exactly those hours from the raw window.
+        delete_item_hours_batched(self, "clear item hours", "day >= ?2", target, day)
+    }
+
+    fn backfill_item_hours(&self, since_day: i64) -> Result<u64, StoreError> {
         // One statement per (target, kind, day, HOUR) — see
-        // `backfill_item_hour_cells`: each statement is driven by the hour's
-        // concrete snapshot-id list through the `snapshot_id` indexes, so no
-        // rebuild ever sorts or scans a whole day's/week's listing set. The
-        // statement is atomic per hour, which keeps the skip invariant exact:
-        // an hour that holds ANY cell is complete (interrupted passes resume
-        // at hour granularity), and a day never gains raw rows retroactively
-        // (fetched_at is ingest time), so a skipped hour cannot go stale.
+        // `rebuild_item_hour`: each rebuild is driven by the hour's concrete
+        // snapshot-id list through the `snapshot_id` indexes, so no statement
+        // ever sorts or scans a whole day's/week's listing set. It is atomic
+        // per hour, which keeps the skip invariant exact: an hour that holds
+        // ANY cell is complete (interrupted passes resume at hour
+        // granularity), and a day never gains raw rows retroactively
+        // (`fetched_at` is ingest time), so a skipped hour cannot go stale.
         //
-        // Discovery reads `snapshots`, NEVER `listing`: one row per
-        // snapshot (thousands) instead of one per raw listing (tens of
-        // millions on a full window). `listing.day` is always
-        // `utc_day(fetched_at)` (record derives both from the same
-        // timestamp), so the hour tuples match exactly; an hour whose
-        // listings were all dropped simply yields a zero-row rebuild.
-        let candidates: Vec<(String, String, i64, i64)> = {
+        // The horizon is what keeps the pass bounded — see
+        // `unreconciled_item_hours`.
+        let candidates = {
             let conn = self.open_transaction();
-            let mut statement = conn
-                .prepare(
-                    "SELECT DISTINCT s.target_id, s.kind, s.fetched_at / 86400,
-                            (s.fetched_at % 86400) / 3600
-                     FROM snapshots s
-                     WHERE NOT EXISTS (
-                         SELECT 1 FROM item_hour h
-                         WHERE h.target_id = s.target_id AND h.kind = s.kind
-                           AND h.day = s.fetched_at / 86400
-                           AND h.hour = (s.fetched_at % 86400) / 3600)",
-                )
-                .map_err(|e| backend("prepare backfill hours", e))?;
-            let rows = statement
-                .query_map([], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, i64>(2)?,
-                        row.get::<_, i64>(3)?,
-                    ))
-                })
-                .map_err(|e| backend("query backfill hours", e))?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row.map_err(|e| backend("read backfill hours", e))?);
-            }
-            out.sort_unstable();
-            out
+            unreconciled_item_hours(&conn, since_day)?
         };
         // Progress is logged per rebuilt hour: an operator watching a fresh
         // deployment must see the pass move instead of a silent gap between
         // the start and completion lines.
         tracing::info!(
+            since_day,
             candidate_hours = candidates.len(),
             "item hour backfill: hour scan complete"
         );
         let mut written = 0u64;
+        let mut failed = 0u32;
         for (target, kind, day, hour) in candidates {
-            // The hour's snapshot ids first (index-only, a handful of rows):
-            // driving the rebuild with a concrete id list lets SQLite seek
-            // listings through the snapshot_id indexes, and an hour with no
-            // snapshots left (cannot happen per discovery, guarded anyway)
-            // skips the statement entirely.
-            let ids: Vec<i64> = {
-                let conn = self.open_transaction();
-                let mut statement = conn
-                    .prepare(
-                        "SELECT id FROM snapshots
-                         WHERE target_id = ?1 AND kind = ?2
-                           AND fetched_at >= ?3 * 86400 AND fetched_at < (?3 + 1) * 86400
-                           AND (fetched_at % 86400) / 3600 = ?4",
-                    )
-                    .map_err(|e| backend("prepare backfill snapshot ids", e))?;
-                let rows = statement
-                    .query_map(rusqlite::params![target, kind, day, hour], |row| {
-                        row.get::<_, i64>(0)
-                    })
-                    .map_err(|e| backend("query backfill snapshot ids", e))?;
-                let mut out = Vec::new();
-                for row in rows {
-                    out.push(row.map_err(|e| backend("read backfill snapshot ids", e))?);
-                }
-                out
-            };
-            if ids.is_empty() {
-                continue;
-            }
+            // One mutex hold per hour — see `rebuild_item_hour`.
             let started = std::time::Instant::now();
-            let cells = {
+            let outcome = {
                 let conn = self.open_transaction();
-                let written = backfill_item_hour_cells(&conn, &target, &kind, day, hour, &ids)?;
-                drop(conn);
-                written
+                rebuild_item_hour(&conn, &target, &kind, day, hour)
             };
-            written += cells;
             let elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-            if cells > 0 {
-                tracing::info!(
-                    target = %target,
-                    kind = %kind,
-                    day,
-                    hour,
-                    snapshots = ids.len(),
-                    cells,
-                    elapsed_ms,
-                    "item hour backfill: hour rebuilt"
-                );
-                // Reader fairness: a short pause between rebuilt hours lets
-                // queued page renders and cycles take the store mutex
-                // between the pass's statements.
-                std::thread::sleep(std::time::Duration::from_millis(20));
-            } else {
+            let (snapshots, cells) = match outcome {
+                Ok(counts) => counts,
+                Err(error) => {
+                    // The hour's statement is atomic, so a failed hour holds
+                    // no cell and stays a candidate for the next run; one bad
+                    // hour (a busy store, a corrupt row) must not stall the
+                    // rest of the window behind it.
+                    failed += 1;
+                    tracing::warn!(
+                        target = %target,
+                        kind = %kind,
+                        day,
+                        hour,
+                        error = %error,
+                        "item hour backfill: hour failed, continuing with the next hour"
+                    );
+                    continue;
+                }
+            };
+            if cells == 0 {
                 tracing::debug!(
                     target = %target,
                     kind = %kind,
                     day,
                     hour,
+                    snapshots,
                     "item hour backfill: hour has no raw rows, nothing written"
                 );
+                continue;
             }
+            written += cells;
+            tracing::info!(
+                target = %target,
+                kind = %kind,
+                day,
+                hour,
+                snapshots,
+                cells,
+                elapsed_ms,
+                "item hour backfill: hour rebuilt"
+            );
+            // Reader fairness: a short pause between rebuilt hours lets
+            // queued page renders and cycles take the store mutex between
+            // the pass's statements.
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if failed > 0 {
+            tracing::warn!(
+                failed,
+                "item hour backfill: hours failed and stay unreconciled; the next run retries them"
+            );
         }
         Ok(written)
     }
@@ -3953,6 +3910,144 @@ fn backfill_item_hour_cells(
     conn.execute(sql.as_str(), args.as_slice())
         .map(|cells| u64::try_from(cells).unwrap_or(0))
         .map_err(|e| backend("backfill item hours", e))
+}
+
+/// The batched delete both hour-fold pruning (`day < cutoff`) and the repair
+/// clear (`day >= from`) share: one `DELETE … LIMIT` statement per mutex
+/// hold, repeated until a batch comes back short, so the store mutex is
+/// released between statements and concurrent readers interleave (the
+/// discipline of `prune_raw_before`). `idx_item_hour_day(target_id, day)`
+/// serves both ranges. `predicate` is a literal fragment over `?2` — never
+/// data — so the formatted SQL is as parameterized as the rest.
+fn delete_item_hours_batched(
+    store: &SqliteStore,
+    operation: &'static str,
+    predicate: &'static str,
+    target: &TargetId,
+    day: i64,
+) -> Result<u64, StoreError> {
+    const BATCH: usize = 50_000;
+    const BATCH_I64: i64 = 50_000;
+    let sql = format!(
+        "DELETE FROM item_hour WHERE rowid IN (
+             SELECT rowid FROM item_hour WHERE target_id = ?1 AND {predicate} LIMIT ?3)"
+    );
+    let mut removed = 0usize;
+    loop {
+        let conn = store.open_transaction();
+        let batch = conn
+            .execute(sql.as_str(), rusqlite::params![target.as_str(), day, BATCH_I64])
+            .map_err(|e| backend(operation, e))?;
+        drop(conn);
+        removed += batch;
+        if batch < BATCH {
+            break;
+        }
+    }
+    Ok(removed as u64)
+}
+
+/// Discovery for `backfill_item_hours`: the `(target, kind, day, hour)`
+/// tuples from `since_day` on that hold a snapshot but no fold cell, sorted
+/// oldest first. One statement under the caller's mutex hold.
+///
+/// It reads `snapshots`, NEVER `listing` — one row per snapshot (thousands)
+/// instead of one per raw listing (tens of millions on a full window) — and
+/// `listing.day` is always `utc_day(fetched_at)` (`record` derives both from
+/// the same timestamp), so the hour tuples match exactly.
+///
+/// The horizon is part of the contract, not an optimization. Snapshot rows
+/// outlive their listings and the fold's retention outlives the raw window,
+/// so without `since_day` every hour older than both would be a candidate on
+/// every call, forever. Worse, the `NOT EXISTS` probe seeks only
+/// `(target_id, kind)` — the PK cannot seek `day`/`hour` past `item_ref_id`,
+/// and the planner prefers the covering PK over `idx_item_hour_day` — so a
+/// non-matching probe scans the target's whole fold: each forgotten hour
+/// would cost a full partition scan under the store mutex. Hours before
+/// `since_day` have no raw rows to fold, so skipping them is exact.
+fn unreconciled_item_hours(
+    conn: &Connection,
+    since_day: i64,
+) -> Result<Vec<(String, String, i64, i64)>, StoreError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT DISTINCT s.target_id, s.kind, s.fetched_at / 86400,
+                    (s.fetched_at % 86400) / 3600
+             FROM snapshots s
+             WHERE s.fetched_at >= ?1 * 86400
+               AND NOT EXISTS (
+                 SELECT 1 FROM item_hour h
+                 WHERE h.target_id = s.target_id AND h.kind = s.kind
+                   AND h.day = s.fetched_at / 86400
+                   AND h.hour = (s.fetched_at % 86400) / 3600)",
+        )
+        .map_err(|e| backend("prepare backfill hours", e))?;
+    let rows = statement
+        .query_map(rusqlite::params![since_day], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, i64>(3)?,
+            ))
+        })
+        .map_err(|e| backend("query backfill hours", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| backend("read backfill hours", e))?);
+    }
+    out.sort_unstable();
+    Ok(out)
+}
+
+/// One hour of `backfill_item_hours`: the hour's snapshot ids, then the cells
+/// they drive, both on the caller's connection — one mutex hold, because the
+/// list and the rebuild must see the same store (a `record()` landing between
+/// two holds would be overwritten by the INSERT OR REPLACE). Returns
+/// `(snapshots, cells written)`; an hour with no snapshot left (cannot happen
+/// per discovery, guarded anyway) answers `(0, 0)` without a rebuild.
+fn rebuild_item_hour(
+    conn: &Connection,
+    target: &str,
+    kind: &str,
+    day: i64,
+    hour: i64,
+) -> Result<(usize, u64), StoreError> {
+    let ids = snapshot_ids_for_hour(conn, target, kind, day, hour)?;
+    if ids.is_empty() {
+        return Ok((0, 0));
+    }
+    let cells = backfill_item_hour_cells(conn, target, kind, day, hour, &ids)?;
+    Ok((ids.len(), cells))
+}
+
+/// The hour's concrete snapshot ids. `idx_snapshots_target(target_id, kind,
+/// …)` serves the target/kind range and `fetched_at` is filtered per row —
+/// a few thousand rows per (target, kind), cheap next to the rebuild it
+/// drives.
+fn snapshot_ids_for_hour(
+    conn: &Connection,
+    target: &str,
+    kind: &str,
+    day: i64,
+    hour: i64,
+) -> Result<Vec<i64>, StoreError> {
+    let mut statement = conn
+        .prepare(
+            "SELECT id FROM snapshots
+             WHERE target_id = ?1 AND kind = ?2
+               AND fetched_at >= ?3 * 86400 AND fetched_at < (?3 + 1) * 86400
+               AND (fetched_at % 86400) / 3600 = ?4",
+        )
+        .map_err(|e| backend("prepare backfill snapshot ids", e))?;
+    let rows = statement
+        .query_map(rusqlite::params![target, kind, day, hour], |row| row.get::<_, i64>(0))
+        .map_err(|e| backend("query backfill snapshot ids", e))?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row.map_err(|e| backend("read backfill snapshot ids", e))?);
+    }
+    Ok(out)
 }
 
 fn get_or_create_item_ref(conn: &Connection, item: &ItemRef) -> Result<i64, StoreError> {
@@ -4354,9 +4449,8 @@ mod tests {
                 "auctions",
                 &[(14, 90)],
             );
-            // A snapshot whose listings were all dropped: discovery must
-            // surface its day (it reads `snapshots`, not `listing`), and the
-            // rebuild simply writes zero cells for it.
+            // A snapshot whose listings were all dropped: harmless — the
+            // rebuild of its hour simply writes zero cells.
             seed_snapshot_min(
                 &conn,
                 item_ref_id,
@@ -4368,16 +4462,16 @@ mod tests {
         }
         // Raw rows predate the fold: one backfill pass turns them into the
         // permanent hour cells, exactly once per (kind, item, hour).
-        let written = store.backfill_item_hours().expect("backfill");
+        let written = store.backfill_item_hours(day).expect("backfill");
         assert_eq!(written, 2, "one commodities cell + one auctions cell");
-        let rerun = store.backfill_item_hours().expect("backfill again");
-        assert_eq!(rerun, 0, "reconciled days are skipped; their cells stay untouched");
+        let rerun = store.backfill_item_hours(day).expect("backfill again");
+        assert_eq!(rerun, 0, "reconciled hours are skipped; their cells stay untouched");
 
         let cells =
             store.item_hour_cells(&target, &item, PayloadKind::Commodities, day).expect("cells");
         assert_eq!(cells.len(), 1, "both hour-2 snapshots collapse into one cell");
         assert_eq!((cells[0].day, cells[0].hour), (day, 2));
-        assert_eq!(cells[0].floor, 120, "min across the day's snapshots");
+        assert_eq!(cells[0].floor, 120, "min across the hour's snapshots");
         let mut mins = cells[0].mins.clone();
         mins.sort_unstable();
         assert_eq!(mins, [120, 150]);
@@ -4400,6 +4494,74 @@ mod tests {
             )
             .expect("cells");
         assert!(unknown.is_empty(), "unseen identity answers empty, not an error");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn item_hour_backfill_resumes_per_hour_and_honors_the_horizon() {
+        let (dir, store) = test_store("snapshot-min-horizon");
+        let target = TargetId("eu-1602".into());
+        let item = ItemRef::Item { item_id: 77 };
+        let day = 500_i64;
+        {
+            let conn = store.open_transaction();
+            let item_ref_id = get_or_create_item_ref(&conn, &item).expect("item ref");
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                1,
+                day * 86_400 + 2 * 3_600,
+                "commodities",
+                &[(10, 300)],
+            );
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                2,
+                day * 86_400 + 5 * 3_600,
+                "commodities",
+                &[(11, 150)],
+            );
+            // The day before the horizon the passes below start.
+            seed_snapshot_min(
+                &conn,
+                item_ref_id,
+                3,
+                (day - 1) * 86_400 + 2 * 3_600,
+                "commodities",
+                &[(12, 90)],
+            );
+        }
+        assert_eq!(
+            store.backfill_item_hours(day).expect("backfill"),
+            2,
+            "both of the day's hours, none of the day before the horizon"
+        );
+        // An interrupted pass leaves whole hours without cells: dropping one
+        // hour's cell (the atomicity unit) makes exactly that hour rebuild,
+        // and its sibling on the same day stays untouched.
+        store
+            .open_transaction()
+            .execute("DELETE FROM item_hour WHERE hour = 5", [])
+            .expect("drop one hour");
+        assert_eq!(
+            store.backfill_item_hours(day).expect("resume"),
+            1,
+            "only the missing hour rebuilds"
+        );
+        let cells =
+            store.item_hour_cells(&target, &item, PayloadKind::Commodities, day).expect("cells");
+        assert_eq!(cells.len(), 2, "the sibling hour stayed, the dropped hour is back");
+        assert_eq!((cells[0].hour, cells[0].mins.as_slice()), (2, [300].as_slice()));
+        assert_eq!((cells[1].hour, cells[1].mins.as_slice()), (5, [150].as_slice()));
+        // Widening the horizon reaches the older day (`item_hour_cells` reads
+        // `day >= since_day`, so the newer day's two cells come along).
+        assert_eq!(store.backfill_item_hours(day - 1).expect("wider backfill"), 1);
+        let older = store
+            .item_hour_cells(&target, &item, PayloadKind::Commodities, day - 1)
+            .expect("cells");
+        assert_eq!(older.len(), 3, "the older day joins the two cells the newer day holds");
+        assert_eq!((older[0].day, older[0].mins.as_slice()), (day - 1, [90].as_slice()));
         std::fs::remove_dir_all(&dir).ok();
     }
 
