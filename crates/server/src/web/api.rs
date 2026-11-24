@@ -603,6 +603,72 @@ fn keyed_by_category(list: Vec<(Category, Vec<serde_json::Value>)>) -> serde_jso
     )
 }
 
+/// `GET /api/crafts?target=` — the manual recipe book evaluated against one
+/// target: every recipe with its priced reagents, the output's value and
+/// sale rate, and the money fields per make (copper). Efficient crafts come
+/// first (`ranked: true`, highest expected profit first); the rest carry the
+/// first `issue` that kept them out.
+pub(crate) async fn api_crafts(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    use amtracker_core::services::craft::CraftRow;
+
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let report = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.crafts.crafts(&target)
+    });
+    match report.await {
+        Ok(Ok(report)) => {
+            let row = |row: &CraftRow| {
+                serde_json::json!({
+                    "item": item_json(&row.recipe.item),
+                    "makes": row.recipe.makes,
+                    "ranked": row.issue.is_none(),
+                    "issue": row.issue.as_ref().map(amtracker_core::services::craft::CraftIssue::as_str),
+                    "outputCategory": row.output.as_ref().map(|output| output.category.as_str()),
+                    "outputValue": row.output.as_ref().map(|output| output.value7),
+                    "saleRate": row.output.as_ref().and_then(|output| output.sale_rate),
+                    "unitsSoldPerDay": row.output.as_ref().and_then(|output| output.units_sold_per_day),
+                    "reagents": row.reagents.iter().map(|reagent| serde_json::json!({
+                        "item": item_json(&reagent.item),
+                        "qty": reagent.qty,
+                        "category": reagent.category.map(|category| category.as_str()),
+                        "unitValue": reagent.unit_value,
+                        "liveUnitPrice": reagent.live_unit_price,
+                    })).collect::<Vec<_>>(),
+                    "cost": row.cost,
+                    "costNow": row.cost_now,
+                    "gross": row.gross,
+                    "profit": row.profit,
+                    "expected": row.expected,
+                    "roi": row.roi,
+                })
+            };
+            Json(serde_json::json!({
+                "target": target.as_str(),
+                "recipesFile": state.config.crafts.recipes_file,
+                "ahCutPercent": state.config.crafts.ah_cut_percent,
+                "minSaleRate": state.config.crafts.min_sale_rate,
+                "crafts": report
+                    .ranked
+                    .iter()
+                    .chain(report.unranked.iter())
+                    .map(row)
+                    .collect::<Vec<_>>(),
+            }))
+            .into_response()
+        }
+        Ok(Err(error)) => internal_error("crafts", &error),
+        Err(error) => internal_error("crafts-join", &error),
+    }
+}
+
 /// `GET /api/overview?target=&category=&limit=` — without `category`, one
 /// response keyed by all three categories; with it, the bare shape.
 pub(crate) async fn api_overview(

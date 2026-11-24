@@ -577,6 +577,31 @@ pub struct SnapshotListing {
     pub first_seen_at: Option<i64>,
 }
 
+// ------------------------------------------------------------------ crafting
+
+/// One reagent of a recipe: the item consumed and how many units one make
+/// uses.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Reagent {
+    /// The consumed item.
+    pub item: ItemRef,
+    /// Units consumed per make (≥ 1).
+    pub qty: i64,
+}
+
+/// One manual recipe: the item crafted, how many units a single make yields
+/// and the reagents it consumes. The recipe book is hand-maintained (see
+/// `[crafts].recipes` in the config); the tracker only supplies the prices.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Recipe {
+    /// The crafted item.
+    pub item: ItemRef,
+    /// Units one make yields (≥ 1).
+    pub makes: i64,
+    /// Reagents consumed per make, at least one.
+    pub reagents: Vec<Reagent>,
+}
+
 // ---------------------------------------------------------------- analytics
 
 /// Aggregate price histogram for one item-day: per distinct unit price, the

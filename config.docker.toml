@@ -34,6 +34,11 @@ spans = ["d1", "d7", "d14", "d30"]
 min_samples = 30
 weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 
+# Crafting view: mount a recipe file into /work and point [crafts].recipes at
+# it (format: recipes.example.toml). Absent = /crafts has no recipes.
+# [crafts]
+# recipes = "/work/recipes.toml"
+
 # Optional: Sentry-protocol endpoint (Sentry SaaS or self-hosted GlitchTip).
 # Remove the comments and set the DSN to enable error reporting.
 # [sentry]

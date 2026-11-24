@@ -182,6 +182,7 @@ fn config(token_env: Option<String>) -> TrackerConfig {
             chat_id_env: None,
             max_data_age_secs: 0,
         },
+        crafts: amtracker_core::config::CraftsConfig::default(),
         catalog: CatalogConfig::default(),
         targets: vec![TargetConfig {
             id: TargetId(TARGET.into()),
@@ -286,6 +287,13 @@ fn test_state_with_config(
     );
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
+    let opportunities = Arc::new(OpportunityService::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        clock.clone(),
+        &config,
+    ));
     let state = AppState {
         config: config.clone(),
         clock: clock.clone(),
@@ -296,13 +304,7 @@ fn test_state_with_config(
         )),
         catalog: Arc::new(CatalogService::new(store.clone(), item_info, clock.clone())),
         metrics: metrics.clone(),
-        opportunities: Arc::new(OpportunityService::new(
-            store.clone(),
-            store.clone(),
-            store.clone(),
-            clock.clone(),
-            &config,
-        )),
+        opportunities: opportunities.clone(),
         watchlist: Arc::new(WatchlistService::new(store.clone(), clock.clone())),
         watchlist_report: Arc::new(
             amtracker_core::services::watchlist_report::WatchlistReportService::new(
@@ -318,6 +320,11 @@ fn test_state_with_config(
             metrics.clone(),
             store.clone(),
             clock.clone(),
+        )),
+        crafts: Arc::new(amtracker_core::services::craft::CraftService::new(
+            opportunities.clone(),
+            metrics.clone(),
+            &config.crafts,
         )),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),
@@ -2259,6 +2266,233 @@ async fn alert_api_handles_the_live_deal_conditions() {
     assert_eq!(status, StatusCode::OK);
     assert!(body.contains("live floor ≤ 100% of 7d value"), "{body}");
     assert!(body.contains("new listing ≤ 50% of 7d value"), "{body}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// -------------------------------------------------------------------- crafts
+
+/// One recipe for the crafting tests: `output` from `(reagent, qty)` pairs.
+fn recipe(output: i64, reagents: &[(i64, i64)]) -> amtracker_core::domain::Recipe {
+    amtracker_core::domain::Recipe {
+        item: ItemRef::Item { item_id: output },
+        makes: 1,
+        reagents: reagents
+            .iter()
+            .map(|(id, qty)| amtracker_core::domain::Reagent {
+                item: ItemRef::Item { item_id: *id },
+                qty: *qty,
+            })
+            .collect(),
+    }
+}
+
+/// The craftable market behind the crafting tests: output 2589 sells at a
+/// 7-day value of 1 000 with two credited sales behind it, reagent 2590 at
+/// 200 and reagent 2591 at 100 (both listed in the newest snapshot), 2594
+/// has a price but never sold, 2592 and 2593 were never seen. The state's
+/// recipe book holds five recipes covering every outcome.
+fn craft_state() -> (Arc<AppState>, PathBuf) {
+    use amtracker_core::ports::{
+        PriceHistoryRepository,
+        SalesRepository,
+        SnapshotRepository,
+    };
+
+    let (state, root) = test_state_with_config(None, Arc::new(NoItemInfo), |config| {
+        config.crafts.recipes = vec![
+            recipe(2589, &[(2590, 1), (2591, 2)]),
+            recipe(2589, &[(2590, 3)]),
+            recipe(2592, &[(2590, 1)]),
+            recipe(2594, &[(2590, 1)]),
+            recipe(2594, &[(2593, 1), (2590, 1)]),
+        ];
+        config.crafts.recipes_file = Some("recipes.toml".into());
+    });
+    let store = SqliteStore::open(
+        &root.join("db.sqlite3"),
+        &root.join("raw"),
+        Arc::new(SystemClock),
+        AutoVacuum::Off,
+    )
+    .expect("open the seed store");
+    let target = TargetId(TARGET.into());
+    let at = state.clock.now();
+    let today = utc_day(at);
+    for (item_id, price, count) in
+        [(2589, 1_000, 20), (2590, 200, 10), (2591, 100, 10), (2594, 500, 5)]
+    {
+        let item = ItemRef::Item { item_id };
+        let mut fold = DayFold::new(item.clone());
+        for n in 0..count {
+            fold.apply(&[listing(900_000 + item_id * 10 + n, &item, price)]);
+        }
+        store.save_fold(&target, &item, today, Category::Commodity, &fold).expect("save fold");
+    }
+
+    // Sale evidence for the output: two listings sighted an hour ago are gone
+    // by the newest snapshot (credited), which lists the two reagents instead.
+    let snap = |fetched_at: i64, count: usize| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: count as u64,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    let sellers = [
+        listing(950_001, &ItemRef::Item { item_id: 2589 }, 1_100),
+        listing(950_002, &ItemRef::Item { item_id: 2589 }, 1_200),
+    ];
+    let first = store
+        .record(&snap(at - 1_200, sellers.len()), &sellers, b"sellers")
+        .expect("record sellers");
+    store
+        .observe(&target, PayloadKind::Commodities, &sellers, first, at - 1_200)
+        .expect("observe sellers");
+    let mut listed = Vec::new();
+    for n in 0..3 {
+        listed.push(listing(960_000 + n, &ItemRef::Item { item_id: 2590 }, 200));
+        listed.push(listing(960_100 + n, &ItemRef::Item { item_id: 2591 }, 100));
+    }
+    let newest = store.record(&snap(at - 600, listed.len()), &listed, b"listed").expect("record");
+    store
+        .observe(&target, PayloadKind::Commodities, &listed, newest, at - 600)
+        .expect("observe listed");
+    let credits = store
+        .close_missing(&target, PayloadKind::Commodities, newest, at - 600)
+        .expect("close missing");
+    assert_eq!(credits.len(), 2, "both output listings sold: a 100% sale rate");
+    (state, root)
+}
+
+/// The crafting page ranks efficient crafts best-first with their arithmetic,
+/// explains the rest, and is reachable from the navigation.
+#[tokio::test]
+async fn crafts_page_ranks_efficient_crafts_and_explains_the_rest() {
+    let (state, root) = craft_state();
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router, "/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains(r#"href="/crafts""#), "the navigation links the page");
+    assert!(body.contains("recipes from <code>recipes.toml</code> (5 loaded"), "{body}");
+
+    let (headers, rows) = table_shape(&body, "crafts");
+    assert_eq!(headers, 11, "efficient-craft header columns");
+    assert_eq!(rows.len(), 2);
+    assert!(rows.iter().all(|cells| *cells == headers), "every row is complete: {rows:?}");
+    let ranked = body
+        .split("<table id=\"crafts\">")
+        .nth(1)
+        .expect("ranked table")
+        .split("</table>")
+        .next()
+        .expect("closed");
+    // Best craft first: cost 400 for a 1 000 output, 50 cut, 550 profit,
+    // expected 550 at a 100% sale rate, ROI 1.375 (shown as 138%).
+    assert!(
+        ranked.contains("data-v=\"400\"")
+            && ranked.contains("data-v=\"1000\"")
+            && ranked.contains("data-v=\"550.000\"")
+            && ranked.contains("data-v=\"1.375\">138%"),
+        "{ranked}"
+    );
+    assert!(ranked.contains("data-v=\"600\""), "the second recipe for 2589 costs 600");
+
+    let (headers, rows) = table_shape(&body, "crafts-unranked");
+    assert_eq!(headers, 6, "not-ranked header columns");
+    assert_eq!(rows.len(), 3);
+    assert!(rows.iter().all(|cells| *cells == headers), "{rows:?}");
+    assert!(body.contains("the crafted item has no 7-day price"), "{body}");
+    assert!(body.contains("no sale evidence for the output yet"), "{body}");
+    assert!(body.contains("reagent without a 7-day price: item 2593"), "{body}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `/api/crafts` carries every recipe, ranked first, with the priced
+/// reagents and the per-make money fields.
+#[tokio::test]
+async fn crafts_api_reports_priced_recipes_ranked_first() {
+    let (state, root) = craft_state();
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router.clone(), "/api/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["recipesFile"], "recipes.toml");
+    assert_eq!(json["ahCutPercent"], 5.0);
+    assert_eq!(json["minSaleRate"], 0.2);
+    let crafts = json["crafts"].as_array().expect("crafts array");
+    assert_eq!(crafts.len(), 5);
+
+    let best = &crafts[0];
+    assert_eq!(best["ranked"], true);
+    assert_eq!(best["item"]["itemID"], 2589);
+    assert_eq!(best["outputCategory"], "commodity");
+    assert_eq!(best["outputValue"], 1000);
+    assert_eq!(best["saleRate"], 1.0);
+    assert_eq!(best["cost"], 400);
+    assert_eq!(best["costNow"], 400, "both reagents are listed at their values");
+    assert_eq!(best["gross"], 1000);
+    assert_eq!(best["profit"], 550);
+    assert_eq!(best["expected"], 550.0);
+    assert_eq!(best["roi"], 1.375);
+    let reagents = best["reagents"].as_array().expect("reagents");
+    assert_eq!(reagents.len(), 2);
+    assert_eq!(reagents[0]["item"]["itemID"], 2590);
+    assert_eq!(reagents[0]["unitValue"], 200);
+    assert_eq!(reagents[0]["liveUnitPrice"], 200);
+    assert_eq!(reagents[0]["category"], "commodity");
+    let sold_per_day = best["unitsSoldPerDay"].as_f64().expect("units sold per day");
+    assert!((sold_per_day - 2.0 / 14.0).abs() < 1e-9, "{sold_per_day}");
+
+    assert_eq!(crafts[1]["ranked"], true);
+    assert_eq!(crafts[1]["cost"], 600);
+    assert_eq!(crafts[1]["expected"], 350.0);
+
+    let issues: Vec<&str> = crafts[2..]
+        .iter()
+        .map(|craft| {
+            assert_eq!(craft["ranked"], false);
+            craft["issue"].as_str().expect("an issue")
+        })
+        .collect();
+    assert_eq!(
+        issues,
+        ["output-without-price", "no-sale-evidence", "reagent-without-price"],
+        "unranked rows keep recipe order"
+    );
+    assert_eq!(crafts[3]["profit"], 275, "priced but unproven outputs still show the arithmetic");
+    assert_eq!(crafts[3]["expected"], serde_json::Value::Null);
+
+    let (status, _) = get(router, "/api/crafts?target=nobody").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "unknown targets answer 400");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Without a recipe book the page says how to configure one and the API
+/// answers with an empty list.
+#[tokio::test]
+async fn crafts_page_without_recipes_says_so() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router.clone(), "/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("no recipes configured"), "{body}");
+    assert!(body.contains("no recipe file configured"), "{body}");
+    assert!(!body.contains("<table"), "nothing to tabulate: {body}");
+
+    let (status, body) = get(router, "/api/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["crafts"].as_array().map(std::vec::Vec::len), Some(0));
+    assert!(json["recipesFile"].is_null());
 
     std::fs::remove_dir_all(&root).ok();
 }

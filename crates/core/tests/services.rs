@@ -2213,6 +2213,7 @@ fn opportunity_config() -> TrackerConfig {
             chat_id_env: None,
             max_data_age_secs: 0,
         },
+        crafts: amtracker_core::config::CraftsConfig::default(),
         catalog: amtracker_core::config::CatalogConfig::default(),
         targets: vec![target()],
     }
@@ -3203,4 +3204,96 @@ fn sell_priority_compare_spans_targets_and_marks_the_best_market() {
     assert!(!other_row.cells[0].watched);
     assert!(other_row.cells[1].now.is_none(), "no fold on beta");
     assert_eq!(other_row.best, Some(0), "alpha is the only market with data");
+}
+
+/// The market view exposes the scan's per-item facts by identity — value,
+/// evidence, sale rate and live floor — from the same cached scan the ranking
+/// reads.
+#[test]
+fn market_view_serves_per_item_facts_from_the_scan() {
+    let target = TargetId("us-4".into());
+    let (service, history, _sales, _clock) = opportunity_fixture(1_000_000);
+
+    let view = service.market(&target, Category::Commodity).expect("market view");
+    assert_eq!(view.computed_at(), 1_000_000);
+    assert_eq!(view.snapshot().map(|live| live.fetched_at), Some(1_000_000));
+    let item1 = view.get(&item(1)).expect("item 1 is scanned");
+    assert_eq!(item1.value7, 110_000, "the quantity-weighted window value");
+    assert_eq!(item1.samples7, 2_000);
+    assert_eq!(item1.sale_rate, Some(0.25));
+    assert_eq!(
+        item1.live.map(|live| (live.floor_price, live.floor_qty, live.listing_count)),
+        Some((55_000, 10, 10))
+    );
+    let item2 = view.get(&item(2)).expect("item 2 is scanned");
+    assert_eq!(item2.value7, 95_000);
+    assert_eq!(item2.sale_rate, None, "no evidence stays None");
+    assert!(view.get(&item(3)).is_none(), "never seen: no row at all");
+
+    assert_eq!(history.item_day_rows_calls(), 1, "the view is one scan");
+    drop(service.market(&target, Category::Commodity).expect("second view"));
+    assert_eq!(history.item_day_rows_calls(), 1, "and it is served from the cache afterwards");
+}
+
+/// Recipe validation names the offending recipe, allows several recipes for
+/// one output (alternative reagent sets), and keeps the thresholds in range.
+#[test]
+fn recipe_validation_rejects_malformed_books() {
+    use amtracker_core::domain::{
+        Reagent,
+        Recipe,
+    };
+
+    let recipe = |output: i64, makes: i64, reagents: &[(i64, i64)]| Recipe {
+        item: item(output),
+        makes,
+        reagents: reagents.iter().map(|(id, qty)| Reagent { item: item(*id), qty: *qty }).collect(),
+    };
+    let check = |recipes: Vec<Recipe>| {
+        let mut config = opportunity_config();
+        config.crafts.recipes = recipes;
+        config.validate().map_err(|error| error.0)
+    };
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(2, 1), (3, 2)]), recipe(1, 2, &[(2, 3)])]),
+        Ok(()),
+        "alternative recipes for one output are fine"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 0, &[(2, 1)])]).unwrap_err(),
+        "recipe for item 1: makes must be at least 1"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 1, &[])]).unwrap_err(),
+        "recipe for item 1: at least one reagent is required"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(0, 1)])]).unwrap_err(),
+        "recipe for item 1: reagent ids and quantities must be positive"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(2, 0)])]).unwrap_err(),
+        "recipe for item 1: reagent ids and quantities must be positive"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(1, 1)])]).unwrap_err(),
+        "recipe for item 1: an item cannot be its own reagent"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(2, 1), (2, 3)])]).unwrap_err(),
+        "recipe for item 1: duplicate reagent 2 — combine the quantities"
+    );
+    assert_eq!(
+        check(vec![recipe(-7, 1, &[(2, 1)])]).unwrap_err(),
+        "recipe item id must be positive (got -7)"
+    );
+
+    let mut config = opportunity_config();
+    config.crafts.min_sale_rate = 1.5;
+    assert!(config.validate().unwrap_err().0.contains("min_sale_rate"));
+    config.crafts.min_sale_rate = 0.2;
+    config.crafts.ah_cut_percent = -1.0;
+    assert!(config.validate().unwrap_err().0.contains("ah_cut_percent"));
+    let defaults = amtracker_core::config::CraftsConfig::default();
+    assert_eq!((defaults.min_sale_rate, defaults.ah_cut_percent), (0.2, 5.0));
 }

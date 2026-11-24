@@ -1,9 +1,12 @@
 //! TOML config loading — an ACL over the file format. Serde types here mirror
 //! the file exactly; the mapping output is the core's plain config model.
 
-use std::path::{
-    Path,
-    PathBuf,
+use std::{
+    collections::HashMap,
+    path::{
+        Path,
+        PathBuf,
+    },
 };
 
 use amtracker_core::{
@@ -11,6 +14,7 @@ use amtracker_core::{
         AlertsConfig,
         AuthConfig,
         CatalogConfig,
+        CraftsConfig,
         MetricsConfig,
         OpportunitiesConfig,
         PollConfig,
@@ -22,7 +26,12 @@ use amtracker_core::{
         TrackerConfig,
         VacuumPolicy,
     },
-    domain::Span,
+    domain::{
+        ItemRef,
+        Reagent,
+        Recipe,
+        Span,
+    },
     error::ConfigError,
 };
 use serde::Deserialize;
@@ -66,6 +75,10 @@ pub struct FileConfig {
     /// enabled with `log` delivery (events surface in the UI/API only).
     #[serde(default)]
     pub alerts: FileAlerts,
+    /// `[crafts]` section: the manual recipe book and the crafting view's
+    /// knobs. Absent = no recipes, so the crafting views stay empty.
+    #[serde(default)]
+    pub crafts: FileCrafts,
     /// `[catalog]` section: item/pet name resolution knobs. Absent = chained
     /// Wowhead→Blizzard resolution with English names and polite pacing.
     #[serde(default)]
@@ -347,6 +360,42 @@ fn default_alert_max_data_age() -> u64 {
     48 * 60 * 60
 }
 
+/// File shape of the optional `[crafts]` section.
+#[derive(Deserialize)]
+pub struct FileCrafts {
+    /// Path of the manual recipe file (TOML, one `[[recipe]]` per crafted
+    /// item; see `recipes.example.toml`). Relative paths resolve against the
+    /// working directory like the storage paths. Absent = no recipes.
+    pub recipes: Option<String>,
+    /// Crafted items below this 14-day sale rate are not ranked as efficient
+    /// crafts. Defaults to `0.2`.
+    #[serde(default = "default_min_sale_rate")]
+    pub min_sale_rate: f64,
+    /// Auction-house cut applied to the output value, in percent. Defaults to
+    /// `5.0`.
+    #[serde(default = "default_ah_cut_percent")]
+    pub ah_cut_percent: f64,
+}
+
+impl Default for FileCrafts {
+    /// An absent section: no recipes and the documented thresholds.
+    fn default() -> Self {
+        Self {
+            recipes: None,
+            min_sale_rate: default_min_sale_rate(),
+            ah_cut_percent: default_ah_cut_percent(),
+        }
+    }
+}
+
+fn default_min_sale_rate() -> f64 {
+    0.2
+}
+
+fn default_ah_cut_percent() -> f64 {
+    5.0
+}
+
 /// File shape of the score-weight table under `[opportunities]`.
 #[derive(Deserialize)]
 pub struct FileWeights {
@@ -618,6 +667,12 @@ fn build_tracker(file: FileConfig) -> Result<TrackerConfig, ConfigError> {
             chat_id_env: file.alerts.chat_id_env,
             max_data_age_secs: file.alerts.max_data_age_secs,
         },
+        crafts: CraftsConfig {
+            recipes_file: file.crafts.recipes,
+            recipes: Vec::new(),
+            min_sale_rate: file.crafts.min_sale_rate,
+            ah_cut_percent: file.crafts.ah_cut_percent,
+        },
         catalog: CatalogConfig {
             source: file.catalog.source.unwrap_or_else(|| CatalogConfig::default().source),
             locale: file.catalog.locale.unwrap_or_else(|| CatalogConfig::default().locale),
@@ -644,6 +699,7 @@ const TOP_KEYS: &[&str] = &[
     "metrics",
     "opportunities",
     "alerts",
+    "crafts",
     "catalog",
     "targets",
     "logging",
@@ -658,6 +714,9 @@ const TOP_KEYS: &[&str] = &[
 ///
 /// # Errors
 /// Returns [`ConfigLoadError::UnknownKeys`] naming every unknown path.
+// One declarative table per section: the key lists read best as a single
+// ordered block.
+#[allow(clippy::too_many_lines)]
 fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
     let mut unknown = Vec::new();
     collect_unknown(root, "", TOP_KEYS, &mut unknown);
@@ -731,6 +790,14 @@ fn check_unknown_keys(root: &toml::Table) -> Result<(), ConfigLoadError> {
                 "chat_id_env",
                 "max_data_age_secs",
             ],
+            &mut unknown,
+        );
+    }
+    if let Some(crafts) = section(root, "crafts") {
+        collect_unknown(
+            crafts,
+            "crafts",
+            &["recipes", "min_sale_rate", "ah_cut_percent"],
             &mut unknown,
         );
     }
@@ -833,15 +900,88 @@ pub fn parse_config_str(text: &str) -> Result<LoadedConfig, ConfigLoadError> {
     Ok(loaded)
 }
 
-/// Loads and validates a TOML config file from disk.
+/// Loads and validates a TOML config file from disk, then the recipe book it
+/// points at (see [`parse_recipe_book`]).
 ///
 /// # Errors
-/// Returns [`ConfigLoadError::Io`] when the file cannot be read,
-/// [`ConfigLoadError::Toml`] when its contents are not valid TOML,
-/// [`ConfigLoadError::UnknownKeys`] when the file contains unknown keys, and
-/// [`ConfigLoadError::Validation`] when the parsed model fails validation.
+/// Returns [`ConfigLoadError::Io`] when either file cannot be read,
+/// [`ConfigLoadError::Toml`] when their contents are not valid TOML,
+/// [`ConfigLoadError::UnknownKeys`] when the config contains unknown keys,
+/// and [`ConfigLoadError::Validation`] when the parsed model or a recipe
+/// fails validation.
 pub fn load_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
     let text = std::fs::read_to_string(path)
         .map_err(|e| ConfigLoadError::Io(format!("{}: {e}", path.display())))?;
-    parse_config_str(&text)
+    let mut loaded = parse_config_str(&text)?;
+    if let Some(recipes_file) = loaded.tracker.crafts.recipes_file.clone() {
+        let recipes_path = Path::new(&recipes_file);
+        let text = std::fs::read_to_string(recipes_path)
+            .map_err(|e| ConfigLoadError::Io(format!("{}: {e}", recipes_path.display())))?;
+        loaded.tracker.crafts.recipes = parse_recipe_book(&text)?;
+        // The structural recipe rules ride the model's validation.
+        loaded.tracker.validate().map_err(ConfigLoadError::Validation)?;
+    }
+    Ok(loaded)
+}
+
+/// File shape of the recipe book: `[[recipe]]` entries and nothing else, so a
+/// typo fails the load instead of silently dropping a field.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRecipeBook {
+    /// One entry per crafted item, in file order.
+    #[serde(rename = "recipe", default)]
+    recipes: Vec<FileRecipe>,
+}
+
+/// File shape of one `[[recipe]]` entry.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct FileRecipe {
+    /// Crafted item id.
+    item: i64,
+    /// Units one make yields; defaults to 1.
+    #[serde(default = "default_makes")]
+    makes: i64,
+    /// Reagent item id → units per make. TOML table keys are strings, so ids
+    /// arrive spelled out.
+    #[serde(default)]
+    reagents: HashMap<String, i64>,
+}
+
+fn default_makes() -> i64 {
+    1
+}
+
+/// Parses the recipe file's TOML into core recipes. Reagents sort by id so
+/// two loads of one file read identically; structural rules (positive ids
+/// and quantities, no repeats) are left to `TrackerConfig::validate`, which
+/// names the offending recipe.
+///
+/// # Errors
+/// Returns [`ConfigLoadError::Toml`] for invalid TOML or an unknown key, and
+/// [`ConfigLoadError::Validation`] when a reagent key is not an item id.
+pub fn parse_recipe_book(text: &str) -> Result<Vec<Recipe>, ConfigLoadError> {
+    let book: FileRecipeBook =
+        toml::from_str(text).map_err(|e| ConfigLoadError::Toml(format!("recipe file: {e}")))?;
+    book.recipes
+        .into_iter()
+        .map(|entry| {
+            let mut reagents = Vec::with_capacity(entry.reagents.len());
+            for (key, qty) in entry.reagents {
+                let item_id = key.trim().parse::<i64>().map_err(|_| {
+                    ConfigLoadError::Validation(ConfigError(format!(
+                        "recipe for item {}: reagent '{key}' is not an item id",
+                        entry.item
+                    )))
+                })?;
+                reagents.push(Reagent { item: ItemRef::Item { item_id }, qty });
+            }
+            reagents.sort_by_key(|reagent| match reagent.item {
+                ItemRef::Item { item_id } => item_id,
+                ItemRef::Pet { species, .. } => species,
+            });
+            Ok(Recipe { item: ItemRef::Item { item_id: entry.item }, makes: entry.makes, reagents })
+        })
+        .collect()
 }

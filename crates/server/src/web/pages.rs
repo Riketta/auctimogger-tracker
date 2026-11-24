@@ -2284,6 +2284,266 @@ pub(crate) async fn opportunities_page(
     page("opportunities", "opportunities", &body, Some(switcher))
 }
 
+// -------------------------------------------------------------------- crafts
+
+/// A fractional copper amount rounded to whole copper for display.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn money_rounded(copper: f64) -> String {
+    money(copper.round() as i64)
+}
+
+/// A craft row's reagents as one cell: names with quantities, the tooltip
+/// carrying each reagent's 7-day value.
+fn reagents_cell(
+    reagents: &[amtracker_core::services::craft::ReagentCost],
+    names: &render::ItemNames,
+) -> String {
+    let name = |item: &ItemRef| match item {
+        ItemRef::Item { item_id } => {
+            names.items.get(item_id).cloned().unwrap_or_else(|| render::item_label(item))
+        }
+        ItemRef::Pet { .. } => render::item_label(item),
+    };
+    let mut summary = String::new();
+    let mut detail = String::new();
+    for (index, reagent) in reagents.iter().enumerate() {
+        if index > 0 {
+            summary.push_str(" · ");
+            detail.push_str("; ");
+        }
+        let value = if reagent.unit_value > 0 {
+            format!("{} each", money(reagent.unit_value))
+        } else {
+            "no 7-day price".to_string()
+        };
+        let _ = write!(summary, "{} ×{}", name(&reagent.item), reagent.qty);
+        let _ = write!(detail, "{} ×{} at {value}", name(&reagent.item), reagent.qty);
+    }
+    tip(&summary, &detail)
+}
+
+/// The human reason a craft did not rank (raw text; callers escape it).
+fn craft_issue_text(
+    issue: &amtracker_core::services::craft::CraftIssue,
+    min_sale_rate: f64,
+    names: &render::ItemNames,
+) -> String {
+    use amtracker_core::services::craft::CraftIssue;
+
+    let name = |item: &ItemRef| match item {
+        ItemRef::Item { item_id } => {
+            names.items.get(item_id).cloned().unwrap_or_else(|| render::item_label(item))
+        }
+        ItemRef::Pet { .. } => render::item_label(item),
+    };
+    match issue {
+        CraftIssue::ReagentWithoutPrice(item) => {
+            format!("reagent without a 7-day price: {}", name(item))
+        }
+        CraftIssue::OutputWithoutPrice => "the crafted item has no 7-day price".to_string(),
+        CraftIssue::NoSaleEvidence => "no sale evidence for the output yet".to_string(),
+        CraftIssue::SlowSeller(rate) => format!(
+            "sells too slowly: {:.0}% over 14 days (floor {:.0}%)",
+            rate * 100.0,
+            min_sale_rate * 100.0
+        ),
+        CraftIssue::NotProfitable => "reagents cost as much as the output nets".to_string(),
+    }
+}
+
+/// `GET /crafts?target=` — the manual recipe book evaluated against one
+/// target: which crafts are worth running (the reagents' market cost against
+/// the output's value, scaled by how reliably it sells) and, separately, why
+/// the others are not.
+#[allow(clippy::too_many_lines)]
+pub(crate) async fn crafts_page(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match target_param(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let report = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || state.crafts.crafts(&target)
+    });
+    let report = match report.await {
+        Ok(Ok(report)) => report,
+        Ok(Err(error)) => return render::store_error_page(error).await,
+        Err(error) => {
+            return render::store_error_page(StoreError::Backend(error.to_string())).await
+        }
+    };
+    let switcher = target_switcher(&state.config, "/crafts", &target, &[]);
+    let crafts = &state.config.crafts;
+    let provenance = match crafts.recipes_file.as_deref() {
+        Some(file) => format!(
+            "recipes from <code>{}</code> ({} loaded — edit the file and restart to apply)",
+            html_escape(file),
+            crafts.recipes.len()
+        ),
+        None => "no recipe file configured".to_string(),
+    };
+    let mut body = format!(
+        "<p class=\"muted\">{} target <code>{}</code> · {} · {}</p>",
+        tip(
+            "crafts",
+            "Every manual recipe priced on this target: the reagents' quantity-weighted 7-day cost against the output's 7-day value, less the house cut, scaled by how reliably the output sells."
+        ),
+        html_escape(target.as_str()),
+        provenance,
+        tip(
+            "assumptions",
+            &format!(
+                "The output is assumed to sell at its 7-day quantity-weighted value; house cut {:.0}%; \
+                 outputs below a {:.0}% 14-day sale rate are not ranked. Prices come from the scans \
+                 the scheduler refreshes every few minutes.",
+                report.cut * 100.0,
+                report.min_sale_rate * 100.0
+            ),
+        ),
+    );
+
+    if crafts.recipes.is_empty() {
+        body.push_str(
+            "<div class=\"empty\">no recipes configured — point [crafts].recipes at a recipe file \
+             (see recipes.example.toml in the repository) and restart.</div>",
+        );
+        return page("crafts", "crafts", &body, Some(switcher));
+    }
+
+    let mut identities: Vec<ItemRef> = Vec::new();
+    for row in report.ranked.iter().chain(report.unranked.iter()) {
+        identities.push(row.recipe.item.clone());
+        identities.extend(row.reagents.iter().map(|reagent| reagent.item.clone()));
+    }
+    let names =
+        resolve_names(&state, &super::target_flavor(&state.config, &target), &identities).await;
+
+    if report.ranked.is_empty() {
+        body.push_str(
+            "<h2>efficient crafts</h2><div class=\"empty\">no craft clears the bar right now — \
+             the rest of the book is listed below with the reason.</div>",
+        );
+    } else {
+        body.push_str(
+            "<h2>efficient crafts</h2><div class=\"scroll-x\"><table id=\"crafts\"><thead><tr>",
+        );
+        for (label, tip_text) in [
+            ("item", "The crafted item — click for its full history."),
+            ("makes", "Units one make yields."),
+            ("value 7d", "The output's quantity-weighted 7-day median unit price: what the craft is assumed to fetch per unit."),
+            ("sale rate", "14-day sell-through of the output: the share of credit-eligible listings sold. — = no evidence."),
+            ("sold/day", "Units the market absorbed per day over the last 14 days."),
+            ("cost 7d", "The reagents at their 7-day values, per make."),
+            ("cost now", "The reagents at the newest snapshot's cheapest listings, per make; — unless every reagent is listed right now."),
+            ("profit", "Value × makes − house cut − cost 7d: what one make nets if the output sells."),
+            ("expected", "Profit × sale rate: what one make is worth given the risk the output does not sell. Sorted descending by default."),
+            ("ROI", "Profit ÷ cost 7d."),
+            ("reagents", "What one make consumes; the tooltip carries each reagent's 7-day value."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        let money_or_dash = |copper: Option<i64>| copper.map_or_else(|| "—".to_string(), money);
+        let percent = |rate: Option<f64>| {
+            rate.map_or_else(|| "—".to_string(), |rate| format!("{:.0}%", rate * 100.0))
+        };
+        for row in &report.ranked {
+            let output = row.output.as_ref();
+            let sold_per_day = output.and_then(|output| output.units_sold_per_day);
+            let sale_rate = output.and_then(|output| output.sale_rate);
+            let _ = write!(
+                body,
+                "<tr>{}<td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td data-v=\"{}\">{}</td><td data-v=\"{:.3}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td data-v=\"{:.3}\">{}</td><td class=\"num\" data-v=\"{:.3}\">{:.0}%</td><td>{}</td></tr>",
+                item_cell(&target, &row.recipe.item, &names, output.map(|output| output.category)),
+                row.recipe.makes,
+                row.recipe.makes,
+                output.map_or(-1, |output| output.value7),
+                money_or_dash(output.map(|output| output.value7)),
+                sale_rate.unwrap_or(-1.0),
+                percent(sale_rate),
+                sold_per_day.unwrap_or(-1.0),
+                sold_per_day.map_or_else(|| "—".to_string(), |units| format!("{units:.1}")),
+                row.cost.unwrap_or(-1),
+                money_or_dash(row.cost),
+                row.cost_now.unwrap_or(-1),
+                money_or_dash(row.cost_now),
+                row.profit.unwrap_or(0),
+                money_or_dash(row.profit),
+                row.expected.unwrap_or(0.0),
+                row.expected.map_or_else(|| "—".to_string(), money_rounded),
+                row.roi.unwrap_or(0.0),
+                row.roi.unwrap_or(0.0) * 100.0,
+                reagents_cell(&row.reagents, &names),
+            );
+        }
+        body.push_str("</tbody></table></div>");
+        let _ = write!(
+            body,
+            "<p><button class=\"btn btn-sm\" data-csv=\"crafts\">export CSV</button></p>"
+        );
+    }
+
+    body.push_str("<h2>not ranked</h2>");
+    if report.unranked.is_empty() {
+        body.push_str("<div class=\"empty\">every recipe ranks.</div>");
+    } else {
+        body.push_str("<div class=\"scroll-x\"><table id=\"crafts-unranked\"><thead><tr>");
+        for (label, tip_text) in [
+            ("item", "The crafted item — click for its full history."),
+            ("why", "The first reason the recipe did not rank, in order of severity."),
+            (
+                "value 7d",
+                "The output's quantity-weighted 7-day median unit price, when it has one.",
+            ),
+            ("sale rate", "14-day sell-through of the output. — = no evidence."),
+            (
+                "cost 7d",
+                "The reagents at their 7-day values, per make, when every reagent has a price.",
+            ),
+            ("reagents", "What one make consumes; the tooltip carries each reagent's 7-day value."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        for row in &report.unranked {
+            let issue = row.issue.as_ref().map_or_else(String::new, |issue| {
+                craft_issue_text(issue, report.min_sale_rate, &names)
+            });
+            let sale_rate = row.output.as_ref().and_then(|output| output.sale_rate);
+            let _ = write!(
+                body,
+                "<tr>{}<td>{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td data-v=\"{}\">{}</td><td class=\"num\" data-v=\"{}\">{}</td><td>{}</td></tr>",
+                item_cell(
+                    &target,
+                    &row.recipe.item,
+                    &names,
+                    row.output.as_ref().map(|output| output.category)
+                ),
+                html_escape(&issue),
+                row.output.as_ref().map_or(-1, |output| output.value7),
+                row.output.as_ref().map_or_else(|| "—".to_string(), |output| money(output.value7)),
+                sale_rate.unwrap_or(-1.0),
+                sale_rate.map_or_else(|| "—".to_string(), |rate| format!("{:.0}%", rate * 100.0)),
+                row.cost.unwrap_or(-1),
+                row.cost.map_or_else(|| "—".to_string(), money),
+                reagents_cell(&row.reagents, &names),
+            );
+        }
+        body.push_str("</tbody></table></div>");
+    }
+    page("crafts", "crafts", &body, Some(switcher))
+}
+
 // ---------------------------------------------------------------- overview
 
 /// One movers table (rising / falling / most active) with honest 30-day
@@ -3173,6 +3433,8 @@ pub(crate) async fn help_page() -> Response {
         ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted geometric mean of discount, reliability, churn and stability (weights from the config, normalized; only ratios matter for ranking). Any component at zero scores zero: a liquid but undiscounted market cannot outrank a real deal."),
+        ("efficient crafts", "The /crafts ranking: every manual recipe with its reagents at their quantity-weighted 7-day values against the output's 7-day value, less the house cut, scaled by the output's 14-day sale rate. Recipes that miss a price, lack sale evidence, sell too slowly or lose money are listed separately with the reason."),
+        ("expected profit", "Per make: (output value × makes − house cut − reagent cost) × the output's sale rate — what one make is worth given the risk the output does not sell. The crafting ranking sorts on it."),
         ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
         ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),

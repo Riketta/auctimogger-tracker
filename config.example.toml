@@ -74,6 +74,16 @@ min_samples = 30
 # LISTED price sits under the item's quantity-weighted 7-day value.
 weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 
+# Crafting view (/crafts, /api/crafts): a hand-maintained recipe file plus
+# two knobs. The tracker prices every reagent and output from its own market
+# data; the file says which items craft into which (see recipes.example.toml).
+# Relative paths resolve against the working directory, like the storage
+# paths. Without the section the crafting views simply have no recipes.
+# [crafts]
+# recipes = "recipes.toml"
+# min_sale_rate = 0.2     # outputs below this 14-day sale rate are not ranked
+# ah_cut_percent = 5.0    # house cut taken off the output value
+
 # Alert rules (per target, managed on the /alerts page or via the API) are
 # evaluated after every ingest cycle. A fired rule re-fires at most once per
 # cooldown window. Rules are skipped while a target's newest feed snapshot is

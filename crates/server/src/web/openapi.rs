@@ -283,6 +283,14 @@ fn spec_paths_market(target: &Value) -> Value {
                 ok_json_ref("MissedDealsResponse"),
             ),
         },
+        "/api/crafts": {
+            "get": get_op(
+                "Efficient crafts",
+                "The manual recipe book ([crafts].recipes) evaluated against the target: every recipe with its reagents priced at their quantity-weighted 7-day values (and the newest snapshot's floors), the output's value and 14-day sale rate, and the money fields per make in copper. Efficient crafts come first (ranked = true, highest expected profit first); the rest carry the first issue that kept them out.",
+                vec![target.clone()],
+                ok_json_ref("CraftsResponse"),
+            ),
+        },
         "/api/history": {
             "get": get_op(
                 "Bulk day-level market history",
@@ -694,8 +702,55 @@ fn spec_schemas_market() -> Value {
 }
 
 /// Overview, search and index schemas.
+// One declarative schema per named response: the table reads best as a single
+// ordered block.
+#[allow(clippy::too_many_lines)]
 fn spec_schemas_secondary() -> Value {
     json!({
+        "CraftsResponse": {
+            "description": "The recipe book evaluated against one target; ranked rows first, then the unranked ones in recipe order.",
+            "type": "object",
+            "properties": {
+                "target": { "type": "string" },
+                "recipesFile": { "type": ["string", "null"], "description": "Configured recipe file path; null when none is configured." },
+                "ahCutPercent": { "type": "number", "description": "House cut applied to the output value, in percent." },
+                "minSaleRate": { "type": "number", "description": "Outputs below this 14-day sale rate are not ranked." },
+                "crafts": { "type": "array", "items": { "$ref": "#/components/schemas/CraftRow" } }
+            }
+        },
+        "CraftRow": {
+            "description": "One recipe priced on the target. Money fields are per make, in copper; null whenever an input they need is missing.",
+            "type": "object",
+            "properties": {
+                "item": { "$ref": "#/components/schemas/ItemRef" },
+                "makes": { "type": "integer", "description": "Units one make yields." },
+                "ranked": { "type": "boolean", "description": "True for an efficient craft (priced, selling fast enough, profitable)." },
+                "issue": { "type": ["string", "null"], "enum": ["reagent-without-price", "output-without-price", "no-sale-evidence", "slow-seller", "not-profitable", null], "description": "The first reason the row did not rank; null when ranked." },
+                "outputCategory": { "type": ["string", "null"], "enum": ["item", "commodity", null], "description": "The market the output was priced in (the one with more 7-day evidence)." },
+                "outputValue": { "type": ["integer", "null"], "description": "Output's quantity-weighted 7-day median unit price." },
+                "saleRate": { "type": ["number", "null"], "description": "Output's 14-day sale-through fraction 0..1; null = no credit-eligible evidence." },
+                "unitsSoldPerDay": { "type": ["number", "null"], "description": "Units the market absorbed per day over the trailing 14 days." },
+                "reagents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "item": { "$ref": "#/components/schemas/ItemRef" },
+                            "qty": { "type": "integer" },
+                            "category": { "type": ["string", "null"], "enum": ["item", "commodity", null] },
+                            "unitValue": { "type": "integer", "description": "Quantity-weighted 7-day unit value; 0 without a price." },
+                            "liveUnitPrice": { "type": ["integer", "null"], "description": "Cheapest listing in the newest snapshot, when listed." }
+                        }
+                    }
+                },
+                "cost": { "type": ["integer", "null"], "description": "Reagents at 7-day values; null when a reagent is unpriced." },
+                "costNow": { "type": ["integer", "null"], "description": "Reagents at the newest snapshot's floors; null unless every reagent is listed." },
+                "gross": { "type": ["integer", "null"], "description": "Output value x makes, before the house cut." },
+                "profit": { "type": ["integer", "null"], "description": "Gross - cut - cost." },
+                "expected": { "type": ["number", "null"], "description": "Profit x sale rate — the ranking key." },
+                "roi": { "type": ["number", "null"], "description": "Profit / cost." }
+            }
+        },
         "OverviewResponse": {
             "description": concat!("With ?category=, the bare shape below (plus a category echo). ",
                                    "Without it, an object keyed by category: {\"item\": {…}, \"commodity\": {…}, \"pet\": {…}}."),
@@ -829,6 +884,10 @@ fn build_docs_body() -> String {
             "missed = requests.get(f\"{BASE}/api/missed-deals\",\n",
             "                      params={\"target\": TARGET, \"category\": \"commodity\"\",\n",
             "                              \"min_discount\": 25}).json()[\"missed\"]\n",
+            "\n",
+            "# which manual recipes are worth crafting here (see recipes.example.toml)\n",
+            "crafts = requests.get(f\"{BASE}/api/crafts\",\n",
+            "                    params={\"target\": TARGET}).json()[\"crafts\"]\n",
             "\n",
             "# bulk day-level history for the whole market (all categories)\n",
             "rows = requests.get(f\"{BASE}/api/history\",\n",

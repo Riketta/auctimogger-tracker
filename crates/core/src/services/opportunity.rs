@@ -164,6 +164,56 @@ pub struct LiveSnapshot {
     pub source_last_modified: Option<i64>,
 }
 
+/// One item's market facts from a prepared scan — the read-only fuel of the
+/// crafting view, which needs every reagent and output priced the same way
+/// the deal ranking prices them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarketValue {
+    /// Quantity-weighted 7-day median unit price (copper); 0 without evidence.
+    pub value7: i64,
+    /// Auction-days of evidence behind it.
+    pub samples7: i64,
+    /// 14-day sale rate (`None` = no credit-eligible evidence).
+    pub sale_rate: Option<f64>,
+    /// The item's listing summary in the newest snapshot (`None` = not
+    /// listed there).
+    pub live: Option<SnapshotFloor>,
+}
+
+/// Read-only view of one category's prepared scan, keyed by identity.
+#[derive(Clone, Debug)]
+pub struct MarketView {
+    scan: Arc<ScanSnapshot>,
+}
+
+impl MarketView {
+    /// One item's market facts; `None` when the scan holds no row for it.
+    #[must_use]
+    pub fn get(&self, item: &ItemRef) -> Option<MarketValue> {
+        // `rows` is built in BTreeMap order, so it is sorted by identity and
+        // the aligned `rates` vector shares the index.
+        let index = self.scan.rows.binary_search_by(|row| row.item.cmp(item)).ok()?;
+        Some(MarketValue {
+            value7: as_copper(self.scan.rows.get(index)?.value7),
+            samples7: self.scan.rows.get(index)?.samples7,
+            sale_rate: self.scan.rates.get(index).copied().flatten(),
+            live: self.scan.floors.get(item).copied(),
+        })
+    }
+
+    /// When the scan was computed (unix seconds).
+    #[must_use]
+    pub fn computed_at(&self) -> i64 {
+        self.scan.computed_at
+    }
+
+    /// The snapshot the view's live floors describe, when one is stored.
+    #[must_use]
+    pub fn snapshot(&self) -> Option<LiveSnapshot> {
+        self.scan.live
+    }
+}
+
 /// Row ordering for [`OpportunityService::opportunities`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpportunitySort {
@@ -464,6 +514,19 @@ impl OpportunityService {
         let cache = self.scan_cache().ok()?;
         let (_, snapshot) = cache.get(&(target.clone(), category))?;
         snapshot.live
+    }
+
+    /// One category's prepared scan as a read-only market view (value,
+    /// evidence, sale rate and live floor per identity). Serves from the
+    /// cache like the ranking does; a cold cache computes inline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cold-start inline scan cannot
+    /// read history rows, live floors or sale rates, or the scan cache is
+    /// poisoned.
+    pub fn market(&self, target: &TargetId, category: Category) -> Result<MarketView, StoreError> {
+        Ok(MarketView { scan: self.scan(target, category)? })
     }
 
     /// Recomputes the full scan artifact for one target — history read,

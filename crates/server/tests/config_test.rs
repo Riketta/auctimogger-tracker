@@ -7,10 +7,16 @@
 
 use amtracker_core::{
     config::TargetKind,
-    domain::Span,
+    domain::{
+        ItemRef,
+        Span,
+    },
 };
 use amtracker_server::config_file::{
+    load_config,
     parse_config_str,
+    parse_recipe_book,
+    ConfigLoadError,
     LoggingSettings,
     Rotation,
     SentrySettings,
@@ -297,4 +303,127 @@ fn blank_credential_env_names_are_rejected() {
         .replace("client_secret_env = \"BLIZZARD_CLIENT_SECRET\"", "client_secret_env = \"  \"");
     let error = parse_config_str(&text).expect_err("blank env name must fail");
     assert!(error.to_string().contains("must not be empty"), "{error}");
+}
+
+// --------------------------------------------------------------- recipe book
+
+#[test]
+fn parses_the_recipe_book_with_reagents_in_id_order() {
+    let book = "[[recipe]]\n\
+                item = 13446\n\
+                [recipe.reagents]\n\
+                2449 = 1\n\
+                765 = 2\n\
+                \n\
+                [[recipe]]\n\
+                item = 999\n\
+                makes = 5\n\
+                reagents = { 765 = 1 }\n";
+    let recipes = parse_recipe_book(book).expect("recipe book must parse");
+    assert_eq!(recipes.len(), 2);
+    assert_eq!(recipes[0].item, ItemRef::Item { item_id: 13446 });
+    assert_eq!(recipes[0].makes, 1, "makes defaults to 1");
+    let reagents: Vec<(i64, i64)> = recipes[0]
+        .reagents
+        .iter()
+        .map(|reagent| match reagent.item {
+            ItemRef::Item { item_id } => (item_id, reagent.qty),
+            ItemRef::Pet { .. } => panic!("recipes only deal in items"),
+        })
+        .collect();
+    assert_eq!(reagents, [(765, 2), (2449, 1)], "sorted by id, not file order");
+    assert_eq!(recipes[1].item, ItemRef::Item { item_id: 999 });
+    assert_eq!(recipes[1].makes, 5);
+    assert_eq!(parse_recipe_book("").expect("an empty book is a valid book"), Vec::new());
+}
+
+#[test]
+fn rejects_malformed_recipe_books() {
+    let error = parse_recipe_book("[[recipe]]\nitem = 1\nquanity = 2\n")
+        .expect_err("a typo in a key must not be ignored");
+    assert!(matches!(error, ConfigLoadError::Toml(_)), "{error:?}");
+
+    let error = parse_recipe_book("[[recipe]]\nitem = 1\n[recipe.reagents]\nherb = 2\n")
+        .expect_err("reagent keys are item ids");
+    match error {
+        ConfigLoadError::Validation(message) => {
+            assert!(message.0.contains("reagent 'herb' is not an item id"), "{message}");
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+
+    assert!(parse_recipe_book("[[recipe]]\nmakes = 1\n").is_err(), "item is required");
+}
+
+#[test]
+fn the_crafts_section_maps_its_knobs() {
+    let text = format!(
+        "{EXAMPLE}\n[crafts]\nrecipes = \"recipes.toml\"\nmin_sale_rate = 0.3\nah_cut_percent = 3\n"
+    );
+    let loaded = parse_config_str(&text).expect("the crafts section must parse");
+    assert_eq!(loaded.tracker.crafts.recipes_file.as_deref(), Some("recipes.toml"));
+    assert_eq!(loaded.tracker.crafts.min_sale_rate, 0.3);
+    assert_eq!(loaded.tracker.crafts.ah_cut_percent, 3.0);
+    assert!(loaded.tracker.crafts.recipes.is_empty(), "the string loader reads no files");
+
+    let error = parse_config_str(&format!("{EXAMPLE}\n[crafts]\nrecipe = \"x\"\n"))
+        .expect_err("unknown crafts key");
+    assert!(matches!(error, ConfigLoadError::UnknownKeys(_)), "{error:?}");
+    let error = parse_config_str(&format!("{EXAMPLE}\n[crafts]\nmin_sale_rate = 1.5\n"))
+        .expect_err("out-of-range floor");
+    assert!(matches!(error, ConfigLoadError::Validation(_)), "{error:?}");
+
+    // Defaults apply when the section is absent.
+    let plain = parse_config_str(EXAMPLE).expect("example parses");
+    assert_eq!(plain.tracker.crafts.min_sale_rate, 0.2);
+    assert_eq!(plain.tracker.crafts.ah_cut_percent, 5.0);
+    assert!(plain.tracker.crafts.recipes_file.is_none());
+}
+
+/// A TOML basic string for a filesystem path (backslashes escaped).
+fn toml_path(path: &std::path::Path) -> String {
+    let text = path.to_str().expect("utf8 temp path");
+    format!("\"{}\"", text.replace('\\', "\\\\"))
+}
+
+#[test]
+fn load_config_reads_and_validates_the_recipe_file() {
+    let dir = std::env::temp_dir().join(format!(
+        "amtracker-config-recipes-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    std::fs::create_dir_all(&dir).expect("temp dir");
+    let recipes_path = dir.join("recipes.toml");
+    std::fs::write(&recipes_path, "[[recipe]]\nitem = 1\nreagents = { 2 = 1, 3 = 2 }\n")
+        .expect("write recipes");
+    let config_path = dir.join("config.toml");
+    std::fs::write(
+        &config_path,
+        format!("{EXAMPLE}\n[crafts]\nrecipes = {}\n", toml_path(&recipes_path)),
+    )
+    .expect("write config");
+
+    let loaded = load_config(&config_path).expect("config and recipes load");
+    assert_eq!(loaded.tracker.crafts.recipes.len(), 1);
+    assert_eq!(loaded.tracker.crafts.recipes[0].reagents.len(), 2);
+
+    // A malformed book fails the load naming the recipe.
+    std::fs::write(&recipes_path, "[[recipe]]\nitem = 1\n[recipe.reagents]\n2 = 0\n")
+        .expect("rewrite recipes");
+    match load_config(&config_path).expect_err("a zero quantity must fail") {
+        ConfigLoadError::Validation(message) => {
+            assert!(message.0.contains("recipe for item 1"), "{message}");
+        }
+        other => panic!("expected a validation error, got {other:?}"),
+    }
+
+    // A missing recipe file is an IO error naming the path.
+    std::fs::write(
+        &config_path,
+        format!("{EXAMPLE}\n[crafts]\nrecipes = {}\n", toml_path(&dir.join("missing.toml"))),
+    )
+    .expect("rewrite config");
+    assert!(matches!(load_config(&config_path), Err(ConfigLoadError::Io(_))));
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -5,6 +5,7 @@ pub mod alert;
 pub mod buy_timing;
 pub mod catalog;
 pub mod chain;
+pub mod craft;
 pub mod cycle;
 pub mod feed_export;
 pub mod health;

@@ -16,6 +16,7 @@ normal for this item, and how do I know this deal is real?"*.
 - [Configuration](#configuration)
 - [CLI reference](#cli-reference)
 - [Web UI & JSON API](#web-ui--json-api)
+- [Crafting (recipe file)](#crafting-recipe-file)
 - [Feed contract (v3)](#feed-contract-v3)
 - [For developers](#for-developers)
   - [Architecture](#architecture)
@@ -77,6 +78,13 @@ normal for this item, and how do I know this deal is real?"*.
   were bought or cancelled land in a separate "seen today, already gone"
   table (and `GET /api/missed-deals`) instead of passing as buyable. Ranked
   per market category (items, commodities, pets).
+- **Efficient crafts** — `/crafts` prices a hand-maintained recipe file
+  (`recipes.example.toml`) on each target: the reagents' quantity-weighted
+  7-day cost (and what they cost right now) against the crafted item's
+  value, less the auction-house cut, scaled by how reliably the item sells —
+  ranked by expected profit per make, with every recipe that misses a price,
+  lacks sale evidence, sells too slowly or loses money listed separately
+  with the reason.
 - **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
@@ -111,8 +119,8 @@ remains for one-off/manual exports; the plain `fetch` subcommand runs
 ingestion only — feeds, retention and ranking refreshes are `serve`'s job.
 
 Prebuilt binaries (linux-gnu / windows-msvc archives with
-`config.example.toml`) are attached to GitHub releases — see
-[Releases](#github-ci--releases).
+`config.example.toml` and `recipes.example.toml`) are attached to GitHub
+releases — see [Releases](#github-ci--releases).
 
 ## Configuration
 
@@ -139,6 +147,9 @@ only — never put secrets in this file.
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
 | `opportunities.min_samples` | `30` | auction-days of 7-day evidence behind an item's value (per category): below it an item neither ranks nor lists as a gone-today deal, and `floor-below-value`/`new-listing-below` alerts do not fire |
 | `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | exponents of the weighted-geometric-mean score (only ratios matter; a component at zero scores zero) |
+| `crafts.recipes` | absent | path of the manual recipe file (TOML, see `recipes.example.toml` and [Crafting](#crafting-recipe-file)); without it `/crafts` has no recipes |
+| `crafts.min_sale_rate` | `0.2` | crafted items below this 14-day sale rate are not ranked as efficient crafts |
+| `crafts.ah_cut_percent` | `5.0` | auction-house cut taken off the output value |
 | `[logging]` | absent | optional file logging: `dir` (created at boot, failure aborts), `rotation` = `daily`\|`never`, independent `level` (EnvFilter directives) |
 | `[sentry]` | absent | optional Sentry/GlitchTip reporting: `dsn` (empty = off), `environment`, `traces_sample_rate` (0.0..=1.0; absent = error-only) |
 | `[[targets]]` | — | see below |
@@ -231,7 +242,9 @@ alphabetical catalog browse · `/items/{target}/{item}` item detail ·
 in-game auction house: name/id/class/quality filters, sortable price/qty/time
 columns, page arrows; unpinned = newest snapshot, pinned = frozen history) ·
 `/opportunities` (live deals with filter/sort/CSV, then the "seen today,
-already gone" list) · `/overview` (movers with real 30-day
+already gone" list) · `/crafts` (the manual recipe book priced on the
+target: efficient crafts best-first, the rest with the reason) ·
+`/overview` (movers with real 30-day
 sparklines) · `/watchlist` · `/priorities` (the watchlist ranked best sell
 first: 50% liquidity + 30% momentum + 20% recency, components in tooltips,
 thin-data ranks marked `~`) · `/compare` (one watched identity across all
@@ -253,6 +266,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
 | `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`) and the response names the `snapshot` they come from. `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
 | `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first — the same two response shapes as opportunities |
+| `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents, the output's value and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out |
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
@@ -302,6 +316,46 @@ scheduler tick — not by the TTL alone. Two inline fallbacks remain: a
 completely cold cache (e.g. the very first request before the scheduler's
 initial refresh lands) and, as a self-heal backstop, any scan that ages past
 six scan TTLs (which would take a dead or persistently failing scheduler).
+
+## Crafting (recipe file)
+
+The tracker knows prices, not recipes: which items craft into which is the
+one thing you supply by hand. A recipe file is TOML, one `[[recipe]]` per
+craft, with reagents as `item id = quantity`:
+
+```toml
+[[recipe]]
+item = 12345          # the crafted item
+makes = 1             # units per make (default 1)
+[recipe.reagents]
+11111 = 1
+22222 = 2
+```
+
+Point `[crafts].recipes` at the file (relative paths resolve against the
+working directory — `/work` in the container, so mount it beside
+`config.toml`) and restart; `config-check` validates it like the rest of
+the config. Unknown keys, non-numeric reagent keys, non-positive ids or
+quantities and a repeated reagent fail startup naming the recipe. Several
+recipes may craft one item (alternative reagent sets) — each is its own
+row. `recipes.example.toml` in the repository is a commented template.
+
+`/crafts?target=` then prices every recipe on that target:
+
+- **value 7d** — the output's quantity-weighted 7-day median unit price,
+  the same value the deal ranking discounts against (an item trading in
+  both houses is priced where it has more evidence);
+- **cost 7d / cost now** — the reagents at their 7-day values, and at the
+  newest snapshot's cheapest listings when every reagent is listed;
+- **profit** — value × makes − house cut (`crafts.ah_cut_percent`) − cost;
+- **expected profit** — profit × the output's 14-day sale rate, the ranking
+  key; **ROI** — profit ÷ cost.
+
+A recipe is an *efficient craft* when every reagent and the output have a
+7-day price, the output's sale rate is at least `crafts.min_sale_rate`, and
+the craft is profitable. Everything else is listed below with the first
+reason it missed: a reagent or the output without a price, no sale evidence
+yet, a slow seller, or reagents that cost as much as the output nets.
 
 ## Feed contract (v3)
 
@@ -480,8 +534,10 @@ poll = { commodities_secs = 3600, auctions_secs = 3600 }
 # poll = { commodities_secs = 3600, auctions_secs = 1800 }
 ```
 
-Every other key is documented in [Configuration](#configuration). Validate
-before starting:
+To use the crafting view, mount a recipe file into `/work` as well and set
+`[crafts].recipes = "/work/recipes.toml"` (see
+[Crafting](#crafting-recipe-file)). Every other key is documented in
+[Configuration](#configuration). Validate before starting:
 
 ```sh
 docker compose run --rm tracker config-check /work/config.toml

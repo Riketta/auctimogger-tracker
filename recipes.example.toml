@@ -1,0 +1,37 @@
+# Recipe book for the crafting view — the MANUAL half of /crafts.
+#
+# The tracker prices everything (every reagent and the output) from its own
+# market data; it does not know which items craft into which. This file is
+# where you write that down, one [[recipe]] block per craft. Point
+# [crafts].recipes in config.toml at a copy of this file and restart.
+#
+#   item      the crafted item's id
+#   makes     units one make yields (optional, default 1)
+#   reagents  the items one make consumes, as `item id = quantity`
+#
+# Item ids are the ones the tracker shows everywhere (the /items/<target>/<id>
+# page, the wowhead links, the API's itemID). Recipe details — which reagents,
+# how many — are on the item's Wowhead page ("Reagents" on the spell tab).
+#
+# Several recipes may craft the same item (alternative reagent sets); each is
+# its own row on /crafts. Unknown keys, non-numeric reagent keys, non-positive
+# ids/quantities and a repeated reagent inside one recipe fail startup with a
+# message naming the recipe.
+
+# [[recipe]]
+# item = 12345
+# makes = 1
+# [recipe.reagents]
+# 11111 = 1
+# 22222 = 2
+#
+# A recipe that yields several units per make:
+#
+# [[recipe]]
+# item = 23456
+# makes = 5
+# [recipe.reagents]
+# 11111 = 2
+# 33333 = 1
+
+# An empty book is valid: /crafts then says no recipes are configured.

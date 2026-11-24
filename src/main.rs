@@ -635,6 +635,15 @@ fn build_app_state(
     item_info: &Arc<dyn ItemInfoPort>,
     metrics: Arc<MetricsService>,
 ) -> Arc<AppState> {
+    // The crafting view reads the ranking's prepared scans, so both services
+    // share one opportunity service instance.
+    let opportunities = Arc::new(amtracker_core::services::opportunity::OpportunityService::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        clock.clone(),
+        config,
+    ));
     Arc::new(AppState {
         config: config.clone(),
         clock: clock.clone(),
@@ -653,13 +662,7 @@ fn build_app_state(
             clock.clone(),
         )),
         metrics: metrics.clone(),
-        opportunities: Arc::new(amtracker_core::services::opportunity::OpportunityService::new(
-            store.clone(),
-            store.clone(),
-            store.clone(),
-            clock.clone(),
-            config,
-        )),
+        opportunities: opportunities.clone(),
         watchlist: Arc::new(amtracker_core::services::watchlist::WatchlistService::new(
             store.clone(),
             clock.clone(),
@@ -678,6 +681,11 @@ fn build_app_state(
             metrics.clone(),
             store.clone(),
             clock.clone(),
+        )),
+        crafts: Arc::new(amtracker_core::services::craft::CraftService::new(
+            opportunities.clone(),
+            metrics.clone(),
+            &config.crafts,
         )),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),

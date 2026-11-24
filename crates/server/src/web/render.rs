@@ -348,6 +348,7 @@ pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> 
         ("/items", "items", "items"),
         ("/browse", "browse", "browse"),
         ("/opportunities", "opportunities", "opportunities"),
+        ("/crafts", "crafts", "crafts"),
         ("/overview", "overview", "overview"),
         ("/watchlist", "watchlist", "watchlist"),
         ("/priorities", "priorities", "priorities"),
@@ -364,8 +365,11 @@ pub fn page(title: &str, active: &str, body: &str, switcher: Option<String>) -> 
     let switcher_html = switcher.unwrap_or_else(|| "<span class=\"spacer\"></span>".into());
     // The opportunities ranking is the UI's widest table (11 columns, three
     // with component bars); its page opts into the wider `body.wide` measure
-    // (see app.css) instead of scrolling inside the default 1180px one.
-    let body_class = if active == "opportunities" { r#" class="wide""# } else { "" };
+    // (see app.css) instead of scrolling inside the default 1180px one. The
+    // crafting table is nearly as wide (reagent cost, live cost, profit,
+    // expectation and ROI per row), so it shares the measure.
+    let body_class =
+        if matches!(active, "opportunities" | "crafts") { r#" class="wide""# } else { "" };
     Html(format!(
         "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\">\
          <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\

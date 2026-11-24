@@ -7,6 +7,8 @@ use std::path::PathBuf;
 use crate::{
     domain::{
         Flavor,
+        ItemRef,
+        Recipe,
         Span,
         TargetId,
     },
@@ -27,6 +29,8 @@ pub struct TrackerConfig {
     pub opportunities: OpportunitiesConfig,
     /// Alert evaluation and delivery settings.
     pub alerts: AlertsConfig,
+    /// The manual recipe book and the crafting view's settings.
+    pub crafts: CraftsConfig,
     /// Item/pet name resolution settings (source chain, locale, pacing).
     pub catalog: CatalogConfig,
     /// One entry per configured market source.
@@ -231,6 +235,29 @@ impl AlertsConfig {
     }
 }
 
+/// Crafting analysis settings and the manual recipe book behind the crafting
+/// view.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CraftsConfig {
+    /// Path of the recipe file the book was loaded from (as configured);
+    /// `None` when no file is configured.
+    pub recipes_file: Option<String>,
+    /// The loaded recipes, in file order. Empty when no file is configured.
+    pub recipes: Vec<Recipe>,
+    /// Crafted items below this 14-day sale rate are not ranked as efficient
+    /// crafts (a craft nobody buys is not a bargain at any reagent price).
+    pub min_sale_rate: f64,
+    /// Auction-house cut applied to the output value, in percent.
+    pub ah_cut_percent: f64,
+}
+
+impl Default for CraftsConfig {
+    /// No recipes; a one-in-five sale-rate floor; the standard 5% house cut.
+    fn default() -> Self {
+        Self { recipes_file: None, recipes: Vec::new(), min_sale_rate: 0.2, ah_cut_percent: 5.0 }
+    }
+}
+
 /// Delivery adapters the config string can select.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AlertDelivery {
@@ -377,6 +404,15 @@ impl TargetConfig {
 /// addition and panic at startup.
 const MAX_INTERVAL_SECS: u64 = 30 * 24 * 60 * 60;
 
+/// The id of a plain-item identity (`None` for pets — the recipe book only
+/// deals in items).
+fn plain_item_id(item: &ItemRef) -> Option<i64> {
+    match item {
+        ItemRef::Item { item_id } => Some(*item_id),
+        ItemRef::Pet { .. } => None,
+    }
+}
+
 /// Whether `id` is a valid target id: `[a-z0-9][a-z0-9._-]*`. Target ids are
 /// used as filesystem path segments (`feeds/<id>/`, raw archives), so the
 /// charset is restricted to lowercase ASCII alphanumerics plus `.`, `_`, `-`
@@ -499,6 +535,72 @@ fn validate_target_kind(target: &TargetConfig) -> Result<(), ConfigError> {
 }
 
 impl TrackerConfig {
+    /// Crafting checks: recipe ids, yields and quantities are sane, nothing
+    /// repeats inside a recipe, and an item is never its own reagent. Several
+    /// recipes may craft one item (alternative reagent sets): each is its own
+    /// row in the view.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `ConfigError` for the first violated rule.
+    fn validate_crafts(&self) -> Result<(), ConfigError> {
+        let crafts = &self.crafts;
+        if !crafts.min_sale_rate.is_finite() || !(0.0..=1.0).contains(&crafts.min_sale_rate) {
+            return Err(ConfigError(
+                "[crafts].min_sale_rate must be a finite number within 0.0..=1.0".into(),
+            ));
+        }
+        if !crafts.ah_cut_percent.is_finite() || !(0.0..=100.0).contains(&crafts.ah_cut_percent) {
+            return Err(ConfigError(
+                "[crafts].ah_cut_percent must be a finite number within 0.0..=100.0".into(),
+            ));
+        }
+        for recipe in &crafts.recipes {
+            let Some(item_id) = plain_item_id(&recipe.item) else {
+                return Err(ConfigError("recipes craft plain items, not pet variants".into()));
+            };
+            if item_id <= 0 {
+                return Err(ConfigError(format!(
+                    "recipe item id must be positive (got {item_id})"
+                )));
+            }
+            if recipe.makes < 1 {
+                return Err(ConfigError(format!(
+                    "recipe for item {item_id}: makes must be at least 1"
+                )));
+            }
+            if recipe.reagents.is_empty() {
+                return Err(ConfigError(format!(
+                    "recipe for item {item_id}: at least one reagent is required"
+                )));
+            }
+            let mut reagents = std::collections::BTreeSet::new();
+            for reagent in &recipe.reagents {
+                let Some(reagent_id) = plain_item_id(&reagent.item) else {
+                    return Err(ConfigError(format!(
+                        "recipe for item {item_id}: reagents are plain items, not pet variants"
+                    )));
+                };
+                if reagent_id <= 0 || reagent.qty < 1 {
+                    return Err(ConfigError(format!(
+                        "recipe for item {item_id}: reagent ids and quantities must be positive"
+                    )));
+                }
+                if reagent_id == item_id {
+                    return Err(ConfigError(format!(
+                        "recipe for item {item_id}: an item cannot be its own reagent"
+                    )));
+                }
+                if !reagents.insert(reagent_id) {
+                    return Err(ConfigError(format!(
+                        "recipe for item {item_id}: duplicate reagent {reagent_id} — combine the quantities"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The configured target with the given id, if any.
     #[must_use]
     pub fn find_target(&self, id: &str) -> Option<&TargetConfig> {
@@ -518,9 +620,11 @@ impl TrackerConfig {
     /// or source URL/region is blank, `connected_realm_id`/`ruleset_id`/
     /// `house_id` are not positive,
     /// `[metrics].spans` is empty, a score weight is negative/non-finite or
-    /// the weights sum to zero, `[opportunities].min_samples` is zero, the
-    /// `[catalog]` `source/locale/wowhead_base` are invalid, or a target
-    /// flavor is empty.
+    /// the weights sum to zero, `[opportunities].min_samples` is zero, a
+    /// recipe names a non-positive id or quantity, repeats a reagent, or
+    /// crafts a pet, `[crafts].min_sale_rate` or `[crafts].ah_cut_percent`
+    /// is out of range, the `[catalog]` `source/locale/wowhead_base` are
+    /// invalid, or a target flavor is empty.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.targets.is_empty() {
             return Err(ConfigError("at least one [[targets]] entry is required".into()));
@@ -584,6 +688,7 @@ impl TrackerConfig {
         if self.opportunities.min_samples == 0 {
             return Err(ConfigError("[opportunities].min_samples must be positive".into()));
         }
+        self.validate_crafts()?;
         self.validate_catalog()?;
         if !matches!(self.alerts.delivery.as_str(), "log" | "discord" | "telegram") {
             return Err(ConfigError(format!(

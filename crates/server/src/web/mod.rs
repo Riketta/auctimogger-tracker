@@ -46,6 +46,7 @@ use amtracker_core::{
         SpaceMaintenance,
     },
     services::{
+        craft::CraftService,
         cycle::IngestCycleService,
         feed_export::FeedExportService,
         health::{
@@ -100,6 +101,9 @@ pub struct AppState {
     /// Sell-priority ranking over the watchlist behind the `/priorities`
     /// page and `/api/priorities`.
     pub sell_priority: Arc<amtracker_core::services::sell_priority::SellPriorityService>,
+    /// The manual recipe book evaluated against the prepared scans, behind
+    /// the `/crafts` page and `/api/crafts`.
+    pub crafts: Arc<CraftService>,
     /// Alert rule evaluation + CRUD behind the scheduler's post-cycle pass
     /// and the `/alerts` page/API.
     pub alerts: Arc<amtracker_core::services::alert::AlertEvaluationService>,
@@ -201,6 +205,7 @@ pub fn api_routes() -> Vec<ApiRoute> {
         ("/api/search", &["get"], get(api::api_search)),
         ("/api/opportunities", &["get"], get(api::api_opportunities)),
         ("/api/missed-deals", &["get"], get(api::api_missed_deals)),
+        ("/api/crafts", &["get"], get(api::api_crafts)),
         ("/api/overview", &["get"], get(api::api_overview)),
         ("/api/items/{target_id}/{item_id}/metrics", &["get"], get(api::api_item_metrics)),
         (
@@ -248,6 +253,7 @@ pub fn build_router_arc(state: Arc<AppState>) -> Router {
         .route("/items/{target_id}/{item_id}", get(pages::item_page))
         .route("/items/{target_id}/pet/{species_id}", get(pages::pet_page))
         .route("/opportunities", get(pages::opportunities_page))
+        .route("/crafts", get(pages::crafts_page))
         .route("/overview", get(pages::overview_page))
         .route("/watchlist", get(pages::watchlist_page))
         .route("/priorities", get(pages::priorities_page))
@@ -601,6 +607,7 @@ mod tests {
                 chat_id_env: None,
                 max_data_age_secs: 0,
             },
+            crafts: amtracker_core::config::CraftsConfig::default(),
             catalog: amtracker_core::config::CatalogConfig::default(),
             targets: vec![amtracker_core::config::TargetConfig {
                 id: TargetId("us-4".into()),
