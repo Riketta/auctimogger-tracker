@@ -44,6 +44,7 @@ use amtracker_core::{
         FeedPublisher,
         FeedRenderer,
         PriceHistoryRepository,
+        SalesRepository,
         SnapshotRepository,
         SpaceMaintenance,
     },
@@ -106,6 +107,9 @@ pub struct AppState {
     /// The manual recipe book evaluated against the prepared scans, behind
     /// the `/crafts` page and `/api/crafts`.
     pub crafts: Arc<CraftService>,
+    /// Trailing sale ledger behind the item page's sold/expired counts (the
+    /// ranking's and alerts' evidence, read for one identity).
+    pub sales: Arc<dyn SalesRepository>,
     /// Alert rule evaluation + CRUD behind the scheduler's post-cycle pass
     /// and the `/alerts` page/API.
     pub alerts: Arc<amtracker_core::services::alert::AlertEvaluationService>,

@@ -644,6 +644,7 @@ fn build_app_state(
         store.clone(),
         store.clone(),
         store.clone(),
+        store.clone(),
         clock.clone(),
         config,
     ));
@@ -690,6 +691,7 @@ fn build_app_state(
             metrics.clone(),
             &config.crafts,
         )),
+        sales: store.clone(),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),
             store.clone(),

@@ -2309,6 +2309,234 @@ fn sale_rate_denominator_counts_only_credit_eligible_closes() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// The ledger counts behind the rate: a credit is `sold`, an eligible close
+/// without one is `expired`, a MEDIUM-band vanish is neither, and their ratio
+/// is exactly the rate `sale_rate` reports — positionally, with unknown and
+/// evidence-free identities reading `None`.
+#[test]
+fn sale_counts_split_sold_from_expired_like_the_rate() {
+    let dir = temp_dir("sale-counts");
+    let store = open_store(&dir, 100_000);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let item2 = item(2);
+    let banded = |id: i64, owner: &ItemRef, band: TimeLeftBand| NormalizedListing {
+        auction_id: id,
+        item_ref: owner.clone(),
+        kind: ListingKind::Commodity,
+        quantity: 1,
+        unit_price: 100,
+        bid: None,
+        time_left: band,
+        context: None,
+        bonus_lists: vec![],
+    };
+    // Same book as the denominator test: a1 sells, a2 dies out of MEDIUM
+    // (neither count), a3 expires out of LONG (expired), a4 sells.
+    let s1_batch = [
+        banded(1, &item1, TimeLeftBand::VeryLong),
+        banded(2, &item1, TimeLeftBand::Medium),
+        banded(3, &item2, TimeLeftBand::Long),
+        banded(4, &item2, TimeLeftBand::VeryLong),
+    ];
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 10_000, 4), &s1_batch, b"e1")
+        .expect("e1");
+    store.observe(&target, PayloadKind::Commodities, &s1_batch, 1, 10_000).expect("observe e1");
+    let s2_batch = [banded(2, &item1, TimeLeftBand::Medium), banded(3, &item2, TimeLeftBand::Long)];
+    store
+        .record(&snap(&target, PayloadKind::Commodities, 11_000, 2), &s2_batch, b"e2")
+        .expect("e2");
+    store.observe(&target, PayloadKind::Commodities, &s2_batch, 2, 11_000).expect("observe e2");
+    store.close_missing(&target, PayloadKind::Commodities, 2, 11_000).expect("close e2");
+    store.record(&snap(&target, PayloadKind::Commodities, 18_200, 0), &[], b"e3").expect("e3");
+    store.close_missing(&target, PayloadKind::Commodities, 3, 18_200).expect("close e3");
+
+    let one = store.sale_counts(&target, &item1, 14, Category::Commodity).expect("counts1");
+    assert_eq!(
+        one,
+        Some(amtracker_core::domain::SaleCounts { sold: 1, expired: 0 }),
+        "the MEDIUM vanish belongs to neither count"
+    );
+    assert_eq!(
+        one.expect("evidence").rate(),
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate1")
+    );
+    let two = store.sale_counts(&target, &item2, 14, Category::Commodity).expect("counts2");
+    assert_eq!(
+        two,
+        Some(amtracker_core::domain::SaleCounts { sold: 1, expired: 1 }),
+        "the LONG expiry counts"
+    );
+    assert_eq!(
+        two.expect("evidence").rate(),
+        store.sale_rate(&target, &item2, 14, Category::Commodity).expect("rate2")
+    );
+
+    // Positional batch: an unknown identity and one without ledger rows both
+    // read `None`, never a zero.
+    let batch = store
+        .sale_counts_each(
+            &target,
+            &[item2.clone(), item(999), item1.clone(), item(7)],
+            14,
+            Category::Commodity,
+        )
+        .expect("batch");
+    assert_eq!(
+        batch,
+        vec![
+            Some(amtracker_core::domain::SaleCounts { sold: 1, expired: 1 }),
+            None,
+            Some(amtracker_core::domain::SaleCounts { sold: 1, expired: 0 }),
+            None,
+        ]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The daily lows are one narrow row per identity and day it was seen, the
+/// minimum over that day's hour cells, scoped to the payload kind and the
+/// since-day cutoff.
+#[test]
+fn daily_lows_take_the_day_minimum_per_identity_from_the_hour_fold() {
+    let dir = temp_dir("daily-lows");
+    let base = 100 * 86_400;
+    let store = open_store(&dir, base + 6 * 3_600);
+    let target = TargetId("us-4".into());
+    let identity = item(1);
+    let other = item(2);
+    let snap = |fetched_at: i64, kind: PayloadKind, listings: &[NormalizedListing]| NewSnapshot {
+        target: target.clone(),
+        kind,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: listings.len() as u64,
+        dropped_count: 0,
+        dropped_reasons: std::collections::BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    // Day 100, hour 2: two snapshots (mins 300 then 120); hour 5: 150. Day
+    // 99: a single 90. Another identity appears once on day 100; the
+    // auctions kind has its own cells for the same identity.
+    store
+        .record(
+            &snap(base + 2 * 3_600, PayloadKind::Commodities, &[listing(10, &identity, 300, 1)]),
+            &[listing(10, &identity, 300, 1)],
+            b"a".as_slice(),
+        )
+        .expect("a");
+    store
+        .record(
+            &snap(
+                base + 2 * 3_600 + 60,
+                PayloadKind::Commodities,
+                &[listing(11, &identity, 120, 5)],
+            ),
+            &[listing(11, &identity, 120, 5)],
+            b"b".as_slice(),
+        )
+        .expect("b");
+    store
+        .record(
+            &snap(base + 5 * 3_600, PayloadKind::Commodities, &[listing(12, &identity, 150, 1)]),
+            &[listing(12, &identity, 150, 1)],
+            b"c".as_slice(),
+        )
+        .expect("c");
+    store
+        .record(
+            &snap(
+                base - 86_400 + 3 * 3_600,
+                PayloadKind::Commodities,
+                &[listing(13, &identity, 90, 1)],
+            ),
+            &[listing(13, &identity, 90, 1)],
+            b"d".as_slice(),
+        )
+        .expect("d");
+    store
+        .record(
+            &snap(base + 7 * 3_600, PayloadKind::Commodities, &[listing(14, &other, 400, 1)]),
+            &[listing(14, &other, 400, 1)],
+            b"e".as_slice(),
+        )
+        .expect("e");
+    store
+        .record(
+            &snap(base + 7 * 3_600, PayloadKind::Auctions, &[listing(15, &identity, 50, 1)]),
+            &[listing(15, &identity, 50, 1)],
+            b"f".as_slice(),
+        )
+        .expect("f");
+
+    let lows = store.daily_lows(&target, PayloadKind::Commodities, 99).expect("lows");
+    assert_eq!(
+        lows,
+        vec![
+            amtracker_core::domain::ItemDayLow { item: identity.clone(), day: 99, min: 90 },
+            amtracker_core::domain::ItemDayLow { item: identity.clone(), day: 100, min: 120 },
+            amtracker_core::domain::ItemDayLow { item: other.clone(), day: 100, min: 400 },
+        ],
+        "one row per identity-day, the minimum over its cells, in identity then day order"
+    );
+    // The cutoff and the kind scope apply; the auctions cells never leak in.
+    let recent = store.daily_lows(&target, PayloadKind::Commodities, 100).expect("recent");
+    assert_eq!(recent.len(), 2, "day 99 is cut off");
+    let auctions = store.daily_lows(&target, PayloadKind::Auctions, 99).expect("auctions");
+    assert_eq!(
+        auctions,
+        vec![amtracker_core::domain::ItemDayLow { item: identity.clone(), day: 100, min: 50 }]
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Vendor prices come back only for ids with a recorded positive price, under
+/// their own flavor, as a set.
+#[test]
+fn sell_prices_return_recorded_positive_prices_under_the_flavor() {
+    let dir = temp_dir("sell-prices");
+    let store = open_store(&dir, 1_000_000);
+    let retail = Flavor("retail".into());
+    let forever = Flavor("forever".into());
+    let record = |id: i64, sell_price: Option<i64>| amtracker_core::domain::NameRecord {
+        item_id: id,
+        name: format!("Item {id}"),
+        item_class: None,
+        item_subclass: None,
+        inventory_slot: None,
+        quality: None,
+        icon: None,
+        sell_price,
+        item_level: None,
+        fetched_at: 0,
+    };
+    store
+        .upsert(&retail, &[record(1, Some(1_250)), record(2, Some(0)), record(3, None)])
+        .expect("upsert retail");
+    store.upsert(&forever, &[record(1, Some(7))]).expect("upsert forever");
+
+    assert_eq!(
+        store.sell_prices(&retail, &[1, 2, 3, 999]).expect("retail"),
+        std::collections::HashMap::from([(1, 1_250)])
+    );
+    assert_eq!(
+        store.sell_prices(&forever, &[1, 2]).expect("forever"),
+        std::collections::HashMap::from([(1, 7)]),
+        "the same id prices under its own flavor"
+    );
+    assert_eq!(
+        store.sell_prices(&retail, &[1, 1]).expect("repeats"),
+        std::collections::HashMap::from([(1, 1_250)]),
+        "a repeated id is one entry"
+    );
+    assert!(store.sell_prices(&retail, &[]).expect("empty").is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// No eligible close is `None`; an eligible close that did NOT credit (a
 /// LONG-band listing that stayed gone past its band's lower bound — an
 /// expiry) is a genuine zero. The two must never read the same.

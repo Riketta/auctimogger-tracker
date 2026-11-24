@@ -518,6 +518,57 @@ struct HistoryResponse<'a> {
     rows: HistoryRows<'a>,
 }
 
+/// Wire shape of one ranked live deal (the `Opportunity` schema). Next to
+/// the score components it carries the evidence a buyer reads beside them:
+/// the sold/expired ledger counts, days of supply, the 30-day low and the
+/// vendor floor.
+fn opportunity_json(o: &amtracker_core::services::opportunity::Opportunity) -> serde_json::Value {
+    serde_json::json!({
+        "item": item_json(&o.item),
+        "category": o.category.as_str(),
+        "median7": o.median7,
+        "floorNow": o.floor_now,
+        "floorQty": o.floor_qty,
+        "listedNow": o.listed_now,
+        "value7": o.value7,
+        "soldMedian14": o.sold_median14,
+        "valueSource": o.value_source.as_str(),
+        "discount": o.discount,
+        "reliability": o.reliability,
+        "churnPerDay": o.churn_per_day,
+        "stability": o.stability,
+        "samples7": o.samples7,
+        "confidence": o.confidence,
+        "score": o.score,
+        "daysSinceLastSale": o.days_since_last_sale,
+        "closuresSinceLastSale": o.closures_since_last_sale,
+        "soldCount": o.sold_count,
+        "expiredCount": o.expired_count,
+        "supplyDays": o.supply_days,
+        "lowRank30d": o.low_rank_30d,
+        "vendorPrice": o.vendor_price,
+    })
+}
+
+/// Wire shape of one gone-today deal (the `MissedDeal` schema).
+fn missed_deal_json(deal: &amtracker_core::services::opportunity::MissedDeal) -> serde_json::Value {
+    serde_json::json!({
+        "item": item_json(&deal.item),
+        "category": deal.category.as_str(),
+        "seenFloor": deal.seen_floor,
+        "seenFloorQty": deal.seen_floor_qty,
+        "liveFloor": deal.live_floor,
+        "value7": deal.value7,
+        "soldMedian14": deal.sold_median14,
+        "valueSource": deal.value_source.as_str(),
+        "discount": deal.discount,
+        "reliability": deal.reliability,
+        "samples7": deal.samples7,
+        "soldCount": deal.sold_count,
+        "expiredCount": deal.expired_count,
+    })
+}
+
 /// `GET /api/opportunities?target=&category=&min_churn=&limit=&sort=` — LIVE
 /// deals: only what the newest snapshot still lists, discounted against the
 /// item's quantity-weighted 7-day value. Without `category`, one response
@@ -573,30 +624,7 @@ pub(crate) async fn api_opportunities(
     match list.await {
         Ok(Ok(list)) => {
             let ranked = |rows: &[amtracker_core::services::opportunity::Opportunity]| {
-                rows.iter()
-                    .map(|o| {
-                        serde_json::json!({
-                            "item": item_json(&o.item),
-                            "category": o.category.as_str(),
-                            "median7": o.median7,
-                            "floorNow": o.floor_now,
-                            "floorQty": o.floor_qty,
-                            "listedNow": o.listed_now,
-                            "value7": o.value7,
-                            "soldMedian14": o.sold_median14,
-                            "valueSource": o.value_source.as_str(),
-                            "discount": o.discount,
-                            "reliability": o.reliability,
-                            "churnPerDay": o.churn_per_day,
-                            "stability": o.stability,
-                            "samples7": o.samples7,
-                            "confidence": o.confidence,
-                            "score": o.score,
-                            "daysSinceLastSale": o.days_since_last_sale,
-                            "closuresSinceLastSale": o.closures_since_last_sale,
-                        })
-                    })
-                    .collect::<Vec<_>>()
+                rows.iter().map(opportunity_json).collect::<Vec<_>>()
             };
             match category {
                 Some(category) => {
@@ -677,23 +705,7 @@ pub(crate) async fn api_missed_deals(
     match list.await {
         Ok(Ok(list)) => {
             let missed = |rows: &[amtracker_core::services::opportunity::MissedDeal]| {
-                rows.iter()
-                    .map(|deal| {
-                        serde_json::json!({
-                            "item": item_json(&deal.item),
-                            "category": deal.category.as_str(),
-                            "seenFloor": deal.seen_floor,
-                            "seenFloorQty": deal.seen_floor_qty,
-                            "liveFloor": deal.live_floor,
-                            "value7": deal.value7,
-                            "soldMedian14": deal.sold_median14,
-                            "valueSource": deal.value_source.as_str(),
-                            "discount": deal.discount,
-                            "reliability": deal.reliability,
-                            "samples7": deal.samples7,
-                        })
-                    })
-                    .collect::<Vec<_>>()
+                rows.iter().map(missed_deal_json).collect::<Vec<_>>()
             };
             match category {
                 Some(category) => Json(serde_json::json!({

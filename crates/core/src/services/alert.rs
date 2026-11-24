@@ -295,6 +295,12 @@ impl AlertEvaluationService {
                 self.observe_deal(rule, category, newest, &label)
             }
             AlertCondition::SaleRateAbove { rate } => {
+                let counts = self.sales.sale_counts(
+                    &rule.target,
+                    &rule.item,
+                    SALE_RATE_WINDOW_DAYS,
+                    category,
+                )?;
                 match self.sales.sale_rate(
                     &rule.target,
                     &rule.item,
@@ -303,7 +309,17 @@ impl AlertEvaluationService {
                 )? {
                     Some(actual) if actual >= rate => Ok(Some(Observation {
                         value: Some(actual),
-                        message: format!("{label}: 14d sale rate {actual:.2} (target ≥ {rate:.2})"),
+                        // The raw ledger behind the rate rides along when the
+                        // adapter keeps one: how many sold, how many relisted.
+                        message: match counts {
+                            Some(counts) => format!(
+                                "{label}: 14d sale rate {actual:.2} (target ≥ {rate:.2}) — {} sold, {} expired",
+                                counts.sold, counts.expired
+                            ),
+                            None => {
+                                format!("{label}: 14d sale rate {actual:.2} (target ≥ {rate:.2})")
+                            }
+                        },
                     })),
                     _ => Ok(None),
                 }

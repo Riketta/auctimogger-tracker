@@ -15,6 +15,7 @@ use crate::{
         FeedSnapshot,
         FetchOutcome,
         Flavor,
+        ItemDayLow,
         ItemRef,
         ListingPage,
         ListingQuery,
@@ -26,6 +27,7 @@ use crate::{
         PayloadKind,
         PetNameRecord,
         PublishedFeed,
+        SaleCounts,
         SearchHit,
         SnapshotFloor,
         SnapshotListing,
@@ -460,6 +462,29 @@ pub trait PriceHistoryRepository: Send + Sync {
         let _ = since_day;
         Ok(0)
     }
+    /// Per-identity daily lowest asks from the PERMANENT intraday fold on/after
+    /// `since_day`: for every identity with hour cells in the window, one row
+    /// per UTC day it was seen, carrying the minimum of that day's
+    /// per-snapshot floors. Narrow rows — no day-fold JSON to parse — so a
+    /// whole market's month of lows reads in a fraction of the day rows'
+    /// cost. `kind` scopes the market (items and pets share the auctions
+    /// payload).
+    ///
+    /// The default answers empty — correct for adapters without an intraday
+    /// fold (the 30-day-low indicator then reads as "no history").
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cells cannot be read.
+    fn daily_lows(
+        &self,
+        target: &TargetId,
+        kind: PayloadKind,
+        since_day: i64,
+    ) -> Result<Vec<ItemDayLow>, StoreError> {
+        let _ = (target, kind, since_day);
+        Ok(Vec::new())
+    }
 }
 
 /// Outbound: auction sighting bookkeeping for sell-through (R3).
@@ -550,6 +575,50 @@ pub trait SalesRepository: Send + Sync {
             rates.push(self.sale_rate(target, item, days, category)?);
         }
         Ok(rates)
+    }
+    /// The ledger counts behind the sale rate for EACH of the given identities,
+    /// positionally aligned (`counts[i]` belongs to `items[i]`); `None`
+    /// entries have no credit-eligible close in the window — the same "no
+    /// evidence" contract as [`Self::sale_rate`], whose figure is exactly
+    /// `sold / (sold + expired)`. Scoped to one category.
+    ///
+    /// The default answers `None` for every identity — correct for adapters
+    /// without a ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the credit statistics cannot be
+    /// read.
+    fn sale_counts_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Vec<Option<SaleCounts>>, StoreError> {
+        let _ = (target, days, category);
+        Ok(vec![None; items.len()])
+    }
+    /// The ledger counts behind the sale rate for one identity and category
+    /// (see [`Self::sale_counts_each`]); `None` when the window holds no
+    /// credit-eligible close.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the credit statistics cannot be
+    /// read.
+    fn sale_counts(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        days: i64,
+        category: Category,
+    ) -> Result<Option<SaleCounts>, StoreError> {
+        Ok(self
+            .sale_counts_each(target, std::slice::from_ref(item), days, category)?
+            .into_iter()
+            .next()
+            .flatten())
     }
     /// Credited sale PRICES for each of the given identities, positionally
     /// aligned (`sold[i]` belongs to `items[i]`): the window's priced sold
@@ -890,6 +959,35 @@ pub trait ItemCatalogRepository: Send + Sync {
     ///
     /// Returns `StoreError::Backend` when the catalog cannot be read.
     fn counts(&self) -> Result<CatalogCounts, StoreError>;
+    /// Vendor sell prices (copper) of the given item ids under one flavor —
+    /// only ids with a recorded, positive price; an id the API reports no
+    /// price for is absent. The hard floor under an item's market (players
+    /// vendor rather than list cheaper), behind the deal ranking's at-vendor
+    /// marker. Ids may repeat; the answer is a set.
+    ///
+    /// The default loops [`Self::by_id`] — correct for any adapter, just less
+    /// efficient.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the catalog cannot be read.
+    fn sell_prices(
+        &self,
+        flavor: &Flavor,
+        item_ids: &[i64],
+    ) -> Result<HashMap<i64, i64>, StoreError> {
+        let mut out = HashMap::new();
+        for item_id in item_ids {
+            if let Some(price) = self
+                .by_id(flavor, *item_id)?
+                .and_then(|record| record.sell_price)
+                .filter(|price| *price > 0)
+            {
+                out.insert(*item_id, price);
+            }
+        }
+        Ok(out)
+    }
 }
 
 /// Outbound: watchlist persistence (`Conflict` on duplicates).

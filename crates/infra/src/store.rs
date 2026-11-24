@@ -22,6 +22,7 @@ use amtracker_core::{
         Category,
         ClassSummary,
         Flavor,
+        ItemDayLow,
         ItemDayRow,
         ItemHourRow,
         ItemRef,
@@ -37,6 +38,7 @@ use amtracker_core::{
         NormalizedListing,
         PayloadKind,
         PetNameRecord,
+        SaleCounts,
         SaleCredit,
         SearchHit,
         SnapshotFloor,
@@ -2033,6 +2035,51 @@ impl SalesRepository for SqliteStore {
             .collect())
     }
 
+    fn sale_counts(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        days: i64,
+        category: Category,
+    ) -> Result<Option<SaleCounts>, StoreError> {
+        let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(None);
+        };
+        let now_day = utc_day(self.clock.now());
+        // The same credited/eligible sums `sale_rate` divides — sold and
+        // expired are the two halves of that ratio's denominator.
+        Ok(sale_rates_by_id(&conn, target, &[item_ref_id], now_day - days + 1, category)?
+            .get(&item_ref_id)
+            .and_then(|(credited, eligible)| SaleCounts::from_ledger(*credited, *eligible)))
+    }
+
+    fn sale_counts_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Vec<Option<SaleCounts>>, StoreError> {
+        let conn = self.open_transaction();
+        // Positional resolution (None = unknown item), so the result stays
+        // aligned with `items`.
+        let ids = item_ids_in_order(&conn, items)?;
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        if known.is_empty() {
+            return Ok(vec![None; items.len()]);
+        }
+        let now_day = utc_day(self.clock.now());
+        let rates = sale_rates_by_id(&conn, target, &known, now_day - days + 1, category)?;
+        Ok(ids
+            .iter()
+            .map(|id| {
+                id.and_then(|id| rates.get(&id))
+                    .and_then(|(credited, eligible)| SaleCounts::from_ledger(*credited, *eligible))
+            })
+            .collect())
+    }
+
     fn sold_price_each(
         &self,
         target: &TargetId,
@@ -3600,6 +3647,40 @@ impl ItemCatalogRepository for SqliteStore {
             pets: u64::try_from(pets).unwrap_or(0),
         })
     }
+
+    fn sell_prices(
+        &self,
+        flavor: &Flavor,
+        item_ids: &[i64],
+    ) -> Result<std::collections::HashMap<i64, i64>, StoreError> {
+        /// Ids per query — same chunking rationale as `sale_rates_by_id`.
+        const SELL_PRICE_CHUNK: usize = 500;
+        let conn = self.open_transaction();
+        let mut out = std::collections::HashMap::new();
+        for chunk in item_ids.chunks(SELL_PRICE_CHUNK) {
+            let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            // The (flavor, item_id) primary key serves the whole filter.
+            let sql = format!(
+                "SELECT item_id, sell_price FROM item_catalog
+                 WHERE flavor = ? AND item_id IN ({placeholders}) AND sell_price > 0"
+            );
+            let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 1);
+            params.push(rusqlite::types::Value::Text(flavor.as_str().to_string()));
+            for id in chunk {
+                params.push(rusqlite::types::Value::Integer(*id));
+            }
+            let mut statement =
+                conn.prepare(&sql).map_err(|e| backend("prepare sell_prices", e))?;
+            let rows = statement
+                .query(rusqlite::params_from_iter(params.iter()))
+                .map_err(|e| backend("query sell_prices", e))?
+                .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| backend("sell_prices row", e))?;
+            out.extend(rows);
+        }
+        Ok(out)
+    }
 }
 
 /// Maps one row of the unified catalog queries (`id, name, kind,
@@ -4023,6 +4104,53 @@ impl PriceHistoryRepository for SqliteStore {
             let mins: Vec<i64> =
                 serde_json::from_str(&mins_json).map_err(|e| backend("parse item_hour mins", e))?;
             out.push(ItemHourRow { day, hour, floor, mins });
+        }
+        Ok(out)
+    }
+
+    fn daily_lows(
+        &self,
+        target: &TargetId,
+        kind: PayloadKind,
+        since_day: i64,
+    ) -> Result<Vec<ItemDayLow>, StoreError> {
+        let conn = self.open_transaction();
+        // One narrow aggregate over the PK range (target, kind, …): the scan
+        // walks the hour cells in (item, day) order, so the GROUP BY needs
+        // no temp b-tree and the join is a rowid point lookup per group.
+        let mut statement = conn
+            .prepare(
+                "SELECT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed,
+                        h.day, MIN(h.floor)
+                 FROM item_hour h JOIN item_ref r ON r.id = h.item_ref_id
+                 WHERE h.target_id = ?1 AND h.kind = ?2 AND h.day >= ?3 AND h.floor > 0
+                 GROUP BY h.item_ref_id, h.day
+                 ORDER BY h.item_ref_id, h.day",
+            )
+            .map_err(|e| backend("prepare daily lows", e))?;
+        let rows = statement
+            .query_map(rusqlite::params![target.as_str(), kind.as_str(), since_day], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            })
+            .map_err(|e| backend("query daily lows", e))?;
+        let mut out = Vec::new();
+        for row in rows {
+            let (ref_kind, item_id, species, level, quality, breed, day, min) =
+                row.map_err(|e| backend("daily lows row", e))?;
+            out.push(ItemDayLow {
+                item: join_item_ref(&ref_kind, item_id, species, level, quality, breed),
+                day,
+                min,
+            });
         }
         Ok(out)
     }

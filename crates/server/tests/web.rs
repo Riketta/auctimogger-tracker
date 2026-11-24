@@ -306,6 +306,7 @@ fn test_state_build(
         store.clone(),
         store.clone(),
         store.clone(),
+        store.clone(),
         clock.clone(),
         &config,
     ));
@@ -341,6 +342,7 @@ fn test_state_build(
             metrics.clone(),
             &config.crafts,
         )),
+        sales: store.clone(),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),
             store.clone(),
@@ -554,7 +556,7 @@ async fn table_rows_carry_a_cell_for_every_header_column() {
     let (status, body) = get(router, "/opportunities?target=t1&category=commodity").await;
     assert_eq!(status, StatusCode::OK);
     let (headers, rows) = table_shape(&body, "opportunities");
-    assert_eq!(headers, 13, "opportunities header columns");
+    assert_eq!(headers, 15, "opportunities header columns");
     assert!(!rows.is_empty(), "seeded ranking renders at least one row");
     assert!(rows.iter().all(|cells| *cells == headers), "every ranking row is complete");
     assert!(body.contains("<td><button"), "the watch action renders inside a cell");
@@ -2108,6 +2110,127 @@ async fn sold_prices_become_the_deal_reference() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The evidence fields end to end: the ledger counts behind the rate, days of
+/// supply, the 30-day low read off the hour fold and the vendor floor all
+/// reach the API row, the deals page and the item page's ledger line.
+#[tokio::test]
+async fn deal_rows_carry_their_evidence_end_to_end() {
+    use amtracker_core::{
+        domain::{
+            Flavor,
+            NameRecord,
+        },
+        ports::{
+            ItemCatalogRepository,
+            SalesRepository,
+        },
+    };
+
+    let settable = Arc::new(SettableClock(Arc::new(std::sync::Mutex::new(1_760_000_000))));
+    let clock: Arc<dyn ClockPort> = settable.clone();
+    let (state, root) = test_state_build(None, Arc::new(NoItemInfo), Some(clock), |_| {});
+    let router = build_router_arc(Arc::clone(&state));
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Item { item_id: 2589 };
+    let now = settable.now();
+
+    // Five prior days of hour cells at 200 (recorded FIRST so the live
+    // snapshot below stays the newest by id): the live 150 floor undercuts
+    // every one of them — a 30-day low.
+    for days_ago in 1..=5 {
+        let listings: Vec<NormalizedListing> =
+            (0..3).map(|n| listing(80_000 + days_ago * 10 + n, &item, 200)).collect();
+        seed_snapshot(&state, PayloadKind::Commodities, now - days_ago * 86_400 + 3_600, &listings);
+    }
+    seed_live_and_gone(&state);
+    // The ledger, in two rounds: a MEDIUM-band stack of 12 gone a minute
+    // later (credited), then a LONG-band listing that outlives its band's
+    // lower bound (expired unsold).
+    let seed = SqliteStore::open(
+        &root.join("db.sqlite3"),
+        &root.join("raw"),
+        Arc::new(SystemClock),
+        AutoVacuum::Off,
+    )
+    .expect("seed store");
+    let mut sold = listing(970_001, &item, 300);
+    sold.quantity = 12;
+    sold.time_left = TimeLeftBand::Medium;
+    let mut expired = listing(970_002, &item, 310);
+    expired.quantity = 5;
+    expired.time_left = TimeLeftBand::Long;
+    let t0 = now - 10_000;
+    seed.observe(&target, PayloadKind::Commodities, &[sold], 1, t0).expect("observe");
+    seed.close_missing(&target, PayloadKind::Commodities, 2, t0 + 60).expect("close sold");
+    seed.observe(&target, PayloadKind::Commodities, &[expired], 3, t0 + 120).expect("observe");
+    seed.close_missing(&target, PayloadKind::Commodities, 4, t0 + 120 + 3 * 3_600)
+        .expect("close expired");
+    // A vendor pays 160 for the item: the 150 floor is a zero-risk buy.
+    seed.upsert(
+        &Flavor::default(),
+        &[NameRecord {
+            item_id: 2589,
+            name: "Linen Cloth".into(),
+            item_class: None,
+            item_subclass: None,
+            inventory_slot: None,
+            quality: None,
+            icon: None,
+            sell_price: Some(160),
+            item_level: None,
+            fetched_at: 0,
+        }],
+    )
+    .expect("catalog");
+
+    // API: 200 units listed ÷ (12 sold / 14 days) = 233.33 days of supply.
+    let (status, body) =
+        get(router.clone(), "/api/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let row = &json["opportunities"][0];
+    assert_eq!(row["soldCount"], 1);
+    assert_eq!(row["expiredCount"], 1);
+    assert_eq!(row["supplyDays"], 233.33);
+    assert_eq!(row["lowRank30d"], 1.0, "every prior day sat above the live floor");
+    assert_eq!(row["vendorPrice"], 160);
+    let (_, gone) = get(router.clone(), "/api/missed-deals?target=t1&category=commodity").await;
+    let gone: Value = serde_json::from_str(&gone).expect("json");
+    assert_eq!(gone["missed"][0]["soldCount"], 1);
+    assert_eq!(gone["missed"][0]["expiredCount"], 1);
+
+    // The page: the vendor badge, the low as a percentage, supply in days and
+    // the counts in the reliability tooltip.
+    let (status, page) = get(router.clone(), "/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("30d low"), "the new column: {page}");
+    assert!(page.contains("supply"), "the new column: {page}");
+    let live_table = page
+        .split("<table id=\"opportunities\">")
+        .nth(1)
+        .expect("live table")
+        .split("</table>")
+        .next()
+        .expect("closed");
+    assert!(live_table.contains("≤ vendor"), "the badge: {live_table}");
+    assert!(live_table.contains("data-tip=\"Vendors for 1s 60c"), "{live_table}");
+    assert!(live_table.contains("data-v=\"1\">100%"), "the 30-day low: {live_table}");
+    assert!(live_table.contains(">233d<"), "days of supply: {live_table}");
+    assert!(
+        live_table.contains("1 sold · 1 expired unsold over 14 days"),
+        "the counts behind the rate: {live_table}"
+    );
+
+    // The item page carries the same counts under its metric blocks.
+    let (status, item_page) = get(router, "/items/t1/2589?category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        item_page.contains("1 sold · 1 expired unsold over the last 14 days — 50% sold"),
+        "{item_page}"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // --------------------------------------------------------- api discovery
 
 /// Fires one method at a concrete path and returns the status. Registration
@@ -2383,7 +2506,7 @@ async fn opportunities_page_ranks_live_listings_and_lists_gone_deals_apart() {
     assert!(body.contains("min_discount"), "the gone-today floor is a form control");
 
     let (headers, rows) = table_shape(&body, "opportunities");
-    assert_eq!(headers, 13, "opportunities header columns");
+    assert_eq!(headers, 15, "opportunities header columns");
     assert_eq!(rows.len(), 1, "one live deal");
     let live_table = body
         .split("<table id=\"opportunities\">")

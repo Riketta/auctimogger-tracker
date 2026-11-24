@@ -632,7 +632,12 @@ fn spec_schemas_market() -> Value {
                 "confidence": { "type": "number", "description": "min(1, samples7/[opportunities].min_samples) — always 1 on ranked rows, which the evidence floor already admits." },
                 "score": { "type": "number", "description": "Weighted geometric mean of discount, reliability, churn and stability — for RANKING only; any component at zero scores zero." },
                 "daysSinceLastSale": { "type": ["integer", "null"], "description": "Whole days since the ledger last credited a sale; null = no credited sale ever (sorts last under sort=last_sale)." },
-                "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale." }
+                "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale." },
+                "soldCount": { "type": ["integer", "null"], "description": "Listings credited as sold over the 14-day window; null = no credit-eligible close (no evidence)." },
+                "expiredCount": { "type": ["integer", "null"], "description": "Credit-eligible closes that ran out unsold over the window (relisted). soldCount / (soldCount + expiredCount) is exactly reliability." },
+                "supplyDays": { "type": ["number", "null"], "description": "Days the listed stock takes to clear at the window's sale pace (live quantity ÷ units sold per day over 14 days). null = nothing sold (never clears) or no ledger rows. Informational, never a score input." },
+                "lowRank30d": { "type": ["number", "null"], "description": "Share of the previous 30 days whose cheapest listing sat above floorNow (1 = a 30-day low); null with fewer than 5 days of hour-fold history. Informational." },
+                "vendorPrice": { "type": ["integer", "null"], "description": "Vendor sell price (copper) when the catalog knows one; floorNow at or under it is a zero-risk vendor flip. null = no recorded price (pets carry none)." }
             }
         },
         "OpportunitiesResponse": {
@@ -667,7 +672,9 @@ fn spec_schemas_market() -> Value {
                 "valueSource": { "type": "string", "enum": ["sold", "listed"], "description": "Which value the discount is measured against, as on opportunities." },
                 "discount": { "type": "number", "description": "1 - seenFloor/reference (soldMedian14 when present, else value7), clamped to [0,1]." },
                 "reliability": { "type": ["number", "null"], "description": "14-day sale-through fraction; null = no credit-eligible evidence." },
-                "samples7": { "type": "integer", "description": "Auction-days folded over the window — the evidence behind value7." }
+                "samples7": { "type": "integer", "description": "Auction-days folded over the window — the evidence behind value7." },
+                "soldCount": { "type": ["integer", "null"], "description": "Listings credited as sold over the 14-day window, as on opportunities." },
+                "expiredCount": { "type": ["integer", "null"], "description": "Credit-eligible closes that ran out unsold over the window, as on opportunities." }
             }
         },
         "MissedDealsResponse": {

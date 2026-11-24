@@ -2025,19 +2025,44 @@ impl ClockPort for MutableClock {
 }
 
 /// Full-market history fake: scripted day rows plus a read counter, so tests
-/// can prove that steady-state requests touch no store.
+/// can prove that steady-state requests touch no store; optional daily lows
+/// served by `daily_lows` (default: none, like a fresh hour fold).
 struct CountingHistory {
     rows: Vec<ItemDayRow>,
     item_day_rows_calls: Mutex<usize>,
+    lows: Mutex<Vec<amtracker_core::domain::ItemDayLow>>,
+    daily_lows_calls: Mutex<usize>,
 }
 
 impl CountingHistory {
     fn new(rows: Vec<ItemDayRow>) -> Self {
-        Self { rows, item_day_rows_calls: Mutex::new(0) }
+        Self {
+            rows,
+            item_day_rows_calls: Mutex::new(0),
+            lows: Mutex::new(Vec::new()),
+            daily_lows_calls: Mutex::new(0),
+        }
     }
 
     fn item_day_rows_calls(&self) -> usize {
         *self.item_day_rows_calls.lock().unwrap()
+    }
+
+    fn daily_lows_calls(&self) -> usize {
+        *self.daily_lows_calls.lock().unwrap()
+    }
+
+    /// Scripts `days` daily lows for an item, ending `days` before today.
+    fn set_lows(&self, item_id: i64, today: i64, days: &[i64]) {
+        *self.lows.lock().unwrap() = days
+            .iter()
+            .enumerate()
+            .map(|(index, min)| amtracker_core::domain::ItemDayLow {
+                item: item(item_id),
+                day: today - 1 - i64::try_from(index).unwrap_or(i64::MAX),
+                min: *min,
+            })
+            .collect();
     }
 }
 
@@ -2095,26 +2120,115 @@ impl PriceHistoryRepository for CountingHistory {
     ) -> Result<Vec<ItemDayRow>, StoreError> {
         Ok(Vec::new())
     }
+
+    fn daily_lows(
+        &self,
+        _target: &TargetId,
+        _kind: PayloadKind,
+        _since_day: i64,
+    ) -> Result<Vec<amtracker_core::domain::ItemDayLow>, StoreError> {
+        *self.daily_lows_calls.lock().unwrap() += 1;
+        Ok(self.lows.lock().unwrap().clone())
+    }
 }
 
-/// Sales fake: a deterministic per-item rate, a batch-call counter, and an
-/// injectable failure mode for the failed-refresh resilience test.
+/// Catalog fake for the vendor-price lookups: a scripted id → sell price map,
+/// nothing else (the ranking never touches the rest of the catalog).
+#[derive(Default)]
+struct FakeCatalog {
+    sell_prices: Mutex<HashMap<i64, i64>>,
+}
+
+impl amtracker_core::ports::ItemCatalogRepository for FakeCatalog {
+    fn upsert(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        _records: &[amtracker_core::domain::NameRecord],
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn upsert_pets(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        _records: &[amtracker_core::domain::PetNameRecord],
+    ) -> Result<(), StoreError> {
+        Ok(())
+    }
+
+    fn search(
+        &self,
+        _query: &str,
+        _limit: usize,
+        _offset: usize,
+    ) -> Result<Vec<amtracker_core::domain::SearchHit>, StoreError> {
+        Ok(Vec::new())
+    }
+
+    fn by_id(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        _item_id: i64,
+    ) -> Result<Option<amtracker_core::domain::NameRecord>, StoreError> {
+        Ok(None)
+    }
+
+    fn pet_by_species(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        _species_id: i64,
+    ) -> Result<Option<amtracker_core::domain::PetNameRecord>, StoreError> {
+        Ok(None)
+    }
+
+    fn browse(
+        &self,
+        _after: Option<&amtracker_core::domain::BrowseCursor>,
+        _limit: usize,
+    ) -> Result<(Vec<amtracker_core::domain::SearchHit>, bool), StoreError> {
+        Ok((Vec::new(), false))
+    }
+
+    fn counts(&self) -> Result<amtracker_core::domain::CatalogCounts, StoreError> {
+        Ok(amtracker_core::domain::CatalogCounts { items: 0, pets: 0 })
+    }
+
+    fn sell_prices(
+        &self,
+        _flavor: &amtracker_core::domain::Flavor,
+        item_ids: &[i64],
+    ) -> Result<HashMap<i64, i64>, StoreError> {
+        let prices = self.sell_prices.lock().unwrap();
+        Ok(item_ids.iter().filter_map(|id| prices.get(id).map(|price| (*id, *price))).collect())
+    }
+}
+
+/// Sales fake: a deterministic per-item ledger (item 1: one sale, three
+/// expiries — a 0.25 rate), a batch-call counter, and an injectable failure
+/// mode for the failed-refresh resilience test.
 #[derive(Default)]
 struct CountingSales {
-    sale_rate_each_calls: Mutex<usize>,
-    fail_sale_rate_each: Mutex<bool>,
+    sale_counts_each_calls: Mutex<usize>,
+    fail_sale_counts_each: Mutex<bool>,
     /// Optional per-item sold-price histograms served by `sold_price_each`
     /// (default: none, like a ledger that predates sold prices).
     sold: Mutex<HashMap<ItemRef, Vec<(i64, i64)>>>,
+    /// Optional per-item units sold served by `qty_sold`/`qty_sold_each`
+    /// (default: none — no ledger rows).
+    units: Mutex<HashMap<ItemRef, i64>>,
 }
 
 impl CountingSales {
-    fn sale_rate_each_calls(&self) -> usize {
-        *self.sale_rate_each_calls.lock().unwrap()
+    fn sale_counts_each_calls(&self) -> usize {
+        *self.sale_counts_each_calls.lock().unwrap()
     }
 
-    fn set_sale_rate_each_failure(&self, fail: bool) {
-        *self.fail_sale_rate_each.lock().unwrap() = fail;
+    fn set_sale_counts_each_failure(&self, fail: bool) {
+        *self.fail_sale_counts_each.lock().unwrap() = fail;
+    }
+
+    fn set_units(&self, units: &[(i64, i64)]) {
+        *self.units.lock().unwrap() = units.iter().map(|(id, units)| (item(*id), *units)).collect();
     }
 }
 
@@ -2150,18 +2264,24 @@ impl SalesRepository for CountingSales {
         Ok(None)
     }
 
-    fn sale_rate_each(
+    fn sale_counts_each(
         &self,
         _target: &TargetId,
         items: &[ItemRef],
         _days: i64,
         _category: amtracker_core::domain::Category,
-    ) -> Result<Vec<Option<f64>>, StoreError> {
-        *self.sale_rate_each_calls.lock().unwrap() += 1;
-        if *self.fail_sale_rate_each.lock().unwrap() {
+    ) -> Result<Vec<Option<amtracker_core::domain::SaleCounts>>, StoreError> {
+        *self.sale_counts_each_calls.lock().unwrap() += 1;
+        if *self.fail_sale_counts_each.lock().unwrap() {
             return Err(StoreError::Backend("sales store unavailable".into()));
         }
-        Ok(items.iter().map(|i| if *i == item(1) { Some(0.25) } else { None }).collect())
+        Ok(items
+            .iter()
+            .map(|i| {
+                (*i == item(1))
+                    .then_some(amtracker_core::domain::SaleCounts { sold: 1, expired: 3 })
+            })
+            .collect())
     }
 
     fn sold_price_each(
@@ -2178,11 +2298,11 @@ impl SalesRepository for CountingSales {
     fn qty_sold(
         &self,
         _target: &TargetId,
-        _item: &ItemRef,
+        item: &ItemRef,
         _days: i64,
         _category: amtracker_core::domain::Category,
     ) -> Result<Option<i64>, StoreError> {
-        Ok(None)
+        Ok(self.units.lock().unwrap().get(item).copied())
     }
 }
 
@@ -2295,6 +2415,17 @@ fn opportunity_fixture_at(
     live: &[amtracker_core::domain::NormalizedListing],
     min_samples: u32,
 ) -> (Arc<OpportunityService>, Arc<CountingHistory>, Arc<CountingSales>, Arc<MutableClock>) {
+    opportunity_fixture_all(now, rows, live, min_samples, Arc::new(FakeCatalog::default()))
+}
+
+/// The fixture with an explicit evidence floor and catalog (vendor prices).
+fn opportunity_fixture_all(
+    now: i64,
+    rows: Vec<ItemDayRow>,
+    live: &[amtracker_core::domain::NormalizedListing],
+    min_samples: u32,
+    catalog: Arc<FakeCatalog>,
+) -> (Arc<OpportunityService>, Arc<CountingHistory>, Arc<CountingSales>, Arc<MutableClock>) {
     let history = Arc::new(CountingHistory::new(rows));
     let sales = Arc::new(CountingSales::default());
     let clock = MutableClock::new(now);
@@ -2321,6 +2452,7 @@ fn opportunity_fixture_at(
         history.clone(),
         sales.clone(),
         snapshots,
+        catalog,
         clock.clone(),
         &config,
     ));
@@ -2479,6 +2611,108 @@ fn unknown_sale_rates_rank_at_the_median_known_rate() {
     assert!((ranked[1].score - 0.198).abs() < 0.002, "score {}", ranked[1].score);
 }
 
+/// Live rows carry the ledger evidence next to the rate: the sold/expired
+/// counts behind it, days of supply at the fortnight's sale pace, where the
+/// live floor sits against the previous month's daily lows, and the vendor
+/// floor — none of which moves the score.
+#[test]
+fn live_rows_carry_ledger_counts_supply_low_rank_and_the_vendor_floor() {
+    let target = TargetId("us-4".into());
+    let now = 1_000_000;
+    let catalog = Arc::new(FakeCatalog::default());
+    // Item 1's floor (55 000) is at or under its vendor price; item 2's is not.
+    *catalog.sell_prices.lock().unwrap() = HashMap::from([(1, 60_000), (2, 10_000)]);
+    let (service, history, sales, _clock) =
+        opportunity_fixture_all(now, scan_day_rows(), &live_listings(), 1, Arc::clone(&catalog));
+    // Item 1: 140 units sold over the fortnight = 10 a day; ten single-unit
+    // listings are listed → one day of supply. Six prior daily lows, all above
+    // the live floor → a 30-day low. Item 2: no ledger rows at all.
+    sales.set_units(&[(1, 140)]);
+    history.set_lows(1, utc_day(now), &[100_000, 90_000, 120_000, 110_000, 95_000, 130_000]);
+
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    let (first, second) = (&ranked[0], &ranked[1]);
+    assert_eq!((first.item.clone(), second.item.clone()), (item(1), item(2)));
+    assert_eq!((first.sold_count, first.expired_count), (Some(1), Some(3)));
+    assert_eq!(first.reliability, Some(0.25), "the rate is the counts' ratio");
+    assert_eq!(first.supply_days, Some(1.0), "10 listed ÷ 10 sold a day");
+    assert_eq!(first.low_rank_30d, Some(1.0), "every prior day sat above the live floor");
+    assert_eq!(first.vendor_price, Some(60_000));
+    assert!(first.at_vendor_floor(), "55 000 ≤ the 60 000 vendor price");
+
+    assert_eq!((second.sold_count, second.expired_count), (None, None), "no ledger evidence");
+    assert_eq!(second.supply_days, None);
+    assert_eq!(second.low_rank_30d, None, "no daily lows scripted for item 2");
+    assert_eq!(second.vendor_price, Some(10_000));
+    assert!(!second.at_vendor_floor(), "90 000 is a market price, not a vendor one");
+    // The informational fields never enter the score: the rows rank exactly as
+    // the counts-only fixture does.
+    let (plain, _history, _sales, _clock) = opportunity_fixture(now);
+    let plain = plain
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    assert_eq!(
+        (first.score, second.score),
+        (plain[0].score, plain[1].score),
+        "evidence fields are not score inputs"
+    );
+}
+
+/// A partial month still ranks, under the history floor it stays silent, and
+/// the gone-today list carries the counts too.
+#[test]
+fn low_rank_needs_a_week_of_lows_and_missed_deals_carry_the_counts() {
+    let target = TargetId("us-4".into());
+    let now = 1_000_000;
+    let today = utc_day(now);
+    // Item 1 seen today at 50 000 with the live floor at 60 000: a gone deal.
+    let rows = vec![day_row(1, today, 50, 50_000, 100_000)];
+    let live = (0..10).map(|n| listing(7_000 + n, &item(1), 60_000, 1)).collect::<Vec<_>>();
+    let (service, history, _sales, clock) = opportunity_fixture_with(now, rows, &live);
+    history.set_lows(1, today, &[55_000, 70_000, 80_000, 90_000, 100_000]);
+
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    assert_eq!(ranked[0].low_rank_30d, Some(0.8), "four of five prior days sat above 60 000");
+    let missed = service.missed_deals(&target, Category::Commodity, 0.0, 50).expect("missed");
+    assert_eq!(missed[0].seen_floor, 50_000);
+    assert_eq!((missed[0].sold_count, missed[0].expired_count), (Some(1), Some(3)));
+
+    // Four days cannot place a price inside a month. The context is cached
+    // for an hour, so the changed script only lands once that has passed.
+    history.set_lows(1, today, &[55_000, 70_000, 80_000, 90_000]);
+    clock.advance(3601);
+    service.refresh(&target, Category::Commodity).expect("refresh");
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    assert_eq!(ranked[0].low_rank_30d, None, "under the history floor");
+}
+
+/// The month of daily lows is the heaviest read behind the ranking: it is
+/// read once per scan on a cold cache, then at most once an hour however often
+/// the scan refreshes, and a scan re-read of the day rows never drags it along.
+#[test]
+fn the_low_context_is_read_hourly_not_per_scan() {
+    let target = TargetId("us-4".into());
+    let (service, history, _sales, clock) = opportunity_fixture(1_000_000);
+    assert_eq!(history.daily_lows_calls(), 0, "nothing read before the first scan");
+
+    service.refresh(&target, Category::Commodity).expect("first refresh");
+    assert_eq!(history.daily_lows_calls(), 1, "the cold context is read once");
+
+    // Two more scan refreshes inside the hour: day rows re-read, lows cached.
+    clock.advance(3601);
+    service.refresh(&target, Category::Commodity).expect("second refresh");
+    clock.advance(31);
+    service.refresh(&target, Category::Commodity).expect("third refresh");
+    assert_eq!(history.item_day_rows_calls(), 3, "every scan re-reads the day rows");
+    assert_eq!(history.daily_lows_calls(), 2, "the lows were re-read once, when the hour passed");
+}
+
 /// The scan's live floors describe exactly the snapshot the page names.
 #[test]
 fn live_snapshot_names_the_scan_source() {
@@ -2514,7 +2748,7 @@ fn stale_snapshot_is_still_served_without_recompute() {
         .expect("ranked from the stale snapshot");
     service.overview(&target, Category::Commodity, 15).expect("overview from the stale snapshot");
     assert_eq!(history.item_day_rows_calls(), 1, "a stale snapshot must not recompute inline");
-    assert_eq!(sales.sale_rate_each_calls(), 1);
+    assert_eq!(sales.sale_counts_each_calls(), 1);
 }
 
 #[test]
@@ -2527,12 +2761,12 @@ fn cold_cache_falls_back_to_inline_compute() {
         .expect("ranked");
     assert_eq!(ranked.len(), 2);
     assert_eq!(history.item_day_rows_calls(), 1, "cold cache computes inline");
-    assert_eq!(sales.sale_rate_each_calls(), 1);
+    assert_eq!(sales.sale_counts_each_calls(), 1);
 
     // The inline compute also seeds the cache: the next request reads nothing.
     service.overview(&target, Category::Commodity, 15).expect("overview");
     assert_eq!(history.item_day_rows_calls(), 1);
-    assert_eq!(sales.sale_rate_each_calls(), 1);
+    assert_eq!(sales.sale_counts_each_calls(), 1);
 }
 
 #[test]
@@ -2546,13 +2780,13 @@ fn refresh_debounces_inside_the_window_and_recomputes_outside() {
     let covered = service.refresh(&target, Category::Commodity).expect("debounced refresh");
     assert_eq!(covered, 2, "debounced refresh reports the cached coverage");
     assert_eq!(history.item_day_rows_calls(), 1, "inside the debounce window no work happens");
-    assert_eq!(sales.sale_rate_each_calls(), 1);
+    assert_eq!(sales.sale_counts_each_calls(), 1);
 
     clock.advance(21); // 31s after the first refresh
     let covered = service.refresh(&target, Category::Commodity).expect("post-debounce refresh");
     assert_eq!(covered, 2);
     assert_eq!(history.item_day_rows_calls(), 2, "outside the window the scan recomputes");
-    assert_eq!(sales.sale_rate_each_calls(), 2);
+    assert_eq!(sales.sale_counts_each_calls(), 2);
 }
 
 #[test]
@@ -2562,7 +2796,7 @@ fn a_failed_refresh_keeps_the_previous_snapshot_serving() {
     service.refresh(&target, Category::Commodity).expect("first refresh");
 
     clock.advance(31); // past the debounce, so the next refresh really runs
-    sales.set_sale_rate_each_failure(true);
+    sales.set_sale_counts_each_failure(true);
     assert!(
         service.refresh(&target, Category::Commodity).is_err(),
         "the failed sales lookup surfaces as an Err"
@@ -2580,7 +2814,7 @@ fn a_failed_refresh_keeps_the_previous_snapshot_serving() {
         2,
         "the failed attempt re-read history before the sales step failed"
     );
-    assert_eq!(sales.sale_rate_each_calls(), 2, "the failed attempt counted");
+    assert_eq!(sales.sale_counts_each_calls(), 2, "the failed attempt counted");
 }
 
 #[test]
@@ -2611,7 +2845,7 @@ fn requests_self_heal_once_a_snapshot_passes_the_backstop() {
         .expect("ranked");
     assert_eq!(ranked.len(), 2);
     assert_eq!(history.item_day_rows_calls(), 2, "the backstop recomputed inline");
-    assert_eq!(sales.sale_rate_each_calls(), 2);
+    assert_eq!(sales.sale_counts_each_calls(), 2);
     assert_eq!(
         service.snapshot_age_secs(&target, Category::Commodity),
         Some(0),

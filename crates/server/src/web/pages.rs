@@ -100,6 +100,8 @@ type ItemPageData = (
     // intraday hour fold (bounded only by its own retention knob).
     Vec<amtracker_core::domain::ItemDayRow>,
     Vec<amtracker_core::domain::ItemHourRow>,
+    // The sold/expired ledger counts behind the 14-day sale rate.
+    Option<amtracker_core::domain::SaleCounts>,
 );
 
 /// Watchlist membership key: kind-prefixed identity string, so items and
@@ -1508,6 +1510,13 @@ async fn item_detail_page(
                 category.payload_kind(),
                 sample_since,
             )?;
+            // The raw ledger behind the blocks' 14-day sale rate.
+            let counts = state.sales.sale_counts(
+                &target,
+                &item,
+                amtracker_core::services::opportunity::SALE_RATE_WINDOW_DAYS,
+                category,
+            )?;
             // Cross-target comparison: the same identity + category on every
             // other configured target (cached d7 blocks — cheap by design).
             let mut peers = Vec::new();
@@ -1515,10 +1524,10 @@ async fn item_detail_page(
                 let block = state.metrics.block(&other.id, &item, category, Span::D7)?;
                 peers.push((other.id.clone(), block));
             }
-            Ok((rows, blocks, chart_rows, distribution, peers, weekday_rows, hour_cells))
+            Ok((rows, blocks, chart_rows, distribution, peers, weekday_rows, hour_cells, counts))
         }
     });
-    let (rows, blocks, mut chart_rows, distribution, peers, weekday_rows, hour_cells) =
+    let (rows, blocks, mut chart_rows, distribution, peers, weekday_rows, hour_cells, ledger) =
         match page_data.await {
             Ok(Ok(data)) => data,
             Ok(Err(error)) => return render::store_error_page(error).await,
@@ -1749,6 +1758,29 @@ async fn item_detail_page(
         );
     }
     body.push_str("</tbody></table></div>");
+
+    // The raw ledger behind the sale-rate column: how many listings sold, how
+    // many ran out unsold and were relisted.
+    match ledger {
+        Some(counts) => {
+            let _ = write!(
+                body,
+                "<p class=\"muted\">{}: {} sold · {} expired unsold over the last 14 days{}</p>",
+                tip(
+                    "14-day ledger",
+                    "Credit-eligible closes of the trailing fortnight: sold = vanished before the band's lower bound; expired unsold = ran out past it (relisted). Their ratio is the sale rate above; SHORT/MEDIUM-band vanishes cannot be told apart from expiry at the poll cadence and count in neither."
+                ),
+                counts.sold,
+                counts.expired,
+                counts
+                    .rate()
+                    .map_or_else(String::new, |rate| format!(" — {:.0}% sold", rate * 100.0))
+            );
+        }
+        None => body.push_str(
+            "<p class=\"muted\">14-day ledger: no credit-eligible close yet — a listing that has not closed is not evidence of a non-seller.</p>",
+        ),
+    }
 
     // Watch action: live in open mode, disabled-until-keyed in protected mode.
     let open = mutations_open(&state.config);
@@ -2164,10 +2196,12 @@ pub(crate) async fn opportunities_page(
             ("item", "Item or pet variant the deal row describes — click for its full history."),
             ("score", "Weighted geometric mean of the components below (see the page tip). Sorted descending by default."),
             ("discount", "1 − price now ÷ reference value: how far the cheapest listed price sits under what the item is worth (see value)."),
-            ("price now", "Cheapest unit price listed in the newest snapshot — buyable right now."),
+            ("30d low", "Share of the previous 30 days whose cheapest listing sat ABOVE the live price: 100% = the cheapest it has been all month, 0% = nothing special. Read from the permanent hour fold; — = fewer than 5 days of history."),
+            ("price now", "Cheapest unit price listed in the newest snapshot — buyable right now. ≤ vendor marks a price at or under what a vendor pays for the item: it cannot fall further, and reselling to a vendor returns every copper."),
             ("qty", "Units listed at exactly that price: how deep the deal is."),
             ("value", "Reference value: the 14-day sold median (what buyers actually paid) once at least 3 priced units sold — marked * — else the quantity-weighted 7-day listing median (where half the listed quantity trades)."),
-            ("reliability", "14-day sell-through: share of credit-eligible listings sold. — = no evidence yet; such items rank at the market's median rate."),
+            ("reliability", "14-day sell-through: share of credit-eligible listings sold. — = no evidence yet; such items rank at the market's median rate. The tooltip carries the raw counts: sold, and the listings that ran out unsold (relisted)."),
+            ("supply", "Days the listed stock takes to clear at the fortnight's sale pace: quantity listed ÷ units sold per day. High = oversupplied (prices sag, a flip sits); low = scarce. — = nothing sold in 14 days (such stock never clears) or no ledger rows."),
             ("churn/day", "Average unique listings per day across the whole 7-day window."),
             ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
             ("samples 7d", "Auction-days folded over the last 7 days (listings × days seen) — the evidence behind the value."),
@@ -2182,17 +2216,23 @@ pub(crate) async fn opportunities_page(
         for o in &data {
             let reliability =
                 o.reliability.map_or_else(|| "—".to_string(), |rate| component_bar("rel", rate));
+            let reliability = ledger_tooltip(&reliability, o.sold_count, o.expired_count);
             let value = o.sold_median14.filter(|median| *median > 0).unwrap_or(o.value7);
             let value_cell = sold_marked(o.sold_median14, value);
+            let low_rank = percent_or_dash(o.low_rank_30d);
+            let supply = supply_cell(o.supply_days, o.sold_count);
+            let price_now = vendor_badged(o);
             let _ = write!(
                 body,
                 "<tr>{}\
                  <td data-v=\"{:.4}\"><strong>{:.3}</strong></td>\
                  <td data-v=\"{:.3}\">{}</td>\
+                 <td data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{:.2}\">{:.1}</td>\
                  <td data-v=\"{:.4}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
@@ -2204,14 +2244,18 @@ pub(crate) async fn opportunities_page(
                 o.score,
                 o.discount,
                 component_bar("disc", o.discount),
+                o.low_rank_30d.unwrap_or(-1.0),
+                low_rank,
                 o.floor_now,
-                money(o.floor_now),
+                price_now,
                 o.floor_qty,
                 o.floor_qty,
                 value,
                 value_cell,
                 o.reliability.unwrap_or(-1.0),
                 reliability,
+                supply.0,
+                supply.1,
                 o.churn_per_day,
                 o.churn_per_day,
                 o.stability,
@@ -2248,7 +2292,7 @@ pub(crate) async fn opportunities_page(
             ("qty", "Units that gone listing offered."),
             ("live floor", "Cheapest listing of the item in the newest snapshot; — = nothing of it is listed."),
             ("value", "Reference value, as on the live rows: the 14-day sold median (*) once at least 3 priced units sold, else the quantity-weighted 7-day listing median."),
-            ("reliability", "14-day sell-through; — = no credit-eligible evidence yet."),
+            ("reliability", "14-day sell-through; — = no credit-eligible evidence yet. The tooltip carries the sold/expired counts behind it."),
             ("samples 7d", "Auction-days folded over the last 7 days — the evidence behind the value."),
         ] {
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
@@ -2257,6 +2301,7 @@ pub(crate) async fn opportunities_page(
         for deal in &missed {
             let reliability =
                 deal.reliability.map_or_else(|| "—".to_string(), |rate| format!("{rate:.2}"));
+            let reliability = ledger_tooltip(&reliability, deal.sold_count, deal.expired_count);
             let live_floor = deal.live_floor.map_or_else(|| "—".to_string(), money);
             let value = deal.sold_median14.filter(|median| *median > 0).unwrap_or(deal.value7);
             let value_cell = sold_marked(deal.sold_median14, value);
@@ -2305,6 +2350,59 @@ fn sold_marked(sold_median: Option<i64>, value: i64) -> String {
         format!("{}*", money(value))
     } else {
         money(value)
+    }
+}
+
+/// A 0..1 fraction as a whole percent, or the em dash for `None`.
+fn percent_or_dash(fraction: Option<f64>) -> String {
+    fraction.map_or_else(|| "—".into(), |fraction| format!("{:.0}%", fraction * 100.0))
+}
+
+/// The sold/expired counts behind a rate ride in the cell's tooltip: how
+/// many listings sold, how many ran out unsold (relisted) over the window.
+fn ledger_tooltip(inner: &str, sold: Option<i64>, expired: Option<i64>) -> String {
+    match (sold, expired) {
+        (Some(sold), Some(expired)) => {
+            let text = if sold + expired > 0 {
+                format!("{sold} sold · {expired} expired unsold over 14 days — the counts behind the rate")
+            } else {
+                "ledger rows exist but no credit-eligible close in 14 days".to_string()
+            };
+            format!(
+                "<span class=\"tip\" tabindex=\"0\" data-tip=\"{}\">{inner}</span>",
+                html_escape(&text)
+            )
+        }
+        _ => inner.to_string(),
+    }
+}
+
+/// Days of supply as a sortable `(data-v, text)` pair: whole days over ten,
+/// one decimal under; `∞` (sorting last) when the ledger shows a fortnight
+/// without a sale; the em dash without ledger rows.
+fn supply_cell(supply_days: Option<f64>, sold_count: Option<i64>) -> (String, String) {
+    match (supply_days, sold_count) {
+        (Some(days), _) => {
+            let text = if days >= 10.0 { format!("{days:.0}d") } else { format!("{days:.1}d") };
+            (format!("{days:.2}"), text)
+        }
+        (None, Some(0)) => ("1000000000".to_string(), "∞".to_string()),
+        (None, _) => ("-1".to_string(), "—".to_string()),
+    }
+}
+
+/// The live price cell, carrying the at-vendor badge when the floor sits at
+/// or under the vendor sell price (the tooltip names the price).
+fn vendor_badged(o: &amtracker_core::services::opportunity::Opportunity) -> String {
+    let price = money(o.floor_now);
+    if o.at_vendor_floor() {
+        let vendor = money(o.vendor_price.unwrap_or(0));
+        format!(
+            "{price} <span class=\"tip\" tabindex=\"0\" data-tip=\"{}\"><span class=\"badge ok\">≤ vendor</span></span>",
+            html_escape(&format!("Vendors for {vendor}: the price cannot fall further, and a vendor buys it back for at least this much"))
+        )
+    } else {
+        price
     }
 }
 
@@ -3447,6 +3545,10 @@ pub(crate) async fn help_page() -> Response {
         ("discount", "1 − floor now ÷ reference value: how far the cheapest listed price sits under what the item is worth."),
         ("seen today, already gone", "A listing seen today under the item's value that the newest snapshot no longer lists (bought or cancelled). The day fold never forgets a listing, so its floor outlives the listing — these rows say so instead of passing it as buyable."),
         ("reliability", "Sell-through strength feeding the ranking — how confidently listings actually sell on this item. “—” = no credit-eligible evidence; the score then ranks the item at the market's median rate rather than at zero."),
+        ("sold / expired", "The raw ledger counts behind a 14-day sale rate, shown in the reliability tooltip and the item page's ledger line: sold = listings credited as sold; expired unsold = credit-eligible listings that ran out past their band's lower bound (relisted). Sold ÷ (sold + expired) is exactly the sale rate, so a 50% rate reads very differently over 2 sales than over 200."),
+        ("supply (days of supply)", "Days the listed stock takes to clear at the fortnight's sale pace: quantity listed ÷ units sold per day. High = oversupplied (prices sag, a flip sits); low = scarce. “∞” = nothing sold in 14 days, so the stock never clears at the current demand; “—” = no ledger rows."),
+        ("30d low", "Where the live price sits against the previous 30 days' cheapest listings (read from the permanent hour fold): the share of those days whose low was HIGHER. 100% = the cheapest it has been all month; 0% = nothing special. “—” = fewer than 5 days of history. Informational: it never moves the score."),
+        ("≤ vendor", "The live price sits at or under the vendor sell price (from the item API). Vendors pay that much for the item, so the price cannot fall further — and buying at or below it is a zero-risk flip back to a vendor."),
         ("churn/day", "Average unique listings per day across the whole 7-day window — days without data count as zero, so a single-day spike reads as a spike, not sustained volume."),
         ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),

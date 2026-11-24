@@ -680,6 +680,20 @@ pub struct ItemHourRow {
     pub mins: Vec<i64>,
 }
 
+/// One identity's lowest ask on one UTC day, read off the permanent intraday
+/// fold: the minimum of the day's per-snapshot floors. Narrow long-horizon
+/// fuel (no day-fold JSON to parse) for the deal ranking's 30-day-low
+/// indicator.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ItemDayLow {
+    /// The item or pet the low describes.
+    pub item: ItemRef,
+    /// UTC day number.
+    pub day: i64,
+    /// Cheapest unit price seen that day (copper).
+    pub min: i64,
+}
+
 /// A vanished sighting credited as a sale candidate (plan D7).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SaleCredit {
@@ -807,6 +821,44 @@ pub struct MetricBlock {
     /// for the identity at all ("no evidence" stays distinct from a
     /// genuine zero).
     pub qty_sold: Option<i64>,
+}
+
+/// The ledger counts behind a sale rate over a window: credited sales and
+/// credit-eligible closes that did not credit. A close books `credited` and
+/// `eligible` together on the sight's open day, so `expired = eligible −
+/// credited` is exact for any window (reopened sights reverse both). An
+/// expired close is a listing last seen with ≥ 2 h left that outlived its
+/// band's lower bound — it ran out unsold (the "relisted, not selling" half
+/// of the rate); SHORT/MEDIUM-band vanishes cannot be told apart from natural
+/// expiry at the poll cadence and belong to neither count.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SaleCounts {
+    /// Listings credited as sold in the window.
+    pub sold: i64,
+    /// Credit-eligible closes that ran out unsold.
+    pub expired: i64,
+}
+
+impl SaleCounts {
+    /// The counts of one ledger window from its credited/eligible sums;
+    /// `None` when nothing credit-eligible closed (no evidence, never a zero —
+    /// the `sale_rate` contract).
+    #[must_use]
+    pub fn from_ledger(credited: i64, eligible: i64) -> Option<Self> {
+        if eligible <= 0 {
+            return None;
+        }
+        Some(Self { sold: credited.max(0), expired: (eligible - credited).max(0) })
+    }
+
+    /// The sale rate these counts imply: `sold / (sold + expired)`, the same
+    /// figure `sale_rate` reads off the ledger.
+    #[must_use]
+    #[allow(clippy::cast_precision_loss)] // ledger counts into a display ratio
+    pub fn rate(&self) -> Option<f64> {
+        let eligible = self.sold.saturating_add(self.expired);
+        (eligible > 0).then(|| self.sold as f64 / eligible as f64)
+    }
 }
 
 /// Ledger-derived recency for one identity: the last day a sale was credited
@@ -1314,5 +1366,24 @@ mod tests {
         assert_eq!(Category::parse("commodities"), None);
         assert_eq!(Category::parse("auctions"), None);
         assert_eq!(Category::parse(""), None);
+    }
+
+    #[test]
+    fn sale_counts_split_the_eligible_denominator_and_rate_like_the_ledger() {
+        let counts = SaleCounts { sold: 3, expired: 9 };
+        assert_eq!(SaleCounts::from_ledger(3, 12), Some(counts), "twelve eligible closes");
+        assert_eq!(counts.rate(), Some(0.25), "3 / (3 + 9) is the sale rate");
+        assert_eq!(
+            SaleCounts::from_ledger(0, 5),
+            Some(SaleCounts { sold: 0, expired: 5 }),
+            "rows with no sale read as a genuine zero rate"
+        );
+        assert_eq!(
+            SaleCounts::from_ledger(0, 5).and_then(|counts| counts.rate()),
+            Some(0.0),
+            "a genuine zero, not missing evidence"
+        );
+        assert_eq!(SaleCounts::from_ledger(0, 0), None, "no eligible close is no evidence");
+        assert_eq!(SaleCounts::from_ledger(2, -1), None, "a corrupt negative sum is no evidence");
     }
 }

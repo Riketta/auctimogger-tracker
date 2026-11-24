@@ -74,10 +74,15 @@ normal for this item, and how do I know this deal is real?"*.
   lists: each item's cheapest listed price against its quantity-weighted
   7-day value (the bulk price for stackables), scored by a weighted geometric
   mean of discount, sale-rate reliability, churn and stability — a liquid but
-  undiscounted market cannot outrank a real deal. Listings seen today that
-  were bought or cancelled land in a separate "seen today, already gone"
-  table (and `GET /api/missed-deals`) instead of passing as buyable. Ranked
-  per market category (items, commodities, pets).
+  undiscounted market cannot outrank a real deal. Every row also carries the
+  evidence a buyer reads beside the score: the **sold / expired** ledger
+  counts behind the sale rate, **days of supply** at the current sale pace,
+  where the price sits against the **previous 30 days' daily lows**, and the
+  **vendor floor** (a `≤ vendor` badge on a zero-risk buy) — informational,
+  never score inputs. Listings seen today that were bought or cancelled land
+  in a separate "seen today, already gone" table (and `GET
+  /api/missed-deals`) instead of passing as buyable. Ranked per market
+  category (items, commodities, pets).
 - **Efficient crafts** — `/crafts` prices a hand-maintained recipe file
   (`recipes.example.toml`) on each target: the reagents' quantity-weighted
   7-day cost (and what they cost right now) against the crafted item's
@@ -264,9 +269,9 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole JSON API + feed surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
-| `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`, `soldMedian14`, `valueSource`) and the response names the `snapshot` they come from. `discount = 1 - floorNow / reference`, the reference being `soldMedian14` once ≥ 3 priced units sold in 14 days, else `value7` (see “Sold prices and the reference value”). `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
-| `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first — the same two response shapes as opportunities |
 | `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents, the output's reference value (14-day sold median once ≥ 3 priced units sold, else 7-day listing value) and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out |
+| `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`, `soldMedian14`, `valueSource`) and the evidence next to them (`soldCount`, `expiredCount`, `supplyDays`, `lowRank30d`, `vendorPrice` — see “Evidence next to the deal rows”), and the response names the `snapshot` they come from. `discount = 1 - floorNow / reference`, the reference being `soldMedian14` once ≥ 3 priced units sold in 14 days, else `value7` (see “Sold prices and the reference value”). `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
+| `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first, with the sold/expired counts behind each row's rate — the same two response shapes as opportunities |
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7). The market is read once per category per 300 s; every `days` window is served from that read |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
@@ -337,6 +342,31 @@ priced units included. Nothing recorded before the upgrade can be
 back-priced — those sales still count toward quantities and sale rates but
 carry no price, so the reference only switches to "sold" as fresh evidence
 accumulates after the deploy.
+
+### Evidence next to the deal rows
+
+Four informational fields ride on every live deal row (API and the
+`/opportunities` table); none of them moves the score:
+
+- **`soldCount` / `expiredCount`** — the raw ledger behind the 14-day sale
+  rate. A credited close is *sold*; a credit-eligible close that outlived its
+  band's lower bound is *expired unsold* (relisted). Their ratio is exactly
+  `reliability`, so a 50 % rate over 2 sales and one over 200 read
+  differently. No migration: both halves were always in the ledger
+  (`expired = eligible − credited`). The item page shows the same counts
+  under its metric blocks, and `sale-rate-above` alerts carry them.
+- **`supplyDays`** — days the listed stock takes to clear at the fortnight's
+  sale pace (quantity listed ÷ units sold per day). High = oversupplied,
+  prices sag, a flip sits; `∞` = nothing sold in 14 days.
+- **`lowRank30d`** — the share of the previous 30 days whose cheapest listing
+  sat *above* the live price (100 % = a 30-day low). Read from the permanent
+  hour fold (`MIN(floor)` per item-day), refreshed hourly per market — a
+  narrow aggregate, not 30 days of fold JSON — and silent under five days of
+  history.
+- **`vendorPrice`** — the vendor sell price from the item API, when known.
+  Vendors pay that much, so the market cannot durably sit below it; a floor at
+  or under it is flagged `≤ vendor` (`at_vendor_floor`): it cannot fall
+  further, and a vendor buys it back for at least that much.
 
 ## Crafting (recipe file)
 
