@@ -5,9 +5,11 @@
 //! opportunity/overview scans (`OpportunityService::refresh`) — run on a
 //! companion maintenance thread fed by a deduplicated per-target queue, so a
 //! slow publish or prune can never delay the next target's fetch. Name
-//! resolution for every id ever folded runs on its own warmer thread,//! decoupled from the ingest cadence. Requests serve prepared data with no
-//! store reads; a plain `serve` stays self-contained — no cron, no exporter
-//! sidecar.
+//! resolution for every id ever folded runs on its own warmer thread (an
+//! all-time listing once at boot, then only what folded since the previous
+//! pass), decoupled from the ingest cadence. Requests serve prepared data
+//! with no store reads; a plain `serve` stays self-contained — no cron, no
+//! exporter sidecar.
 //!
 //! D13: no async in or around the core; everything below is blocking and
 //! runs on these three dedicated threads.
@@ -15,6 +17,7 @@
 use std::{
     any::Any,
     collections::{
+        BTreeSet,
         HashMap,
         HashSet,
         VecDeque,
@@ -47,6 +50,7 @@ use amtracker_core::{
         utc_day,
         Category,
         FeedFormat,
+        Flavor,
         ItemRef,
         PayloadKind,
         TargetId,
@@ -70,6 +74,17 @@ const MAINTENANCE_IDLE_TICK: Duration = Duration::from_secs(60);
 /// How long the name warmer waits after a pass that had nothing to fetch./// Passes that fetched (or hit the batch cap) loop immediately, so a fresh
 /// backlog drains at the pacing pace instead of one batch per tick.
 const WARMER_IDLE_TICK: Duration = Duration::from_secs(30);
+
+/// How long the warmer trusts the catalog's "needs no lookup" answer for an
+/// identity before re-checking it. The only way a complete row needs the
+/// source again is the 30-day enrichment window, so a day is fine-grained
+/// enough for that heal while keeping the re-check load negligible.
+const WARMER_REVERIFY_SECONDS: i64 = 24 * 60 * 60;
+
+/// Known identities re-checked per pass on the round-robin ring (see
+/// [`TargetWarmer`]): a handful of point reads, so re-verification never
+/// needs a whole-market listing.
+const WARMER_REVERIFY_PER_PASS: usize = 64;
 
 /// Freelist fraction above which the incremental pass returns pages to the
 /// filesystem. Below it, freed pages are simply reused by future writes, so
@@ -769,7 +784,7 @@ fn spawn_item_hour_backfill(
     })
 }
 
-/// The warmer thread's loop: run a [`warm_pass`], then either loop
+/// The warmer thread's loop: run one [`NameWarmer::pass`], then either loop
 /// immediately (the pass fetched, or stopped on the batch cap with work
 /// left — a fresh backlog drains continuously at the pacing pace) or sleep
 /// [`WARMER_IDLE_TICK`] (nothing actionable — steady state). A panicking
@@ -779,17 +794,19 @@ fn warmer_loop(state: &Arc<AppState>) {
     tracing::info!(
         batch = config.catalog.warm_batch,
         pace_ms = config.catalog.warm_pace_ms,
-        "background name warmer started"
+        "background name warmer started (all-time listing once, then incremental)"
     );
+    let mut warmer = NameWarmer::new();
     loop {
-        let pass = panic::catch_unwind(AssertUnwindSafe(|| warm_pass(state, &config)))
-            .unwrap_or_else(|payload| {
+        let pass = panic::catch_unwind(AssertUnwindSafe(|| warmer.pass(state))).unwrap_or_else(
+            |payload| {
                 tracing::error!(
                     panic = %panic_message(&payload),
                     "name warmer pass panicked; continuing"
                 );
                 WarmPassStats::default()
-            });
+            },
+        );
         if pass.fetched > 0 {
             tracing::info!(
                 fetched = pass.fetched,
@@ -818,7 +835,8 @@ fn warmer_loop(state: &Arc<AppState>) {
 /// What one warmer pass did, for logging and tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct WarmPassStats {
-    /// Distinct identities (per target) examined this pass.
+    /// Ids examined against the catalog this pass: newly listed, re-checked
+    /// on the ring, and carried over from earlier passes.
     pub candidates: usize,
     /// Ids resolved from the source this pass (budget-limited by
     /// `[catalog].warm_batch`).
@@ -829,114 +847,310 @@ pub struct WarmPassStats {
     pub more_work: bool,
 }
 
-/// One background name-warmer pass: every identity that ever produced a
-/// fold — all-time, all targets, all categories — goes through the catalog
-/// at the configured politeness pace, so no id stays unnamed in the store.
-/// Best effort: a source outage just pauses resolution until a later pass
-/// (the error cache defers the failing id briefly).
-///
-/// The budget (`[catalog].warm_batch`) caps *source lookups* per pass, not
-/// examined ids: with all-time candidate lists, capping examined ids would
-/// starve unnamed ids sitting behind thousands of already-named ones. The
-/// walk itself is cheap — known ids cost one local read each, deferred ones
-/// not even that — so walking the whole list per pass is safe. A listing
-/// read failure skips the pass (next one retries); a lookup failure pauses
-/// it, and the negative/error cache prevents re-asking the same id hot.
-pub fn warm_pass(
+/// The catalog identity a name lookup is about: an item id, or a pet
+/// SPECIES — level/quality/breed never matter to the catalog, so every
+/// variant of a species collapses onto one key.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum NameKey {
+    Item(i64),
+    Species(i64),
+}
+
+impl NameKey {
+    fn of(item: &ItemRef) -> Self {
+        match *item {
+            ItemRef::Item { item_id } => Self::Item(item_id),
+            ItemRef::Pet { species, .. } => Self::Species(species),
+        }
+    }
+}
+
+/// Whether a lookup of `key` would hit the source right now: the id is
+/// unseen, or its stored row is past the enrichment window while still
+/// missing fields.
+fn needs_lookup(state: &AppState, flavor: &Flavor, key: NameKey) -> Result<bool, StoreError> {
+    match key {
+        NameKey::Item(item_id) => state.catalog.needs_enrichment(flavor, item_id),
+        NameKey::Species(species) => state.catalog.known_pet(flavor, species).map(|known| !known),
+    }
+}
+
+/// Whether the catalog recently answered "missing" or failed for `key`.
+fn is_deferred(state: &AppState, flavor: &Flavor, key: NameKey) -> bool {
+    match key {
+        NameKey::Item(item_id) => state.catalog.deferred(flavor, item_id),
+        NameKey::Species(species) => state.catalog.deferred_pet(flavor, species),
+    }
+}
+
+/// Resolves `key` from the source. `Ok(true)` = the catalog holds it now;
+/// `Ok(false)` = the source has no record (remembered negatively).
+fn lookup(state: &AppState, flavor: &Flavor, key: NameKey) -> Result<bool, StoreError> {
+    match key {
+        NameKey::Item(item_id) => {
+            state.catalog.ensure(flavor, item_id).map(|record| record.is_some())
+        }
+        NameKey::Species(species) => {
+            state.catalog.ensure_pet(flavor, species).map(|record| record.is_some())
+        }
+    }
+}
+
+/// One identity the catalog last confirmed as needing no source lookup.
+struct Verified {
+    key: NameKey,
+    at: i64,
+}
+
+/// Per-target warmer state, carried across passes on the warmer thread.
+#[derive(Default)]
+struct TargetWarmer {
+    /// First day the next listing reads from: `0` on the first pass after
+    /// boot (all-time), then `today` — only identities with a fold since the
+    /// previous pass are listed again, never the whole history.
+    since_day: i64,
+    /// Every identity the catalog ever answered for, as a round-robin ring:
+    /// each pass visits a few slots and re-checks the stale ones, so a row
+    /// that only later qualifies for enrichment (the 30-day window) still
+    /// gets its heal without rescanning the folds.
+    verified: Vec<Verified>,
+    /// `NameKey` → slot in `verified`.
+    index: HashMap<NameKey, usize>,
+    /// Next ring slot the sweep visits.
+    cursor: usize,
+    /// Ids that still need a source lookup — unseen, negatively cached,
+    /// failed, or cut off by the budget — carried from pass to pass until
+    /// resolved.
+    pending: BTreeSet<NameKey>,
+}
+
+impl TargetWarmer {
+    /// Whether the catalog confirmed `key` recently enough to skip it.
+    fn is_fresh(&self, key: &NameKey, now: i64) -> bool {
+        self.index.get(key).is_some_and(|&slot| {
+            self.verified
+                .get(slot)
+                .is_some_and(|entry| now.saturating_sub(entry.at) <= WARMER_REVERIFY_SECONDS)
+        })
+    }
+
+    /// Stamps `key` as confirmed at `now`, adding it to the ring when new.
+    fn confirm(&mut self, key: NameKey, now: i64) {
+        if let Some(&slot) = self.index.get(&key) {
+            if let Some(entry) = self.verified.get_mut(slot) {
+                entry.at = now;
+            }
+        } else {
+            self.index.insert(key, self.verified.len());
+            self.verified.push(Verified { key, at: now });
+        }
+    }
+
+    /// Advances the sweep by up to [`WARMER_REVERIFY_PER_PASS`] slots (never
+    /// more than one lap) and returns the identities whose confirmation is
+    /// too old to trust.
+    fn due(&mut self, now: i64) -> Vec<NameKey> {
+        let len = self.verified.len();
+        let mut due = Vec::new();
+        for _ in 0..len.min(WARMER_REVERIFY_PER_PASS) {
+            self.cursor = (self.cursor + 1) % len;
+            if let Some(entry) = self.verified.get(self.cursor) {
+                if now.saturating_sub(entry.at) > WARMER_REVERIFY_SECONDS {
+                    due.push(entry.key);
+                }
+            }
+        }
+        due
+    }
+}
+
+/// How one target's walk ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Walk {
+    /// The pending set was walked to its end (or up to the budget cap).
+    Complete,
+    /// A source lookup failed: every target would pay the same outage, so
+    /// the pass stops here.
+    Paused,
+}
+
+/// Everything one warmer pass shares across its targets.
+struct PassRun {
+    stats: WarmPassStats,
+    now: i64,
+    today: i64,
+    budget: u32,
+    pace: Duration,
+}
+
+/// The background name warmer's state, owned by its thread: one
+/// [`TargetWarmer`] per configured target.
+#[derive(Default)]
+pub struct NameWarmer {
+    targets: HashMap<String, TargetWarmer>,
+}
+
+impl NameWarmer {
+    /// An empty warmer: its first pass lists every target all-time.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// One background name-warmer pass over every configured target. The
+    /// first pass after boot lists all-time — every identity that ever
+    /// produced a fold goes through the catalog — and moves a per-target day
+    /// cursor to today; later passes list only identities with a fold since
+    /// the previous pass (an index range over the newest day), re-check a
+    /// slice of the known-identity ring, and walk the ids still pending from
+    /// earlier passes. Best effort: a source outage just pauses resolution
+    /// until a later pass (the error cache defers the failing id briefly).
+    ///
+    /// The budget (`[catalog].warm_batch`) caps *source lookups* per pass,
+    /// not examined ids: ids beyond it stay pending and keep their place, so
+    /// an unnamed id never starves behind named ones. A listing read failure
+    /// leaves that target's cursor untouched and skips it for the pass (the
+    /// other targets still run; the next pass retries).
+    pub fn pass(&mut self, state: &Arc<AppState>) -> WarmPassStats {
+        let config = &state.config;
+        let budget = config.catalog.warm_batch;
+        if budget == 0 {
+            // The warmer thread is not spawned in this mode; guard the direct
+            // (test/manual) call path too.
+            return WarmPassStats::default();
+        }
+        let now = state.clock.now();
+        let mut run = PassRun {
+            stats: WarmPassStats::default(),
+            now,
+            today: utc_day(now),
+            budget,
+            pace: Duration::from_millis(config.catalog.warm_pace_ms),
+        };
+        for target in &config.targets {
+            let warmer = self.targets.entry(target.id.0.clone()).or_default();
+            if warm_target(state, warmer, target, &mut run) == Walk::Paused {
+                break;
+            }
+        }
+        run.stats
+    }
+}
+
+/// One pass for one target: list the identities with folds since the cursor,
+/// re-check a ring slice, then walk every id still needing a lookup under the
+/// source budget. Returns early (cursor untouched) when the listing fails, so
+/// the next pass retries the same range. `pending` only shrinks once the
+/// walk is over, so a panic mid-walk loses no work.
+fn warm_target(
     state: &Arc<AppState>,
-    config: &amtracker_core::config::TrackerConfig,
-) -> WarmPassStats {
-    let budget = config.catalog.warm_batch;
-    if budget == 0 {
-        // The warmer thread is not spawned in this mode; guard the direct
-        // (test/manual) call path too.
-        return WarmPassStats::default();
-    }
-    let pace = Duration::from_millis(config.catalog.warm_pace_ms);
-    let mut pass = WarmPassStats::default();
-    for target in &config.targets {
-        let flavor = &target.flavor;
-        let target_id = TargetId(target.id.0.clone());
-        // Distinct identities across all categories: the same item id can
-        // have both commodity and item-AH folds, and the catalog names ids,
-        // not categories. `since_day = 0` means all-time coverage.
-        let mut items: Vec<ItemRef> = Vec::new();
-        let mut seen: HashSet<ItemRef> = HashSet::new();
-        for category in Category::ALL {
-            match state.history.items_with_data(&target_id, 0, category) {
-                Ok(list) => {
-                    for item in list {
-                        if seen.insert(item.clone()) {
-                            items.push(item);
-                        }
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target = %target.id.0,
-                        error = %error,
-                        "name warmer listing failed"
-                    );
-                    return WarmPassStats::default();
-                }
-            }
-        }
-        pass.candidates += items.len();
-        for item in items {
-            // Only ids whose lookup would hit the source right now cost a
-            // request: never-seen ids, and rows past the enrichment window
-            // that still miss fields (the merged chain's class/level heal).
-            // Fresh rows are a single local read away. Ids remembered as
-            // missing or recently failed are skipped outright: re-asking
-            // would burn the budget and the pacing sleep without new
-            // information, and both windows expire, so those ids get their
-            // turn again later. Counting the deferred ids per pass makes a
-            // persistent source outage (or a junk-id burst) visible at the
-            // edge even when the other chain leg absorbs it.
-            let (needs_lookup, is_deferred) = match &item {
-                ItemRef::Item { item_id } => (
-                    state.catalog.needs_enrichment(flavor, *item_id).is_ok_and(|needs| needs),
-                    state.catalog.deferred(flavor, *item_id),
-                ),
-                ItemRef::Pet { species, .. } => (
-                    !matches!(state.catalog.known_pet(flavor, *species), Ok(true)),
-                    state.catalog.deferred_pet(flavor, *species),
-                ),
-            };
-            if is_deferred {
-                pass.deferred += 1;
-                continue;
-            }
-            if !needs_lookup {
-                continue;
-            }
-            if pass.fetched >= budget {
-                pass.more_work = true;
-                return pass;
-            }
-            let outcome = match &item {
-                ItemRef::Item { item_id } => state.catalog.ensure(flavor, *item_id).map(|_| ()),
-                ItemRef::Pet { species, .. } => {
-                    state.catalog.ensure_pet(flavor, *species).map(|_| ())
-                }
-            };
-            match outcome {
-                Ok(()) => {
-                    pass.fetched += 1;
-                    thread::sleep(pace);
-                }
-                Err(error) => {
-                    tracing::warn!(
-                        target = %target.id.0,
-                        error = %error,
-                        "name warmer lookup failed; pausing until the next pass"
-                    );
-                    return pass;
-                }
+    warmer: &mut TargetWarmer,
+    target: &amtracker_core::config::TargetConfig,
+    run: &mut PassRun,
+) -> Walk {
+    let flavor = &target.flavor;
+    let all_time = warmer.since_day == 0;
+    let mut listed: Vec<NameKey> = Vec::new();
+    for category in Category::ALL {
+        match state.history.items_with_data(&target.id, warmer.since_day, category) {
+            // The same id can have both commodity and item-AH folds; the
+            // pending set dedupes. Recently confirmed ids cost nothing here.
+            Ok(list) => listed.extend(list.iter().filter_map(|item| {
+                let key = NameKey::of(item);
+                (!warmer.is_fresh(&key, run.now)).then_some(key)
+            })),
+            Err(error) => {
+                tracing::warn!(
+                    target = %target.id.0,
+                    error = %error,
+                    "name warmer listing failed; cursor unchanged"
+                );
+                return Walk::Complete;
             }
         }
     }
-    pass
+    warmer.since_day = run.today;
+
+    // Ring slice: stale confirmations go back to pending. Stamping them now
+    // keeps the ring from re-checking an id while pending still owns it.
+    for key in warmer.due(run.now) {
+        warmer.confirm(key, run.now);
+        warmer.pending.insert(key);
+    }
+    warmer.pending.extend(listed);
+
+    let queue: Vec<NameKey> = warmer.pending.iter().copied().collect();
+    let mut resolved = Vec::new();
+    let mut unreadable = 0usize;
+    let mut walk = Walk::Complete;
+    for key in queue {
+        run.stats.candidates += 1;
+        // Ids remembered as missing or recently failed are skipped outright:
+        // re-asking would burn the budget and the pacing sleep without new
+        // information, and both windows expire, so they get their turn again.
+        if is_deferred(state, flavor, key) {
+            run.stats.deferred += 1;
+            continue;
+        }
+        // Only ids whose lookup would hit the source cost a request. An
+        // unreadable catalog leaves the id pending; one line per target
+        // below covers a store failing wholesale.
+        let Ok(needed) = needs_lookup(state, flavor, key) else {
+            unreadable += 1;
+            continue;
+        };
+        if !needed {
+            warmer.confirm(key, run.now);
+            resolved.push(key);
+            continue;
+        }
+        if run.stats.fetched >= run.budget {
+            run.stats.more_work = true;
+            break;
+        }
+        match lookup(state, flavor, key) {
+            Ok(true) => {
+                run.stats.fetched += 1;
+                thread::sleep(run.pace);
+                warmer.confirm(key, run.now);
+                resolved.push(key);
+            }
+            Ok(false) => {
+                // Negatively cached now: it stays pending and reads as
+                // deferred until that window lapses.
+                run.stats.fetched += 1;
+                thread::sleep(run.pace);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target = %target.id.0,
+                    error = %error,
+                    "name warmer lookup failed; pausing until the next pass"
+                );
+                walk = Walk::Paused;
+                break;
+            }
+        }
+    }
+    for key in resolved {
+        warmer.pending.remove(&key);
+    }
+    if unreadable > 0 {
+        tracing::warn!(
+            target = %target.id.0,
+            ids = unreadable,
+            "name warmer could not read the catalog; those ids stay pending"
+        );
+    }
+    if all_time {
+        tracing::info!(
+            target = %target.id.0,
+            identities = warmer.verified.len(),
+            pending = warmer.pending.len(),
+            "name warmer: all-time pass complete; listing incrementally from today"
+        );
+    }
+    walk
 }
 
 /// Applies retention pruning when the target has not been pruned today yet.
@@ -1356,5 +1570,59 @@ mod tests {
             !HOUR_BACKFILL_RUNNING.load(Ordering::Acquire),
             "the pass ended (or unwound): prunes resume"
         );
+    }
+
+    #[test]
+    fn name_key_collapses_pet_variants_onto_the_species() {
+        let young = ItemRef::Pet { species: 264, level: 1, quality: 3, breed: 11 };
+        let grown = ItemRef::Pet { species: 264, level: 25, quality: 5, breed: 4 };
+        assert_eq!(NameKey::of(&young), NameKey::of(&grown));
+        assert_eq!(NameKey::of(&ItemRef::Item { item_id: 264 }), NameKey::Item(264));
+        // Species ids are their own namespace: a cataloged item with the same
+        // number says nothing about the pet.
+        assert_ne!(NameKey::of(&young), NameKey::of(&ItemRef::Item { item_id: 264 }));
+    }
+
+    #[test]
+    fn ring_recheck_returns_only_stale_confirmations_and_covers_every_slot() {
+        let mut warmer = TargetWarmer::default();
+        assert!(warmer.due(0).is_empty(), "an empty ring has nothing due");
+
+        let confirmed_at = 100;
+        for id in 1..=3 {
+            warmer.confirm(NameKey::Item(id), confirmed_at);
+        }
+        assert!(warmer.due(confirmed_at).is_empty(), "fresh confirmations are not due");
+        assert!(warmer.is_fresh(&NameKey::Item(1), confirmed_at + WARMER_REVERIFY_SECONDS));
+        assert!(
+            !warmer.is_fresh(&NameKey::Item(1), confirmed_at + WARMER_REVERIFY_SECONDS + 1),
+            "one second past the window the confirmation no longer counts"
+        );
+
+        let later = confirmed_at + WARMER_REVERIFY_SECONDS + 1;
+        let mut due = warmer.due(later);
+        due.sort_unstable();
+        assert_eq!(
+            due,
+            vec![NameKey::Item(1), NameKey::Item(2), NameKey::Item(3)],
+            "a lap re-checks every known identity"
+        );
+
+        // Re-confirming one leaves only the others due on the next lap.
+        warmer.confirm(NameKey::Item(2), later);
+        let mut due = warmer.due(later);
+        due.sort_unstable();
+        assert_eq!(due, vec![NameKey::Item(1), NameKey::Item(3)]);
+    }
+
+    #[test]
+    fn confirming_a_known_identity_restamps_its_slot_instead_of_growing_the_ring() {
+        let mut warmer = TargetWarmer::default();
+        warmer.confirm(NameKey::Species(7), 10);
+        warmer.confirm(NameKey::Species(7), 20);
+        assert_eq!(warmer.verified.len(), 1);
+        assert_eq!(warmer.index.len(), 1);
+        assert!(warmer.is_fresh(&NameKey::Species(7), 20 + WARMER_REVERIFY_SECONDS));
+        assert!(!warmer.is_fresh(&NameKey::Species(8), 20), "unknown ids are never fresh");
     }
 }

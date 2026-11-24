@@ -35,6 +35,8 @@ use amtracker_core::{
     domain::{
         utc_day,
         Category,
+        FeedFormat,
+        FeedSnapshot,
         FetchOutcome,
         Flavor,
         ItemRef,
@@ -51,6 +53,7 @@ use amtracker_core::{
     ports::{
         AuctionSourcePort,
         ClockPort,
+        FeedRenderer,
         ItemInfoPort,
     },
     services::{
@@ -272,10 +275,22 @@ fn test_state_with_config(
     item_info: Arc<dyn ItemInfoPort>,
     mutate: impl FnOnce(&mut TrackerConfig),
 ) -> (Arc<AppState>, PathBuf) {
+    test_state_build(token_env, item_info, None, mutate)
+}
+
+/// Same, with an optional clock override: every service sharing `clock`
+/// (store stamps, catalog windows, the warmer, the response caches) then
+/// runs on time the test moves by hand.
+fn test_state_build(
+    token_env: Option<String>,
+    item_info: Arc<dyn ItemInfoPort>,
+    clock_override: Option<Arc<dyn ClockPort>>,
+    mutate: impl FnOnce(&mut TrackerConfig),
+) -> (Arc<AppState>, PathBuf) {
     let root = temp_root("state");
     let mut config = config(token_env);
     mutate(&mut config);
-    let clock: Arc<dyn ClockPort> = Arc::new(SystemClock);
+    let clock: Arc<dyn ClockPort> = clock_override.unwrap_or_else(|| Arc::new(SystemClock));
     let store = Arc::new(
         SqliteStore::open(
             &root.join("db.sqlite3"),
@@ -347,6 +362,10 @@ fn test_state_with_config(
         )),
         publisher: Arc::new(FileFeedPublisher::new(root.join("feeds"))),
         renderer: Arc::new(FeedCodec),
+        response_cache: amtracker_server::web::cache::ResponseCache::new(
+            clock.clone(),
+            i64::try_from(config.server.feed_publish_secs).unwrap_or(i64::MAX),
+        ),
         cycle: Arc::new(IngestCycleService::new(
             Arc::new(OfflineSource),
             store.clone(),
@@ -1793,7 +1812,7 @@ async fn warm_up_names_pets_through_the_pet_table() {
     // ...while pet species 264 has fold data but no pet-catalog row.
     seed_pet_history(&state);
 
-    let pass = amtracker_server::scheduler::warm_pass(&state, &state.config);
+    let pass = amtracker_server::scheduler::NameWarmer::new().pass(&state);
 
     assert_eq!(
         state.catalog.known_pet(&flavor, 264),
@@ -1801,6 +1820,224 @@ async fn warm_up_names_pets_through_the_pet_table() {
         "the warmer must consult the pet table for species ids"
     );
     assert!(pass.fetched >= 1, "species 264 must have cost a source lookup");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Clock the tests move by hand (enrichment windows, cache intervals).
+struct SettableClock(Arc<std::sync::Mutex<i64>>);
+
+impl ClockPort for SettableClock {
+    fn now(&self) -> i64 {
+        *self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl SettableClock {
+    fn advance(&self, secs: i64) {
+        let mut now = self.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *now += secs;
+    }
+}
+
+/// One day fold (four listings) for a plain item on `day`, saved under the
+/// commodity category — the warmer/history fixtures.
+fn save_item_fold(state: &AppState, item_id: i64, day: i64) {
+    let item = ItemRef::Item { item_id };
+    let mut fold = DayFold::new(item.clone());
+    let listings: Vec<NormalizedListing> =
+        (0..4).map(|n| listing(item_id * 1_000 + n, &item, 100)).collect();
+    fold.apply(&listings);
+    state
+        .history
+        .save_fold(&TargetId(TARGET.into()), &item, day, Category::Commodity, &fold)
+        .expect("save fold");
+}
+
+/// The warmer lists all-time ONCE (the first pass after boot) and then only
+/// identities with a fold since the previous pass: a backdated fold written
+/// later is not re-listed, while anything folding today is picked up on the
+/// next pass. (Regression: every pass used to re-list all-time — a full scan
+/// of the day folds under the store mutex every 30 seconds.)
+#[tokio::test]
+async fn warmer_lists_all_time_once_then_only_what_folded_since() {
+    let (state, root) = test_state_build(None, Arc::new(StaticItemInfo), None, |config| {
+        config.catalog.warm_pace_ms = 0;
+    });
+    let flavor = Flavor::default();
+    let today = utc_day(state.clock.now());
+    save_item_fold(&state, 1_001, today - 40);
+
+    let mut warmer = amtracker_server::scheduler::NameWarmer::new();
+    let first = warmer.pass(&state);
+    assert_eq!(first.fetched, 1, "the boot pass reaches back through all of history");
+    assert_eq!(state.catalog.known(&flavor, 1_001), Ok(true));
+
+    // Written after the cursor moved to today: a fold forty days back is
+    // invisible to the incremental listing...
+    save_item_fold(&state, 1_002, today - 40);
+    // ...while a fold landing today is not.
+    save_item_fold(&state, 1_003, today);
+    let second = warmer.pass(&state);
+    assert_eq!(second.fetched, 1, "only today's newcomer costs a lookup");
+    assert_eq!(state.catalog.known(&flavor, 1_003), Ok(true));
+    assert_eq!(
+        state.catalog.known(&flavor, 1_002),
+        Ok(false),
+        "backdated folds wait for the next boot's all-time pass"
+    );
+
+    // Nothing new: an idle pass examines nothing and asks nothing.
+    let idle = warmer.pass(&state);
+    assert_eq!(
+        idle,
+        amtracker_server::scheduler::WarmPassStats::default(),
+        "steady state costs no catalog reads"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// Unresolved ids are carried from pass to pass and skipped while the
+/// negative cache still defers them — neither dropped nor re-asked hot.
+#[tokio::test]
+async fn warmer_carries_unresolved_ids_and_skips_deferred_ones() {
+    // NoItemInfo: the source has no record for anything.
+    let (state, root) = test_state_build(None, Arc::new(NoItemInfo), None, |config| {
+        config.catalog.warm_pace_ms = 0;
+    });
+    save_item_fold(&state, 2_001, utc_day(state.clock.now()));
+
+    let mut warmer = amtracker_server::scheduler::NameWarmer::new();
+    let first = warmer.pass(&state);
+    assert_eq!((first.fetched, first.deferred), (1, 0), "asked once, remembered negatively");
+    let second = warmer.pass(&state);
+    assert_eq!(
+        (second.fetched, second.deferred),
+        (0, 1),
+        "deferred: no second request inside the negative window"
+    );
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// A named id is re-checked on the slow ring: once its catalog row is past
+/// the enrichment window it is fetched again — without any pass re-listing
+/// the whole history.
+#[tokio::test]
+async fn warmer_rechecks_named_ids_on_the_slow_ring() {
+    let settable = Arc::new(SettableClock(Arc::new(std::sync::Mutex::new(1_760_000_000))));
+    let clock: Arc<dyn ClockPort> = settable.clone();
+    let (state, root) = test_state_build(None, Arc::new(StaticItemInfo), Some(clock), |config| {
+        config.catalog.warm_pace_ms = 0;
+    });
+    let flavor = Flavor::default();
+    // Older than any day cursor: only the ring can bring this id back.
+    save_item_fold(&state, 3_001, utc_day(settable.now()) - 40);
+
+    let mut warmer = amtracker_server::scheduler::NameWarmer::new();
+    let first = warmer.pass(&state);
+    assert_eq!(first.fetched, 1, "named by the all-time pass");
+    assert_eq!(state.catalog.known(&flavor, 3_001), Ok(true));
+
+    // A day on, the ring visits the id and finds the row still fresh.
+    settable.advance(86_400 + 60);
+    let rechecked = warmer.pass(&state);
+    assert_eq!(
+        (rechecked.candidates, rechecked.fetched),
+        (1, 0),
+        "the ring re-checks the id; a fresh row costs no request"
+    );
+
+    // Thirty-one days after its fetch the row is past the enrichment window
+    // (the static source never fills the class): the ring heals it.
+    settable.advance(31 * 86_400);
+    let healed = warmer.pass(&state);
+    assert_eq!(healed.fetched, 1, "the stale row is fetched again");
+    assert_eq!(state.catalog.known(&flavor, 3_001), Ok(true));
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `/api/feed.json` serves the copy the scheduler publishes — never a
+/// per-request whole-market rebuild — and, like `/feed.lua`, answers 404
+/// until the first publication.
+#[tokio::test]
+async fn api_feed_json_serves_the_published_copy() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) = get(router.clone(), "/api/feed.json?target=t1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing published yet");
+
+    let published = FeedCodec
+        .render(
+            &FeedSnapshot {
+                target: TargetId(TARGET.into()),
+                generated_at: 1_760_000_000,
+                entries: Vec::new(),
+            },
+            FeedFormat::Json,
+        )
+        .expect("render");
+    state
+        .publisher
+        .publish(&TargetId(TARGET.into()), FeedFormat::Json, &published)
+        .expect("publish");
+    // A rebuild would see this fold; the published copy must win.
+    seed_history(&state);
+
+    let (status, body) = get(router, "/api/feed.json?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_bytes(), published.as_slice(), "served verbatim");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The slim feed is cached between requests, and a watchlist change shows on
+/// the very next request — long before the publish interval would expire the
+/// cached copy.
+#[tokio::test]
+async fn feed_slim_lua_is_cached_and_refreshed_by_watchlist_changes() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    // A second tradable item, not watched yet.
+    save_item_fold(&state, 2590, utc_day(state.clock.now()));
+    let target = TargetId(TARGET.into());
+    state.watchlist.add(&target, ItemRef::Item { item_id: 2589 }, None).expect("watch item");
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, first) = get(router.clone(), "/feed-slim.lua?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(first.contains("itemID = 2589"), "the watched item is exported");
+    assert!(!first.contains("itemID = 2590"), "unwatched items stay out");
+    let (_, again) = get(router.clone(), "/feed-slim.lua?target=t1").await;
+    assert_eq!(again, first, "unchanged watchlist: the cached copy");
+
+    // Straight through the service, as the mutation handlers do: the cached
+    // copy was rendered from another watchlist revision.
+    state.watchlist.add(&target, ItemRef::Item { item_id: 2590 }, None).expect("watch second item");
+    let (_, grown) = get(router, "/feed-slim.lua?target=t1").await;
+    assert!(grown.contains("itemID = 2590"), "the new entry shows at once");
+    assert!(grown.contains("itemID = 2589"), "and the earlier one stays");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `/api/history` reads the whole market once per category per TTL; within
+/// the window every request — whatever its `days` — is served from that
+/// read, so repeated calls never multiply whole-market scans.
+#[tokio::test]
+async fn api_history_reads_the_market_once_per_ttl() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, first) = get(router.clone(), "/api/history?target=t1&days=7").await;
+    assert_eq!(status, StatusCode::OK);
+    // New folds land; inside the TTL the cached read still answers.
+    save_item_fold(&state, 9_001, utc_day(state.clock.now()));
+    let (_, second) = get(router.clone(), "/api/history?target=t1&days=7").await;
+    assert_eq!(second, first, "within the TTL the whole-market read is not repeated");
+    let (_, narrow) = get(router, "/api/history?target=t1&days=1").await;
+    let json: Value = serde_json::from_str(&narrow).expect("history json");
+    let rows = json["rows"].as_array().expect("rows array");
+    assert_eq!(rows.len(), 1, "the one-day window keeps only today's fold");
+    assert_eq!(rows[0]["item"]["itemID"], 2589);
+    assert_eq!(json["sinceDay"], json["rows"][0]["day"], "sinceDay names the window's first day");
     std::fs::remove_dir_all(&root).ok();
 }
 

@@ -2,7 +2,8 @@
 //! opportunities, overview, watchlist, help), the JSON API surface, feed
 //! downloads, and token-gated mutation endpoints. Rendering helpers live in
 //! [`render`], the embedded assets in [`assets`], handlers in [`pages`] and
-//! [`api`].
+//! [`api`], and the request-time caches for the whole-market read paths in
+//! [`cache`].
 
 // Handlers stay `async` even when they never await so every axum route
 // signature is uniform and stays forward-compatible with async extraction.
@@ -12,6 +13,7 @@
 
 pub mod api;
 pub mod assets;
+pub mod cache;
 pub mod openapi;
 pub mod pages;
 pub mod render;
@@ -107,8 +109,12 @@ pub struct AppState {
     /// Alert rule evaluation + CRUD behind the scheduler's post-cycle pass
     /// and the `/alerts` page/API.
     pub alerts: Arc<amtracker_core::services::alert::AlertEvaluationService>,
-    /// Feed assembly shared by the JSON endpoint and the Lua downloads.
+    /// Feed assembly behind the scheduler's full-feed publish and the
+    /// on-demand slim Lua download.
     pub feed_export: Arc<FeedExportService>,
+    /// Request-time caches for the whole-market read paths: the slim Lua
+    /// feed and `/api/history`'s day rows (see [`cache`]).
+    pub response_cache: cache::ResponseCache,
     /// Published feed bytes backing the cached `/feed.lua` download.
     pub publisher: Arc<dyn FeedPublisher>,
     /// Feed serialization into Lua/JSON byte payloads.

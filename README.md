@@ -267,12 +267,12 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`) and the response names the `snapshot` they come from. `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
 | `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first — the same two response shapes as opportunities |
 | `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents, the output's value and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out |
-| `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
+| `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7). The market is read once per category per 300 s; every `days` window is served from that read |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
 | `GET /api/browse?target=&kind=&snapshot=&q=&item=&class=&quality=&sort=&dir=&page=` | one page (50 rows) of a stored snapshot's listings joined to their catalog identity; without `snapshot` the newest for the pair serves; `sort=price\|qty\|time` (default price asc, `dir=desc` flips) |
 | `GET /api/snapshots?target=&kind=&limit=` | snapshot metadata rows, newest first (`kind=commodities\|auctions`) |
-| `GET /api/feed.json` | machine-readable feed (future companion client) |
+| `GET /api/feed.json` | the published `feed.json` — the same file the scheduler writes after each successful cycle (throttled by `server.feed_publish_secs`), never rebuilt per request; 404 until the first publish |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` | every watchlist entry joined to its metric blocks, sale rate and 30-day trend — one batched read (the live watchlist page's contract) |
 | `GET /api/priorities?target=&category=` | the watchlist ranked best sell first: score (50% liquidity + 30% momentum + 20% recency) with components, current-day median, week block and trend rows (the `/priorities` page's contract; default category `item`) |
@@ -281,7 +281,7 @@ switcher in the top bar works on every target-scoped page.
 | `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"floor-below","copper":10000}` \| `{"type":"floor-below-value","fraction":0.5}` \| `{"type":"new-listing-below","fraction":0.5}` \| `{"type":"sale-rate-above","rate":0.3}` \| `{"type":"days-since-last-sale-above","days":14}` |
 | `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
-| `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |
+| `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target). `feed-slim.lua` is built on demand, cached for `server.feed_publish_secs`, and refreshed on the next request after any watchlist change |
 
 The API is designed to be driven by agents and scripts: `GET /api` is a
 discoverable index, `/api/openapi.json` serves the OpenAPI 3.1 contract
@@ -303,9 +303,11 @@ actions stay API-only. Item and pet names resolve through Wowhead's
 credential-free endpoints first (`[catalog]`, optional Blizzard fallback)
 and are cached permanently in the per-flavor `item_catalog`/`pet_catalog`
 tables — no credentials needed, every id is fetched once. A background
-warmer thread continuously resolves every id ever folded (paced by
+warmer thread resolves every id ever folded (paced by
 `[catalog].warm_batch` / `warm_pace_ms`), so unnamed ids drain to zero
-without waiting on ingest cycles.
+without waiting on ingest cycles. It lists all-time once at boot and then
+only what folded since its previous pass (re-checking known ids about once a
+day), so its steady state costs no whole-market scans.
 
 Opportunities and overview are served from scans the scheduler prepares in
 the background: once right after startup, after each successful ingest cycle

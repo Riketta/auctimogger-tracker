@@ -298,7 +298,8 @@ fn spec_paths_market(target: &Value) -> Value {
                     "One call, whole market: per-item-per-day aggregate rows for every item/pet with fold data in the window. ",
                     "This is the analysis-grade bulk payload — feed it straight into pandas/a script. ",
                     "Days are UTC day numbers (days since 1970-01-01). min/p05/median/mad are listing-level nearest-rank stats in copper. ",
-                    "Rows arrive ordered by day, then item kind, then item id."
+                    "Rows arrive ordered by day, then item kind, then item id. ",
+                    "Rows are read once per category per 300 seconds (the prepared scans' cadence); any days window is served from that cache."
                 ),
                 vec![
                     target.clone(),
@@ -405,11 +406,12 @@ fn spec_paths_items_and_feeds() -> Value {
             "get": json!({
                 "tags": ["feeds"],
                 "summary": "Full market feed (JSON)",
-                "description": "Per-item metric blocks and identities for the whole market — the addon feed in JSON form.",
+                "description": "Per-item metric blocks and identities for the whole market — the addon feed in JSON form. Served from the copy the scheduler publishes after each successful cycle (throttled by server.feed_publish_secs), exactly like /feed.lua; a request never rebuilds the market.",
                 "parameters": vec![feed_target_param()],
                 "responses": {
                     "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } },
                     "400": { "description": "Unknown target." },
+                    "404": { "description": "No feed published yet for the target." },
                     "500": { "description": "Store or internal failure." }
                 }
             }),
@@ -431,12 +433,11 @@ fn spec_paths_items_and_feeds() -> Value {
             "get": json!({
                 "tags": ["feeds"],
                 "summary": "Watchlist-only addon feed (Lua)",
-                "description": "Slim feed covering exactly the target's watchlist entries.",
+                "description": "Slim feed covering exactly the target's watchlist entries. Built on demand, then cached for the feed publish interval; a watchlist change shows on the next request.",
                 "parameters": vec![feed_target_param()],
                 "responses": {
                     "200": { "description": "OK", "content": { "text/x-lua": { "schema": { "type": "string" } } } },
-                    "400": { "description": "Unknown target." },
-                    "404": { "description": "No feed published yet for the target." }
+                    "400": { "description": "Unknown target." }
                 }
             }),
         },

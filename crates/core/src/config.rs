@@ -167,9 +167,11 @@ pub struct CatalogConfig {
     /// warmer names them. `0` disables inline source resolution only.
     pub render_resolve_max: u32,
     /// Source lookups one background warmer pass may make. The warmer is a
-    /// dedicated thread that continuously resolves every id ever seen in a
-    /// fold (all-time, all targets/categories, paced, see `warm_pace_ms`).
-    /// `0` disables the warmer thread entirely.
+    /// dedicated thread that resolves every id ever seen in a fold (all
+    /// targets/categories, paced, see `warm_pace_ms`): it lists all-time once
+    /// per boot, then only ids with folds since the previous pass, and
+    /// re-checks known ids about once a day. `0` disables the warmer thread
+    /// entirely.
     pub warm_batch: u32,
     /// Milliseconds the background warmer sleeps between two source lookups
     /// (politeness pacing for the credential-free adapters).

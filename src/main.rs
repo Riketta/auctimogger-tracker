@@ -48,7 +48,10 @@ use amtracker_server::{
         load_config,
         LoadedConfig,
     },
-    web::AppState,
+    web::{
+        cache::ResponseCache,
+        AppState,
+    },
 };
 use clap::{
     Parser,
@@ -708,6 +711,11 @@ fn build_app_state(
         )),
         publisher: Arc::new(FileFeedPublisher::new(PathBuf::from(&config.storage.feed_dir))),
         renderer: Arc::new(FeedCodec),
+        // Request-time caches; the slim feed follows the publish interval.
+        response_cache: ResponseCache::new(
+            clock.clone(),
+            i64::try_from(config.server.feed_publish_secs).unwrap_or(i64::MAX),
+        ),
         cycle: Arc::new(IngestCycleService::new(
             Arc::new(BlizzardSource::new()),
             store.clone(),

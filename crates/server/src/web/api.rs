@@ -13,6 +13,7 @@ use amtracker_core::{
     domain::{
         Category,
         FeedFormat,
+        ItemDayRow,
         PayloadKind,
         Span,
     },
@@ -39,10 +40,14 @@ use axum::{
     },
     Json,
 };
-use serde::Deserialize;
+use serde::{
+    Deserialize,
+    Serialize,
+};
 
 use super::{
     browse_query_params,
+    cache::HISTORY_MAX_DAYS,
     category_option,
     expected_api_token,
     known_target,
@@ -128,18 +133,23 @@ async fn feed_file(
         let target = target.clone();
         move || {
             if slim {
-                // slim is built on demand from the watchlist (no cached copy)
+                // Built on demand from the watchlist, then served from the
+                // cache until the publish interval passes or the watchlist
+                // revision moves (any add/remove, from any path).
                 let options = ExportOptions {
                     spans: state.config.metrics.spans.clone(),
                     watchlist_only: true,
                 };
-                state.feed_export.build_feed(&target, &options).and_then(|feed| {
-                    state
-                        .renderer
-                        .render(&feed, FeedFormat::Lua)
-                        .map(Some)
-                        .map_err(|e| StoreError::Backend(e.to_string()))
-                })
+                let bytes =
+                    state.response_cache.slim_feed(&target, state.watchlist.revision(), || {
+                        state.feed_export.build_feed(&target, &options).and_then(|feed| {
+                            state
+                                .renderer
+                                .render(&feed, FeedFormat::Lua)
+                                .map_err(|e| StoreError::Backend(e.to_string()))
+                        })
+                    })?;
+                Ok(Some(bytes.as_ref().clone()))
             } else {
                 state.publisher.read(&target, FeedFormat::Lua)
             }
@@ -184,7 +194,9 @@ pub(crate) async fn feed_lua(
     feed_file(state, params, false).await
 }
 
-/// `GET /feed-slim.lua?target=` — watchlist-only feed, built on demand.
+/// `GET /feed-slim.lua?target=` — watchlist-only feed: built on demand,
+/// then cached for the feed publish interval; a watchlist change shows on
+/// the very next request.
 pub(crate) async fn feed_slim_lua(
     state: State<Arc<AppState>>,
     params: Query<HashMap<String, String>>,
@@ -346,6 +358,11 @@ pub(crate) async fn api_openapi() -> Response {
 /// every price field is integer copper, days are UTC day numbers). Without
 /// `category`, rows of all three categories are concatenated (each row names
 /// its `category`); with it, only that category's rows.
+///
+/// Rows come from a per-category cache covering the longest servable window,
+/// read at most once per prepared-scan TTL: `days` is a filter over it, so
+/// neither the requested window nor repeated calls multiply whole-market
+/// reads.
 pub(crate) async fn api_history(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -358,48 +375,147 @@ pub(crate) async fn api_history(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let days = params.get("days").and_then(|v| v.parse::<i64>().ok()).map_or(7, |v| v.clamp(1, 30));
-    let computed = tokio::task::spawn_blocking({
+    let days = params
+        .get("days")
+        .and_then(|v| v.parse::<i64>().ok())
+        .map_or(7, |v| v.clamp(1, HISTORY_MAX_DAYS));
+    // The window reads (and the serialization of ~10^5 rows) are blocking
+    // work: keep them off the async workers.
+    let body = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || -> Result<(i64, Vec<amtracker_core::domain::ItemDayRow>), StoreError> {
+        move || -> Result<Vec<u8>, StoreError> {
             let today = amtracker_core::domain::utc_day(state.clock.now());
             let since_day = today.saturating_sub(days - 1);
-            let rows = match category {
-                Some(category) => state.history.item_day_rows(&target, since_day, category)?,
-                None => Category::ALL
-                    .iter()
-                    .map(|category| state.history.item_day_rows(&target, since_day, *category))
-                    .collect::<Result<Vec<Vec<_>>, _>>()?
-                    .into_iter()
-                    .flatten()
-                    .collect(),
-            };
-            Ok((since_day, rows))
+            let categories: &[Category] =
+                category.as_ref().map_or(&Category::ALL[..], std::slice::from_ref);
+            // One cached read per category; `days` never widens or narrows
+            // the read, it only selects from the cached window.
+            let mut cached: Vec<Arc<Vec<ItemDayRow>>> = Vec::with_capacity(categories.len());
+            for category in categories {
+                cached.push(state.response_cache.history_rows(&target, *category, || {
+                    state.history.item_day_rows(&target, today - HISTORY_MAX_DAYS + 1, *category)
+                })?);
+            }
+            // Categories in canonical order, each category's rows in the
+            // store's (day, kind, id) order — the documented row order.
+            let rows: Vec<&ItemDayRow> = cached
+                .iter()
+                .flat_map(|rows| rows.iter().filter(|row| row.day >= since_day))
+                .collect();
+            render_history(&target, category, days, since_day, &rows)
         }
     });
-    match computed.await {
-        Ok(Ok((since_day, rows))) => Json(serde_json::json!({
-            "target": target.as_str(),
-            "category": category.map_or_else(|| "all".to_string(), |c| c.as_str().to_string()),
-            "days": days,
-            "sinceDay": since_day,
-            "rows": rows.iter().map(|row| serde_json::json!({
-                "item": item_json(&row.item),
-                "category": row.category.as_str(),
-                "day": row.day,
-                "listingCount": row.listing_count,
-                "qtySum": row.qty_sum,
-                "min": row.min,
-                "p05": row.p05,
-                "median": row.median,
-                "mad": row.mad,
-            })).collect::<Vec<_>>(),
-        }))
-        .into_response(),
+    match body.await {
+        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
         Ok(Err(error)) => internal_error("history", &error),
         Err(error) => internal_error("history-join", &error),
     }
+}
+
+/// The `/api/history` envelope, serialized straight from the cached rows — no
+/// intermediate `Value` tree, which a 30-day whole-market payload (~10^5
+/// rows) would build and drop on every request.
+fn render_history(
+    target: &amtracker_core::domain::TargetId,
+    category: Option<Category>,
+    days: i64,
+    since_day: i64,
+    rows: &[&ItemDayRow],
+) -> Result<Vec<u8>, StoreError> {
+    let response = HistoryResponse {
+        target: target.as_str(),
+        category: category.map_or_else(|| "all".to_string(), |c| c.as_str().to_string()),
+        days,
+        since_day,
+        rows: HistoryRows(rows),
+    };
+    serde_json::to_vec(&response).map_err(|e| StoreError::Backend(format!("history render: {e}")))
+}
+
+/// The wire shape of one history row (camelCase, same as [`item_json`]).
+#[derive(Serialize)]
+struct HistoryRow<'a> {
+    item: HistoryItem,
+    category: &'a str,
+    day: i64,
+    #[serde(rename = "listingCount")]
+    listing_count: u64,
+    #[serde(rename = "qtySum")]
+    qty_sum: i64,
+    min: i64,
+    p05: i64,
+    median: i64,
+    mad: i64,
+}
+
+impl<'a> From<&'a ItemDayRow> for HistoryRow<'a> {
+    fn from(row: &'a ItemDayRow) -> Self {
+        Self {
+            item: HistoryItem::of(&row.item),
+            category: row.category.as_str(),
+            day: row.day,
+            listing_count: row.listing_count,
+            qty_sum: row.qty_sum,
+            min: row.min,
+            p05: row.p05,
+            median: row.median,
+            mad: row.mad,
+        }
+    }
+}
+
+/// Tagged item identity: `{"type":"item","itemID":n}` or the pet tuple.
+#[derive(Serialize)]
+#[serde(tag = "type", rename_all = "camelCase")]
+enum HistoryItem {
+    Item {
+        #[serde(rename = "itemID")]
+        item_id: i64,
+    },
+    Pet {
+        #[serde(rename = "speciesID")]
+        species: i64,
+        level: i64,
+        #[serde(rename = "qualityID")]
+        quality: i64,
+        #[serde(rename = "breedID")]
+        breed: i64,
+    },
+}
+
+impl HistoryItem {
+    fn of(item: &amtracker_core::domain::ItemRef) -> Self {
+        match *item {
+            amtracker_core::domain::ItemRef::Item { item_id } => Self::Item { item_id },
+            amtracker_core::domain::ItemRef::Pet { species, level, quality, breed } => Self::Pet {
+                species,
+                level: i64::from(level),
+                quality: i64::from(quality),
+                breed: i64::from(breed),
+            },
+        }
+    }
+}
+
+/// The row array, streamed one row at a time.
+struct HistoryRows<'a>(&'a [&'a ItemDayRow]);
+
+impl Serialize for HistoryRows<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(self.0.iter().copied().map(HistoryRow::from))
+    }
+}
+
+#[derive(Serialize)]
+struct HistoryResponse<'a> {
+    target: &'a str,
+    category: String,
+    days: i64,
+    /// First day included (UTC day number).
+    #[serde(rename = "sinceDay")]
+    since_day: i64,
+    rows: HistoryRows<'a>,
 }
 
 /// `GET /api/opportunities?target=&category=&min_churn=&limit=&sort=` — LIVE
@@ -944,7 +1060,10 @@ fn blocks_response(
     }
 }
 
-/// `GET /api/feed.json?target=` — the full feed, JSON rendering.
+/// `GET /api/feed.json?target=` — the published full feed: the very
+/// `feed.json` the scheduler writes after each successful cycle (throttled by
+/// `server.feed_publish_secs`), the JSON twin of `/feed.lua`. Served as-is —
+/// a request never rebuilds the whole market.
 pub(crate) async fn api_feed_json(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -953,24 +1072,21 @@ pub(crate) async fn api_feed_json(
         Ok(target) => target,
         Err(response) => return *response,
     };
-    let options =
-        ExportOptions { spans: state.config.metrics.spans.clone(), watchlist_only: false };
-    // Feed assembly touches SQLite and lots of folds; keep it off the async
-    // workers (render errors map into the same store-error shape as build).
-    let payload = tokio::task::spawn_blocking({
+    // A multi-megabyte file read: keep it off the async workers.
+    let read = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || {
-            state.feed_export.build_feed(&target, &options).and_then(|feed| {
-                state
-                    .renderer
-                    .render(&feed, FeedFormat::Json)
-                    .map_err(|e| StoreError::Backend(e.to_string()))
-            })
-        }
+        move || state.publisher.read(&target, FeedFormat::Json)
     });
-    match payload.await {
-        Ok(Ok(bytes)) => ([(header::CONTENT_TYPE, "application/json")], bytes).into_response(),
+    match read.await {
+        Ok(Ok(Some(bytes))) => {
+            ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
+        }
+        Ok(Ok(None)) => (
+            StatusCode::NOT_FOUND,
+            format!("no feed published yet for target '{}'", target.as_str()),
+        )
+            .into_response(),
         Ok(Err(error)) => internal_error("feed-json", &error),
         Err(error) => internal_error("feed-json-join", &error),
     }
