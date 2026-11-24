@@ -31,6 +31,8 @@ use amtracker_core::{
         NewSnapshot,
         NormalizedListing,
         PayloadKind,
+        SnapshotFloor,
+        SnapshotListing,
         SnapshotStatus,
         Span,
         TargetId,
@@ -567,10 +569,10 @@ fn sell_through_credits_band_violations_only() {
         store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate").expect("rate");
     assert!((rate - 1.0).abs() < 1e-9, "all vanishings credited so far");
 
-    // item 2 closed past its band floor: credited stays 0, denominator 1.
-    let rate2 =
-        store.sale_rate(&target, &item(2), 14, Category::Commodity).expect("rate").expect("rate");
-    assert_eq!(rate2, 0.0);
+    // item 2's only close was a MEDIUM-band expiry: not credit-eligible, so
+    // the window holds no evidence — `None`, never a zero (the listings
+    // fallback that read it as 0% sold is gone).
+    assert_eq!(store.sale_rate(&target, &item(2), 14, Category::Commodity).expect("rate2"), None);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -1037,8 +1039,10 @@ fn sale_rates_chunking_merges_results_across_chunk_boundaries() {
     assert_eq!(rates.len(), expected_len, "positionally aligned across all chunks");
     for (index, rate) in rates.iter().enumerate() {
         let index = i64::try_from(index).unwrap();
-        let expected = if dropped.contains(&index) { 1.0 } else { 0.0 };
-        assert_eq!(*rate, Some(expected), "index {index} (chunk {})", index / CHUNK);
+        // A vanished listing credited (1/1); a listing still up has no
+        // eligible close and reads as no evidence.
+        let expected = if dropped.contains(&index) { Some(1.0) } else { None };
+        assert_eq!(*rate, expected, "index {index} (chunk {})", index / CHUNK);
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -1998,11 +2002,14 @@ fn credits_book_on_the_open_day_so_sale_rate_stays_within_one() {
         assert_eq!(open_day_rows, 2, "listings book on their open days (96 and 100) only");
     }
 
-    // Window rate: in-window credits (0 — both booked on day 96) over
-    // in-window listings (1) — NOT 2/1 under close-day booking.
-    let rate =
-        store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate").expect("rate");
-    assert!((rate - 0.0).abs() < 1e-9, "pre-window opens must not inflate the window rate: {rate}");
+    // The only in-window listing (opened day 100) has not closed: no
+    // credit-eligible evidence, so the window reads as `None` — the pre-window
+    // credits booked on day 96 cannot leak into it under any denominator.
+    assert_eq!(
+        store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate"),
+        None,
+        "pre-window opens and credits must not fabricate a window rate"
+    );
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2088,7 +2095,7 @@ fn id_reuse_reversal_books_on_the_prior_identity_and_reopens_under_the_new_one()
     // Item 1's phantom credit is reversed on ITEM 1's ledger; item 2 got a
     // fresh listing event so its later credit has a denominator.
     let rate1 = store.sale_rate(&target, &item(1), 14, Category::Commodity).expect("rate1");
-    assert_eq!(rate1, Some(0.0), "item 1: phantom credit fully reversed");
+    assert_eq!(rate1, None, "item 1: phantom credit fully reversed, no evidence left");
     {
         let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
         let (item1_listings, item1_credited): (i64, i64) = conn
@@ -2172,8 +2179,9 @@ fn commodity_partial_fills_book_units_without_listing_counts() {
     store.observe(&target, PayloadKind::Commodities, &partial2, 3, 12_000).expect("observe f3");
     assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(110));
 
-    // Fills never touch the listing-rate ledger: one listing, no credits.
-    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(0.0));
+    // Fills never touch the listing-rate ledger: one listing, no eligible
+    // close — no rate evidence at all, not a zero.
+    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), None);
 
     // The remainder vanishes early (VERY_LONG, 1h gap): credited, and its
     // remaining 90 units book on the close — the original 200 fully
@@ -2283,7 +2291,9 @@ fn sale_rate_denominator_counts_only_credit_eligible_closes() {
         Some(0.5)
     );
 
-    // Pre-v10 rows (eligible = 0) fall back to the listings denominator.
+    // A pre-upgrade row (eligible = 0) carries no eligible evidence either:
+    // the listings-denominator fallback is gone (the ledger holds no such
+    // rows), so it reads as `None` instead of 1/4.
     {
         let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("seed");
         conn.execute("INSERT OR IGNORE INTO item_ref (kind, item_id) VALUES ('item', 3)", [])
@@ -2294,10 +2304,53 @@ fn sale_rate_denominator_counts_only_credit_eligible_closes() {
         )
         .expect("seed pre-v10 row");
     }
+    assert_eq!(store.sale_rate(&target, &item(3), 14, Category::Commodity).expect("rate3"), None);
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// No eligible close is `None`; an eligible close that did NOT credit (a
+/// LONG-band listing that stayed gone past its band's lower bound — an
+/// expiry) is a genuine zero. The two must never read the same.
+#[test]
+fn an_eligible_uncredited_close_is_a_true_zero_rate() {
+    let dir = temp_dir("eligible-zero");
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+    let expiring = item(5);
+    let still_open = item(6);
+    let with_band = |auction_id: i64, item: &ItemRef, band: TimeLeftBand| NormalizedListing {
+        time_left: band,
+        ..listing(auction_id, item, 100, 1)
+    };
+
+    let batch = [
+        with_band(9, &expiring, TimeLeftBand::Long),
+        with_band(10, &still_open, TimeLeftBand::VeryLong),
+    ];
+    store.record(&snap(&target, PayloadKind::Commodities, 10_000, 2), &batch, b"z1").expect("z1");
+    store.observe(&target, PayloadKind::Commodities, &batch, 1, 10_000).expect("observe z1");
     assert_eq!(
-        store.sale_rate(&target, &item(3), 14, Category::Commodity).expect("rate3"),
-        Some(0.25)
+        store.sale_rate(&target, &expiring, 14, Category::Commodity).expect("open"),
+        None,
+        "nothing has closed yet: no evidence, not a zero"
     );
+
+    // Two hours and a minute later listing 9 is gone and listing 10 remains.
+    // A LONG-band listing vanishing only after its band's 2h lower bound
+    // expired naturally: eligible for the denominator, never credited.
+    let later = 10_000 + 2 * 3_600 + 60;
+    let kept = [with_band(10, &still_open, TimeLeftBand::VeryLong)];
+    store.record(&snap(&target, PayloadKind::Commodities, later, 1), &kept, b"z2").expect("z2");
+    store.observe(&target, PayloadKind::Commodities, &kept, 2, later).expect("observe z2");
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 2, later).expect("close");
+    assert!(credits.is_empty(), "a 2h+ vanish is an expiry, not a sale");
+    assert_eq!(
+        store.sale_rate(&target, &expiring, 14, Category::Commodity).expect("expired"),
+        Some(0.0),
+        "an eligible close without a credit is a true 0%"
+    );
+    assert_eq!(store.sale_rate(&target, &still_open, 14, Category::Commodity).expect("open"), None);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2326,7 +2379,11 @@ fn reopen_reverses_eligible_and_units_alongside_the_credit() {
     store.record(&snap(&target, PayloadKind::Commodities, 12_000, 1), &first, b"r3").expect("r3");
     store.observe(&target, PayloadKind::Commodities, &first, 3, 12_000).expect("reobserve r3");
     assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("units"), Some(0));
-    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(0.0));
+    assert_eq!(
+        store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"),
+        None,
+        "the reversed close leaves no eligible evidence behind"
+    );
     {
         let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect");
         let (eligible, credited, closed): (i64, i64, i64) = conn
@@ -2343,8 +2400,8 @@ fn reopen_reverses_eligible_and_units_alongside_the_credit() {
 }
 
 /// v10 re-adds `sales.eligible` to downgraded files without disturbing the
-/// ledger rows; legacy rows keep eligible = 0 and the rate falls back to the
-/// listings denominator.
+/// ledger rows; the legacy row (eligible = 0) carries no eligible evidence
+/// and reads as `None`.
 #[test]
 fn v10_migration_readds_eligible_preserving_ledger_rows() {
     let dir = temp_dir("v10-eligible");
@@ -2366,7 +2423,7 @@ fn v10_migration_readds_eligible_preserving_ledger_rows() {
         conn.pragma_update(None, "user_version", 9).expect("stamp v9");
     }
     // Reopening migrates back; the ledger row survives with eligible = 0
-    // (legacy), so the rate falls back to the listings denominator.
+    // (legacy), which is no eligible evidence — `None`.
     let store = open_store(&dir, 20_000);
     let target = TargetId("us-4".into());
     let item1 = item(1);
@@ -2384,7 +2441,7 @@ fn v10_migration_readds_eligible_preserving_ledger_rows() {
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
         assert_eq!(version, 10);
     }
-    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), Some(0.0));
+    assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), None);
 
     std::fs::remove_dir_all(&dir).ok();
 }
@@ -2553,5 +2610,248 @@ fn pooled_sale_recency_takes_the_newest_variant_sale_and_sums_closures_after_it(
         .expect("sale_recency_multi quiet");
     assert_eq!(quiet, None);
 
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+// ------------------------------------------------------ live snapshot floors
+
+/// `record` writes one live-floor row per item in the same transaction as the
+/// listing rows: the floor, how much of it is listed, and the item's whole
+/// presence in the snapshot.
+#[test]
+fn record_writes_per_item_snapshot_floors() {
+    let dir = temp_dir("snapshot-floors");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let id = store
+        .record(
+            &snap(&target, PayloadKind::Commodities, 1_000_000, 6),
+            &[
+                listing(1, &item(1), 100, 20),
+                // A second listing at the floor: the deal is 25 units deep.
+                listing(2, &item(1), 100, 5),
+                listing(3, &item(1), 250, 10),
+                listing(4, &item(2), 999, 1),
+                listing(5, &item(2), 999, 2),
+                listing(6, &item(2), 999, 3),
+            ],
+            b"floors".as_slice(),
+        )
+        .expect("record");
+
+    let floors = store.floors(&target, PayloadKind::Commodities, id).expect("floors");
+    assert_eq!(floors.len(), 2);
+    assert_eq!(
+        floors.get(&item(1)),
+        Some(&SnapshotFloor { floor_price: 100, floor_qty: 25, listing_count: 3, qty_sum: 35 })
+    );
+    assert_eq!(
+        floors.get(&item(2)),
+        Some(&SnapshotFloor { floor_price: 999, floor_qty: 6, listing_count: 3, qty_sum: 6 })
+    );
+    assert_eq!(
+        store.floor(&target, &item(1), id).expect("floor"),
+        floors.get(&item(1)).copied(),
+        "the point read agrees with the bulk read"
+    );
+    assert!(
+        store.floor(&target, &item(3), id).expect("absent floor").is_none(),
+        "an item the snapshot does not list has no floor"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A snapshot recorded before the floor table existed heals on first read:
+/// its summary is rebuilt from the retained listings, once, and a caller
+/// naming the wrong target/kind for it is refused instead of answered.
+#[test]
+fn floors_rebuild_from_listings_when_rows_are_missing() {
+    let dir = temp_dir("floors-heal");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    let id = store
+        .record(
+            &snap(&target, PayloadKind::Commodities, 1_000_000, 2),
+            &[listing(1, &item(1), 100, 7), listing(2, &item(1), 90, 3)],
+            b"legacy".as_slice(),
+        )
+        .expect("record");
+    // The pre-upgrade shape: the snapshot and its listings, but no summary.
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("open db");
+        conn.execute("DELETE FROM snapshot_item_floor", []).expect("drop floor rows");
+    }
+
+    assert!(
+        store.floors(&target, PayloadKind::Auctions, id).is_err(),
+        "a snapshot of another payload kind is refused, not summarized"
+    );
+    let floors = store.floors(&target, PayloadKind::Commodities, id).expect("floors");
+    assert_eq!(
+        floors.get(&item(1)).map(|f| (f.floor_price, f.floor_qty, f.listing_count)),
+        Some((90, 3, 2)),
+        "rebuilt from the listings: the cheapest stack, its quantity, both listings"
+    );
+    // The rebuilt rows persist.
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot_item_floor WHERE snapshot_id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(rows, 1);
+    }
+    assert_eq!(store.floor(&target, &item(1), id).expect("floor").map(|f| f.floor_price), Some(90));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// New-listing reads join each of the item's live listings to its sighting:
+/// a listing the newest snapshot first saw names that snapshot, one that was
+/// already up names the earlier one.
+#[test]
+fn listings_for_item_report_which_snapshot_first_saw_each_listing() {
+    let dir = temp_dir("snapshot-listings");
+    let store = open_store(&dir, 20_000);
+    let target = TargetId("us-4".into());
+    let first = [listing(1, &item(1), 500, 2), listing(2, &item(1), 700, 1)];
+    let s1 = store
+        .record(&snap(&target, PayloadKind::Commodities, 10_000, 2), &first, b"s1")
+        .expect("s1");
+    store.observe(&target, PayloadKind::Commodities, &first, s1, 10_000).expect("observe s1");
+    let second = [listing(1, &item(1), 500, 2), listing(3, &item(1), 200, 72)];
+    let s2 = store
+        .record(&snap(&target, PayloadKind::Commodities, 11_000, 2), &second, b"s2")
+        .expect("s2");
+    store.observe(&target, PayloadKind::Commodities, &second, s2, 11_000).expect("observe s2");
+
+    let rows =
+        store.listings_for_item(&target, &item(1), PayloadKind::Commodities, s2).expect("listings");
+    assert_eq!(rows.len(), 2, "only the newest snapshot's listings, cheapest first");
+    assert_eq!(
+        rows[0],
+        SnapshotListing {
+            auction_id: 3,
+            unit_price: 200,
+            quantity: 72,
+            first_seen_snapshot: Some(s2),
+            first_seen_at: Some(11_000),
+        },
+        "new to the newest snapshot"
+    );
+    assert_eq!(rows[1].auction_id, 1);
+    assert_eq!(rows[1].first_seen_snapshot, Some(s1), "already up an hour ago");
+    assert_eq!(rows[1].first_seen_at, Some(10_000));
+    assert!(store
+        .listings_for_item(&target, &item(2), PayloadKind::Commodities, s2)
+        .expect("listings")
+        .is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The floor rows leave with their listings: a prune past a snapshot's day
+/// drops its summary and keeps a newer snapshot's.
+#[test]
+fn prune_drops_snapshot_floors_with_their_listings() {
+    let dir = temp_dir("floors-prune");
+    let store = open_store(&dir, 30 * 86_400);
+    let target = TargetId("us-4".into());
+    let old = store
+        .record(
+            &snap(&target, PayloadKind::Commodities, 10 * 86_400, 1),
+            &[listing(1, &item(1), 100, 1)],
+            b"old",
+        )
+        .expect("old");
+    let fresh = store
+        .record(
+            &snap(&target, PayloadKind::Commodities, 30 * 86_400, 1),
+            &[listing(2, &item(2), 300, 1)],
+            b"new",
+        )
+        .expect("new");
+
+    store.prune_raw_before(&target, 20).expect("prune");
+
+    {
+        let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("inspect db");
+        let old_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM snapshot_item_floor WHERE snapshot_id = ?1",
+                [old],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(old_rows, 0, "the pruned snapshot's summary is gone");
+    }
+    assert!(
+        store.floor(&target, &item(1), old).expect("old floor").is_none(),
+        "no listings left to rebuild it from either"
+    );
+    assert_eq!(
+        store.floor(&target, &item(2), fresh).expect("fresh floor").map(|f| f.floor_price),
+        Some(300)
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Day rows carry the quantity behind the floor and the quantity-weighted
+/// per-unit price, so stackable goods read as the bulk price they trade at.
+#[test]
+fn day_rows_carry_floor_quantity_and_quantity_weighted_median() {
+    let dir = temp_dir("day-row-qty");
+    let store = open_store(&dir, 100 * 86_400);
+    let target = TargetId("us-4".into());
+    let bulk = item(1);
+    let mut fold = DayFold::new(bulk.clone());
+    // One bulk stack of 1 000 units at 10 copper; nine single units at 100.
+    fold.apply(&[listing(1, &bulk, 10, 1_000)]);
+    for n in 0..9 {
+        fold.apply(&[listing(2 + n, &bulk, 100, 1)]);
+    }
+    store.save_fold(&target, &bulk, 100, Category::Commodity, &fold).expect("save");
+
+    let rows = store.item_day_rows(&target, 98, Category::Commodity).expect("rows");
+    assert_eq!(rows.len(), 1);
+    assert_eq!((rows[0].min, rows[0].min_qty), (10, 1_000), "the floor is the bulk stack");
+    assert_eq!(rows[0].median, 100, "the listing-level median reads as the single-unit price");
+    assert_eq!(rows[0].qty_median, 10, "half the quantity sits at the bulk price");
+    assert_eq!(
+        store
+            .item_day_rows_for_item(&target, &bulk, 98, Category::Commodity)
+            .expect("rows for item"),
+        rows,
+        "the per-item read agrees with the whole-market read"
+    );
+    assert!(store
+        .item_day_rows_for_item(&target, &item(2), 98, Category::Commodity)
+        .expect("rows")
+        .is_empty());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The day-fold window index is the shape the whole-market scans need:
+/// without statistics the planner's choice rests on the column order alone.
+#[test]
+fn day_fold_window_index_covers_target_category_day() {
+    let dir = temp_dir("day-fold-index");
+    let store = open_store(&dir, 100 * 86_400);
+    let conn = rusqlite::Connection::open(dir.join("db.sqlite3")).expect("open db");
+    let columns: Vec<String> = conn
+        .prepare("SELECT name FROM pragma_index_info('idx_item_day_window') ORDER BY seqno")
+        .expect("prepare index info")
+        .query_map([], |row| row.get(0))
+        .expect("index rows")
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(columns, ["target_id", "category", "day"]);
+    drop(store);
     std::fs::remove_dir_all(&dir).ok();
 }

@@ -2,6 +2,8 @@
 //! `server`'s driving adapters call the application services, which depend
 //! only on these traits.
 
+use std::collections::HashMap;
+
 use crate::{
     config::TargetConfig,
     domain::{
@@ -25,6 +27,8 @@ use crate::{
         PetNameRecord,
         PublishedFeed,
         SearchHit,
+        SnapshotFloor,
+        SnapshotListing,
         SnapshotMeta,
         Span,
         TargetId,
@@ -119,6 +123,59 @@ pub trait SnapshotRepository: Send + Sync {
         target: &TargetId,
         kind: PayloadKind,
     ) -> Result<Option<SnapshotMeta>, StoreError>;
+    /// Live listing summary of every item in one stored snapshot — what was
+    /// listed, and at which floor, at the moment of that fetch. `snapshot_id`
+    /// must belong to `target`/`kind` (callers resolve it through
+    /// [`Self::latest`]). The default answers empty: correct for adapters
+    /// without a raw working set (live-deal views then read as "nothing
+    /// listed").
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the summary cannot be read.
+    fn floors(
+        &self,
+        target: &TargetId,
+        kind: PayloadKind,
+        snapshot_id: i64,
+    ) -> Result<HashMap<ItemRef, SnapshotFloor>, StoreError> {
+        let _ = (target, kind, snapshot_id);
+        Ok(HashMap::new())
+    }
+    /// [`Self::floors`] narrowed to one identity: `None` when the item has no
+    /// listing in the snapshot. The default answers `None` (see
+    /// [`Self::floors`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the summary cannot be read.
+    fn floor(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        snapshot_id: i64,
+    ) -> Result<Option<SnapshotFloor>, StoreError> {
+        let _ = (target, item, snapshot_id);
+        Ok(None)
+    }
+    /// Every listing of one identity in one stored snapshot, each joined to
+    /// its sighting bookkeeping (`first_seen_*` is `None` without a sighting
+    /// row). The per-listing view behind the sniper alert conditions; the
+    /// default answers empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the listings cannot be read.
+    fn listings_for_item(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        kind: PayloadKind,
+        snapshot_id: i64,
+    ) -> Result<Vec<SnapshotListing>, StoreError> {
+        let _ = (target, item, kind, snapshot_id);
+        Ok(Vec::new())
+    }
     /// The `limit` newest snapshots for a target/kind, newest first (the
     /// snapshot browser's history view).
     ///
@@ -472,9 +529,9 @@ pub trait SalesRepository: Send + Sync {
         Ok(None)
     }
     /// Sale rate for EACH of the given identities, positionally aligned
-    /// (`rates[i]` belongs to `items[i]`); `None` entries have no sales rows.
-    /// Batched replacement for per-item `sale_rate` loops over candidate
-    /// lists. Scoped to one category.
+    /// (`rates[i]` belongs to `items[i]`); `None` entries have no
+    /// credit-eligible evidence in the window. Batched replacement for per-item
+    /// `sale_rate` loops over candidate lists. Scoped to one category.
     ///
     /// # Errors
     ///

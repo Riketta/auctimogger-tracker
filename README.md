@@ -69,13 +69,18 @@ normal for this item, and how do I know this deal is real?"*.
   addon's (golden vectors asserted in both repos), and one auction is counted
   once per UTC day at its last observed price (hourly snapshots don't inflate
   samples).
-- **Opportunity ranking** — transparent weighted score (discount, sale-rate
-  reliability, churn, stability + confidence) over the stored history,
-  ranked per market category (items, commodities, pets).
+- **Live deals** — `/opportunities` ranks only what the newest snapshot still
+  lists: each item's cheapest listed price against its quantity-weighted
+  7-day value (the bulk price for stackables), scored by a weighted geometric
+  mean of discount, sale-rate reliability, churn and stability — a liquid but
+  undiscounted market cannot outrank a real deal. Listings seen today that
+  were bought or cancelled land in a separate "seen today, already gone"
+  table (and `GET /api/missed-deals`) instead of passing as buyable. Ranked
+  per market category (items, commodities, pets).
 - **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
-- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below`, `below-floor`, `sale-rate-above`, `days-since-last-sale-above`) are evaluated after every ingest cycle with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Each market category only observes while its own feed is younger than `[alerts].max_data_age_secs` (48 h by default, `0` disables) — commodity rules gate on the commodities feed, item/pet rules on the auctions feed — so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
+- **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below` and `below-floor` on the cached blocks; `floor-below`, `floor-below-value` and `new-listing-below` on the newest snapshot's live listings — the sniper operands, each fired listing counted once; `sale-rate-above` and `days-since-last-sale-above` on the ledger) are evaluated first after every ingest cycle, with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Each market category only observes while its own feed is younger than `[alerts].max_data_age_secs` (48 h by default, `0` disables) — commodity rules gate on the commodities feed, item/pet rules on the auctions feed — so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
   completions, item detail with interactive 30-day price-band chart (p05–p95,
   median, VWAP), opportunities, market overview, live watchlist, cross-target
@@ -132,8 +137,8 @@ only — never put secrets in this file.
 | `storage.backup_keep` | `7` | recent backups kept (oldest pruned after each backup) |
 | `storage.vacuum` | `incremental` | freed-space reclamation after prunes: `incremental` (returns pages once ~20% of the file is free; legacy stores convert with a one-time full VACUUM), `full` (complete VACUUM daily), `off` (never shrink) |
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
-| `opportunities.min_samples` | `30` | samples before an item is scored (per category) |
-| `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | score mix, tunable without code changes |
+| `opportunities.min_samples` | `30` | auction-days of 7-day evidence behind an item's value (per category): below it an item neither ranks nor lists as a gone-today deal, and `floor-below-value`/`new-listing-below` alerts do not fire |
+| `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | exponents of the weighted-geometric-mean score (only ratios matter; a component at zero scores zero) |
 | `[logging]` | absent | optional file logging: `dir` (created at boot, failure aborts), `rotation` = `daily`\|`never`, independent `level` (EnvFilter directives) |
 | `[sentry]` | absent | optional Sentry/GlitchTip reporting: `dsn` (empty = off), `environment`, `traces_sample_rate` (0.0..=1.0; absent = error-only) |
 | `[[targets]]` | — | see below |
@@ -225,7 +230,8 @@ alphabetical catalog browse · `/items/{target}/{item}` item detail ·
 `/browse` snapshot viewer (one stored snapshot's listings, laid out like the
 in-game auction house: name/id/class/quality filters, sortable price/qty/time
 columns, page arrows; unpinned = newest snapshot, pinned = frozen history) ·
-`/opportunities` (filter/sort/CSV) · `/overview` (movers with real 30-day
+`/opportunities` (live deals with filter/sort/CSV, then the "seen today,
+already gone" list) · `/overview` (movers with real 30-day
 sparklines) · `/watchlist` · `/priorities` (the watchlist ranked best sell
 first: 50% liquidity + 30% momentum + 20% recency, components in tooltips,
 thin-data ranks marked `~`) · `/compare` (one watched identity across all
@@ -245,7 +251,8 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole JSON API + feed surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
-| `GET /api/opportunities` · `/api/overview?limit=` | ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
+| `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`) and the response names the `snapshot` they come from. `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
+| `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first — the same two response shapes as opportunities |
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7) |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
@@ -257,7 +264,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/priorities?target=&category=` | the watchlist ranked best sell first: score (50% liquidity + 30% momentum + 20% recency) with components, current-day median, week block and trend rows (the `/priorities` page's contract; default category `item`) |
 | `GET /api/watchlist/compare?category=` | the union of all configured targets' watchlists as a matrix: one row per identity, one cell per target (`watched`/`now`/`weekMedian`), `best` = index of the highest-paying market per row (the `/compare` page's contract; default category `item`) |
 | `GET /api/alerts?target=&events=` | a target's alert rules + newest fired events |
-| `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"sale-rate-above","rate":0.3}` \| `{"type":"days-since-last-sale-above","days":14}` |
+| `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"floor-below","copper":10000}` \| `{"type":"floor-below-value","fraction":0.5}` \| `{"type":"new-listing-below","fraction":0.5}` \| `{"type":"sale-rate-above","rate":0.3}` \| `{"type":"days-since-last-sale-above","days":14}` |
 | `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
 | `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target) |

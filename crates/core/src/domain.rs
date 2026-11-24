@@ -543,6 +543,40 @@ impl core::fmt::Display for BrowseError {
     }
 }
 
+// ---------------------------------------------------------- live snapshots
+
+/// One item's listing summary inside a single stored snapshot — the live side
+/// of one market at the moment of that fetch. Written with the snapshot, so
+/// "what is listed right now" is a point read instead of a listing scan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotFloor {
+    /// Cheapest unit price listed for the item in the snapshot (copper).
+    pub floor_price: i64,
+    /// Quantity listed at exactly that price — how deep the deal is.
+    pub floor_qty: i64,
+    /// Listings of the item in the snapshot.
+    pub listing_count: u64,
+    /// Total quantity of the item listed in the snapshot.
+    pub qty_sum: i64,
+}
+
+/// One listing of an item in one stored snapshot, joined to its sighting
+/// bookkeeping — the per-listing view behind the sniper alert conditions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SnapshotListing {
+    /// Blizzard auction id; stable while the listing stays up.
+    pub auction_id: i64,
+    /// Buyout price per unit (copper).
+    pub unit_price: i64,
+    /// Number of units on the listing.
+    pub quantity: i64,
+    /// Snapshot that first sighted the listing (`None` without a sighting
+    /// row). Equals the queried snapshot's id exactly for listings new to it.
+    pub first_seen_snapshot: Option<i64>,
+    /// Unix seconds of that first sighting (`None` without a sighting row).
+    pub first_seen_at: Option<i64>,
+}
+
 // ---------------------------------------------------------------- analytics
 
 /// Aggregate price histogram for one item-day: per distinct unit price, the
@@ -583,12 +617,19 @@ pub struct ItemDayRow {
     pub qty_sum: i64,
     /// Cheapest listing of the day (copper per unit).
     pub min: i64,
+    /// Quantity of the day's cheapest listing — how deep the day's floor was.
+    pub min_qty: i64,
     /// 5th-percentile unit price of the day (nearest rank) — the robust
     /// floor behind discount scoring; equals `min` on days with ≤ 20
     /// listings.
     pub p05: i64,
     /// Listing-level nearest-rank median (copper per unit).
     pub median: i64,
+    /// Quantity-weighted median unit price of the day: the price half the
+    /// listed quantity sits at (the bulk price for stackable goods; equals
+    /// `median` when every listing is a single unit). Falls back to `median`
+    /// when nothing carries quantity.
+    pub qty_median: i64,
     /// Median absolute deviation of the day's unit prices.
     pub mad: i64,
 }
@@ -1080,6 +1121,29 @@ pub enum AlertCondition {
         span: Span,
         /// Which floor percentile to compare against.
         percentile: FloorPercentile,
+    },
+    /// The newest snapshot's cheapest listing of the item is at `copper` or
+    /// below — a literal price target on the live floor (what a buyer can
+    /// buy right now), independent of how the rest of the day traded.
+    FloorBelow {
+        /// Threshold in copper per unit.
+        copper: i64,
+    },
+    /// The newest snapshot's cheapest listing sits at `fraction` of the
+    /// item's 7-day quantity-weighted value or below — a listing priced as a
+    /// deal relative to where the market normally trades.
+    FloorBelowValue {
+        /// Threshold fraction of the value (0.0..=1.0).
+        fraction: f64,
+    },
+    /// At least one listing first sighted in the newest snapshot sits at
+    /// `fraction` of the item's 7-day quantity-weighted value or below — the
+    /// sniper operand: a freshly posted underpriced listing. Listings first
+    /// seen at or before the rule's last firing never count again, so a
+    /// listing that stays up cannot re-fire the rule.
+    NewListingBelow {
+        /// Threshold fraction of the value (0.0..=1.0).
+        fraction: f64,
     },
     /// The trailing 14-day sale rate reaches `rate` or above — demand is
     /// accelerating.

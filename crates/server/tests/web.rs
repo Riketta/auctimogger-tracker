@@ -299,6 +299,7 @@ fn test_state_with_config(
         opportunities: Arc::new(OpportunityService::new(
             store.clone(),
             store.clone(),
+            store.clone(),
             clock.clone(),
             &config,
         )),
@@ -324,9 +325,11 @@ fn test_state_with_config(
             metrics.clone(),
             store.clone(),
             store.clone(),
+            store.clone(),
             None,
             clock.clone(),
             0,
+            config.opportunities.min_samples,
         )),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),
@@ -389,6 +392,11 @@ fn seed_history(state: &AppState) {
             .save_fold(&target, &item, today - offset, Category::Commodity, &fold)
             .expect("save fold");
     }
+    // The newest snapshot lists the item at 150: the ranking is live-only, so
+    // without a stored snapshot nothing would rank.
+    let now = state.clock.now();
+    let live: Vec<NormalizedListing> = (0..4).map(|n| listing(1200 + n, &item, 150)).collect();
+    seed_snapshot(state, PayloadKind::Commodities, now, &live);
     // A finished cycle record so the dashboard's recent-cycles table renders.
     state.recent_cycles.push(crate_recent_cycle());
 }
@@ -1465,6 +1473,12 @@ fn seed_second_item(state: &AppState) {
             .save_fold(&target, &item, today - offset, Category::Commodity, &fold)
             .expect("save fold");
     }
+    // The ranking is live-only: a newer snapshot listing both items keeps
+    // 2589 ranked while 2592 takes its deterministic second place.
+    let first = ItemRef::Item { item_id: 2589 };
+    let mut live: Vec<NormalizedListing> = (0..4).map(|n| listing(6400 + n, &first, 150)).collect();
+    live.extend((0..4).map(|n| listing(6500 + n, &item, 2000)));
+    seed_snapshot(state, PayloadKind::Commodities, state.clock.now(), &live);
 }
 
 /// Pet identities flow through the same catalog lane: the detail page
@@ -2008,5 +2022,243 @@ async fn items_page_rejects_unparseable_after_id() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "malformed cursor rejected");
     let (status, _) = get(router, "/items?target=t1").await;
     assert_eq!(status, StatusCode::OK, "plain page renders");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------- live deal ranking
+
+/// The live-deal scenario: a 7-day value of 150 (yesterday four 50-unit
+/// stacks at 100, today four at 150), the newest snapshot still listing the
+/// four 150 stacks, and one 60-copper stack of 72 seen today that the newest
+/// snapshot no longer lists. Returns the live snapshot's id.
+fn seed_live_and_gone(state: &AppState) -> i64 {
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Item { item_id: 2589 };
+    let today = utc_day(state.clock.now());
+    let stack = |auction_id: i64, price: i64, qty: i64| NormalizedListing {
+        quantity: qty,
+        ..listing(auction_id, &item, price)
+    };
+    let save = |day: i64, listings: &[NormalizedListing]| {
+        let mut fold = DayFold::new(item.clone());
+        fold.apply(listings);
+        state
+            .history
+            .save_fold(&target, &item, day, Category::Commodity, &fold)
+            .expect("save fold");
+    };
+    let yesterday: Vec<NormalizedListing> = (0..4).map(|n| stack(1000 + n, 100, 50)).collect();
+    save(today - 1, &yesterday);
+    let mut seen_today: Vec<NormalizedListing> = (0..4).map(|n| stack(1100 + n, 150, 50)).collect();
+    seen_today.push(stack(1150, 60, 72));
+    save(today, &seen_today);
+    let live: Vec<NormalizedListing> = (0..4).map(|n| stack(1200 + n, 150, 50)).collect();
+    seed_snapshot(state, PayloadKind::Commodities, state.clock.now(), &live)
+}
+
+/// The opportunities page is live-only: the ranking shows the newest
+/// snapshot's price with the snapshot it comes from, and a listing seen today
+/// but no longer listed moves to its own table instead of passing as a deal.
+#[tokio::test]
+async fn opportunities_page_ranks_live_listings_and_lists_gone_deals_apart() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    seed_live_and_gone(&state);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router, "/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("live prices from snapshot #"), "the page names its snapshot: {body}");
+    assert!(body.contains("min_discount"), "the gone-today floor is a form control");
+
+    let (headers, rows) = table_shape(&body, "opportunities");
+    assert_eq!(headers, 13, "opportunities header columns");
+    assert_eq!(rows.len(), 1, "one live deal");
+    let live_table = body
+        .split("<table id=\"opportunities\">")
+        .nth(1)
+        .expect("live table")
+        .split("</table>")
+        .next()
+        .expect("closed");
+    // Price now 150 against a value of 150: listed, but no discount.
+    assert!(live_table.contains("data-v=\"150\""), "the live price: {live_table}");
+    assert!(live_table.contains("data-v=\"200\""), "200 units deep: {live_table}");
+    assert!(live_table.contains("data-v=\"-1\">—"), "no sale evidence renders as —: {live_table}");
+
+    let (headers, rows) = table_shape(&body, "missed-deals");
+    assert_eq!(headers, 8, "gone-today header columns");
+    assert_eq!(rows.len(), 1, "the gone 60-copper stack is reported, not ranked");
+    let gone_table = body
+        .split("<table id=\"missed-deals\">")
+        .nth(1)
+        .expect("gone table")
+        .split("</table>")
+        .next()
+        .expect("closed");
+    assert!(gone_table.contains("data-v=\"0.600\""), "60 under the 150 value: {gone_table}");
+    assert!(gone_table.contains("data-v=\"60\""), "{gone_table}");
+    assert!(gone_table.contains("data-v=\"72\""), "the gone listing's quantity: {gone_table}");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `/api/opportunities` reports live prices plus the snapshot they come
+/// from; the all-categories shape stays keyed arrays; gone deals live in
+/// `/api/missed-deals` behind their own discount floor.
+#[tokio::test]
+async fn opportunities_api_reports_live_prices_and_missed_deals_separately() {
+    let (state, root) = test_state(None);
+    let live_id = seed_live_and_gone(&state);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) =
+        get(router.clone(), "/api/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["snapshot"]["id"], live_id, "the newest snapshot is named");
+    let rows = json["opportunities"].as_array().expect("opportunities array");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0]["floorNow"], 150);
+    assert_eq!(rows[0]["floorQty"], 200);
+    assert_eq!(rows[0]["listedNow"], 4);
+    assert_eq!(rows[0]["value7"], 150);
+    assert_eq!(rows[0]["discount"], 0.0);
+    assert!(rows[0]["reliability"].is_null(), "no sale evidence is null, never a zero");
+
+    let (status, body) = get(router.clone(), "/api/opportunities?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert!(json["commodity"].is_array(), "the all-categories shape stays keyed arrays");
+    assert!(json.get("snapshot").is_none());
+
+    let (status, body) =
+        get(router.clone(), "/api/missed-deals?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json["minDiscount"], 25.0);
+    let missed = json["missed"].as_array().expect("missed array");
+    assert_eq!(missed.len(), 1);
+    assert_eq!(missed[0]["seenFloor"], 60);
+    assert_eq!(missed[0]["seenFloorQty"], 72);
+    assert_eq!(missed[0]["liveFloor"], 150);
+    assert_eq!(missed[0]["discount"], 0.6);
+    assert!(missed[0]["reliability"].is_null());
+
+    let (status, body) =
+        get(router.clone(), "/api/missed-deals?target=t1&category=commodity&min_discount=90").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(
+        json["missed"].as_array().map(std::vec::Vec::len),
+        Some(0),
+        "a 60% gap stays under a 90% floor"
+    );
+    let (status, _) = get(router, "/api/missed-deals?target=t1&category=nonsense").await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "an unknown category is rejected");
+
+    std::fs::remove_dir_all(&root).ok();
+}
+
+async fn post_alert(router: Router, condition: &str) -> StatusCode {
+    let body =
+        format!(r#"{{"target":"{TARGET}","type":"item","itemID":2589,"condition":{condition}}}"#);
+    let response = router
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts")
+                .header("content-type", "application/json")
+                .body(Body::from(body))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    response.status()
+}
+
+/// The live-deal alert conditions end to end over the real store: accepted
+/// by the API, echoed in rule JSON, fired against the newest snapshot's
+/// floor, labelled on the page, and rejected with 400 when malformed.
+#[tokio::test]
+async fn alert_api_handles_the_live_deal_conditions() {
+    let (state, root) = test_state(None);
+    seed_live_and_gone(&state);
+    let router = build_router_arc(Arc::clone(&state));
+
+    assert_eq!(
+        post_alert(router.clone(), r#"{"type":"floor-below","copper":200}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_alert(router.clone(), r#"{"type":"floor-below-value","fraction":1.0}"#).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        post_alert(router.clone(), r#"{"type":"new-listing-below","fraction":0.5}"#).await,
+        StatusCode::OK
+    );
+    // Malformed shapes never reach the store.
+    assert_eq!(
+        post_alert(router.clone(), r#"{"type":"floor-below-value","fraction":1.5}"#).await,
+        StatusCode::BAD_REQUEST,
+        "a fraction above 1 is rejected"
+    );
+    assert_eq!(
+        post_alert(router.clone(), r#"{"type":"new-listing-below"}"#).await,
+        StatusCode::BAD_REQUEST,
+        "a missing fraction is rejected"
+    );
+    assert_eq!(
+        post_alert(router.clone(), r#"{"type":"floor-below"}"#).await,
+        StatusCode::BAD_REQUEST,
+        "a missing copper threshold is rejected"
+    );
+
+    // The live floor is 150: at/below 200 fires, within 100% of the 150 value
+    // fires; the 150 stacks are not within 50% of it.
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/alerts/evaluate?target=t1")
+                .header("content-type", "application/json")
+                .body(Body::from("{}"))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = response.into_body();
+    let body = String::from_utf8(
+        http_body_util::BodyExt::collect(bytes).await.expect("body").to_bytes().to_vec(),
+    )
+    .expect("utf8");
+    let json: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(json.get("evaluated").and_then(Value::as_u64), Some(3));
+    assert_eq!(json.get("fired").and_then(Value::as_u64), Some(2));
+
+    let (status, body) = get(router.clone(), "/api/alerts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let rules = json["rules"].as_array().expect("rules array");
+    assert_eq!(rules.len(), 3);
+    assert_eq!(rules[1]["condition"]["type"], "floor-below-value");
+    assert_eq!(rules[1]["condition"]["fraction"], 1.0);
+    let events = json["events"].as_array().expect("events array");
+    assert_eq!(events.len(), 2);
+    assert!(
+        events.iter().any(|event| event["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("live floor 150 copper"))),
+        "{events:?}"
+    );
+
+    let (status, body) = get(router, "/alerts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("live floor ≤ 100% of 7d value"), "{body}");
+    assert!(body.contains("new listing ≤ 50% of 7d value"), "{body}");
+
     std::fs::remove_dir_all(&root).ok();
 }

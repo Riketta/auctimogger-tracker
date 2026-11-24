@@ -532,8 +532,9 @@
       }
       var type = get("type");
       payload.condition = { type: type };
-      if (type === "price-below") payload.condition.copper = Number(get("copper"));
+      if (type === "price-below" || type === "floor-below") payload.condition.copper = Number(get("copper"));
       if (type === "below-floor") { payload.condition.span = get("span") || "d7"; payload.condition.percentile = get("percentile") || "p05"; }
+      if (type === "floor-below-value" || type === "new-listing-below") payload.condition.fraction = Number(get("percent")) / 100;
       if (type === "sale-rate-above") payload.condition.rate = Number(get("rate"));
       if (type === "days-since-last-sale-above") payload.condition.days = Number(get("days"));
       if (get("note")) payload.note = get("note");

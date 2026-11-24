@@ -647,18 +647,25 @@ fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
     }
 }
 
-/// Operational side effects after a successful cycle for one target:
-/// once-per-UTC-day retention pruning, throttled feed publication, and a
-/// refresh of the target's prepared opportunity scan (new folds/credits just
-/// landed). All are best effort — a failure is logged and retried on a later
-/// pass. (Name warm-up is not among them: it runs on its own dedicated
-/// warmer thread, decoupled from the ingest cadence.)
+/// Operational side effects after a successful cycle for one target.
+/// Alerts run FIRST: a fresh dump may carry a listing that is gone minutes
+/// later, and a sniper alert is worth nothing queued behind a whole-market
+/// feed build and three scan refreshes — it only needs the cycle's own
+/// writes (snapshot floors, day folds, sightings), which have already
+/// landed. Then once-per-UTC-day retention pruning, throttled feed
+/// publication, and a refresh of the target's prepared opportunity scan
+/// (new folds/credits just landed). All are best effort — a failure is
+/// logged and retried on a later pass. (Name warm-up is not among them: it
+/// runs on its own dedicated warmer thread, decoupled from the ingest
+/// cadence.)
 fn run_pass(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
     maintenance: &mut MaintenanceState,
     target: &str,
 ) {
+    evaluate_alerts(state, target);
+
     run_prune_if_due(state, config, maintenance, target);
 
     let publish_due = maintenance
@@ -675,7 +682,6 @@ fn run_pass(
     for category in Category::ALL {
         refresh_opportunities(state, &TargetId(target.to_string()), category);
     }
-    evaluate_alerts(state, target);
 }
 
 /// Spawns the dedicated background name-warmer thread. `warm_batch == 0`
@@ -1141,9 +1147,9 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 }
 
 /// Runs the after-cycle side effects for one target right now, without the
-/// maintenance worker's once-per-day/throttle bookkeeping: retention pruning,
-/// feed publication, and an opportunity scan refresh, exactly as a successful
-/// scheduled cycle would trigger them.
+/// maintenance worker's once-per-day/throttle bookkeeping: alert evaluation,
+/// retention pruning, feed publication, and an opportunity scan refresh,
+/// exactly as a successful scheduled cycle would trigger them.
 /// Used by the manual `/api/fetch` path, whose successful cycles must show
 /// up in `/feed.lua` and the ranking pages immediately instead of waiting
 /// for the maintenance worker. (Name resolution needs no trigger here: the

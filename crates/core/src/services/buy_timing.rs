@@ -207,8 +207,10 @@ mod tests {
             listing_count: 4,
             qty_sum: 40,
             min: p05,
+            min_qty: 1,
             p05,
             median,
+            qty_median: median,
             mad: 0,
         }
     }

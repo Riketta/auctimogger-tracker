@@ -1,5 +1,6 @@
 //! Alert evaluation (R-alerts): runs a target's alert rules against the same
-//! cached metric blocks the UI shows, records fired events, stamps cooldown
+//! cached metric blocks the UI shows, the live floors of the newest snapshot
+//! and the trailing sale ledger, records fired events, stamps cooldown
 //! anchors and hands each event to the configured dispatch adapter (log,
 //! Discord, Telegram — whatever the composition root wired in). Rules fire at
 //! most once per cooldown window, anchored on the rule's `last_fired_at`.
@@ -18,6 +19,8 @@ use crate::{
         NewAlertEvent,
         NewAlertRule,
         PayloadKind,
+        SnapshotListing,
+        SnapshotMeta,
         Span,
         TargetId,
     },
@@ -27,10 +30,17 @@ use crate::{
         AlertEventRepository,
         AlertRuleRepository,
         ClockPort,
+        PriceHistoryRepository,
         SalesRepository,
         SnapshotRepository,
     },
-    services::metrics::MetricsService,
+    services::{
+        metrics::MetricsService,
+        opportunity::{
+            quantity_value,
+            SCAN_WINDOW_DAYS,
+        },
+    },
 };
 
 /// Trailing window (days) behind [`AlertCondition::SaleRateAbove`] — the same
@@ -62,20 +72,25 @@ pub struct AlertEvaluationService {
     metrics: Arc<MetricsService>,
     sales: Arc<dyn SalesRepository>,
     snapshots: Arc<dyn SnapshotRepository>,
+    history: Arc<dyn PriceHistoryRepository>,
     dispatcher: Option<Arc<dyn AlertDispatchPort>>,
     clock: Arc<dyn ClockPort>,
     /// Freshness gate in seconds: a market category only observes when its
     /// feed payload's snapshot is fresher (rules blocked this way are counted
     /// as [`AlertRun::skipped_stale`]). `0` disables the gate.
     max_data_age_secs: i64,
+    /// Evidence floor for the value-relative deal conditions — the same
+    /// `[opportunities].min_samples` the ranking applies: a 7-day value from
+    /// fewer listings than this is not worth alerting against.
+    min_samples: u32,
 }
 
 impl AlertEvaluationService {
     /// Wires the evaluator to its ports. `dispatcher` is the configured
     /// delivery adapter; `None` (the `log` delivery) still records events —
     /// they surface in the UI and JSON API without any outbound message.
-    /// `snapshots` fuels the freshness gate; `max_data_age_secs` of `0`
-    /// disables gating.
+    /// `snapshots` fuels the freshness gate and the live-floor conditions;
+    /// `max_data_age_secs` of `0` disables gating.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         rules: Arc<dyn AlertRuleRepository>,
@@ -83,11 +98,24 @@ impl AlertEvaluationService {
         metrics: Arc<MetricsService>,
         sales: Arc<dyn SalesRepository>,
         snapshots: Arc<dyn SnapshotRepository>,
+        history: Arc<dyn PriceHistoryRepository>,
         dispatcher: Option<Arc<dyn AlertDispatchPort>>,
         clock: Arc<dyn ClockPort>,
         max_data_age_secs: i64,
+        min_samples: u32,
     ) -> Self {
-        Self { rules, events, metrics, sales, snapshots, dispatcher, clock, max_data_age_secs }
+        Self {
+            rules,
+            events,
+            metrics,
+            sales,
+            snapshots,
+            history,
+            dispatcher,
+            clock,
+            max_data_age_secs,
+            min_samples,
+        }
     }
 
     // ------------------------------------------------------------- rule CRUD
@@ -136,15 +164,17 @@ impl AlertEvaluationService {
 
     /// Evaluates every rule of one target: skips rules inside their cooldown
     /// window, observes the surviving rules' conditions against the cached
-    /// metric blocks (each market category only when its own feed is fresh —
-    /// see the freshness gate below), records an event per fired rule (and
-    /// stamps its cooldown anchor) and dispatches it best effort.
+    /// metric blocks, the newest snapshots' live listings and the trailing
+    /// ledger (each market category only when its own feed is fresh — see the
+    /// freshness gate below), records an event per fired rule (and stamps its
+    /// cooldown anchor) and dispatches it best effort.
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when rules, blocks or event writes fail;
-    /// dispatch failures are counted in [`AlertRun::dispatch_failures`] and
-    /// reported by the adapter, not returned here.
+    /// Returns `StoreError::Backend` when rules, blocks, live listings or
+    /// event writes fail; dispatch failures are counted in
+    /// [`AlertRun::dispatch_failures`] and reported by the adapter, not
+    /// returned here.
     pub fn evaluate(&self, target: &TargetId, cooldown_secs: i64) -> Result<AlertRun, StoreError> {
         let rules = self.rules.list(target)?;
         let now = self.clock.now();
@@ -156,7 +186,7 @@ impl AlertEvaluationService {
         // feed cannot launder stale evidence from the other. No snapshot at
         // all for a kind reads as "no data yet", not "stale": observation
         // naturally finds nothing.
-        let ages = self.snapshot_ages(target, now)?;
+        let newest = self.newest_snapshots(target)?;
         let mut run = AlertRun::default();
         for rule in rules {
             run.evaluated += 1;
@@ -168,11 +198,13 @@ impl AlertEvaluationService {
             let mut gated = false;
             let mut fired = false;
             for category in Category::ALL {
-                if ages.gates(self.max_data_age_secs, feed_kind(category)) {
+                let kind = category.payload_kind();
+                if newest.gates(self.max_data_age_secs, kind, now) {
                     gated = true;
                     continue;
                 }
-                let Some(observed) = self.observe_category(&rule, category)? else {
+                let Some(observed) = self.observe_category(&rule, category, newest.get(kind))?
+                else {
                     continue;
                 };
                 fired = true;
@@ -216,20 +248,22 @@ impl AlertEvaluationService {
         Ok(run)
     }
 
-    /// One category's observation: `Ok(Some(_))` only when the condition
-    /// held there; no data or a non-breach reads as `Ok(None)` and the next
-    /// category gets its turn.
+    /// One category's observation against its feed's newest snapshot (which
+    /// the freshness gate already let through): `Ok(Some(_))` only when the
+    /// condition held there; no data or a non-breach reads as `Ok(None)` and
+    /// the next category gets its turn.
     fn observe_category(
         &self,
         rule: &AlertRule,
         category: Category,
+        newest: Option<&SnapshotMeta>,
     ) -> Result<Option<Observation>, StoreError> {
         let label = format!("{} [{}]", item_label(&rule.item), category.as_str());
         match rule.condition {
             AlertCondition::PriceBelow { copper } => {
                 match self.metrics.block(&rule.target, &rule.item, category, Span::D1)? {
                     Some(block) if block.median <= copper => Ok(Some(Observation {
-                        value: Some(median_observation(block.median)),
+                        value: Some(copper_as_f64(block.median)),
                         message: format!(
                             "{label}: d1 median {} copper (target ≤ {copper})",
                             block.median
@@ -242,7 +276,7 @@ impl AlertEvaluationService {
                 match self.metrics.block(&rule.target, &rule.item, category, span)? {
                     Some(block) if block.median <= floor(&block, percentile) => {
                         Ok(Some(Observation {
-                            value: Some(median_observation(block.median)),
+                            value: Some(copper_as_f64(block.median)),
                             message: format!(
                                 "{label}: {} median {} copper at/below {} floor {}",
                                 span.name(),
@@ -254,6 +288,11 @@ impl AlertEvaluationService {
                     }
                     _ => Ok(None),
                 }
+            }
+            AlertCondition::FloorBelow { .. }
+            | AlertCondition::FloorBelowValue { .. }
+            | AlertCondition::NewListingBelow { .. } => {
+                self.observe_deal(rule, category, newest, &label)
             }
             AlertCondition::SaleRateAbove { rate } => {
                 match self.sales.sale_rate(
@@ -288,62 +327,161 @@ impl AlertEvaluationService {
         }
     }
 
-    /// Ages in seconds of the target's newest feed snapshot per payload kind
-    /// (source `Last-Modified` when present, else the fetch stamp); a kind
-    /// with no snapshot at all reads as `None`.
-    fn snapshot_ages(&self, target: &TargetId, now: i64) -> Result<FeedAges, StoreError> {
-        Ok(FeedAges {
-            commodities: self.kind_age(target, now, PayloadKind::Commodities)?,
-            auctions: self.kind_age(target, now, PayloadKind::Auctions)?,
+    /// The live-deal conditions: the newest snapshot's listings against the
+    /// item's 7-day quantity-weighted value (see the variants' docs).
+    /// `newest` is the snapshot the freshness gate let through; `label`
+    /// prefixes the message.
+    fn observe_deal(
+        &self,
+        rule: &AlertRule,
+        category: Category,
+        newest: Option<&SnapshotMeta>,
+        label: &str,
+    ) -> Result<Option<Observation>, StoreError> {
+        match rule.condition {
+            AlertCondition::FloorBelow { copper } => {
+                let Some(snapshot_id) = newest.map(|meta| meta.id) else {
+                    return Ok(None);
+                };
+                match self.snapshots.floor(&rule.target, &rule.item, snapshot_id)? {
+                    Some(live) if live.floor_price <= copper => Ok(Some(Observation {
+                        value: Some(copper_as_f64(live.floor_price)),
+                        message: format!(
+                            "{label}: live floor {} copper (target ≤ {copper})",
+                            live.floor_price
+                        ),
+                    })),
+                    _ => Ok(None),
+                }
+            }
+            AlertCondition::FloorBelowValue { fraction } => {
+                let Some(snapshot_id) = newest.map(|meta| meta.id) else {
+                    return Ok(None);
+                };
+                let Some((value, _)) = self.deal_value(rule, category)? else {
+                    return Ok(None);
+                };
+                match self.snapshots.floor(&rule.target, &rule.item, snapshot_id)? {
+                    Some(live) if copper_as_f64(live.floor_price) <= fraction * value => {
+                        Ok(Some(Observation {
+                            value: Some(copper_as_f64(live.floor_price)),
+                            message: format!(
+                                "{label}: live floor {} copper ≤ {}% of 7-day value {:.0}",
+                                live.floor_price,
+                                percent(fraction),
+                                value
+                            ),
+                        }))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            AlertCondition::NewListingBelow { fraction } => {
+                let Some(snapshot) = newest else {
+                    return Ok(None);
+                };
+                let Some((value, _)) = self.deal_value(rule, category)? else {
+                    return Ok(None);
+                };
+                let listings = self.snapshots.listings_for_item(
+                    &rule.target,
+                    &rule.item,
+                    category.payload_kind(),
+                    snapshot.id,
+                )?;
+                // Fresh to this snapshot, and never counted for a firing the
+                // rule already did: a listing that stays up cannot re-fire it.
+                let mut hits: Vec<&SnapshotListing> = listings
+                    .iter()
+                    .filter(|listing| {
+                        listing.first_seen_snapshot == Some(snapshot.id)
+                            && rule.last_fired_at.is_none_or(|fired| {
+                                listing.first_seen_at.is_none_or(|at| at > fired)
+                            })
+                            && copper_as_f64(listing.unit_price) <= fraction * value
+                    })
+                    .collect();
+                if hits.is_empty() {
+                    return Ok(None);
+                }
+                hits.sort_unstable_by_key(|listing| listing.unit_price);
+                let cheapest = hits.first().map_or(0, |listing| listing.unit_price);
+                let units: i64 = hits
+                    .iter()
+                    .fold(0i64, |sum, listing| sum.saturating_add(listing.quantity.max(0)));
+                Ok(Some(Observation {
+                    value: Some(copper_as_f64(cheapest)),
+                    message: format!(
+                        "{label}: {} new listing(s) from {} copper (≤ {}% of 7-day value {:.0}), \
+                         {units} units",
+                        hits.len(),
+                        cheapest,
+                        percent(fraction),
+                        value
+                    ),
+                }))
+            }
+            // Every other condition is observed by `observe_category`.
+            _ => Ok(None),
+        }
+    }
+
+    /// The rule item's 7-day quantity-weighted value behind the deal
+    /// conditions — the ranking's discount reference — admitted only with the
+    /// configured listing evidence behind it.
+    fn deal_value(
+        &self,
+        rule: &AlertRule,
+        category: Category,
+    ) -> Result<Option<(f64, i64)>, StoreError> {
+        let today = utc_day(self.clock.now());
+        let rows = self.history.item_day_rows_for_item(
+            &rule.target,
+            &rule.item,
+            today - SCAN_WINDOW_DAYS + 1,
+            category,
+        )?;
+        Ok(quantity_value(&rows).filter(|(_, samples)| *samples >= i64::from(self.min_samples)))
+    }
+
+    /// Newest snapshot per payload kind for a target; a kind without any
+    /// reads as `None` ("no data yet").
+    fn newest_snapshots(&self, target: &TargetId) -> Result<NewestSnapshots, StoreError> {
+        Ok(NewestSnapshots {
+            commodities: self.snapshots.latest(target, PayloadKind::Commodities)?,
+            auctions: self.snapshots.latest(target, PayloadKind::Auctions)?,
         })
     }
+}
 
-    /// Age of one kind's newest snapshot, in seconds.
-    fn kind_age(
-        &self,
-        target: &TargetId,
-        now: i64,
-        kind: PayloadKind,
-    ) -> Result<Option<i64>, StoreError> {
-        Ok(self
-            .snapshots
-            .latest(target, kind)?
-            .map(|meta| now - meta.source_last_modified.unwrap_or(meta.fetched_at)))
+/// Newest snapshot per payload kind for one target. The freshness gate is per
+/// market: each [`Category`] only observes against its own kind's snapshot,
+/// so a live commodities feed cannot arm rules whose evidence is the (dead)
+/// auctions feed, and vice versa; the live-floor conditions read the same
+/// snapshot the gate let through.
+struct NewestSnapshots {
+    commodities: Option<SnapshotMeta>,
+    auctions: Option<SnapshotMeta>,
+}
+
+impl NewestSnapshots {
+    fn get(&self, kind: PayloadKind) -> Option<&SnapshotMeta> {
+        match kind {
+            PayloadKind::Commodities => self.commodities.as_ref(),
+            PayloadKind::Auctions => self.auctions.as_ref(),
+        }
     }
-}
 
-/// Per-payload-kind snapshot ages for one target. The freshness gate is per
-/// market: each [`Category`] only observes against its own kind's age, so a
-/// live commodities feed cannot arm rules whose evidence is the (dead)
-/// auctions feed, and vice versa.
-struct FeedAges {
-    commodities: Option<i64>,
-    auctions: Option<i64>,
-}
-
-impl FeedAges {
     /// `true` when the gate is enabled and the kind's feed is older than the
     /// maximum data age (`None` = no snapshot of that kind: "no data yet",
     /// not stale — observation naturally finds nothing).
-    fn gates(&self, max_data_age_secs: i64, kind: PayloadKind) -> bool {
+    fn gates(&self, max_data_age_secs: i64, kind: PayloadKind, now: i64) -> bool {
         if max_data_age_secs <= 0 {
             return false;
         }
-        let age = match kind {
-            PayloadKind::Commodities => self.commodities,
-            PayloadKind::Auctions => self.auctions,
-        };
-        age.is_some_and(|age| age > max_data_age_secs)
-    }
-}
-
-/// The feed payload kind a market category's evidence comes from: the
-/// commodity AH dump feeds the commodity market, the per-item auction dump
-/// feeds the item and pet markets.
-fn feed_kind(category: Category) -> PayloadKind {
-    match category {
-        Category::Commodity => PayloadKind::Commodities,
-        Category::Item | Category::Pet => PayloadKind::Auctions,
+        self.get(kind)
+            .map(|meta| now - meta.source_last_modified.unwrap_or(meta.fetched_at))
+            .is_some_and(|age| age > max_data_age_secs)
     }
 }
 
@@ -364,16 +502,23 @@ struct Observation {
     message: String,
 }
 
-/// Median copper as the event's observed value (display-only widening).
+/// A copper amount widened to f64 for the event's observed value and the
+/// value-threshold comparisons (display/ranking math, not money decisions).
 #[allow(clippy::cast_precision_loss)]
-fn median_observation(median: i64) -> f64 {
-    median as f64
+fn copper_as_f64(copper: i64) -> f64 {
+    copper as f64
 }
 
 /// Days-since-last-sale as the event's observed value (display-only widening).
 #[allow(clippy::cast_precision_loss)]
 fn days_observation(days: i64) -> f64 {
     days as f64
+}
+
+/// A value fraction as whole percent for messages (display-only rounding).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn percent(fraction: f64) -> i64 {
+    (fraction * 100.0).round() as i64
 }
 
 /// Compact identity label for event messages: items by id, pets by their

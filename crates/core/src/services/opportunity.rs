@@ -1,7 +1,12 @@
 //! Opportunity ranking and market overview ("what should I actually snipe"
-//! and "how is the market moving"). All scoring components are transparent
-//! and 0..1-normalized; the weighted score is for RANKING only — deal gates
-//! never read it (they use exact metric blocks).
+//! and "how is the market moving"). Deals are LIVE: a row ranks only while its
+//! floor is listed in the newest snapshot, and it is discounted against the
+//! item's quantity-weighted 7-day value. Listings seen today but already gone
+//! are reported separately — the day fold never forgets a listing, so a
+//! bargain bought minutes after it appeared must not pass as buyable. All
+//! scoring components are transparent and 0..1-normalized; the weighted score
+//! is for RANKING only — deal gates never read it (they use exact metric
+//! blocks).
 
 use std::{
     collections::{
@@ -23,6 +28,7 @@ use crate::{
         ItemDayRow,
         ItemRef,
         SaleRecency,
+        SnapshotFloor,
         TargetId,
     },
     error::StoreError,
@@ -30,11 +36,14 @@ use crate::{
         ClockPort,
         PriceHistoryRepository,
         SalesRepository,
+        SnapshotRepository,
     },
 };
 
-/// Scan window for ranking and overview (days).
-const SCAN_WINDOW_DAYS: i64 = 7;
+/// Scan window for ranking and overview (days). The value-relative alert
+/// conditions read the same window, so an alert and the ranking never
+/// disagree about what an item is worth.
+pub const SCAN_WINDOW_DAYS: i64 = 7;
 /// Sale-rate window backing the reliability component (days).
 const SALE_RATE_WINDOW_DAYS: i64 = 14;
 /// How long a prepared scan stays fresh before the scheduler refreshes it;
@@ -53,10 +62,14 @@ const SCAN_REFRESH_DEBOUNCE_SECONDS: i64 = 30;
 /// Normalization anchor for the churn component: this many unique listings
 /// per day scores as a full 1.0 (config could override later).
 const CHURN_ANCHOR: f64 = 50.0;
+/// Default floor for the gone-today list: every sold listing leaves today's
+/// cumulative floor under the live one, and only a deep gap separates a deal
+/// from ordinary turnover.
+pub const DEFAULT_MIN_MISSED_DISCOUNT: f64 = 0.25;
 
-/// One ranked snipe candidate. All components are 0..1-normalized except the
-/// raw price fields; `score` is ranking-only and never gates deals. Rows are
-/// per market category: an item trading in both auction houses ranks
+/// One ranked live snipe candidate. All components are 0..1-normalized except
+/// the raw price fields; `score` is ranking-only and never gates deals. Rows
+/// are per market category: an item trading in both auction houses ranks
 /// independently in each, on that category's evidence alone.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Opportunity {
@@ -64,17 +77,28 @@ pub struct Opportunity {
     pub item: ItemRef,
     /// Which market the row ranks in.
     pub category: Category,
-    /// Weighted median of the window's per-day medians (each day weighted by
-    /// its listing count; copper). An approximation of a true count-weighted
-    /// median — chosen for parity with the addon's math.
+    /// Count-weighted median of the window's per-day listing-level medians
+    /// (each day weighted by its listing count; copper) — where the median
+    /// LISTING asks, kept for parity with the addon's math and behind the
+    /// stability component.
     pub median7: i64,
-    /// Cheapest unit price of the newest day in the window (copper).
+    /// Cheapest unit price listed for the item in the newest snapshot
+    /// (copper) — buyable right now, not merely seen earlier today.
     pub floor_now: i64,
-    /// `1 - p05(newest day) / median7`, clamped to [0, 1] for scoring — the
-    /// robust floor keeps one outlier listing from faking a deep discount.
+    /// Quantity listed at exactly `floor_now` — how deep the deal is.
+    pub floor_qty: i64,
+    /// Listings of the item in the newest snapshot.
+    pub listed_now: u64,
+    /// Quantity-weighted 7-day median unit price (copper): the price half the
+    /// listed quantity sits at — the bulk price for stackable goods, the
+    /// listing median for single units. The discount reference.
+    pub value7: i64,
+    /// `1 - floor_now / value7`, clamped to [0, 1] and rounded to 3 decimals.
     pub discount: f64,
     /// 14-day sale rate: share of credit-eligible listings credited as sold.
-    pub reliability: f64,
+    /// `None` = no credit-eligible evidence; the score then ranks the item at
+    /// the scan's median known rate instead of at zero.
+    pub reliability: Option<f64>,
     /// Average unique listings per day across the whole window — days the
     /// item did not appear count as zero, so a single-day spike cannot read
     /// as sustained volume.
@@ -86,9 +110,12 @@ pub struct Opportunity {
     pub stability: f64,
     /// Unique listings seen over the window (evidence size).
     pub samples7: i64,
-    /// `min(1, samples7 / min_samples)` — thin evidence means thin trust.
+    /// `min(1, samples7 / min_samples)` — always 1.0 on ranked rows, which
+    /// the evidence floor already admits; kept for feed/API compatibility.
     pub confidence: f64,
-    /// Weighted sum of the components (config weights).
+    /// Weighted geometric mean of the four components (the config weights,
+    /// normalized, as exponents): a component at zero zeroes the score, so a
+    /// liquid but undiscounted market cannot outrank a real deal.
     pub score: f64,
     /// Whole days since the ledger last credited a sale; `None` = no sale
     /// ever credited (a young ledger is not evidence of a stalled market).
@@ -96,6 +123,45 @@ pub struct Opportunity {
     /// Net listings that closed after the last credited sale — the "stopped
     /// selling" churn signal riding with `days_since_last_sale`.
     pub closures_since_last_sale: Option<i64>,
+}
+
+/// A deal seen earlier today that is no longer listed: today's cumulative day
+/// fold holds a listing cheaper than anything the newest snapshot lists. The
+/// fold never drops a listing once seen, so a bargain bought minutes after it
+/// appeared keeps showing under the day's floor — this row says so instead of
+/// passing it off as buyable.
+#[derive(Clone, Debug, PartialEq)]
+pub struct MissedDeal {
+    /// The item or pet the gone listing offered.
+    pub item: ItemRef,
+    /// Which market the deal was seen in.
+    pub category: Category,
+    /// Today's cumulative fold minimum (copper) — what the gone listing asked.
+    pub seen_floor: i64,
+    /// Quantity that listing offered.
+    pub seen_floor_qty: i64,
+    /// Cheapest listing of the item in the newest snapshot (copper); `None`
+    /// when nothing of the item is listed at all.
+    pub live_floor: Option<i64>,
+    /// Quantity-weighted 7-day median unit price (copper), as on live rows.
+    pub value7: i64,
+    /// `1 - seen_floor / value7`, clamped to [0, 1] and rounded to 3 decimals.
+    pub discount: f64,
+    /// 14-day sale rate (`None` = no credit-eligible evidence).
+    pub reliability: Option<f64>,
+    /// Unique listings seen over the window (evidence behind `value7`).
+    pub samples7: i64,
+}
+
+/// The stored snapshot a prepared scan's live floors describe.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LiveSnapshot {
+    /// Storage-assigned snapshot id.
+    pub id: i64,
+    /// Unix seconds of the fetch.
+    pub fetched_at: i64,
+    /// The source's `Last-Modified`, when it reported one.
+    pub source_last_modified: Option<i64>,
 }
 
 /// Row ordering for [`OpportunityService::opportunities`].
@@ -173,11 +239,19 @@ pub struct ScanSnapshot {
     pub items: usize,
     rows: Arc<Vec<ItemScan>>,
     /// 14-day sale rates positionally aligned with `rows` (`None` = the item
-    /// has no sales evidence in the window).
+    /// has no credit-eligible evidence in the window).
     rates: Arc<Vec<Option<f64>>>,
     /// Ledger recencies positionally aligned with `rows` (`None` = no
     /// credited sale ever).
     recencies: Arc<Vec<Option<SaleRecency>>>,
+    /// Live floors per item in the category's newest snapshot (empty when the
+    /// target has no snapshot of that payload kind).
+    floors: Arc<HashMap<ItemRef, SnapshotFloor>>,
+    /// The snapshot `floors` describe; `None` when none is stored.
+    live: Option<LiveSnapshot>,
+    /// Median of the known 14-day sale rates in this scan — the neutral
+    /// stand-in that ranks items without evidence.
+    reliability_prior: f64,
 }
 
 /// Per-item intermediate scan row (pre-filter, pre-ranking).
@@ -186,11 +260,12 @@ struct ItemScan {
     item: ItemRef,
     samples7: i64,
     churn_per_day: f64,
-    floor_now: i64,
-    /// Newest day's p05 — the floor discount is scored against.
-    floor_p05: i64,
+    /// Today's cumulative fold floor and the quantity that listing offered;
+    /// `None` when the item has no fold today.
+    seen_today: Option<(i64, i64)>,
     median_now: i64,
     median7: f64,
+    value7: f64,
     mad7: f64,
 }
 
@@ -206,6 +281,7 @@ type ScanCache = HashMap<(TargetId, Category), (i64, Arc<ScanSnapshot>)>;
 pub struct OpportunityService {
     history: Arc<dyn PriceHistoryRepository>,
     sales: Arc<dyn SalesRepository>,
+    snapshots: Arc<dyn SnapshotRepository>,
     clock: Arc<dyn ClockPort>,
     weights: crate::config::ScoreWeights,
     min_samples: u32,
@@ -218,12 +294,14 @@ impl OpportunityService {
     pub fn new(
         history: Arc<dyn PriceHistoryRepository>,
         sales: Arc<dyn SalesRepository>,
+        snapshots: Arc<dyn SnapshotRepository>,
         clock: Arc<dyn ClockPort>,
         config: &TrackerConfig,
     ) -> Self {
         Self {
             history,
             sales,
+            snapshots,
             clock,
             weights: config.opportunities.weights.clone(),
             min_samples: config.opportunities.min_samples,
@@ -231,15 +309,17 @@ impl OpportunityService {
         }
     }
 
-    /// Ranked snipe candidates: `min_samples` evidence floor, optional churn
-    /// floor, sorted by score descending. Served entirely from the prepared
-    /// scan — reliability ships with the snapshot, so steady-state requests
-    /// touch no store.
+    /// Ranked live snipe candidates: only items the newest snapshot lists,
+    /// `min_samples` evidence floor, optional churn floor, sorted by score
+    /// descending. Served entirely from the prepared scan — live floors and
+    /// reliability ship with the snapshot, so steady-state requests touch no
+    /// store.
     ///
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the cold-start inline scan cannot
-    /// read history rows or sale rates, or the scan cache is poisoned.
+    /// read history rows, live floors or sale rates, or the scan cache is
+    /// poisoned.
     pub fn opportunities(
         &self,
         target: &TargetId,
@@ -256,8 +336,13 @@ impl OpportunityService {
         for ((row, rate), recency) in
             scan.rows.iter().zip(scan.rates.iter()).zip(scan.recencies.iter())
         {
+            // Live only: nothing of the item in the newest snapshot, nothing
+            // to buy (its day-fold floor is a memory, see `missed_deals`).
+            let Some(floor) = scan.floors.get(&row.item) else {
+                continue;
+            };
             let Some(opportunity) =
-                self.opportunity_for(row, rate.unwrap_or(0.0), *recency, category)
+                self.opportunity_for(row, floor, *rate, scan.reliability_prior, *recency, category)
             else {
                 continue;
             };
@@ -272,6 +357,70 @@ impl OpportunityService {
         Ok(out)
     }
 
+    /// Deals seen today that the newest snapshot no longer lists, deepest
+    /// discount first: today's fold floor undercuts the live floor (or the
+    /// item is not listed at all) by at least `min_discount` against the same
+    /// value the ranking uses. Same evidence floor as the ranking, so every
+    /// listed price has a value worth comparing against.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cold-start inline scan cannot
+    /// read history rows, live floors or sale rates, or the scan cache is
+    /// poisoned.
+    pub fn missed_deals(
+        &self,
+        target: &TargetId,
+        category: Category,
+        min_discount: f64,
+        limit: usize,
+    ) -> Result<Vec<MissedDeal>, StoreError> {
+        let scan = self.scan(target, category)?;
+        // An empty newest snapshot (a maintenance dump) proves nothing: with
+        // nothing listed, every sighting would read as "gone".
+        if scan.floors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out: Vec<MissedDeal> = Vec::new();
+        for (row, rate) in scan.rows.iter().zip(scan.rates.iter()) {
+            let Some((seen_floor, seen_floor_qty)) = row.seen_today else {
+                continue;
+            };
+            let live_floor = scan.floors.get(&row.item).map(|floor| floor.floor_price);
+            // Gone exactly when today's cheapest sighting undercuts
+            // everything listed now; equal floors mean it is still there.
+            if live_floor.is_some_and(|live| seen_floor >= live) {
+                continue;
+            }
+            if row.samples7 < i64::from(self.min_samples) || row.value7 <= 0.0 || seen_floor <= 0 {
+                continue;
+            }
+            let discount = discount_of(seen_floor, row.value7);
+            if discount < min_discount {
+                continue;
+            }
+            out.push(MissedDeal {
+                item: row.item.clone(),
+                category,
+                seen_floor,
+                seen_floor_qty,
+                live_floor,
+                value7: as_copper(row.value7),
+                discount,
+                reliability: *rate,
+                samples7: row.samples7,
+            });
+        }
+        out.sort_by(|a, b| {
+            b.discount
+                .partial_cmp(&a.discount)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.samples7.cmp(&a.samples7))
+        });
+        out.truncate(limit.max(1));
+        Ok(out)
+    }
+
     /// Market overview: movers vs their window median, plus most-active.
     /// Served from the prepared scan; nothing is read from the store unless
     /// the cache is completely cold.
@@ -279,7 +428,8 @@ impl OpportunityService {
     /// # Errors
     ///
     /// Returns `StoreError::Backend` when the cold-start inline scan cannot
-    /// read history rows or sale rates, or the scan cache is poisoned.
+    /// read history rows, live floors or sale rates, or the scan cache is
+    /// poisoned.
     pub fn overview(
         &self,
         target: &TargetId,
@@ -306,21 +456,32 @@ impl OpportunityService {
         Ok(OverviewData { movers_up, movers_down, most_active })
     }
 
+    /// The stored snapshot the prepared scan's live floors describe; `None`
+    /// until a scan exists for the target/category or when the target has no
+    /// snapshot of that payload kind.
+    #[must_use]
+    pub fn live_snapshot(&self, target: &TargetId, category: Category) -> Option<LiveSnapshot> {
+        let cache = self.scan_cache().ok()?;
+        let (_, snapshot) = cache.get(&(target.clone(), category))?;
+        snapshot.live
+    }
+
     /// Recomputes the full scan artifact for one target — history read,
-    /// per-item aggregation, and one batched sale-rate lookup — and stores it
-    /// as the snapshot requests are served from. Meant for the background
-    /// scheduler: after startup, after each successful ingest cycle, and when
-    /// a prepared scan outlives [`SCAN_TTL_SECONDS`]. Skips all work while the
-    /// cached snapshot is younger than [`SCAN_REFRESH_DEBOUNCE_SECONDS`], so a
-    /// post-cycle refresh and the TTL tick never double-compute.
+    /// per-item aggregation, one batched sale-rate lookup and the newest
+    /// snapshot's live floors — and stores it as the snapshot requests are
+    /// served from. Meant for the background scheduler: after startup, after
+    /// each successful ingest cycle, and when a prepared scan outlives
+    /// [`SCAN_TTL_SECONDS`]. Skips all work while the cached snapshot is
+    /// younger than [`SCAN_REFRESH_DEBOUNCE_SECONDS`], so a post-cycle
+    /// refresh and the TTL tick never double-compute.
     ///
     /// Returns the number of items the scan covered (the cached count when
     /// skipped).
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when history rows or sale rates cannot be
-    /// read, or the scan cache is poisoned.
+    /// Returns `StoreError::Backend` when history rows, live floors or sale
+    /// rates cannot be read, or the scan cache is poisoned.
     pub fn refresh(&self, target: &TargetId, category: Category) -> Result<usize, StoreError> {
         let now = self.clock.now();
         {
@@ -372,9 +533,10 @@ impl OpportunityService {
     }
 
     /// Builds one full-market scan artifact in a single store pass: day rows,
-    /// per-item aggregation, then one batched sale-rate lookup aligned with
-    /// the aggregated rows. This is the whole per-target cost, paid by the
-    /// scheduler (or the cold-start fallback) instead of request threads.
+    /// per-item aggregation, one batched sale-rate lookup aligned with the
+    /// aggregated rows, then the newest snapshot's live floors. This is the
+    /// whole per-target cost, paid by the scheduler (or the cold-start
+    /// fallback) instead of request threads.
     fn compute_scan(
         &self,
         target: &TargetId,
@@ -391,7 +553,7 @@ impl OpportunityService {
 
         let mut scans: Vec<ItemScan> = Vec::with_capacity(by_item.len());
         for (item, day_rows) in &by_item {
-            scans.push(Self::scan_item(item, day_rows));
+            scans.push(Self::scan_item(item, day_rows, today));
         }
         // BTreeMap iteration is sorted, so the batched rates line up
         // positionally with the stored rows by construction.
@@ -408,12 +570,27 @@ impl OpportunityService {
             recencies.len(),
             "sale_recency_each must stay positionally aligned with the scan rows"
         );
+        let reliability_prior = median_known(&rates);
+        // The live side: the category's newest snapshot and what it lists.
+        let kind = category.payload_kind();
+        let live = self.snapshots.latest(target, kind)?.map(|meta| LiveSnapshot {
+            id: meta.id,
+            fetched_at: meta.fetched_at,
+            source_last_modified: meta.source_last_modified,
+        });
+        let floors = match live {
+            Some(live) => self.snapshots.floors(target, kind, live.id)?,
+            None => HashMap::new(),
+        };
         Ok(ScanSnapshot {
             computed_at: now,
             items: scans.len(),
             rows: Arc::new(scans),
             rates: Arc::new(rates),
             recencies: Arc::new(recencies),
+            floors: Arc::new(floors),
+            live,
+            reliability_prior,
         })
     }
 
@@ -429,22 +606,22 @@ impl OpportunityService {
     // Counts/prices feed f64 scoring components; auction-scale magnitudes sit
     // far inside f64's exact-integer range, so precision loss is intended.
     #[allow(clippy::cast_precision_loss)]
-    fn scan_item(item: &ItemRef, day_rows: &[ItemDayRow]) -> ItemScan {
-        let mut samples7 = 0i64;
+    fn scan_item(item: &ItemRef, day_rows: &[ItemDayRow], today: i64) -> ItemScan {
         let mut churn_sum = 0.0f64;
         let mut weighted: Vec<(i64, i64)> = Vec::new(); // (median, listing_count)
         let mut mad_weight_sum = 0i64;
         let mut mad_weighted = 0.0f64;
         let mut newest: Option<&ItemDayRow> = None;
+        let mut seen_today: Option<(i64, i64)> = None;
         for row in day_rows {
             let count = i64::try_from(row.listing_count).unwrap_or(i64::MAX);
-            // Saturating: one absurd listing_count must not overflow the
-            // whole sum (debug builds panic on overflow).
-            samples7 = samples7.saturating_add(count);
             churn_sum += row.listing_count as f64;
             weighted.push((row.median, count));
             mad_weight_sum = mad_weight_sum.saturating_add(count);
             mad_weighted += row.mad as f64 * row.listing_count as f64;
+            if row.day == today {
+                seen_today = Some((row.min, row.min_qty.max(0)));
+            }
             match newest {
                 Some(latest) if latest.day >= row.day => {}
                 _ => newest = Some(row),
@@ -453,71 +630,74 @@ impl OpportunityService {
         weighted.sort_by_key(|(median, _)| *median);
         let median7 = weighted_median(&weighted);
         let mad7 = if mad_weight_sum > 0 { mad_weighted / mad_weight_sum as f64 } else { 0.0 };
-        let (floor_now, floor_p05, median_now) =
-            newest.map_or((0, 0, 0), |row| (row.min, row.p05, row.median));
+        let (value7, samples7) = quantity_value(day_rows).unwrap_or((0.0, 0));
+        let median_now = newest.map_or(0, |row| row.median);
         // Window-denominator churn: days without a fold count as zero, so a
         // single busy day reads as that day's count spread over the window,
         // not as sustained per-day volume (the docs and the `min_churn`
         // filter both describe window semantics).
-        #[allow(clippy::cast_precision_loss)] // const 7 is exact in f64
         let churn_per_day = churn_sum / SCAN_WINDOW_DAYS as f64;
         ItemScan {
             item: item.clone(),
             samples7,
             churn_per_day,
-            floor_now,
-            floor_p05,
+            seen_today,
             median_now,
             median7,
+            value7,
             mad7,
         }
     }
 
-    /// Builds one opportunity from a scan row. `Ok(None)` = the row is not
-    /// rankable (no price evidence). `reliability` comes from the sale rates
-    /// prepared with the snapshot; a failing sales store surfaces while the
-    /// snapshot is computed (in `refresh` or the cold-start fallback), never
-    /// per request.
+    /// Builds one opportunity from a scan row and its live floor. `Ok(None)`
+    /// = the row is not rankable (no value evidence or no live price).
+    /// `reliability` comes from the sale rates prepared with the snapshot;
+    /// a failing sales store surfaces while the snapshot is computed (in
+    /// `refresh` or the cold-start fallback), never per request.
     fn opportunity_for(
         &self,
         scan: &ItemScan,
-        reliability: f64,
+        floor: &SnapshotFloor,
+        rate: Option<f64>,
+        prior: f64,
         recency: Option<SaleRecency>,
         category: Category,
     ) -> Option<Opportunity> {
-        if scan.median7 <= 0.0 || scan.floor_now <= 0 {
+        if scan.median7 <= 0.0 || scan.value7 <= 0.0 || floor.floor_price <= 0 {
             return None;
         }
-        // Discount is rounded to 3 decimals for feed/UI stability. Scored
-        // against the newest day's p05, not the raw min: one outlier listing
-        // cannot fake a deep discount, while days with ≤ 20 listings
-        // degenerate p05 → min and keep full snipe sensitivity.
-        #[allow(clippy::cast_precision_loss)]
-        let discount = ((1.0 - scan.floor_p05 as f64 / scan.median7).clamp(0.0, 1.0) * 1000.0)
-            .round()
-            / 1000.0;
+        let discount = discount_of(floor.floor_price, scan.value7);
         let churn_score = (scan.churn_per_day / CHURN_ANCHOR).min(1.0);
         let stability = 1.0 - (scan.mad7 / scan.median7).min(1.0);
         // Confidence compares evidence against the u32 floor; f64 is exact at
         // these magnitudes.
         #[allow(clippy::cast_precision_loss)]
         let confidence = (scan.samples7 as f64 / f64::from(self.min_samples)).min(1.0);
-        let score = self.weights.discount * discount
-            + self.weights.sale * reliability
-            + self.weights.churn * churn_score
-            + self.weights.stability * stability.clamp(0.0, 1.0);
-        // median7 is a half-precision weighted mean; the published field is
-        // the floored integer median, matching the addon's display rule.
-        #[allow(clippy::cast_possible_truncation)]
-        let median7 = scan.median7 as i64;
+        // No sale evidence is not a proven non-seller: rank the item at the
+        // scan's median known rate rather than at zero.
+        let reliability = rate.unwrap_or(prior);
+        let score = weighted_geometric(
+            &self.weights,
+            discount,
+            reliability,
+            churn_score,
+            stability.clamp(0.0, 1.0),
+        );
+        // median7/value7 are half-precision weighted medians; the published
+        // fields are the floored integers, matching the addon's display rule.
+        let median7 = as_copper(scan.median7);
+        let value7 = as_copper(scan.value7);
         let today = utc_day(self.clock.now());
         Some(Opportunity {
             item: scan.item.clone(),
             category,
             median7,
-            floor_now: scan.floor_now,
+            floor_now: floor.floor_price,
+            floor_qty: floor.floor_qty.max(0),
+            listed_now: floor.listing_count,
+            value7,
             discount,
-            reliability,
+            reliability: rate,
             churn_per_day: scan.churn_per_day,
             churn_score,
             stability: stability.clamp(0.0, 1.0),
@@ -565,6 +745,84 @@ fn apply_sort(out: &mut [Opportunity], sort: OpportunitySort) {
     }
 }
 
+/// The discount reference shared by the ranking and the deal alerts: the
+/// quantity-weighted median of the per-day quantity-weighted medians (each
+/// day weighted by its listed quantity), plus the rows' listing evidence.
+/// Days without quantity fall back to their listing-level median and count,
+/// so single-unit goods weigh exactly as before. `None` when the rows carry
+/// no value at all.
+#[must_use]
+pub fn quantity_value(rows: &[ItemDayRow]) -> Option<(f64, i64)> {
+    let mut qty_weighted: Vec<(i64, i64)> = Vec::with_capacity(rows.len()); // (qty_median, qty_sum)
+    let mut samples = 0i64;
+    for row in rows {
+        let count = i64::try_from(row.listing_count).unwrap_or(i64::MAX);
+        samples = samples.saturating_add(count);
+        // Saturating: one absurd count must not overflow the whole sum.
+        let weight = if row.qty_sum > 0 { row.qty_sum } else { count };
+        qty_weighted.push((row.qty_median, weight.max(0)));
+    }
+    qty_weighted.sort_by_key(|(price, _)| *price);
+    let value = weighted_median(&qty_weighted);
+    (value > 0.0).then_some((value, samples))
+}
+
+/// Weighted geometric mean of the four 0..1 components: the config weights,
+/// normalized to sum 1, are the exponents (only ratios matter, as before).
+/// Multiplicative on purpose — an item that is liquid but not cheap scores
+/// low however good its other components are, where a weighted sum let churn
+/// capped at its anchor carry it to the top. A component at zero zeroes the
+/// score; a weight at zero drops its component from the product.
+#[must_use]
+fn weighted_geometric(
+    weights: &crate::config::ScoreWeights,
+    discount: f64,
+    reliability: f64,
+    churn_score: f64,
+    stability: f64,
+) -> f64 {
+    // Validated finite and positive-sum by the config.
+    let total = weights.discount + weights.sale + weights.churn + weights.stability;
+    discount.powf(weights.discount / total)
+        * reliability.powf(weights.sale / total)
+        * churn_score.powf(weights.churn / total)
+        * stability.powf(weights.stability / total)
+}
+
+/// `1 - price / value`, clamped to [0, 1] and rounded to 3 decimals for
+/// feed/UI stability.
+#[allow(clippy::cast_precision_loss)]
+fn discount_of(price: i64, value: f64) -> f64 {
+    ((1.0 - price as f64 / value).clamp(0.0, 1.0) * 1000.0).round() / 1000.0
+}
+
+/// Display rule for the weighted medians: the floored integer copper.
+#[allow(clippy::cast_possible_truncation)]
+fn as_copper(value: f64) -> i64 {
+    value as i64
+}
+
+/// Median of the known sale rates (midpoint on even counts); `0.0` when
+/// nothing is known.
+// `known` is non-empty past the early return, and `mid` is the middle index
+// for odd lengths and the upper middle for even ones — both indexes are valid.
+// `f64::midpoint` is unstable; sale rates are 0..=1 and cannot overflow.
+#[allow(clippy::indexing_slicing, clippy::manual_midpoint)]
+fn median_known(rates: &[Option<f64>]) -> f64 {
+    let mut known: Vec<f64> =
+        rates.iter().flatten().copied().filter(|rate| rate.is_finite()).collect();
+    if known.is_empty() {
+        return 0.0;
+    }
+    known.sort_by(f64::total_cmp);
+    let mid = known.len() / 2;
+    if known.len() % 2 == 1 {
+        known[mid]
+    } else {
+        (known[mid - 1] + known[mid]) / 2.0
+    }
+}
+
 /// Count-weighted median over per-day medians (approximation for ranking —
 /// deal gates always use the exact blocks from the metrics engine).
 // Copper prices go into ranking math only; f64 keeps 2^53 integers exact.
@@ -597,6 +855,10 @@ fn weighted_median(pairs: &[(i64, i64)]) -> f64 {
 
 #[cfg(test)]
 mod tests {
+    // Test construction is allowed to unwrap/expect/index: fixed synthetic
+    // inputs, not hostile data (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
+
     use super::*;
 
     #[test]
@@ -619,8 +881,11 @@ mod tests {
             category: Category::Commodity,
             median7: 100,
             floor_now: 100,
+            floor_qty: 1,
+            listed_now: 1,
+            value7: 100,
             discount: 0.0,
-            reliability: 0.0,
+            reliability: None,
             churn_per_day: 0.0,
             churn_score: 0.0,
             stability: 0.0,
@@ -645,58 +910,82 @@ mod tests {
         assert_eq!(rows[3].days_since_last_sale, None, "never sold ranks last");
     }
 
+    /// The scan keeps today's cumulative floor apart from the window stats:
+    /// the live ranking reads the snapshot floor, the gone-today list reads
+    /// this one.
     #[test]
-    fn scan_item_picks_the_newest_day_for_the_floor() {
+    fn scan_item_keeps_todays_floor_and_the_window_value_apart() {
         let rows = vec![
-            ItemDayRow {
-                category: Category::Commodity,
-                item: item(1),
-                day: 7,
-                listing_count: 900,
-                qty_sum: 9_000,
-                min: 45_000,
-                p05: 45_000,
-                median: 90_000,
-                mad: 500,
-            },
-            ItemDayRow {
-                category: Category::Commodity,
-                item: item(1),
-                day: 8,
-                listing_count: 1_100,
-                qty_sum: 11_000,
-                min: 55_000,
-                p05: 55_000,
-                median: 110_000,
-                mad: 600,
-            },
+            day_row(7, 900, 9_000, 45_000, 45_000, 90_000, 500),
+            day_row(8, 1_100, 11_000, 55_000, 55_000, 110_000, 600),
         ];
-        let scan = OpportunityService::scan_item(&item(1), &rows);
-        assert_eq!(scan.floor_now, 55_000);
-        assert_eq!(scan.floor_p05, 55_000);
+        let scan = OpportunityService::scan_item(&item(1), &rows, 8);
+        assert_eq!(scan.seen_today, Some((55_000, 10)), "day 8 is today: its floor and quantity");
         assert_eq!(scan.samples7, 2_000);
-        // Window denominator: 2 000 listings across a 7-day window, even
+        assert_eq!(scan.median_now, 110_000);
+        // Window-denominator: 2 000 listings across a 7-day window, even
         // though only two of those days have folds.
         assert!((scan.churn_per_day - 2_000.0 / 7.0).abs() < 1e-9);
+        // Day 8 listed more units, so its per-unit price is the window value.
+        assert_eq!(scan.value7, 110_000.0);
+        assert_eq!(OpportunityService::scan_item(&item(1), &rows, 9).seen_today, None);
     }
 
     #[test]
     fn churn_uses_the_window_denominator_not_days_with_data() {
         // A single-day spike must read as spike-over-window, not as sustained
         // per-day volume: 50 listings on one day are 50/7 per day, not 50.
-        let rows = vec![ItemDayRow {
-            item: item(2),
-            category: Category::Commodity,
-            day: 9,
-            listing_count: 50,
-            qty_sum: 50,
-            min: 100,
-            p05: 100,
-            median: 100,
-            mad: 0,
-        }];
-        let scan = OpportunityService::scan_item(&item(2), &rows);
+        let rows = vec![day_row(9, 50, 50, 100, 100, 100, 0)];
+        let scan = OpportunityService::scan_item(&item(2), &rows, 1);
         assert!((scan.churn_per_day - 50.0 / 7.0).abs() < 1e-9);
+    }
+
+    /// The discount reference follows quantity: a day of big cheap stacks
+    /// outweighs a day of small dear ones, where the listing-level median
+    /// would read as the dear day.
+    #[test]
+    fn quantity_value_weighs_days_by_listed_quantity() {
+        let mut bulky = day_row(1, 5, 1_000, 10, 10, 10, 0);
+        bulky.qty_median = 10;
+        let mut small = day_row(2, 500, 500, 100, 100, 100, 0);
+        small.qty_median = 100;
+        let (value, samples) = quantity_value(&[bulky, small]).expect("value present");
+        assert_eq!(value, 10.0, "1 000 of 1 500 units sit at 10");
+        assert_eq!(samples, 505);
+        assert_eq!(quantity_value(&[day_row(3, 0, 0, 0, 0, 0, 0)]), None, "no rows, no value");
+    }
+
+    /// Multiplicative scoring: zero discount means zero score however liquid
+    /// the market, and a capped churn component cannot carry an undiscounted
+    /// item past a real deal.
+    #[test]
+    fn score_is_a_weighted_geometric_mean() {
+        let weights =
+            crate::config::ScoreWeights { discount: 0.4, sale: 0.3, churn: 0.2, stability: 0.1 };
+        assert_eq!(
+            weighted_geometric(&weights, 0.0, 1.0, 1.0, 1.0),
+            0.0,
+            "not cheap: no deal, whatever else is perfect"
+        );
+        let deal = weighted_geometric(&weights, 0.3, 0.9, 1.0, 0.9);
+        let saturated = weighted_geometric(&weights, 0.05, 1.0, 1.0, 1.0);
+        assert!(deal > saturated, "a 30% discount beats a 5% one even against perfect markets");
+        assert!((weighted_geometric(&weights, 1.0, 1.0, 1.0, 1.0) - 1.0).abs() < 1e-12);
+        let no_stability = crate::config::ScoreWeights { stability: 0.0, ..weights };
+        assert_eq!(
+            weighted_geometric(&no_stability, 1.0, 1.0, 1.0, 0.0),
+            1.0,
+            "a zero weight drops its component instead of zeroing the product"
+        );
+    }
+
+    /// The unknown-sale-rate prior is the median of the known rates.
+    #[test]
+    fn median_known_takes_the_middle_known_rate() {
+        assert_eq!(median_known(&[]), 0.0);
+        assert_eq!(median_known(&[None, None]), 0.0);
+        assert_eq!(median_known(&[Some(0.2), None, Some(0.8)]), 0.5);
+        assert!((median_known(&[Some(0.2), Some(0.4), Some(0.4), Some(1.0)]) - 0.4).abs() < 1e-12);
     }
 
     // ---- helpers ---------------------------------------------------------
@@ -705,5 +994,30 @@ mod tests {
 
     fn item(id: i64) -> ItemRef {
         ItemRef::Item { item_id: id }
+    }
+
+    #[allow(clippy::too_many_arguments, clippy::cast_possible_truncation)]
+    fn day_row(
+        day: i64,
+        listing_count: u64,
+        qty_sum: i64,
+        min: i64,
+        p05: i64,
+        median: i64,
+        mad: i64,
+    ) -> ItemDayRow {
+        ItemDayRow {
+            item: item(1),
+            category: Category::Commodity,
+            day,
+            listing_count,
+            qty_sum,
+            min,
+            min_qty: 10,
+            p05,
+            median,
+            qty_median: median,
+            mad,
+        }
     }
 }

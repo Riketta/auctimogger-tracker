@@ -2013,9 +2013,11 @@ fn category_options(current: Category) -> String {
     out
 }
 
-/// `GET /opportunities?target=&category=&min_churn=&limit=` — ranked deals
-/// for one market category with filters, sortable columns and per-row watch
-/// actions.
+/// `GET /opportunities?target=&category=&min_churn=&limit=&sort=&min_discount=`
+/// — live deals for one market category (only what the newest snapshot still
+/// lists) with filters, sortable columns and per-row watch actions, followed
+/// by the deals seen today that are already gone.
+#[allow(clippy::too_many_lines)]
 pub(crate) async fn opportunities_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -2028,39 +2030,48 @@ pub(crate) async fn opportunities_page(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let min_churn: f64 = params
-        .get("min_churn")
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(1.0);
+    let min_churn = super::min_churn_param(&params);
     let limit: usize = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let sort = params
         .get("sort")
         .and_then(|value| amtracker_core::services::opportunity::OpportunitySort::parse(value))
         .unwrap_or(amtracker_core::services::opportunity::OpportunitySort::Score);
-    let data = tokio::task::spawn_blocking({
+    let min_discount_percent = super::min_discount_param(&params);
+    let loaded = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.opportunities.opportunities(&target, category, min_churn, limit, sort)
+        move || {
+            let deals =
+                state.opportunities.opportunities(&target, category, min_churn, limit, sort)?;
+            // Read after the (possibly cold) scan, so the note names the
+            // snapshot the rows' prices come from.
+            let live = state.opportunities.live_snapshot(&target, category);
+            let missed = state.opportunities.missed_deals(
+                &target,
+                category,
+                min_discount_percent / 100.0,
+                limit,
+            )?;
+            Ok::<_, StoreError>((live, deals, missed))
+        }
     });
-    let data = match data.await {
-        Ok(Ok(data)) => data,
+    let (live, data, missed) = match loaded.await {
+        Ok(Ok(loaded)) => loaded,
         Ok(Err(error)) => return render::store_error_page(error).await,
         Err(error) => {
             return render::store_error_page(StoreError::Backend(error.to_string())).await
         }
     };
     let watched = watched_keys(&state, &target).await;
-    let names = resolve_names(
-        &state,
-        &super::target_flavor(&state.config, &target),
-        &data.iter().map(|o| o.item.clone()).collect::<Vec<_>>(),
-    )
-    .await;
+    let mut identities: Vec<ItemRef> = data.iter().map(|o| o.item.clone()).collect();
+    identities.extend(missed.iter().map(|deal| deal.item.clone()));
+    let names =
+        resolve_names(&state, &super::target_flavor(&state.config, &target), &identities).await;
 
     let min_churn_text = format!("{min_churn}");
     let limit_text = format!("{limit}");
     let sort_text = sort.as_str();
+    let min_discount_text = format!("{min_discount_percent:.0}");
     let mut sort_options = String::new();
     for (value, tip_key, tip_text) in [
         (
@@ -2095,11 +2106,24 @@ pub(crate) async fn opportunities_page(
             ("min_churn", &min_churn_text),
             ("limit", limit_text.as_str()),
             ("sort", sort_text),
+            ("min_discount", &min_discount_text),
         ],
     );
+    let live_note = match live {
+        Some(live) => {
+            format!(
+                "live prices from snapshot #{} ({})",
+                live.id,
+                html_escape(&human_time(live.fetched_at))
+            )
+        }
+        None => "no snapshot stored for this market yet — live deals appear after the first \
+                 fetch"
+            .to_string(),
+    };
 
     let mut body = format!(
-        "<p class=\"muted\">{} target <code>{}</code> · category <code>{}</code></p>\
+        "<p class=\"muted\">{} target <code>{}</code> · category <code>{}</code> · {}</p>\
          <form class=\"toolbar\" method=\"get\" action=\"/opportunities\">\
          <input type=\"hidden\" name=\"target\" value=\"{}\">\
          <label for=\"category\">{}</label>\
@@ -2110,37 +2134,43 @@ pub(crate) async fn opportunities_page(
          <select id=\"limit\" name=\"limit\">{limit_options}</select>\
          <label for=\"sort\">{}</label>\
          <select id=\"sort\" name=\"sort\" data-autosubmit>{sort_options}</select>\
+         <label for=\"min-discount\">{} ≥</label>\
+         <input type=\"number\" id=\"min-discount\" name=\"min_discount\" value=\"{min_discount_text}\" min=\"0\" max=\"100\" step=\"1\" style=\"width:5rem\">\
          <button class=\"btn btn-sm btn-primary\" type=\"submit\">apply</button>\
          </form>",
-        tip("score", "score = Σ wᵢ·componentᵢ over discount, reliability, churn and stability (weights from [opportunities] in the config; only ratios matter)."),
+        tip("score", "score = discount^w₁ · reliability^w₂ · churn^w₃ · stability^w₄ — a weighted geometric mean (weights from [opportunities] in the config, normalized; only ratios matter). Any component at zero scores zero, so a liquid but undiscounted market cannot outrank a real deal."),
         html_escape(target.as_str()),
         html_escape(category.as_str()),
+        live_note,
         html_escape(target.as_str()),
         tip("category", "Which market the ranking covers: items (item AH), commodities (commodity AH) or pets. Each category ranks on its own evidence — an item trading in both AHs appears independently in each."),
         category_options(category),
         tip("min churn", "Only items with at least this many listings churning per day rank — filters out thin, un-tradeable markets."),
-        tip("rows", "Maximum number of ranked items to show."),
+        tip("rows", "Maximum number of rows per list."),
         tip("sort", "Row ordering: weighted score (default) or stalest-since-last-sale first."),
+        tip("min discount", "Gone-today floor in percent: only listings seen today at least this far under the item's 7-day value are listed. Every sold listing leaves today's cumulative floor under the live one — a deep gap is what separates a missed deal from ordinary turnover."),
     );
 
     if data.is_empty() {
         body.push_str(
-            "<div class=\"empty\">nothing ranks yet — the engine needs day folds plus sell-through \
-             evidence. Let cycles accumulate (or raise/lower min churn).</div>",
+            "<div class=\"empty\">nothing is listed at a discount right now — live deals need a \
+             stored snapshot plus day folds and sell-through evidence (or loosen min churn).</div>",
         );
     } else {
-        body.push_str("<div class=\"scroll-x\"><table id=\"opportunities\"><thead><tr>");
+        body.push_str(
+            "<h2>live deals</h2><div class=\"scroll-x\"><table id=\"opportunities\"><thead><tr>",
+        );
         for (label, tip_text) in [
-            ("item", "Item or pet variant the ranking row describes — click for its full history."),
-            ("score", "Weighted sum of the four components below. Sorted descending by default."),
-            ("confidence", "Evidence vs. [opportunities].min_samples: 100% = the window holds at least the configured number of unique listings."),
-            ("discount", "1 − p05/median7: how far today's robust floor (5th percentile) sits under the 7-day median — one outlier listing cannot fake it."),
-            ("reliability", "Sell-through strength over the 14-day window — how confidently listings actually sell here."),
-            ("churn/day", "Average unique listings appearing per day: trading volume."),
-            ("stability", "Low MAD relative to the median — tight, predictable pricing."),
-            ("floor now", "Cheapest listing folded today."),
-            ("median 7d", "7-day median price."),
-            ("samples 7d", "Unique listings folded over the last 7 days (the evidence behind confidence)."),
+            ("item", "Item or pet variant the deal row describes — click for its full history."),
+            ("score", "Weighted geometric mean of the components below (see the page tip). Sorted descending by default."),
+            ("discount", "1 − price now ÷ value 7d: how far the cheapest listed price sits under the item's quantity-weighted 7-day value."),
+            ("price now", "Cheapest unit price listed in the newest snapshot — buyable right now."),
+            ("qty", "Units listed at exactly that price: how deep the deal is."),
+            ("value 7d", "Quantity-weighted 7-day median unit price: where half the listed quantity trades (the bulk price for stackables, the listing median for single units)."),
+            ("reliability", "14-day sell-through: share of credit-eligible listings sold. — = no evidence yet; such items rank at the market's median rate."),
+            ("churn/day", "Average unique listings per day across the whole 7-day window."),
+            ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
+            ("samples 7d", "Auction-days folded over the last 7 days (listings × days seen) — the evidence behind the value."),
             ("last sale", "Whole days since the ledger last credited a sale — the 'stopped selling' churn signal (TSM's NumExpires). — = no sale ever credited."),
             ("closures", "Listings that closed after that last credited sale — how long the quiet stretch has been running."),
             ("", "Watchlist action (open mode only)."),
@@ -2150,17 +2180,19 @@ pub(crate) async fn opportunities_page(
         body.push_str("</tr></thead><tbody>");
         let open = mutations_open(&state.config);
         for o in &data {
+            let reliability =
+                o.reliability.map_or_else(|| "—".to_string(), |rate| component_bar("rel", rate));
             let _ = write!(
                 body,
                 "<tr>{}\
                  <td data-v=\"{:.4}\"><strong>{:.3}</strong></td>\
-                 <td data-v=\"{:.3}\">{:.0}%</td>\
-                 <td data-v=\"{:.4}\">{}</td>\
-                 <td data-v=\"{:.4}\">{}</td>\
+                 <td data-v=\"{:.3}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{:.2}\">{:.1}</td>\
                  <td data-v=\"{:.4}\">{}</td>\
-                 <td class=\"num\" data-v=\"{}\">{}</td>\
-                 <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
                  <td class=\"num\" data-v=\"{}\">{}</td>\
@@ -2168,20 +2200,20 @@ pub(crate) async fn opportunities_page(
                 item_cell(&target, &o.item, &names, Some(category)),
                 o.score,
                 o.score,
-                o.confidence,
-                o.confidence * 100.0,
                 o.discount,
                 component_bar("disc", o.discount),
-                o.reliability,
-                component_bar("rel", o.reliability),
+                o.floor_now,
+                money(o.floor_now),
+                o.floor_qty,
+                o.floor_qty,
+                o.value7,
+                money(o.value7),
+                o.reliability.unwrap_or(-1.0),
+                reliability,
                 o.churn_per_day,
                 o.churn_per_day,
                 o.stability,
                 component_bar("stab", o.stability),
-                o.floor_now,
-                money(o.floor_now),
-                o.median7,
-                money(o.median7),
                 o.samples7,
                 o.samples7,
                 o.days_since_last_sale.unwrap_or(-1),
@@ -2197,6 +2229,57 @@ pub(crate) async fn opportunities_page(
             body,
             "<p><button class=\"btn btn-sm\" data-csv=\"opportunities\">export CSV</button></p>"
         );
+    }
+
+    body.push_str("<h2>seen today, already gone</h2>");
+    if missed.is_empty() {
+        body.push_str(
+            "<div class=\"empty\">no listing seen today undercut the live market by the minimum \
+             discount — cheap listings that were bought or cancelled land here.</div>",
+        );
+    } else {
+        body.push_str("<div class=\"scroll-x\"><table id=\"missed-deals\"><thead><tr>");
+        for (label, tip_text) in [
+            ("item", "Item or pet variant the gone listing offered — click for its full history."),
+            ("discount", "1 − seen floor ÷ value 7d: how far the gone listing sat under the item's quantity-weighted 7-day value."),
+            ("seen floor", "Cheapest price today's day fold holds — the gone listing's unit price. The fold never forgets a listing, so this outlives the listing itself."),
+            ("qty", "Units that gone listing offered."),
+            ("live floor", "Cheapest listing of the item in the newest snapshot; — = nothing of it is listed."),
+            ("value 7d", "Quantity-weighted 7-day median unit price, as on the live rows."),
+            ("reliability", "14-day sell-through; — = no credit-eligible evidence yet."),
+            ("samples 7d", "Auction-days folded over the last 7 days — the evidence behind the value."),
+        ] {
+            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        }
+        body.push_str("</tr></thead><tbody>");
+        for deal in &missed {
+            let reliability =
+                deal.reliability.map_or_else(|| "—".to_string(), |rate| format!("{rate:.2}"));
+            let live_floor = deal.live_floor.map_or_else(|| "—".to_string(), money);
+            let _ = write!(
+                body,
+                "<tr>{}<td data-v=\"{:.3}\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td><td data-v=\"{}\">{}</td>\
+                 <td class=\"num\" data-v=\"{}\">{}</td></tr>",
+                item_cell(&target, &deal.item, &names, Some(category)),
+                deal.discount,
+                component_bar("disc", deal.discount),
+                deal.seen_floor,
+                money(deal.seen_floor),
+                deal.seen_floor_qty,
+                deal.seen_floor_qty,
+                deal.live_floor.unwrap_or(-1),
+                live_floor,
+                deal.value7,
+                money(deal.value7),
+                deal.reliability.unwrap_or(-1.0),
+                reliability,
+                deal.samples7,
+                deal.samples7
+            );
+        }
+        body.push_str("</tbody></table></div>");
     }
     page("opportunities", "opportunities", &body, Some(switcher))
 }
@@ -2857,6 +2940,15 @@ fn condition_label(condition: &amtracker_core::domain::AlertCondition) -> String
         AlertCondition::BelowFloor { span, percentile } => {
             format!("{} median ≤ {} floor", span.name(), percentile.as_str())
         }
+        AlertCondition::FloorBelow { copper } => {
+            format!("live floor ≤ {} copper", money(copper))
+        }
+        AlertCondition::FloorBelowValue { fraction } => {
+            format!("live floor ≤ {:.0}% of 7d value", fraction * 100.0)
+        }
+        AlertCondition::NewListingBelow { fraction } => {
+            format!("new listing ≤ {:.0}% of 7d value", fraction * 100.0)
+        }
         AlertCondition::SaleRateAbove { rate } => format!("14d sale rate ≥ {rate:.2}"),
         AlertCondition::DaysSinceLastSaleAbove { days } => {
             format!("days since last sale ≥ {days}")
@@ -2929,7 +3021,7 @@ pub(crate) async fn alerts_page(
         body.push_str("<div class=\"scroll-x\"><table id=\"alert-rules\"><thead><tr>");
         for (label, tip_text) in [
             ("item", "The watched item or pet variant."),
-            ("condition", "What fires the rule (evaluated against the same cached blocks the item page shows)."),
+            ("condition", "What fires the rule. Price and floor conditions read the same cached blocks the item page shows; the live-floor and new-listing conditions read the newest snapshot's listings against the item's quantity-weighted 7-day value."),
             ("note", "Your free-form label."),
             ("created", "When the rule was added (UTC)."),
             ("last fired", "The rule's cooldown anchor: null until it has fired once."),
@@ -2970,10 +3062,14 @@ pub(crate) async fn alerts_page(
          <select name=\"type\" aria-label=\"condition\">\
          <option value=\"price-below\">d1 median ≤ copper</option>\
          <option value=\"below-floor\">median ≤ floor percentile</option>\
+         <option value=\"floor-below\">live floor ≤ copper</option>\
+         <option value=\"floor-below-value\">live floor ≤ % of 7d value</option>\
+         <option value=\"new-listing-below\">new listing ≤ % of 7d value</option>\
          <option value=\"sale-rate-above\">14d sale rate ≥ rate</option>\
          <option value=\"days-since-last-sale-above\">days since last sale ≥ days</option>\
          </select>\
          <input name=\"copper\" type=\"number\" min=\"1\" placeholder=\"copper\" aria-label=\"copper threshold\">\
+         <input name=\"percent\" type=\"number\" min=\"1\" max=\"100\" step=\"1\" placeholder=\"% of value\" aria-label=\"percent of the 7-day value\">\
          <select name=\"span\" aria-label=\"span\">\
          <option value=\"d7\">d7</option><option value=\"d14\">d14</option>\
          <option value=\"d30\">d30</option><option value=\"d1\">d1</option>\
@@ -2986,7 +3082,7 @@ pub(crate) async fn alerts_page(
          <input name=\"note\" placeholder=\"note (optional)\" aria-label=\"rule note\">\
          <button class=\"btn btn-sm\" type=\"submit\"{auth}>add rule</button>\
          </form>\
-         <p class=\"muted\">pets: fill species + level + quality + breed (they share one market per species).</p>",
+         <p class=\"muted\">live-floor and new-listing rules need at least [opportunities].min_samples listings behind the item's 7-day value; a new-listing rule counts only listings first sighted in the newest snapshot, and never re-counts one it already fired for. pets: fill species + level + quality + breed (rules watch one variant at a time).</p>",
         html_escape(target.as_str()),
     );
     if !open {
@@ -3005,7 +3101,7 @@ pub(crate) async fn alerts_page(
         for (label, tip_text) in [
             ("fired at", "When the condition held (UTC)."),
             ("rule", "The rule that fired."),
-            ("observed", "The number that fired it: median copper or sale-rate fraction."),
+            ("observed", "The number that fired it: median, live-floor or new-listing copper, or a sale-rate fraction."),
             ("detail", "The recorded one-liner; delivery adapters send this text."),
         ] {
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
@@ -3066,14 +3162,17 @@ pub(crate) async fn help_page() -> Response {
         ("mad", "Median absolute deviation — spread around the median. Low MAD = stable, predictable market."),
         ("vwap", "Volume-weighted average price: Σ(price × qty) ÷ Σqty. Weights big stacks more than single listings."),
         ("qty", "Summed quantity across the window's auctions."),
-        ("sale rate", "Estimated sell-through over 14 days: share of daily sightings that vanish and stay gone past their time-left band's lower bound (the credit rule), so replaced listings do not fake sales."),
-        ("floor now", "Cheapest listing folded for the current UTC day."),
-        ("discount", "1 − p05 ÷ median7: how far today's robust floor (5th-percentile price) sits under the weekly median; a single outlier listing cannot fake a deep discount."),
-        ("reliability", "Sell-through strength feeding the ranking — how confidently listings actually sell on this item."),
+        ("sale rate", "Estimated sell-through over 14 days: the share of credit-eligible listings (last seen with ≥2h left) that vanish earlier than their time-left band's lower bound — too early to have expired — so a listing that was simply replaced does not fake a sale. Listings last seen in a SHORT/MEDIUM band cannot clear the hourly poll and stay out of both numerator and denominator. “—” = no eligible close in the window yet: no evidence, not a zero."),
+        ("live deals", "The /opportunities ranking: only items the newest snapshot still lists. A row's price is buyable at the moment of that fetch; listings that were merely seen earlier today are gone-today rows instead."),
+        ("floor now", "Cheapest unit price of the item in the newest snapshot (copper) — what a buyer can buy right now."),
+        ("value 7d", "Quantity-weighted 7-day median unit price: the price half the listed quantity sits at. For stackable goods it is the bulk price rather than the price of the median listing; for single-unit goods the two coincide."),
+        ("discount", "1 − floor now ÷ value 7d: how far the cheapest listed price sits under the item's quantity-weighted weekly value."),
+        ("seen today, already gone", "A listing seen today under the item's value that the newest snapshot no longer lists (bought or cancelled). The day fold never forgets a listing, so its floor outlives the listing — these rows say so instead of passing it as buyable."),
+        ("reliability", "Sell-through strength feeding the ranking — how confidently listings actually sell on this item. “—” = no credit-eligible evidence; the score then ranks the item at the market's median rate rather than at zero."),
         ("churn/day", "Average unique listings per day across the whole 7-day window — days without data count as zero, so a single-day spike reads as a spike, not sustained volume."),
-        ("stability", "Low MAD relative to the median — tight, predictable pricing."),
+        ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
-        ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
+        ("score", "Weighted geometric mean of discount, reliability, churn and stability (weights from the config, normalized; only ratios matter for ranking). Any component at zero scores zero: a liquid but undiscounted market cannot outrank a real deal."),
         ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
         ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),

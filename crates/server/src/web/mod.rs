@@ -200,6 +200,7 @@ pub fn api_routes() -> Vec<ApiRoute> {
         ("/api/history", &["get"], get(api::api_history)),
         ("/api/search", &["get"], get(api::api_search)),
         ("/api/opportunities", &["get"], get(api::api_opportunities)),
+        ("/api/missed-deals", &["get"], get(api::api_missed_deals)),
         ("/api/overview", &["get"], get(api::api_overview)),
         ("/api/items/{target_id}/{item_id}/metrics", &["get"], get(api::api_item_metrics)),
         (
@@ -477,6 +478,30 @@ pub(crate) fn browse_query_params(
         desc: params.get("dir").is_some_and(|dir| dir == "desc"),
         page,
     })
+}
+
+/// `min_churn` query parameter of the deal views: listings per day an item
+/// needs to rank. Missing or non-finite values fall back to the default.
+pub(crate) fn min_churn_param(params: &HashMap<String, String>) -> f64 {
+    params
+        .get("min_churn")
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(1.0)
+}
+
+/// `min_discount` query parameter of the gone-today list, in whole percent
+/// (25 = a listing seen at 75% of its value or cheaper). Clamped to 0..=100;
+/// missing or non-finite values fall back to the default.
+pub(crate) fn min_discount_param(params: &HashMap<String, String>) -> f64 {
+    /// Default gone-today floor, in percent.
+    const DEFAULT_MIN_DISCOUNT_PERCENT: f64 =
+        amtracker_core::services::opportunity::DEFAULT_MIN_MISSED_DISCOUNT * 100.0;
+    params
+        .get("min_discount")
+        .and_then(|raw| raw.parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map_or(DEFAULT_MIN_DISCOUNT_PERCENT, |value| value.clamp(0.0, 100.0))
 }
 
 /// Maps a raw target slug to a configured [`TargetId`], rejecting unknown

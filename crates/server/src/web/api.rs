@@ -402,10 +402,13 @@ pub(crate) async fn api_history(
     }
 }
 
-/// `GET /api/opportunities?target=&category=&min_churn=&limit=&sort=` —
-/// without `category`, one response keyed by all three categories; with it,
-/// the bare single-category shape. Every row names its category. `sort` is
-/// `score` (default) or `last_sale` (stalest first).
+/// `GET /api/opportunities?target=&category=&min_churn=&limit=&sort=` — LIVE
+/// deals: only what the newest snapshot still lists, discounted against the
+/// item's quantity-weighted 7-day value. Without `category`, one response
+/// keyed by all three categories; with it, the bare single-category shape
+/// plus the snapshot its prices come from. Every row names its category.
+/// `sort` is `score` (default) or `last_sale` (stalest first). Deals seen
+/// today but already gone live in `/api/missed-deals`.
 pub(crate) async fn api_opportunities(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -418,11 +421,7 @@ pub(crate) async fn api_opportunities(
         Ok(category) => category,
         Err(response) => return *response,
     };
-    let min_churn = params
-        .get("min_churn")
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| v.is_finite())
-        .unwrap_or(1.0);
+    let min_churn = super::min_churn_param(&params);
     let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
     let sort_param = params.get("sort").map_or("score", String::as_str);
     let Some(sort) = amtracker_core::services::opportunity::OpportunitySort::parse(sort_param)
@@ -436,7 +435,7 @@ pub(crate) async fn api_opportunities(
     let list = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || -> Result<Vec<(Category, Vec<_>)>, StoreError> {
+        move || {
             let categories: Vec<Category> = match category {
                 Some(category) => vec![category],
                 None => Category::ALL.to_vec(),
@@ -444,12 +443,15 @@ pub(crate) async fn api_opportunities(
             categories
                 .iter()
                 .map(|category| {
-                    state
+                    let rows = state
                         .opportunities
-                        .opportunities(&target, *category, min_churn, limit, sort)
-                        .map(|rows| (*category, rows))
+                        .opportunities(&target, *category, min_churn, limit, sort)?;
+                    // Read after the (possibly cold) scan, so the snapshot
+                    // described is the one the rows' prices come from.
+                    let live = state.opportunities.live_snapshot(&target, *category);
+                    Ok((*category, rows, live))
                 })
-                .collect()
+                .collect::<Result<Vec<_>, StoreError>>()
         }
     });
     match list.await {
@@ -462,6 +464,9 @@ pub(crate) async fn api_opportunities(
                             "category": o.category.as_str(),
                             "median7": o.median7,
                             "floorNow": o.floor_now,
+                            "floorQty": o.floor_qty,
+                            "listedNow": o.listed_now,
+                            "value7": o.value7,
                             "discount": o.discount,
                             "reliability": o.reliability,
                             "churnPerDay": o.churn_per_day,
@@ -476,15 +481,28 @@ pub(crate) async fn api_opportunities(
                     .collect::<Vec<_>>()
             };
             match category {
-                Some(category) => Json(serde_json::json!({
-                    "category": category.as_str(),
-                    "opportunities": list.into_iter().next().map(|(_, rows)| ranked(&rows)).unwrap_or_default(),
-                }))
-                .into_response(),
-                None => Json(serde_json::json!(
-                    list.into_iter()
-                        .map(|(category, rows)| (category.as_str().to_string(), serde_json::json!(ranked(&rows))))
-                        .collect::<serde_json::Map<String, serde_json::Value>>()
+                Some(category) => {
+                    let empty: Vec<amtracker_core::services::opportunity::Opportunity> = Vec::new();
+                    let (live, rows) = list
+                        .into_iter()
+                        .next()
+                        .map_or((None, empty), |(_, rows, live)| (live, rows));
+                    let snapshot = live.map_or(serde_json::Value::Null, |live| {
+                        serde_json::json!({
+                            "id": live.id,
+                            "fetchedAt": live.fetched_at,
+                            "sourceLastModified": live.source_last_modified,
+                        })
+                    });
+                    Json(serde_json::json!({
+                        "category": category.as_str(),
+                        "snapshot": snapshot,
+                        "opportunities": ranked(&rows),
+                    }))
+                    .into_response()
+                }
+                None => Json(keyed_by_category(
+                    list.into_iter().map(|(category, rows, _)| (category, ranked(&rows))).collect(),
                 ))
                 .into_response(),
             }
@@ -492,6 +510,97 @@ pub(crate) async fn api_opportunities(
         Ok(Err(error)) => internal_error("opportunities", &error),
         Err(error) => internal_error("opportunities-join", &error),
     }
+}
+
+/// `GET /api/missed-deals?target=&category=&min_discount=&limit=` — deals
+/// seen today that the newest snapshot no longer lists (bought or cancelled
+/// after the tracker saw them): today's cumulative day fold holds a listing
+/// at least `min_discount` percent under the item's quantity-weighted 7-day
+/// value that undercuts everything listed now. Deepest discount first.
+/// Without `category`, one response keyed by all three categories; with it,
+/// the bare single-category shape.
+pub(crate) async fn api_missed_deals(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<HashMap<String, String>>,
+) -> Response {
+    let target = match required_target(&params, &state.config) {
+        Ok(target) => target,
+        Err(response) => return *response,
+    };
+    let category = match category_option(&params) {
+        Ok(category) => category,
+        Err(response) => return *response,
+    };
+    let min_discount_percent = super::min_discount_param(&params);
+    let min_discount = min_discount_percent / 100.0;
+    let limit = params.get("limit").and_then(|v| v.parse().ok()).unwrap_or(50);
+    let list = tokio::task::spawn_blocking({
+        let state = Arc::clone(&state);
+        let target = target.clone();
+        move || {
+            let categories: Vec<Category> = match category {
+                Some(category) => vec![category],
+                None => Category::ALL.to_vec(),
+            };
+            categories
+                .iter()
+                .map(|category| {
+                    let rows = state.opportunities.missed_deals(
+                        &target,
+                        *category,
+                        min_discount,
+                        limit,
+                    )?;
+                    Ok((*category, rows))
+                })
+                .collect::<Result<Vec<_>, StoreError>>()
+        }
+    });
+    match list.await {
+        Ok(Ok(list)) => {
+            let missed = |rows: &[amtracker_core::services::opportunity::MissedDeal]| {
+                rows.iter()
+                    .map(|deal| {
+                        serde_json::json!({
+                            "item": item_json(&deal.item),
+                            "category": deal.category.as_str(),
+                            "seenFloor": deal.seen_floor,
+                            "seenFloorQty": deal.seen_floor_qty,
+                            "liveFloor": deal.live_floor,
+                            "value7": deal.value7,
+                            "discount": deal.discount,
+                            "reliability": deal.reliability,
+                            "samples7": deal.samples7,
+                        })
+                    })
+                    .collect::<Vec<_>>()
+            };
+            match category {
+                Some(category) => Json(serde_json::json!({
+                    "category": category.as_str(),
+                    "minDiscount": min_discount_percent,
+                    "missed": list.into_iter().next().map_or_else(Vec::new, |(_, rows)| missed(&rows)),
+                }))
+                .into_response(),
+                None => Json(keyed_by_category(
+                    list.into_iter().map(|(category, rows)| (category, missed(&rows))).collect(),
+                ))
+                .into_response(),
+            }
+        }
+        Ok(Err(error)) => internal_error("missed-deals", &error),
+        Err(error) => internal_error("missed-deals-join", &error),
+    }
+}
+
+/// The all-categories response shape shared by the deal endpoints: an object
+/// keyed by category name, each value the single-category rows.
+fn keyed_by_category(list: Vec<(Category, Vec<serde_json::Value>)>) -> serde_json::Value {
+    serde_json::Value::Object(
+        list.into_iter()
+            .map(|(category, rows)| (category.as_str().to_string(), serde_json::Value::Array(rows)))
+            .collect(),
+    )
 }
 
 /// `GET /api/overview?target=&category=&limit=` — without `category`, one
@@ -1394,13 +1503,15 @@ pub(crate) async fn api_watchlist_delete(
 /// JSON shape of one alert condition (the tagged union of rule triggers).
 #[derive(Deserialize)]
 pub(crate) struct AlertConditionPost {
-    /// `price-below` | `below-floor` | `sale-rate-above` |
-    /// `days-since-last-sale-above`.
+    /// `price-below` | `below-floor` | `floor-below` | `floor-below-value` |
+    /// `new-listing-below` | `sale-rate-above` | `days-since-last-sale-above`.
     #[serde(rename = "type")]
     kind: String,
     copper: Option<i64>,
     span: Option<String>,
     percentile: Option<String>,
+    /// Fraction of the item's 7-day value for the value-relative conditions.
+    fraction: Option<f64>,
     rate: Option<f64>,
     days: Option<i64>,
 }
@@ -1431,6 +1542,21 @@ impl AlertConditionPost {
                     .ok_or("below-floor requires percentile p05|p25")?;
                 Ok(AlertCondition::BelowFloor { span, percentile })
             }
+            "floor-below" => {
+                let copper = self.copper.ok_or("floor-below requires copper")?;
+                if copper <= 0 {
+                    return Err("copper must be positive".into());
+                }
+                Ok(AlertCondition::FloorBelow { copper })
+            }
+            "floor-below-value" => {
+                let fraction = self.value_fraction("floor-below-value")?;
+                Ok(AlertCondition::FloorBelowValue { fraction })
+            }
+            "new-listing-below" => {
+                let fraction = self.value_fraction("new-listing-below")?;
+                Ok(AlertCondition::NewListingBelow { fraction })
+            }
             "sale-rate-above" => {
                 let rate = self.rate.ok_or("sale-rate-above requires rate")?;
                 if !(0.0..=1.0).contains(&rate) {
@@ -1446,10 +1572,23 @@ impl AlertConditionPost {
                 Ok(AlertCondition::DaysSinceLastSaleAbove { days })
             }
             other => Err(format!(
-                "unknown condition type '{other}' (expected \
-                 price-below|below-floor|sale-rate-above|days-since-last-sale-above)"
+                "unknown condition type '{other}' (expected price-below|below-floor|\
+                 floor-below|floor-below-value|new-listing-below|sale-rate-above|\
+                 days-since-last-sale-above)"
             )),
         }
+    }
+
+    /// The value fraction of a value-relative condition: present, finite and
+    /// within (0, 1] — a fraction of 0 could never fire.
+    fn value_fraction(&self, condition: &str) -> Result<f64, String> {
+        let fraction = self.fraction.ok_or_else(|| format!("{condition} requires fraction"))?;
+        if !fraction.is_finite() || fraction <= 0.0 || fraction > 1.0 {
+            return Err(format!(
+                "{condition} fraction must be within (0, 1] — e.g. 0.5 for half the 7-day value"
+            ));
+        }
+        Ok(fraction)
     }
 }
 
@@ -1465,6 +1604,15 @@ fn condition_json(condition: &amtracker_core::domain::AlertCondition) -> serde_j
             "span": span.name(),
             "percentile": percentile.as_str(),
         }),
+        AlertCondition::FloorBelow { copper } => {
+            serde_json::json!({ "type": "floor-below", "copper": copper })
+        }
+        AlertCondition::FloorBelowValue { fraction } => {
+            serde_json::json!({ "type": "floor-below-value", "fraction": fraction })
+        }
+        AlertCondition::NewListingBelow { fraction } => {
+            serde_json::json!({ "type": "new-listing-below", "fraction": fraction })
+        }
         AlertCondition::SaleRateAbove { rate } => {
             serde_json::json!({ "type": "sale-rate-above", "rate": rate })
         }

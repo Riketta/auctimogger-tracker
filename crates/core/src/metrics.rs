@@ -2,6 +2,8 @@
 //! `domain/metrics.lua` (golden vectors are asserted in BOTH repos; changing
 //! either side without the other must fail a spec).
 
+use std::collections::BTreeMap;
+
 use crate::domain::{
     BlockLedger,
     ItemDayHistogram,
@@ -105,6 +107,47 @@ pub fn block_from_histograms(
         days_since_last_sale: ledger.days_since_last_sale,
         closures_since_last_sale: ledger.closures_since_last_sale,
     })
+}
+
+/// Quantity-weighted median unit price over merged histograms: the price at
+/// which half the listed quantity sits. For single-unit listings it is the
+/// nearest-rank median; for stackable goods it is the bulk price — where most
+/// of the supply trades — instead of the price of the median *listing* (a
+/// hundred one-unit stacks and five 200-unit stacks would otherwise read as
+/// the one-unit price). `None` when nothing carries quantity.
+#[must_use]
+pub fn quantity_weighted_median(histories: &[ItemDayHistogram]) -> Option<i64> {
+    let mut weights: BTreeMap<i64, i64> = BTreeMap::new();
+    let mut total = 0i64;
+    for histogram in histories {
+        for (price, bucket) in &histogram.buckets {
+            // Quantities are non-negative by construction; a corrupt
+            // non-positive value contributes nothing instead of corrupting
+            // the total.
+            if bucket.qty <= 0 {
+                continue;
+            }
+            let weight = weights.entry(*price).or_insert(0);
+            *weight = weight.saturating_add(bucket.qty);
+            total = total.saturating_add(bucket.qty);
+        }
+    }
+    if total <= 0 {
+        return None;
+    }
+    // Saturating weights can only shrink the running sum relative to a true
+    // total, so the final bucket is the fallback for a saturating overflow.
+    // `(total + 1) / 2` is `total.div_ceil(2)`; total is positive and far
+    // from the i64 edge (it sums per-day quantities).
+    let target = (total + 1) / 2;
+    let mut seen = 0i64;
+    for (price, weight) in &weights {
+        seen = seen.saturating_add(*weight);
+        if seen >= target {
+            return Some(*price);
+        }
+    }
+    weights.last_key_value().map(|(price, _)| *price)
 }
 
 #[cfg(test)]
@@ -228,6 +271,53 @@ mod tests {
     fn empty_input_yields_none() {
         assert!(block_from_histograms(&[], BlockLedger::NONE).is_none());
         assert!(block_from_histograms(&[ItemDayHistogram::default()], BlockLedger::NONE).is_none());
+    }
+
+    /// Single-unit listings: the quantity-weighted median IS the nearest-rank
+    /// median (lower-middle on even counts, the day-row convention).
+    #[test]
+    fn quantity_weighted_median_matches_the_median_for_single_units() {
+        let one = hist_from_samples(&[(100, 1), (200, 1), (300, 1)]);
+        assert_eq!(quantity_weighted_median(&[one]), Some(200));
+        let even = hist_from_samples(&[(100, 1), (200, 1)]);
+        assert_eq!(quantity_weighted_median(&[even]), Some(100));
+    }
+
+    /// Stackable goods: the quantity decides, not the listing count. A hundred
+    /// one-unit stacks at 100 copper must not out-vote five 200-unit stacks at
+    /// 10 copper — the bulk price is where the quantity trades.
+    #[test]
+    fn quantity_weighted_median_follows_quantity_not_listing_count() {
+        let mut histogram = ItemDayHistogram::default();
+        histogram.buckets.insert(100, PriceBucket { listings: 100, qty: 100 });
+        histogram.buckets.insert(10, PriceBucket { listings: 5, qty: 1_000 });
+        assert_eq!(
+            quantity_weighted_median(&[histogram.clone()]),
+            Some(10),
+            "1_000 of 1_100 units sit at 10 copper"
+        );
+        assert_eq!(
+            block_from_histograms(std::slice::from_ref(&histogram), BlockLedger::NONE)
+                .expect("data present")
+                .median,
+            100,
+            "the listing-level median still reads as the one-unit price"
+        );
+    }
+
+    /// Histograms merge before the walk, and quantity-less buckets weigh
+    /// nothing.
+    #[test]
+    fn quantity_weighted_median_merges_days_and_skips_empty_buckets() {
+        let day1 = hist_from_samples(&[(100, 10), (999, 0)]);
+        let day2 = hist_from_samples(&[(300, 30)]);
+        assert_eq!(
+            quantity_weighted_median(&[day1, day2]),
+            Some(300),
+            "30 of 40 units sit at 300 copper"
+        );
+        let dry = hist_from_samples(&[(50, 0), (60, 0)]);
+        assert_eq!(quantity_weighted_median(&[dry]), None);
     }
 
     /// Extreme values: `price * qty` products that overflow any i64

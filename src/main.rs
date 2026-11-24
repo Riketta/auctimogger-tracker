@@ -656,6 +656,7 @@ fn build_app_state(
         opportunities: Arc::new(amtracker_core::services::opportunity::OpportunityService::new(
             store.clone(),
             store.clone(),
+            store.clone(),
             clock.clone(),
             config,
         )),
@@ -684,9 +685,11 @@ fn build_app_state(
             metrics.clone(),
             store.clone(),
             store.clone(),
+            store.clone(),
             alert_dispatcher(config),
             clock.clone(),
             i64::try_from(config.alerts.max_data_age_secs).unwrap_or(i64::MAX),
+            config.opportunities.min_samples,
         )),
         feed_export: Arc::new(FeedExportService::new(
             store.clone(),

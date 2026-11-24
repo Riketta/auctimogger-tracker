@@ -172,6 +172,33 @@ impl FakeSnapshots {
     fn new() -> Self {
         Self { inner: Mutex::new(FakeSnapshotsInner::default()) }
     }
+
+    /// Listing summary of one recorded snapshot, derived from its listings —
+    /// the reference semantics the store's `snapshot_item_floor` rows publish.
+    fn summary(&self, snapshot_id: i64) -> HashMap<ItemRef, amtracker_core::domain::SnapshotFloor> {
+        let inner = self.inner.lock().unwrap();
+        let mut out: HashMap<ItemRef, amtracker_core::domain::SnapshotFloor> = HashMap::new();
+        for listing in inner.listings.get(&snapshot_id).into_iter().flatten() {
+            let floor = out.entry(listing.item_ref.clone()).or_insert(
+                amtracker_core::domain::SnapshotFloor {
+                    floor_price: listing.unit_price,
+                    floor_qty: 0,
+                    listing_count: 0,
+                    qty_sum: 0,
+                },
+            );
+            if listing.unit_price < floor.floor_price {
+                floor.floor_price = listing.unit_price;
+                floor.floor_qty = 0;
+            }
+            if listing.unit_price == floor.floor_price {
+                floor.floor_qty += listing.quantity;
+            }
+            floor.listing_count += 1;
+            floor.qty_sum += listing.quantity;
+        }
+        out
+    }
 }
 
 impl SnapshotRepository for FakeSnapshots {
@@ -285,6 +312,68 @@ impl SnapshotRepository for FakeSnapshots {
         .unwrap_or(usize::MAX);
         let rows = rows.into_iter().skip(skip).take(LISTING_PAGE_SIZE).collect();
         Ok(ListingPage { rows, total, page, pages })
+    }
+
+    fn floors(
+        &self,
+        _target: &TargetId,
+        _kind: PayloadKind,
+        snapshot_id: i64,
+    ) -> Result<HashMap<ItemRef, amtracker_core::domain::SnapshotFloor>, StoreError> {
+        Ok(self.summary(snapshot_id))
+    }
+
+    fn floor(
+        &self,
+        _target: &TargetId,
+        item: &ItemRef,
+        snapshot_id: i64,
+    ) -> Result<Option<amtracker_core::domain::SnapshotFloor>, StoreError> {
+        Ok(self.summary(snapshot_id).remove(item))
+    }
+
+    fn listings_for_item(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        kind: PayloadKind,
+        snapshot_id: i64,
+    ) -> Result<Vec<amtracker_core::domain::SnapshotListing>, StoreError> {
+        let inner = self.inner.lock().unwrap();
+        // The previous snapshot of the same target/kind is what a listing can
+        // already have been seen in — the fake's sighting bookkeeping.
+        let previous = inner
+            .metas
+            .values()
+            .filter(|meta| meta.target == *target && meta.kind == kind && meta.id < snapshot_id)
+            .max_by_key(|meta| meta.id);
+        let fetched_at = inner.metas.get(&snapshot_id).map_or(0, |meta| meta.fetched_at);
+        let first_seen = |auction_id: i64| {
+            let earlier = previous.filter(|meta| {
+                inner
+                    .listings
+                    .get(&meta.id)
+                    .is_some_and(|rows| rows.iter().any(|row| row.auction_id == auction_id))
+            });
+            earlier.map_or((snapshot_id, fetched_at), |meta| (meta.id, meta.fetched_at))
+        };
+        Ok(inner
+            .listings
+            .get(&snapshot_id)
+            .into_iter()
+            .flatten()
+            .filter(|listing| &listing.item_ref == item)
+            .map(|listing| {
+                let (first_seen_snapshot, first_seen_at) = first_seen(listing.auction_id);
+                amtracker_core::domain::SnapshotListing {
+                    auction_id: listing.auction_id,
+                    unit_price: listing.unit_price,
+                    quantity: listing.quantity,
+                    first_seen_snapshot: Some(first_seen_snapshot),
+                    first_seen_at: Some(first_seen_at),
+                }
+            })
+            .collect())
     }
 
     fn snapshot_class_summary(
@@ -828,8 +917,10 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
             listing_count: 1,
             qty_sum: 1,
             min: 90,
+            min_qty: 1,
             p05: 90,
             median: 100,
+            qty_median: 100,
             mad: 0,
         },
         ItemDayRow {
@@ -839,8 +930,10 @@ fn watchlist_report_joins_blocks_rates_and_trends_positionally() {
             listing_count: 1,
             qty_sum: 1,
             min: 500,
+            min_qty: 1,
             p05: 500,
             median: 500,
+            qty_median: 500,
             mad: 0,
         },
     ];
@@ -952,9 +1045,11 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
         )),
         Arc::new(FakeSales::default()),
         Arc::new(FakeSnapshots::new()),
+        history.clone(),
         Some(dispatched.clone()),
         clock.clone(),
         0,
+        1,
     );
 
     // First pass: the price rule fires (100 ≤ 150), the data-less one skips.
@@ -989,9 +1084,11 @@ fn alert_evaluation_fires_records_cools_down_and_isolates_dispatch() {
         )),
         Arc::new(FakeSales::default()),
         Arc::new(FakeSnapshots::new()),
+        history,
         Some(Arc::new(FailingDispatcher)),
         clock.clone(),
         0,
+        1,
     );
     let run = failing.evaluate(&target, 21_600).expect("evaluate after cooldown");
     assert_eq!(run.fired, 1);
@@ -1057,16 +1154,18 @@ fn days_since_last_sale_alert_fires_and_never_sold_never_fires() {
         rules.clone(),
         events.clone(),
         Arc::new(amtracker_core::services::metrics::MetricsService::new(
-            history,
+            history.clone(),
             Arc::new(FakeCache::default()),
             sales.clone(),
             clock.clone(),
         )),
         sales,
         Arc::new(FakeSnapshots::new()),
+        history,
         None,
         clock.clone(),
         0,
+        1,
     );
 
     let run = service.evaluate(&target, 21_600).expect("evaluate");
@@ -1135,16 +1234,18 @@ fn stale_feed_snapshot_skips_rules_and_counts_them() {
         rules.clone(),
         events.clone(),
         Arc::new(amtracker_core::services::metrics::MetricsService::new(
-            history,
+            history.clone(),
             Arc::new(FakeCache::default()),
             sales.clone(),
             clock.clone(),
         )),
         sales,
         snapshots,
+        history,
         None,
         clock.clone(),
         48 * 60 * 60,
+        1,
     );
 
     // The rule would fire on its block (the fixture fold is 100 ≤ 150), but
@@ -1236,16 +1337,18 @@ fn freshness_gate_lets_exact_age_pass_and_blocks_beyond_it() {
         rules.clone(),
         events.clone(),
         Arc::new(amtracker_core::services::metrics::MetricsService::new(
-            history,
+            history.clone(),
             Arc::new(FakeCache::default()),
             sales.clone(),
             clock.clone(),
         )),
         sales,
         snapshots,
+        history,
         None,
         clock.clone(),
         gate,
+        1,
     );
 
     let run = service.evaluate(&target, 0).expect("evaluate at the boundary");
@@ -1300,16 +1403,18 @@ fn freshness_gate_ages_from_source_last_modified() {
         rules.clone(),
         events.clone(),
         Arc::new(amtracker_core::services::metrics::MetricsService::new(
-            history,
+            history.clone(),
             Arc::new(FakeCache::default()),
             sales.clone(),
             clock.clone(),
         )),
         sales,
         snapshots,
+        history,
         None,
         clock.clone(),
         48 * 60 * 60,
+        1,
     );
 
     let run = service.evaluate(&target, 0).expect("evaluate");
@@ -1333,16 +1438,18 @@ fn no_snapshots_read_as_not_stale() {
         rules.clone(),
         events.clone(),
         Arc::new(amtracker_core::services::metrics::MetricsService::new(
-            history,
+            history.clone(),
             Arc::new(FakeCache::default()),
             sales.clone(),
             clock.clone(),
         )),
         sales,
         snapshots,
+        history,
         None,
         clock.clone(),
         gate,
+        1,
     );
 
     let run = service.evaluate(&target, 0).expect("evaluate");
@@ -1436,16 +1543,18 @@ fn freshness_gate_is_per_market_kind() {
         rules.clone(),
         events.clone(),
         Arc::new(amtracker_core::services::metrics::MetricsService::new(
-            history,
+            history.clone(),
             Arc::new(FakeCache::default()),
             sales.clone(),
             clock.clone(),
         )),
         sales,
         snapshots,
+        history,
         None,
         clock.clone(),
         48 * 60 * 60,
+        1,
     );
 
     let run = service.evaluate(&target, 0).expect("evaluate");
@@ -1458,6 +1567,245 @@ fn freshness_gate_is_per_market_kind() {
     let stored = events.recent(&target, 10).expect("recent");
     assert_eq!(stored.len(), 1);
     assert!(stored[0].message.contains("[commodity]"), "{}", stored[0].message);
+}
+
+/// Live-deal fixture for the floor/new-listing conditions: item 1 holds a
+/// 7-day value of 1 000 (two days of 30 single-unit listings), and the newest
+/// snapshot lists it at 450 (already seen an hour earlier), 400 and 200 × 5
+/// (both new to it).
+fn live_deal_fixture(
+    condition: amtracker_core::domain::AlertCondition,
+    min_samples: u32,
+) -> (TargetId, amtracker_core::services::alert::AlertEvaluationService, Arc<FakeAlertEvents>) {
+    use amtracker_core::{
+        domain::NewAlertRule,
+        services::alert::AlertEvaluationService,
+    };
+
+    let now = 1_000_000;
+    let today = utc_day(now);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let history = Arc::new(FakeHistory::default());
+    *history.item_rows.lock().unwrap() =
+        vec![day_row(1, today - 1, 30, 900, 1_000), day_row(1, today, 30, 900, 1_000)];
+
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let snap = |fetched_at: i64| NewSnapshot {
+        target: target.clone(),
+        kind: PayloadKind::Commodities,
+        fetched_at,
+        source_last_modified: None,
+        entry_count: 3,
+        dropped_count: 0,
+        dropped_reasons: BTreeMap::new(),
+        status: SnapshotStatus::Ok,
+    };
+    snapshots
+        .record(&snap(now - 3_600), &[listing(1, &item1, 450, 1)], b"".as_slice())
+        .expect("record the earlier snapshot");
+    snapshots
+        .record(
+            &snap(now),
+            &[listing(1, &item1, 450, 1), listing(2, &item1, 200, 5), listing(3, &item1, 400, 1)],
+            b"".as_slice(),
+        )
+        .expect("record the newest snapshot");
+
+    let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
+    rules
+        .add(&NewAlertRule { target: target.clone(), item: item1, condition, note: None })
+        .expect("add rule");
+
+    let clock = MutableClock::new(now);
+    let sales = Arc::new(FakeSales::default());
+    let service = AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history.clone(),
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        history,
+        None,
+        clock,
+        0,
+        min_samples,
+    );
+    (target, service, events)
+}
+
+/// `floor-below` watches the newest snapshot's floor — what a buyer can
+/// actually buy — not the day's median.
+#[test]
+fn floor_below_fires_on_the_live_floor() {
+    use amtracker_core::domain::AlertCondition;
+
+    let (target, service, events) =
+        live_deal_fixture(AlertCondition::FloorBelow { copper: 450 }, 30);
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 1);
+    let stored = events.recent(&target, 10).expect("recent");
+    assert_eq!(stored[0].observed, Some(200.0));
+    assert!(
+        stored[0].message.contains("live floor 200 copper (target ≤ 450)"),
+        "{}",
+        stored[0].message
+    );
+
+    let (target, service, events) =
+        live_deal_fixture(AlertCondition::FloorBelow { copper: 199 }, 30);
+    assert_eq!(service.evaluate(&target, 0).expect("evaluate").fired, 0);
+    assert_eq!(
+        events.recent(&target, 10).expect("recent"),
+        Vec::new(),
+        "a floor above the threshold records nothing"
+    );
+}
+
+/// `floor-below-value` compares the live floor with the ranking's discount
+/// reference, and only with the configured evidence behind that value.
+#[test]
+fn floor_below_value_reads_the_quantity_weighted_value() {
+    use amtracker_core::domain::AlertCondition;
+
+    let (target, service, events) =
+        live_deal_fixture(AlertCondition::FloorBelowValue { fraction: 0.5 }, 30);
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 1, "200 is half of the 1 000 value");
+    let stored = events.recent(&target, 10).expect("recent");
+    assert!(stored[0].message.contains("≤ 50% of 7-day value 1000"), "{}", stored[0].message);
+
+    let (target, service, _events) =
+        live_deal_fixture(AlertCondition::FloorBelowValue { fraction: 0.15 }, 30);
+    assert_eq!(
+        service.evaluate(&target, 0).expect("evaluate").fired,
+        0,
+        "200 is not within 15% of 1 000"
+    );
+
+    let (target, service, _events) =
+        live_deal_fixture(AlertCondition::FloorBelowValue { fraction: 0.5 }, 100);
+    assert_eq!(
+        service.evaluate(&target, 0).expect("evaluate").fired,
+        0,
+        "60 listings of evidence cannot back a 100-listing floor"
+    );
+}
+
+/// `new-listing-below` counts only listings first sighted in the newest
+/// snapshot, and never re-counts one the rule already fired for.
+#[test]
+fn new_listing_below_counts_only_fresh_listings_once() {
+    use amtracker_core::domain::AlertCondition;
+
+    let (target, service, events) =
+        live_deal_fixture(AlertCondition::NewListingBelow { fraction: 0.5 }, 30);
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 1);
+    let stored = events.recent(&target, 10).expect("recent");
+    assert_eq!(stored[0].observed, Some(200.0), "the cheapest fresh listing");
+    let message = &stored[0].message;
+    assert!(message.contains("2 new listing(s) from 200 copper"), "{message}");
+    assert!(message.contains("6 units"), "5 + 1 units of the two fresh listings: {message}");
+
+    // Same snapshot again, cooldown disabled: the listings are no longer new
+    // since the firing, so nothing re-fires.
+    assert_eq!(service.evaluate(&target, 0).expect("evaluate again").fired, 0);
+
+    let (target, service, _events) =
+        live_deal_fixture(AlertCondition::NewListingBelow { fraction: 0.3 }, 30);
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 1, "only the 200 listing sits within 30% of the value");
+
+    let (target, service, _events) =
+        live_deal_fixture(AlertCondition::NewListingBelow { fraction: 0.19 }, 30);
+    assert_eq!(
+        service.evaluate(&target, 0).expect("evaluate").fired,
+        0,
+        "nothing fresh is that cheap"
+    );
+}
+
+/// The 450 listing was already up an hour ago: a new-listing rule must not
+/// count it, however cheap it is.
+#[test]
+fn new_listing_below_ignores_listings_already_up() {
+    use amtracker_core::domain::AlertCondition;
+
+    let now = 1_000_000;
+    let today = utc_day(now);
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    let history = Arc::new(FakeHistory::default());
+    *history.item_rows.lock().unwrap() =
+        vec![day_row(1, today - 1, 30, 900, 1_000), day_row(1, today, 30, 900, 1_000)];
+    let snapshots = Arc::new(FakeSnapshots::new());
+    let snap =
+        |fetched_at: i64, listings: &[amtracker_core::domain::NormalizedListing]| NewSnapshot {
+            target: target.clone(),
+            kind: PayloadKind::Commodities,
+            fetched_at,
+            source_last_modified: None,
+            entry_count: u64::try_from(listings.len()).unwrap_or(u64::MAX),
+            dropped_count: 0,
+            dropped_reasons: BTreeMap::new(),
+            status: SnapshotStatus::Ok,
+        };
+    // A 100-copper listing was up an hour ago and still is: not news.
+    let earlier = [listing(1, &item1, 100, 1), listing(2, &item1, 900, 1)];
+    let newest = earlier.clone();
+    snapshots
+        .record(&snap(now - 3_600, &earlier), &earlier, b"".as_slice())
+        .expect("record the earlier snapshot");
+    snapshots
+        .record(&snap(now, &newest), &newest, b"".as_slice())
+        .expect("record the newest snapshot");
+    let events = Arc::new(FakeAlertEvents::default());
+    let rules = Arc::new(FakeAlertRules {
+        rules: Mutex::new(Vec::new()),
+        next_id: Mutex::new(0),
+        events: events.clone(),
+    });
+    rules
+        .add(&amtracker_core::domain::NewAlertRule {
+            target: target.clone(),
+            item: item1,
+            condition: AlertCondition::NewListingBelow { fraction: 0.5 },
+            note: None,
+        })
+        .expect("add rule");
+    let clock = MutableClock::new(now);
+    let sales = Arc::new(FakeSales::default());
+    let service = amtracker_core::services::alert::AlertEvaluationService::new(
+        rules.clone(),
+        events.clone(),
+        Arc::new(amtracker_core::services::metrics::MetricsService::new(
+            history.clone(),
+            Arc::new(FakeCache::default()),
+            sales.clone(),
+            clock.clone(),
+        )),
+        sales,
+        snapshots,
+        history,
+        None,
+        clock,
+        0,
+        30,
+    );
+
+    let run = service.evaluate(&target, 0).expect("evaluate");
+    assert_eq!(run.fired, 0, "a listing that stayed up is not a new listing");
 }
 
 #[test]
@@ -1878,8 +2226,10 @@ fn day_row(item_id: i64, day: i64, listing_count: u64, min: i64, median: i64) ->
         listing_count,
         qty_sum: 0,
         min,
+        min_qty: 1,
         p05: min,
         median,
+        qty_median: median,
         mad: 500,
     }
 }
@@ -1895,104 +2245,239 @@ fn scan_day_rows() -> Vec<ItemDayRow> {
     ]
 }
 
-/// A fresh opportunity service over the shared fixture: scripted rows,
-/// counting sales fake, movable clock.
+/// What the newest snapshot lists for the shared fixture: item 1 at its day
+/// floor (ten single-unit listings), item 2 a little under its median — both
+/// live, both rankable.
+fn live_listings() -> Vec<amtracker_core::domain::NormalizedListing> {
+    (0..10)
+        .map(|n| listing(5_000 + n, &item(1), 55_000, 1))
+        .chain((0..5).map(|n| listing(6_000 + n, &item(2), 90_000, 1)))
+        .collect()
+}
+
+/// A fresh opportunity service over the shared fixture: scripted rows, the
+/// live snapshot above, counting sales fake, movable clock.
 fn opportunity_fixture(
     now: i64,
 ) -> (Arc<OpportunityService>, Arc<CountingHistory>, Arc<CountingSales>, Arc<MutableClock>) {
-    let history = Arc::new(CountingHistory::new(scan_day_rows()));
+    opportunity_fixture_with(now, scan_day_rows(), &live_listings())
+}
+
+/// The fixture with caller-scripted day rows and newest-snapshot listings.
+fn opportunity_fixture_with(
+    now: i64,
+    rows: Vec<ItemDayRow>,
+    live: &[amtracker_core::domain::NormalizedListing],
+) -> (Arc<OpportunityService>, Arc<CountingHistory>, Arc<CountingSales>, Arc<MutableClock>) {
+    opportunity_fixture_at(now, rows, live, 1)
+}
+
+/// The fixture with an explicit evidence floor (`[opportunities].min_samples`).
+fn opportunity_fixture_at(
+    now: i64,
+    rows: Vec<ItemDayRow>,
+    live: &[amtracker_core::domain::NormalizedListing],
+    min_samples: u32,
+) -> (Arc<OpportunityService>, Arc<CountingHistory>, Arc<CountingSales>, Arc<MutableClock>) {
+    let history = Arc::new(CountingHistory::new(rows));
     let sales = Arc::new(CountingSales::default());
     let clock = MutableClock::new(now);
+    let snapshots = Arc::new(FakeSnapshots::new());
+    snapshots
+        .record(
+            &NewSnapshot {
+                target: target().id,
+                kind: PayloadKind::Commodities,
+                fetched_at: now,
+                source_last_modified: None,
+                entry_count: u64::try_from(live.len()).unwrap_or(u64::MAX),
+                dropped_count: 0,
+                dropped_reasons: BTreeMap::new(),
+                status: SnapshotStatus::Ok,
+            },
+            live,
+            b"live".as_slice(),
+        )
+        .expect("record the live snapshot");
+    let mut config = opportunity_config();
+    config.opportunities.min_samples = min_samples;
     let service = Arc::new(OpportunityService::new(
         history.clone(),
         sales.clone(),
+        snapshots,
         clock.clone(),
-        &opportunity_config(),
+        &config,
     ));
     (service, history, sales, clock)
 }
 
-#[test]
-fn refresh_prepares_the_scan_so_requests_read_nothing() {
-    let target = TargetId("us-4".into());
-    let (service, history, sales, _clock) = opportunity_fixture(1_000_000);
-
-    let covered = service.refresh(&target, Category::Commodity).expect("refresh");
-    assert_eq!(covered, 2, "both scanned items are covered");
-
-    for _ in 0..3 {
-        let ranked = service
-            .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
-            .expect("ranked");
-        assert_eq!(ranked.len(), 2);
-        let overview = service.overview(&target, Category::Commodity, 15).expect("overview");
-        assert_eq!(overview.most_active.len(), 2);
-    }
-    assert_eq!(history.item_day_rows_calls(), 1, "only the refresh reads history");
-    assert_eq!(sales.sale_rate_each_calls(), 1, "only the refresh reads sale rates");
-}
-
-#[test]
-fn prepared_ranking_matches_the_inline_semantics() {
-    let target = TargetId("us-4".into());
-    // The same data through the cold inline fallback and through a prepared
-    // snapshot must produce identical ranking.
-    let (cold, _, _, _) = opportunity_fixture(1_000_000);
-    let inline = cold
-        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
-        .expect("inline ranked");
-
-    let (prepared, history, sales, _clock) = opportunity_fixture(1_000_000);
-    prepared.refresh(&target, Category::Commodity).expect("refresh");
-    let warmed = prepared
-        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
-        .expect("prepared ranked");
-
-    assert_eq!(inline, warmed, "prepared rates must reproduce the inline math");
-    assert_eq!(
-        warmed.first().map(|o| o.item.clone()),
-        Some(item(1)),
-        "biggest discount ranks first"
-    );
-    assert_eq!(
-        warmed.first().map(|o| o.reliability),
-        Some(0.25),
-        "prepared rate feeds reliability"
-    );
-    assert_eq!(history.item_day_rows_calls(), 1);
-    assert_eq!(sales.sale_rate_each_calls(), 1);
-}
-
-#[test]
-fn a_single_troll_floor_cannot_fake_a_deep_discount() {
-    // One 1-copper listing among a busy day: the displayed floor keeps the
-    // true min, but discount scores against the day's p05 so the outlier
-    // cannot top the ranking with a fake ~100% discount.
-    let target = TargetId("us-4".into());
-    let today = amtracker_core::domain::utc_day(1_000_000);
-    let rows = vec![ItemDayRow {
+/// One busy day of item 1: a thousand listings around 100 000, plus a single
+/// listing at 1 copper (a stack of 72) seen at some point that day.
+fn troll_day_row() -> ItemDayRow {
+    ItemDayRow {
         item: item(1),
         category: Category::Commodity,
-        day: today,
+        day: utc_day(1_000_000),
         listing_count: 1_000,
         qty_sum: 1_000,
         min: 1,
+        min_qty: 72,
         p05: 90_000,
         median: 100_000,
+        qty_median: 100_000,
         mad: 5_000,
-    }];
-    let history = Arc::new(CountingHistory::new(rows));
-    let sales = Arc::new(CountingSales::default());
-    let clock = MutableClock::new(1_000_000);
-    let service = OpportunityService::new(history, sales, clock, &opportunity_config());
+    }
+}
+
+/// The day fold never forgets a listing, so a 1-copper sighting stays under
+/// today's floor whether or not it is still listed. The ranking is LIVE: it
+/// takes the newest snapshot's floor, and the gone bargain is reported where
+/// it belongs — on the gone-today list, not as a buyable deal.
+#[test]
+fn a_gone_troll_listing_is_a_missed_deal_not_a_live_one() {
+    let target = TargetId("us-4".into());
+    // Newest snapshot: the 1-copper stack is gone; singles at 95 000 remain.
+    let live: Vec<amtracker_core::domain::NormalizedListing> =
+        (0..20).map(|n| listing(7_000 + n, &item(1), 95_000, 1)).collect();
+    let (service, _history, _sales, _clock) =
+        opportunity_fixture_with(1_000_000, vec![troll_day_row()], &live);
 
     let ranked = service
         .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
         .expect("ranked");
-    let top = ranked.first().expect("rankable");
-    assert_eq!(top.floor_now, 1, "the displayed floor stays the true min");
-    assert_eq!(top.median7, 100_000);
-    assert_eq!(top.discount, 0.1, "discount reads p05, not the troll min");
+    let live_row = ranked.first().expect("rankable");
+    assert_eq!(live_row.floor_now, 95_000, "the live floor is what the newest snapshot lists");
+    assert_eq!(live_row.floor_qty, 20, "every remaining single sits at that price");
+    assert_eq!(live_row.listed_now, 20);
+    assert_eq!(live_row.discount, 0.05, "5% under the 100 000 value, not 100%");
+
+    let missed = service.missed_deals(&target, Category::Commodity, 0.0, 50).expect("missed");
+    assert_eq!(missed.len(), 1, "the gone bargain is reported, not hidden");
+    assert_eq!(missed[0].item, item(1));
+    assert_eq!(missed[0].seen_floor, 1);
+    assert_eq!(missed[0].seen_floor_qty, 72, "the listing's own quantity travels with it");
+    assert_eq!(missed[0].live_floor, Some(95_000));
+    assert_eq!(missed[0].discount, 1.0);
+    assert_eq!(
+        missed[0].reliability,
+        Some(0.25),
+        "the scripted rate for item 1 travels with the gone deal"
+    );
+}
+
+/// A cheap listing that IS listed is the deal: nothing is smoothed away.
+#[test]
+fn a_live_cheap_listing_ranks_at_its_real_price() {
+    let target = TargetId("us-4".into());
+    let mut live: Vec<amtracker_core::domain::NormalizedListing> =
+        (0..20).map(|n| listing(7_000 + n, &item(1), 95_000, 1)).collect();
+    live.push(listing(6_500, &item(1), 1, 72));
+    let (service, _history, _sales, _clock) =
+        opportunity_fixture_with(1_000_000, vec![troll_day_row()], &live);
+
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    let deal = ranked.first().expect("rankable");
+    assert_eq!(deal.floor_now, 1, "buyable right now at the price it asks");
+    assert_eq!(deal.floor_qty, 72);
+    assert_eq!(deal.discount, 1.0);
+
+    let missed = service.missed_deals(&target, Category::Commodity, 0.0, 50).expect("missed");
+    assert!(
+        missed.is_empty(),
+        "the cheapest sighting of the day is still listed: nothing is missed"
+    );
+}
+
+/// Gone-today rows respect the discount floor and the evidence gate.
+#[test]
+fn missed_deals_filter_by_discount_and_evidence() {
+    let target = TargetId("us-4".into());
+    let today = utc_day(1_000_000);
+    // Item 1: today's fold floor 80 000 under a 100 000 value (a 20% gap);
+    // item 3: a 90% gap but only five listings of evidence all week.
+    let rows = vec![
+        day_row(1, today - 1, 50, 100_000, 100_000),
+        day_row(1, today, 50, 80_000, 100_000),
+        day_row(3, today, 5, 10_000, 100_000),
+    ];
+    let live = vec![listing(7_000, &item(1), 100_000, 1), listing(7_100, &item(3), 100_000, 1)];
+    // The evidence floor is the production default, 30 listings.
+    let (service, _history, _sales, _clock) = opportunity_fixture_at(1_000_000, rows, &live, 30);
+
+    let at_default = service.missed_deals(&target, Category::Commodity, 0.25, 50).expect("missed");
+    assert!(
+        at_default.is_empty(),
+        "a 20% gap is ordinary turnover; thin evidence never lists: {at_default:?}"
+    );
+    let loose = service.missed_deals(&target, Category::Commodity, 0.1, 50).expect("missed");
+    assert_eq!(loose.len(), 1, "only item 1 clears the evidence floor");
+    assert_eq!(loose[0].item, item(1));
+    assert_eq!(loose[0].discount, 0.2);
+    assert_eq!(loose[0].reliability, Some(0.25));
+    assert_eq!(
+        service.missed_deals(&target, Category::Commodity, 0.1, 50).expect("missed").len(),
+        1,
+        "item 3's 90% gap on five listings stays out at any floor"
+    );
+}
+
+/// An empty newest snapshot (a maintenance dump) proves nothing: no live
+/// rows, and no "gone" rows either.
+#[test]
+fn an_empty_snapshot_ranks_nothing_and_misses_nothing() {
+    let target = TargetId("us-4".into());
+    let (service, _history, _sales, _clock) =
+        opportunity_fixture_with(1_000_000, scan_day_rows(), &[]);
+    assert_eq!(
+        service
+            .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+            .expect("ranked"),
+        Vec::new(),
+        "nothing is listed: nothing ranks"
+    );
+    assert_eq!(
+        service.missed_deals(&target, Category::Commodity, 0.0, 50).expect("missed"),
+        Vec::new(),
+        "an empty snapshot proves nothing is gone either"
+    );
+}
+
+/// No sale evidence is not a proven non-seller: such rows keep `reliability`
+/// `None` and score at the scan's median known rate instead of at zero.
+#[test]
+fn unknown_sale_rates_rank_at_the_median_known_rate() {
+    let target = TargetId("us-4".into());
+    let (service, _history, _sales, _clock) = opportunity_fixture(1_000_000);
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    // CountingSales scripts item 1 at 0.25 and nothing for item 2, so the
+    // prior is that single known rate.
+    assert_eq!(ranked[0].item, item(1));
+    assert_eq!(ranked[0].reliability, Some(0.25));
+    assert_eq!(ranked[1].reliability, None, "no evidence is reported as such");
+    // discount 0.053, churn 300/7 against the 50 anchor, stability 1 - 500/95 000,
+    // reliability at the 0.25 prior — a geometric mean of about 0.198.
+    assert!((ranked[1].score - 0.198).abs() < 0.002, "score {}", ranked[1].score);
+}
+
+/// The scan's live floors describe exactly the snapshot the page names.
+#[test]
+fn live_snapshot_names_the_scan_source() {
+    let target = TargetId("us-4".into());
+    let (service, _history, _sales, _clock) = opportunity_fixture(1_000_000);
+    assert_eq!(
+        service.live_snapshot(&target, Category::Commodity),
+        None,
+        "no scan yet, no snapshot to name"
+    );
+    service.refresh(&target, Category::Commodity).expect("refresh");
+    let live =
+        service.live_snapshot(&target, Category::Commodity).expect("the scan names its snapshot");
+    assert_eq!(live.fetched_at, 1_000_000);
+    assert_eq!(live.source_last_modified, None);
 }
 
 #[test]
@@ -2554,8 +3039,10 @@ fn sell_priority_ranks_hot_first_and_flags_thin_data() {
         listing_count: 1,
         qty_sum: 1,
         min: median,
+        min_qty: 1,
         p05: median,
         median,
+        qty_median: median,
         mad: 0,
     };
     *history.item_rows.lock().unwrap() =

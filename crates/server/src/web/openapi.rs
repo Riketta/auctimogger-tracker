@@ -239,6 +239,9 @@ fn spec_paths_discovery() -> Value {
 }
 
 /// Read-only market data. Every endpoint here requires `?target=`.
+// One declarative spec table per group: the path list reads best as a single
+// ordered block.
+#[allow(clippy::too_many_lines)]
 fn spec_paths_market(target: &Value) -> Value {
     json!({
         "/api/search": {
@@ -255,8 +258,8 @@ fn spec_paths_market(target: &Value) -> Value {
         },
         "/api/opportunities": {
             "get": get_op(
-                "Ranked deals",
-                "Snipe candidates sorted by score descending: discount (robust p05 floor vs 7-day median), 14-day sale-rate reliability, churn and stability. limit is uncapped enough for whole-ranking pulls (scores are ranking-only; deal gates use exact metric blocks).",
+                "Ranked live deals",
+                "Snipe candidates sorted by score descending — only items the newest snapshot still lists. discount = 1 - floorNow/value7 against the item's quantity-weighted 7-day value; the score is a weighted geometric mean of discount, 14-day sale-rate reliability, churn and stability (any component at zero scores zero). limit is uncapped enough for whole-ranking pulls (scores are ranking-only; deal gates use exact metric blocks). Deals seen today but already gone: /api/missed-deals.",
                 vec![
                     target.clone(),
                     category_param(),
@@ -265,6 +268,19 @@ fn spec_paths_market(target: &Value) -> Value {
                     json!({ "name": "sort", "in": "query", "required": false, "description": "Row ordering: score (weighted score, default) or last_sale (stalest days-since-last-sale first; never-sold rows last). Unknown values are rejected with 400.", "schema": { "type": "string", "enum": ["score", "last_sale"], "default": "score" } }),
                 ],
                 ok_json_ref("OpportunitiesResponse"),
+            ),
+        },
+        "/api/missed-deals": {
+            "get": get_op(
+                "Deals seen today, already gone",
+                "Listings seen today (UTC) at least min_discount percent under the item's quantity-weighted 7-day value that the newest snapshot no longer lists — bought or cancelled after the tracker saw them. Today's day fold never forgets a listing, so its floor outlives the listing; these rows report that honestly instead of ranking it as buyable. Deepest discount first. Same evidence floor as the ranking.",
+                vec![
+                    target.clone(),
+                    category_param(),
+                    json!({ "name": "min_discount", "in": "query", "required": false, "description": "Minimum discount in whole percent (25 = seen at 75% of the value or cheaper). Clamped to 0..=100; non-finite values fall back to the default.", "schema": { "type": "number", "default": 25, "minimum": 0, "maximum": 100 } }),
+                    json!({ "name": "limit", "in": "query", "required": false, "description": "Maximum rows per category; 0 is treated as 1.", "schema": { "type": "integer", "default": 50 } }),
+                ],
+                ok_json_ref("MissedDealsResponse"),
             ),
         },
         "/api/history": {
@@ -422,6 +438,9 @@ fn spec_paths_items_and_feeds() -> Value {
 /// Watchlist and alert management, plus the token-gated triggers. Query
 /// parameters live on the POSTs too: `evaluate` requires one, `fetch` takes
 /// an optional one.
+// One declarative spec table per group: the path list reads best as a single
+// ordered block.
+#[allow(clippy::too_many_lines)]
 fn spec_paths_watchlist_alerts(target: &Value) -> Value {
     json!({
         "/api/watchlist": {
@@ -494,7 +513,9 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
             "post": post_op(
                 "Create alert rule",
                 concat!("Body: ", "{\"target\", item identity, \"condition\": {...}, \"note\"?} — conditions mirror the /help glossary ",
-                        "(price-below, below-floor, sale-rate-above, days-since-last-sale-above). Each market category only observes ",
+                        "(price-below {copper}, below-floor {span, percentile}, floor-below {copper}, floor-below-value {fraction}, ",
+                        "new-listing-below {fraction}, sale-rate-above {rate}, days-since-last-sale-above {days}; fraction is a share of the item's ",
+                        "quantity-weighted 7-day value within (0, 1]). Each market category only observes ",
                         "while its own feed snapshot is younger than [alerts].max_data_age_secs."),
                 vec![],
                 json!({ "type": "object" }),
@@ -575,7 +596,7 @@ fn spec_schemas_market() -> Value {
                 "vwap": { "type": "integer" },
                 "qtySum": { "type": "integer" },
                 "listingCount": { "type": "integer" },
-                "saleRate": { "type": ["number", "null"], "description": "0..1; null when no sightings exist." },
+                "saleRate": { "type": ["number", "null"], "description": "0..1; null when the window holds no credit-eligible close (no evidence — a listing not yet closed is not a zero)." },
                 "saleRate180d": { "type": ["number", "null"], "description": "0..1 over 180 days; null when the window has no sighting evidence." },
                 "daysSinceLastSale": { "type": ["integer", "null"], "description": "Whole days since the ledger last credited a sale; null = never sold." },
                 "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale; null alongside daysSinceLastSale." },
@@ -587,26 +608,62 @@ fn spec_schemas_market() -> Value {
             "properties": {
                 "item": { "$ref": "#/components/schemas/ItemRef" },
                 "category": { "type": "string", "enum": ["item", "commodity", "pet"], "description": "The market this row ranks in." },
-                "median7": { "type": "integer", "description": "Count-weighted 7-day median unit price (copper)." },
-                "floorNow": { "type": "integer", "description": "Cheapest listing of the newest day (copper)." },
-                "discount": { "type": "number", "description": "1 - p05(newest day)/median7, clamped to [0,1] — robust against single outlier listings." },
-                "reliability": { "type": "number", "description": "14-day sale-through fraction 0..1." },
+                "median7": { "type": "integer", "description": "Count-weighted 7-day median unit price of the median LISTING (copper) — the listing-level reference; stacks weigh like singles." },
+                "floorNow": { "type": "integer", "description": "Cheapest unit price listed in the newest snapshot (copper) — buyable at the time of that fetch." },
+                "floorQty": { "type": "integer", "description": "Units listed at exactly floorNow: how deep the deal is." },
+                "listedNow": { "type": "integer", "description": "Listings of the item in the newest snapshot." },
+                "value7": { "type": "integer", "description": "Quantity-weighted 7-day median unit price (copper): where half the listed quantity trades — the bulk price for stackables. The discount reference." },
+                "discount": { "type": "number", "description": "1 - floorNow/value7, clamped to [0,1]." },
+                "reliability": { "type": ["number", "null"], "description": "14-day sale-through fraction 0..1; null = no credit-eligible evidence (the score then uses the scan's median known rate)." },
                 "churnPerDay": { "type": "number", "description": "Average unique listings per day across the 7-day window." },
                 "stability": { "type": "number", "description": "1 - min(1, mad7/median7)." },
-                "samples7": { "type": "integer", "description": "Unique listings folded over the window." },
-                "confidence": { "type": "number", "description": "min(1, samples7/[opportunities].min_samples)." },
-                "score": { "type": "number", "description": "Weighted ranking score — for RANKING only." },
+                "samples7": { "type": "integer", "description": "Auction-days folded over the window (listings x days seen)." },
+                "confidence": { "type": "number", "description": "min(1, samples7/[opportunities].min_samples) — always 1 on ranked rows, which the evidence floor already admits." },
+                "score": { "type": "number", "description": "Weighted geometric mean of discount, reliability, churn and stability — for RANKING only; any component at zero scores zero." },
                 "daysSinceLastSale": { "type": ["integer", "null"], "description": "Whole days since the ledger last credited a sale; null = no credited sale ever (sorts last under sort=last_sale)." },
                 "closuresSinceLastSale": { "type": ["integer", "null"], "description": "Net listings closed after that last credited sale." }
             }
         },
         "OpportunitiesResponse": {
-            "description": concat!("With ?category=, the bare shape below (plus a category echo). ",
-                                   "Without it, an object keyed by category: {\"item\": {…}, \"commodity\": {…}, \"pet\": {…}}."),
+            "description": concat!("With ?category=, the bare shape below (plus a category echo and the snapshot its prices come from). ",
+                                   "Without it, an object keyed by category: {\"item\": […], \"commodity\": […], \"pet\": […]} (arrays, no snapshot)."),
             "type": "object",
             "properties": {
                 "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
+                "snapshot": {
+                    "type": ["object", "null"],
+                    "description": "The newest stored snapshot floorNow comes from; null when the target has none for this market.",
+                    "properties": {
+                        "id": { "type": "integer" },
+                        "fetchedAt": { "type": "integer", "description": "Unix seconds of the fetch." },
+                        "sourceLastModified": { "type": ["integer", "null"] }
+                    }
+                },
                 "opportunities": { "type": "array", "items": { "$ref": "#/components/schemas/Opportunity" } }
+            }
+        },
+        "MissedDeal": {
+            "description": "One listing seen today that the newest snapshot no longer lists.",
+            "type": "object",
+            "properties": {
+                "item": { "$ref": "#/components/schemas/ItemRef" },
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
+                "seenFloor": { "type": "integer", "description": "Today's cumulative fold minimum (copper) — what the gone listing asked." },
+                "seenFloorQty": { "type": "integer", "description": "Units that listing offered." },
+                "liveFloor": { "type": ["integer", "null"], "description": "Cheapest listing of the item in the newest snapshot (copper); null = nothing of it is listed." },
+                "value7": { "type": "integer", "description": "Quantity-weighted 7-day median unit price (copper), as on opportunities." },
+                "discount": { "type": "number", "description": "1 - seenFloor/value7, clamped to [0,1]." },
+                "reliability": { "type": ["number", "null"], "description": "14-day sale-through fraction; null = no credit-eligible evidence." },
+                "samples7": { "type": "integer", "description": "Auction-days folded over the window — the evidence behind value7." }
+            }
+        },
+        "MissedDealsResponse": {
+            "description": "With ?category=, the bare shape below. Without it, an object keyed by category: {\"item\": […], \"commodity\": […], \"pet\": […]}.",
+            "type": "object",
+            "properties": {
+                "category": { "type": "string", "enum": ["item", "commodity", "pet"] },
+                "minDiscount": { "type": "number", "description": "The applied minimum discount in whole percent." },
+                "missed": { "type": "array", "items": { "$ref": "#/components/schemas/MissedDeal" } }
             }
         },
         "HistoryRow": {
@@ -761,11 +818,17 @@ fn build_docs_body() -> String {
             "# what can I ask?\n",
             "print(requests.get(f\"{BASE}/api\").json())\n",
             "\n",
-            "# ranked deals, whole ranking for one market category\n",
-            "# (omit category to get all three, keyed by category)\n",
-            "deals = requests.get(f\"{BASE}/api/opportunities\",\n",
+            "# live deals: only what the newest snapshot still lists, whole\n",
+            "# ranking for one market category (omit category to get all three)\n",
+            "resp = requests.get(f\"{BASE}/api/opportunities\",\n",
             "                     params={\"target\": TARGET, \"category\": \"commodity\",\n",
-            "                             \"limit\": 1000}).json()[\"opportunities\"]\n",
+            "                             \"limit\": 1000}).json()\n",
+            "deals, snapshot = resp[\"opportunities\"], resp[\"snapshot\"]\n",
+            "\n",
+            "# deals seen today that are already gone (bought or cancelled)\n",
+            "missed = requests.get(f\"{BASE}/api/missed-deals\",\n",
+            "                      params={\"target\": TARGET, \"category\": \"commodity\"\",\n",
+            "                              \"min_discount\": 25}).json()[\"missed\"]\n",
             "\n",
             "# bulk day-level history for the whole market (all categories)\n",
             "rows = requests.get(f\"{BASE}/api/history\",\n",

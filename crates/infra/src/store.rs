@@ -39,6 +39,8 @@ use amtracker_core::{
         PetNameRecord,
         SaleCredit,
         SearchHit,
+        SnapshotFloor,
+        SnapshotListing,
         SnapshotMeta,
         SnapshotStatus,
         Span,
@@ -100,11 +102,15 @@ use rusqlite::Connection;
 /// Current schema shape. v10 added `sales.eligible` (the credit-eligible
 /// sale-rate denominator); the ALTER is shape-guarded at the call site, so
 /// upgraded files converge with fresh ones. Post-v10 additive shapes — the
-/// `item_hour` intraday fold and its `idx_item_hour_day` retention index —
-/// ride the unconditional idempotent `SCHEMA` batch instead of a gated
-/// migration: fold cells inside the raw window regenerate exactly from raw
-/// listings (see `backfill_item_hours`), so an upgraded file converges by
-/// itself.
+/// `item_hour` intraday fold with its `idx_item_hour_day` retention index and
+/// the `snapshot_item_floor` live-summary table — ride the unconditional
+/// idempotent `SCHEMA` batch instead of a gated migration: each converges by
+/// itself (fold cells inside the raw window regenerate exactly from raw
+/// listings, see `backfill_item_hours`; floor rows of a snapshot recorded
+/// before the table existed are rebuilt on first read, see
+/// `SnapshotRepository::floors`). The `idx_item_day_window` scan index is
+/// created after the migration ladder instead — it needs the v7 `category`
+/// column and must reach current-version files too.
 const SCHEMA_VERSION: i64 = 10;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
@@ -279,6 +285,16 @@ CREATE TABLE IF NOT EXISTS item_hour (
     PRIMARY KEY (target_id, kind, item_ref_id, day, hour)
 );
 CREATE INDEX IF NOT EXISTS idx_item_hour_day ON item_hour(target_id, day);
+
+CREATE TABLE IF NOT EXISTS snapshot_item_floor (
+    snapshot_id INTEGER NOT NULL,
+    item_ref_id INTEGER NOT NULL REFERENCES item_ref(id),
+    floor_price INTEGER NOT NULL,
+    floor_qty INTEGER NOT NULL,
+    listing_count INTEGER NOT NULL,
+    qty_sum INTEGER NOT NULL,
+    PRIMARY KEY (snapshot_id, item_ref_id)
+);
 
 CREATE TABLE IF NOT EXISTS metrics_cache (
     target_id TEXT NOT NULL,
@@ -627,8 +643,8 @@ impl SqliteStore {
             ))
             .map_err(|e| backend("migrate time rank index", e))?;
             // v10 added the credit-eligible sale-rate denominator. Historical
-            // rows keep `eligible = 0` and fall back to the listings
-            // denominator (see `sale_rates_by_id`), so no rebuild is needed.
+            // rows keep `eligible = 0`; they carry no eligible evidence and
+            // read as `None` (the ledger holds no such rows).
             let sales_has_eligible = conn
                 .query_row(
                     "SELECT EXISTS (SELECT 1 FROM pragma_table_info('sales') WHERE name = 'eligible')",
@@ -658,6 +674,26 @@ impl SqliteStore {
                     "store schema migration complete"
                 );
             }
+        }
+        // The day-fold window index behind the whole-market scans. Created
+        // AFTER the ladder, not in `SCHEMA`: it names the v7 `category`
+        // column, which a pre-v7 file only gains from the migration above,
+        // and it must also reach files already at the current version (the
+        // ladder is gated on `version < SCHEMA_VERSION`). Idempotent.
+        let has_window_index = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                rusqlite::params!["idx_item_day_window"],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|flag| flag == 1)
+            .map_err(|e| backend("inspect day-fold indexes", e))?;
+        if !has_window_index {
+            tracing::info!("creating the day-fold window index (idx_item_day_window)");
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_item_day_window ON item_day(target_id, category, day)",
+            )
+            .map_err(|e| backend("create day-fold window index", e))?;
         }
         Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf(), clock })
     }
@@ -970,15 +1006,16 @@ impl SnapshotRepository for SqliteStore {
             let snapshot_id = tx.last_insert_rowid();
 
             let mut item_ref_ids: HashMap<&ItemRef, i64> = HashMap::new();
-            // This snapshot's cheapest unit price per item — the intraday
-            // fold's one value per (item, hour cell) below.
-            let mut hour_mins: HashMap<i64, i64> = HashMap::new();
+            // This snapshot's per-item listing summary, built in the same
+            // pass as the listing rows: the intraday fold's one value per
+            // (item, hour cell) and the snapshot's live-floor rows below.
+            let mut floors: HashMap<i64, FloorAccumulator> = HashMap::new();
             let mut insert_listing = tx
-            .prepare(
-                "INSERT INTO listing (snapshot_id, target_id, day, auction_id, item_ref_id, quantity, unit_price, bid, time_left, context, bonus_lists)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            )
-            .map_err(|e| backend("prepare listing", e))?;
+                .prepare(
+                    "INSERT INTO listing (snapshot_id, target_id, day, auction_id, item_ref_id, quantity, unit_price, bid, time_left, context, bonus_lists)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                )
+                .map_err(|e| backend("prepare listing", e))?;
             for listing in listings {
                 let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
                     *id
@@ -987,10 +1024,10 @@ impl SnapshotRepository for SqliteStore {
                     item_ref_ids.insert(&listing.item_ref, id);
                     id
                 };
-                let seen_min = hour_mins.entry(item_ref_id).or_insert(listing.unit_price);
-                if listing.unit_price < *seen_min {
-                    *seen_min = listing.unit_price;
-                }
+                floors
+                    .entry(item_ref_id)
+                    .or_insert_with(|| FloorAccumulator::new(listing.unit_price))
+                    .observe(listing.unit_price, listing.quantity);
                 insert_listing
                     .execute(rusqlite::params![
                         snapshot_id,
@@ -1013,7 +1050,12 @@ impl SnapshotRepository for SqliteStore {
             // snapshot — the when-to-buy hour view reads this fold and
             // outlives raw-listing retention by its own knob.
             let hour = snapshot.fetched_at.rem_euclid(86_400) / 3_600;
+            let hour_mins: HashMap<i64, i64> =
+                floors.iter().map(|(id, summary)| (*id, summary.floor_price)).collect();
             upsert_item_hours(&tx, &snapshot.target, snapshot.kind, day, hour, &hour_mins)?;
+            // Live side of the same snapshot: what each item is listed at
+            // right now, a point read for the deal ranking and alerts.
+            insert_snapshot_floors(&tx, snapshot_id, &floors)?;
             tx.commit().map_err(|e| backend("commit", e))?;
             Ok(snapshot_id)
         })();
@@ -1063,6 +1105,123 @@ impl SnapshotRepository for SqliteStore {
             }));
         }
         Ok(None)
+    }
+
+    fn floors(
+        &self,
+        target: &TargetId,
+        kind: PayloadKind,
+        snapshot_id: i64,
+    ) -> Result<HashMap<ItemRef, SnapshotFloor>, StoreError> {
+        let conn = self.open_transaction();
+        // A snapshot recorded before the floor rows existed (an older binary,
+        // or this very upgrade) heals on first read: its summary is rebuilt
+        // from the retained listings under the same hold, once.
+        if !snapshot_has_floors(&conn, snapshot_id)? {
+            rebuild_snapshot_floors(&conn, target, Some(kind), snapshot_id)?;
+        }
+        // The (snapshot, item) primary key serves the whole filter.
+        let mut statement = conn
+            .prepare(
+                "SELECT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed,
+                        f.floor_price, f.floor_qty, f.listing_count, f.qty_sum
+                 FROM snapshot_item_floor f JOIN item_ref r ON r.id = f.item_ref_id
+                 WHERE f.snapshot_id = ?1",
+            )
+            .map_err(|e| backend("prepare snapshot floors", e))?;
+        let rows = statement
+            .query_map(rusqlite::params![snapshot_id], stored_floor_from_row)
+            .map_err(|e| backend("query snapshot floors", e))?;
+        let mut out: HashMap<ItemRef, SnapshotFloor> = HashMap::new();
+        for row in rows {
+            let stored = row.map_err(|e| backend("snapshot floor row", e))?;
+            out.insert(
+                join_item_ref(
+                    &stored.kind,
+                    stored.item_id,
+                    stored.species,
+                    stored.level,
+                    stored.quality,
+                    stored.breed,
+                ),
+                stored.floor,
+            );
+        }
+        Ok(out)
+    }
+
+    fn floor(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        snapshot_id: i64,
+    ) -> Result<Option<SnapshotFloor>, StoreError> {
+        let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(None);
+        };
+        if !snapshot_has_floors(&conn, snapshot_id)? {
+            rebuild_snapshot_floors(&conn, target, None, snapshot_id)?;
+        }
+        conn.query_row(
+            "SELECT floor_price, floor_qty, listing_count, qty_sum FROM snapshot_item_floor
+             WHERE snapshot_id = ?1 AND item_ref_id = ?2",
+            rusqlite::params![snapshot_id, item_ref_id],
+            |row| {
+                Ok(SnapshotFloor {
+                    floor_price: row.get(0)?,
+                    floor_qty: row.get::<_, i64>(1)?.max(0),
+                    listing_count: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
+                    qty_sum: row.get(3)?,
+                })
+            },
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(backend("snapshot floor", other)),
+        })
+    }
+
+    fn listings_for_item(
+        &self,
+        target: &TargetId,
+        item: &ItemRef,
+        kind: PayloadKind,
+        snapshot_id: i64,
+    ) -> Result<Vec<SnapshotListing>, StoreError> {
+        let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(Vec::new());
+        };
+        // One seek over the item's listings in that snapshot through the
+        // (target, item, snapshot) index; the sighting join is a primary-key
+        // lookup per row.
+        let mut statement = conn
+            .prepare(
+                "SELECT l.auction_id, l.unit_price, l.quantity, s.first_seen_snapshot, s.first_seen_at
+                 FROM listing l
+                 LEFT JOIN sight s
+                   ON s.target_id = l.target_id AND s.auction_id = l.auction_id AND s.kind = ?2
+                 WHERE l.target_id = ?1 AND l.item_ref_id = ?3 AND l.snapshot_id = ?4
+                 ORDER BY l.unit_price, l.auction_id",
+            )
+            .map_err(|e| backend("prepare snapshot listings", e))?;
+        let rows = statement
+            .query_map(
+                rusqlite::params![target.as_str(), kind.as_str(), item_ref_id, snapshot_id],
+                |row| {
+                    Ok(SnapshotListing {
+                        auction_id: row.get(0)?,
+                        unit_price: row.get(1)?,
+                        quantity: row.get(2)?,
+                        first_seen_snapshot: row.get(3)?,
+                        first_seen_at: row.get(4)?,
+                    })
+                },
+            )
+            .map_err(|e| backend("query snapshot listings", e))?;
+        rows.collect::<Result<Vec<_>, _>>().map_err(|e| backend("snapshot listing row", e))
     }
 
     fn list_recent(
@@ -1732,12 +1891,14 @@ impl SalesRepository for SqliteStore {
         };
         let now_day = utc_day(self.clock.now());
         let cutoff_day = now_day - days + 1;
-        // Denominator: credit-eligible closes (v10), falling back to all
-        // listings for rows booked before the upgrade (eligible = 0).
+        // Denominator: credit-eligible closes only. A window without any is
+        // NO evidence — `None`, never a zero: a listing that simply has not
+        // closed yet must not read as "never sells". (Rows booked before
+        // `eligible` existed would have needed a listings fallback; the
+        // ledger holds none.)
         let (credited, denominator): (i64, i64) = conn
             .query_row(
-                "SELECT COALESCE(SUM(credited), 0),
-                        COALESCE(NULLIF(SUM(eligible), 0), COALESCE(SUM(listings), 0))
+                "SELECT COALESCE(SUM(credited), 0), COALESCE(SUM(eligible), 0)
                  FROM sales
                  WHERE target_id = ?1 AND item_ref_id = ?2 AND day >= ?3 AND category = ?4",
                 rusqlite::params![target.as_str(), item_ref_id, cutoff_day, category.as_str()],
@@ -1980,6 +2141,13 @@ fn day_rows_from_stored(
             })
             .collect();
         let (min, p05, median, mad) = price_stats_sorted(&prices);
+        // The quantity-weighted per-unit price falls back to the listing
+        // median when nothing carries quantity (single-unit goods make the
+        // two identical anyway).
+        let qty_median =
+            amtracker_core::metrics::quantity_weighted_median(std::slice::from_ref(&histogram))
+                .unwrap_or(median);
+        let min_qty = histogram.buckets.get(&min).map_or(0, |bucket| bucket.qty.max(0));
         out.push(ItemDayRow {
             item: join_item_ref(&kind, item_id, species, level, quality, breed),
             category,
@@ -1987,8 +2155,10 @@ fn day_rows_from_stored(
             listing_count: histogram.listing_count,
             qty_sum: histogram.qty_sum,
             min,
+            min_qty,
             p05,
             median,
+            qty_median,
             mad,
         });
     }
@@ -2035,10 +2205,12 @@ fn item_ids_in_order(conn: &Connection, items: &[ItemRef]) -> Result<Vec<Option<
     Ok(ids)
 }
 
-/// Credited/listings sums per `item_ref` id over the trailing day window,
+/// Credited/eligible sums per `item_ref` id over the trailing day window,
 /// in one grouped query per chunk (the batched fuel for `sale_rate_multi`/
-/// `sale_rate_each`). Placeholders are bound values, never interpolated
-/// input.
+/// `sale_rate_each`). The denominator counts credit-eligible closes only — an
+/// id whose window holds none gets 0 and reads as `None`, the same "no
+/// evidence" contract as `sale_rate`. Placeholders are bound values, never
+/// interpolated input.
 ///
 /// The id list is chunked far below SQLite's 32 766 bound-parameter
 /// ceiling: a very large market must not fail the whole ranking scan with
@@ -2056,12 +2228,9 @@ fn sale_rates_by_id(
     let mut out: HashMap<i64, (i64, i64)> = HashMap::new();
     for chunk in ids.chunks(SALE_RATE_CHUNK) {
         let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
-        // The denominator prefers credit-eligible closes (v10); rows booked
-        // before the upgrade carry eligible = 0 and fall back to all
-        // listings, so mixed-history windows keep a meaningful rate.
         let sql = format!(
-            "SELECT item_ref_id, COALESCE(SUM(credited), 0),
-                    COALESCE(NULLIF(SUM(eligible), 0), COALESCE(SUM(listings), 0)) FROM sales
+            "SELECT item_ref_id, COALESCE(SUM(credited), 0), COALESCE(SUM(eligible), 0)
+             FROM sales
              WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ? AND category = ?
              GROUP BY item_ref_id"
         );
@@ -3252,7 +3421,7 @@ impl PriceHistoryRepository for SqliteStore {
         };
         let json: Option<String> = conn
             .query_row(
-                "SELECT fold_json FROM item_day
+                "SELECT fold_json FROM item_day INDEXED BY sqlite_autoindex_item_day_1
                  WHERE target_id = ?1 AND item_ref_id = ?2 AND day = ?3 AND category = ?4",
                 rusqlite::params![target.as_str(), item_ref_id, day, category.as_str()],
                 |row| row.get(0),
@@ -3288,8 +3457,10 @@ impl PriceHistoryRepository for SqliteStore {
         let mut by_id: HashMap<i64, Vec<(i64, DayFold)>> = HashMap::new();
         for chunk in known.chunks(FOLD_CHUNK) {
             let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+            // Pinned to the PK like every per-item `item_day` read: one seek
+            // per id, never the category window (see `item_day_rows_for_item`).
             let sql = format!(
-                "SELECT item_ref_id, day, fold_json FROM item_day
+                "SELECT item_ref_id, day, fold_json FROM item_day INDEXED BY sqlite_autoindex_item_day_1
                  WHERE target_id = ? AND day >= ? AND day <= ? AND category = ?
                    AND item_ref_id IN ({placeholders})"
             );
@@ -3421,6 +3592,9 @@ impl PriceHistoryRepository for SqliteStore {
         )
         .map_err(|e| backend("prune class summaries", e))?;
         drop(conn);
+        // The live-floor rows follow their listings out: a snapshot fetched
+        // before the cutoff day has no raw rows left to summarize.
+        prune_snapshot_floors(self, target, day)?;
         let conn = self.open_transaction();
         // Best-effort archive cleanup: payload files of old snapshots. The
         // row's path is cleared alongside the file so a re-run neither
@@ -3562,32 +3736,25 @@ impl PriceHistoryRepository for SqliteStore {
         category: Category,
     ) -> Result<Vec<ItemDayRow>, StoreError> {
         let conn = self.open_transaction();
+        let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
+            return Ok(Vec::new());
+        };
+        // One primary-key range per item. The read is pinned to the PK:
+        // without statistics the planner also favours `idx_item_day_window`
+        // here, which would scan the whole category window for this single
+        // identity instead of seeking it.
         let mut statement = conn
             .prepare(
                 "SELECT d.fold_json, d.day, r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
-                 FROM item_day d JOIN item_ref r ON r.id = d.item_ref_id
-                 WHERE d.target_id = ?1 AND d.day >= ?2 AND d.category = ?3
-                   AND r.kind = ?4 AND r.item_id = ?5 AND r.pet_species = ?6
-                   AND r.pet_level = ?7 AND r.pet_quality = ?8 AND r.pet_breed = ?9",
+                 FROM item_day d INDEXED BY sqlite_autoindex_item_day_1
+                 JOIN item_ref r ON r.id = d.item_ref_id
+                 WHERE d.target_id = ?1 AND d.item_ref_id = ?2 AND d.day >= ?3 AND d.category = ?4
+                 ORDER BY d.day",
             )
             .map_err(|e| backend("prepare item_day_rows_for_item", e))?;
-        // The identity tuple is the canonical `item_ref` shape (see
-        // `split_item_ref`): the item page passes a plain item id, exactly
-        // how item rows were written.
-        let (kind, item_id, species, level, quality, breed) = split_item_ref(item);
         let rows = query_day_rows(
             &mut statement,
-            rusqlite::params![
-                target.as_str(),
-                since_day,
-                category.as_str(),
-                kind,
-                item_id,
-                species,
-                level,
-                quality,
-                breed
-            ],
+            rusqlite::params![target.as_str(), item_ref_id, since_day, category.as_str()],
         )?;
         day_rows_from_stored(rows, category)
     }
@@ -3741,7 +3908,8 @@ impl PriceHistoryRepository for SqliteStore {
     }
 }
 
-/// Nearest-rank p05/p25/p75/p95 helper for display tables.
+/// Minimum, nearest-rank p05, nearest-rank median and MAD of one day's
+/// sorted prices (the display-table day-row statistics).
 /// Prices must be sorted ascending.
 ///
 /// Direct indexing is safe here: `n > 0` is ensured by the early return and
@@ -3833,6 +4001,220 @@ fn lookup_item_ref(conn: &Connection, item: &ItemRef) -> Result<Option<i64>, Sto
     match rows.next().map_err(|e| backend("item_ref row", e))? {
         Some(row) => Ok(Some(row.get(0).map_err(|e| backend("item_ref id", e))?)),
         None => Ok(None),
+    }
+}
+
+/// Per-item listing summary built during one `record` pass (or a rebuild):
+/// the numbers [`SnapshotFloor`] publishes.
+#[derive(Clone, Copy)]
+struct FloorAccumulator {
+    floor_price: i64,
+    floor_qty: i64,
+    listing_count: u64,
+    qty_sum: i64,
+}
+
+impl FloorAccumulator {
+    fn new(price: i64) -> Self {
+        Self { floor_price: price, floor_qty: 0, listing_count: 0, qty_sum: 0 }
+    }
+
+    /// Folds one listing in. Quantities are non-negative by construction; a
+    /// corrupt negative value adds nothing instead of corrupting the sums.
+    fn observe(&mut self, price: i64, quantity: i64) {
+        if price < self.floor_price {
+            self.floor_price = price;
+            self.floor_qty = 0;
+        }
+        let quantity = quantity.max(0);
+        if price == self.floor_price {
+            self.floor_qty = self.floor_qty.saturating_add(quantity);
+        }
+        self.listing_count = self.listing_count.saturating_add(1);
+        self.qty_sum = self.qty_sum.saturating_add(quantity);
+    }
+}
+
+/// One `snapshot_item_floor` row joined to its identity columns.
+struct StoredFloor {
+    kind: String,
+    item_id: i64,
+    species: i64,
+    level: i64,
+    quality: i64,
+    breed: i64,
+    floor: SnapshotFloor,
+}
+
+fn stored_floor_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFloor> {
+    Ok(StoredFloor {
+        kind: row.get(0)?,
+        item_id: row.get(1)?,
+        species: row.get(2)?,
+        level: row.get(3)?,
+        quality: row.get(4)?,
+        breed: row.get(5)?,
+        floor: SnapshotFloor {
+            floor_price: row.get(6)?,
+            floor_qty: row.get::<_, i64>(7)?.max(0),
+            listing_count: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
+            qty_sum: row.get(9)?,
+        },
+    })
+}
+
+/// Writes one snapshot's per-item listing summaries (`record`'s write
+/// path). Rows go in item order so the inserts touch the (snapshot, item) key
+/// pages locally.
+fn insert_snapshot_floors(
+    conn: &Connection,
+    snapshot_id: i64,
+    floors: &HashMap<i64, FloorAccumulator>,
+) -> Result<(), StoreError> {
+    let mut rows: Vec<(&i64, &FloorAccumulator)> = floors.iter().collect();
+    rows.sort_unstable_by_key(|(item_ref_id, _)| **item_ref_id);
+    let mut insert = conn
+        .prepare(
+            "INSERT OR REPLACE INTO snapshot_item_floor
+                (snapshot_id, item_ref_id, floor_price, floor_qty, listing_count, qty_sum)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .map_err(|e| backend("prepare snapshot floor", e))?;
+    for (item_ref_id, summary) in rows {
+        insert
+            .execute(rusqlite::params![
+                snapshot_id,
+                item_ref_id,
+                summary.floor_price,
+                summary.floor_qty,
+                i64::try_from(summary.listing_count).unwrap_or(i64::MAX),
+                summary.qty_sum,
+            ])
+            .map_err(|e| backend("insert snapshot floor", e))?;
+    }
+    Ok(())
+}
+
+fn snapshot_has_floors(conn: &Connection, snapshot_id: i64) -> Result<bool, StoreError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM snapshot_item_floor WHERE snapshot_id = ?1)",
+        rusqlite::params![snapshot_id],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|flag| flag == 1)
+    .map_err(|e| backend("probe snapshot floors", e))
+}
+
+/// Rebuilds a snapshot's floor rows from its retained listings, so a
+/// snapshot recorded before the table existed converges on first read. One
+/// bounded pass over that snapshot's own listing rows: `INDEXED BY` pins the
+/// `snapshot_id` index — without statistics the planner also considers the
+/// (target, item, snapshot) index, which this filter can only scan. `kind`
+/// is `None` for the single-item read, which carries no kind to check.
+fn rebuild_snapshot_floors(
+    conn: &Connection,
+    target: &TargetId,
+    kind: Option<PayloadKind>,
+    snapshot_id: i64,
+) -> Result<(), StoreError> {
+    let owner: Option<(String, String)> = conn
+        .query_row(
+            "SELECT target_id, kind FROM snapshots WHERE id = ?1",
+            rusqlite::params![snapshot_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .map(Some)
+        .or_else(|e| match e {
+            rusqlite::Error::QueryReturnedNoRows => Ok(None),
+            other => Err(backend("snapshot owner", other)),
+        })?;
+    let Some((owner_target, owner_kind)) = owner else {
+        return Ok(());
+    };
+    if owner_target != target.as_str() || kind.is_some_and(|kind| owner_kind != kind.as_str()) {
+        return Err(StoreError::Backend(format!(
+            "snapshot {snapshot_id} belongs to another target/kind"
+        )));
+    }
+    let tx = conn.unchecked_transaction().map_err(|e| backend("begin floor rebuild", e))?;
+    let mut floors: HashMap<i64, FloorAccumulator> = HashMap::new();
+    {
+        let mut statement = tx
+            .prepare(
+                "SELECT item_ref_id, unit_price, quantity FROM listing
+                 INDEXED BY idx_listing_snapshot_price
+                 WHERE snapshot_id = ?1",
+            )
+            .map_err(|e| backend("prepare floor rebuild", e))?;
+        let rows = statement
+            .query_map(rusqlite::params![snapshot_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, i64>(2)?))
+            })
+            .map_err(|e| backend("query floor rebuild", e))?;
+        for row in rows {
+            let (item_ref_id, price, quantity) =
+                row.map_err(|e| backend("floor rebuild row", e))?;
+            floors
+                .entry(item_ref_id)
+                .or_insert_with(|| FloorAccumulator::new(price))
+                .observe(price, quantity);
+        }
+    }
+    tracing::info!(
+        snapshot_id,
+        items = floors.len(),
+        "snapshot floor rows rebuilt from retained listings"
+    );
+    insert_snapshot_floors(&tx, snapshot_id, &floors)?;
+    tx.commit().map_err(|e| backend("commit floor rebuild", e))
+}
+
+/// Drops the floor rows of the target's snapshots fetched before `day` —
+/// the cutoff `prune_raw_before` applies to their listings (a listing's day
+/// is its snapshot's fetch day), so no summary outlives the rows it
+/// summarizes. Walks the small `snapshots` table by id cursor with a
+/// primary-key-seek delete per batch, never a scan of the floor table.
+fn prune_snapshot_floors(
+    store: &SqliteStore,
+    target: &TargetId,
+    day: i64,
+) -> Result<(), StoreError> {
+    /// Snapshot ids per delete statement.
+    const FLOOR_PRUNE_BATCH: usize = 500;
+    /// `i64` mirror of `FLOOR_PRUNE_BATCH` for the LIMIT bind parameter.
+    const FLOOR_PRUNE_BATCH_I64: i64 = 500;
+    let cutoff = day * 86_400;
+    let mut after_id = 0i64;
+    loop {
+        let conn = store.open_transaction();
+        let mut statement = conn
+            .prepare(
+                "SELECT id FROM snapshots
+                 WHERE target_id = ?1 AND fetched_at < ?2 AND id > ?3
+                 ORDER BY id LIMIT ?4",
+            )
+            .map_err(|e| backend("prepare prune snapshot floors", e))?;
+        let ids: Vec<i64> = statement
+            .query_map(
+                rusqlite::params![target.as_str(), cutoff, after_id, FLOOR_PRUNE_BATCH_I64],
+                |row| row.get(0),
+            )
+            .map_err(|e| backend("query prune snapshot floors", e))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("prune snapshot floors row", e))?;
+        drop(statement);
+        let Some(newest) = ids.last().copied() else {
+            return Ok(());
+        };
+        let placeholders = std::iter::repeat_n("?", ids.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!("DELETE FROM snapshot_item_floor WHERE snapshot_id IN ({placeholders})");
+        conn.execute(&sql, rusqlite::params_from_iter(ids.iter()))
+            .map_err(|e| backend("prune snapshot floors", e))?;
+        drop(conn);
+        if ids.len() < FLOOR_PRUNE_BATCH {
+            return Ok(());
+        }
+        after_id = newest;
     }
 }
 
@@ -4222,6 +4604,21 @@ enum SerAlertCondition {
         /// Lowercase [`amtracker_core::domain::FloorPercentile`] spelling.
         percentile: String,
     },
+    /// Mirror of `AlertCondition::FloorBelow`.
+    FloorBelow {
+        /// Threshold in copper per unit.
+        copper: i64,
+    },
+    /// Mirror of `AlertCondition::FloorBelowValue`.
+    FloorBelowValue {
+        /// Threshold fraction of the 7-day value (0.0..=1.0).
+        fraction: f64,
+    },
+    /// Mirror of `AlertCondition::NewListingBelow`.
+    NewListingBelow {
+        /// Threshold fraction of the 7-day value (0.0..=1.0).
+        fraction: f64,
+    },
     /// Mirror of `AlertCondition::SaleRateAbove`.
     SaleRateAbove {
         /// Threshold fraction (0.0..=1.0).
@@ -4243,6 +4640,9 @@ impl From<&amtracker_core::domain::AlertCondition> for SerAlertCondition {
                 span: span.name().to_string(),
                 percentile: percentile.as_str().to_string(),
             },
+            AlertCondition::FloorBelow { copper } => Self::FloorBelow { copper },
+            AlertCondition::FloorBelowValue { fraction } => Self::FloorBelowValue { fraction },
+            AlertCondition::NewListingBelow { fraction } => Self::NewListingBelow { fraction },
             AlertCondition::SaleRateAbove { rate } => Self::SaleRateAbove { rate },
             AlertCondition::DaysSinceLastSaleAbove { days } => {
                 Self::DaysSinceLastSaleAbove { days }
@@ -4268,6 +4668,13 @@ impl TryFrom<SerAlertCondition> for amtracker_core::domain::AlertCondition {
                     format!("unknown percentile '{percentile}' in alert condition")
                 })?;
                 Ok(AlertCondition::BelowFloor { span, percentile })
+            }
+            SerAlertCondition::FloorBelow { copper } => Ok(AlertCondition::FloorBelow { copper }),
+            SerAlertCondition::FloorBelowValue { fraction } => {
+                Ok(AlertCondition::FloorBelowValue { fraction })
+            }
+            SerAlertCondition::NewListingBelow { fraction } => {
+                Ok(AlertCondition::NewListingBelow { fraction })
             }
             SerAlertCondition::SaleRateAbove { rate } => Ok(AlertCondition::SaleRateAbove { rate }),
             SerAlertCondition::DaysSinceLastSaleAbove { days } => {

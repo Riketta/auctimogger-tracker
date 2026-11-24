@@ -135,7 +135,10 @@ pub struct MetricsConfig {
 /// Opportunity scoring settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OpportunitiesConfig {
-    /// Minimum unique-listing evidence before an item may rank.
+    /// Minimum unique-listing evidence (auction-days over the scan window)
+    /// before an item's value is trusted: items below it neither rank nor
+    /// list as gone-today deals, and the value-relative alert conditions
+    /// refuse to fire without it.
     pub min_samples: u32,
     /// Relative weights of the four score components.
     pub weights: ScoreWeights,
@@ -239,12 +242,15 @@ pub enum AlertDelivery {
     Telegram,
 }
 
-/// Weights of the opportunity score components. Only the ratio matters for
-/// ranking; the absolute scale is free.
+/// Weights of the opportunity score components. The score is their weighted
+/// geometric mean — the weights, normalized to sum 1, are the exponents — so
+/// only the ratio matters for ranking, and a component at zero zeroes the
+/// score whatever the others do.
 #[derive(Clone, Debug, PartialEq)]
 pub struct ScoreWeights {
-    /// Weight of the discount component (`1 - p05(newest day) / median7`; the
-    /// robust floor keeps one outlier listing from dominating the score).
+    /// Weight of the discount component (`1 - live floor / quantity-weighted
+    /// 7-day value`): how cheap the cheapest LISTED price is against where
+    /// the item's quantity normally trades.
     pub discount: f64,
     /// Weight of the sell-through (reliability) component.
     pub sale: f64,
