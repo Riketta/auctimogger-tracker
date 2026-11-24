@@ -2367,8 +2367,13 @@ pub(crate) async fn overview_page(
 
 // --------------------------------------------------------------- watchlist
 
+/// Column index of the watchlist table's `now (d1)` header — the order the
+/// page opens in (see `watchlist_page`).
+const WATCHLIST_NOW_COLUMN: usize = 1;
+
 /// `GET /watchlist?target=&category=` — the curated list driving
-/// `feed-slim.lua`, joined to one market category's numbers.
+/// `feed-slim.lua`, joined to one market category's numbers. It opens dearest
+/// first by the current day's median; header clicks re-sort client-side.
 pub(crate) async fn watchlist_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -2386,13 +2391,25 @@ pub(crate) async fn watchlist_page(
         let target = target.clone();
         move || state.watchlist_report.report(&target, category, &[Span::D1, Span::D7], 14, 30)
     });
-    let report = match report.await {
+    let mut report = match report.await {
         Ok(Ok(report)) => report,
         Ok(Err(error)) => return render::store_error_page(error).await,
         Err(error) => {
             return render::store_error_page(StoreError::Backend(error.to_string())).await
         }
     };
+    // The page opens dearest first by the current day's median — the column
+    // a trader scans first. The sort is stable, so rows without a d1 block
+    // (thin right after midnight, a category the item has no data in) keep
+    // their watchlist order at the end. Header clicks re-sort client-side
+    // (app.js); the `aria-sort` state on the header keeps that toggle in
+    // phase and draws the arrow.
+    report.sort_by(|a, b| match (d1_median(a), d1_median(b)) {
+        (Some(a), Some(b)) => b.cmp(&a),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    });
     let names = resolve_names(
         &state,
         &super::target_flavor(&state.config, &target),
@@ -2408,7 +2425,10 @@ pub(crate) async fn watchlist_page(
 
     let mut body = format!(
         "<p class=\"muted\">{} <code>{}</code> — {} <code>feed-slim.lua</code> {}</p>",
-        tip("watchlist", "Your curated list for this target."),
+        tip(
+            "watchlist",
+            "Your curated list for this target, dearest first by today's median — click any column header to re-sort."
+        ),
         html_escape(target.as_str()),
         tip("drives", "The slim feed is built on demand from exactly these entries."),
         tip("feed-slim.lua", "Download it from the dashboard or /feed-slim.lua?target=…")
@@ -2431,11 +2451,12 @@ pub(crate) async fn watchlist_page(
         let delta_pct =
             |now: i64, baseline: i64| -> f64 { (now - baseline) as f64 / baseline as f64 * 100.0 };
         body.push_str("<div class=\"scroll-x\"><table id=\"watchlist\"><thead><tr>");
-        for (label, tip_text) in [
+        for (column, (label, tip_text)) in [
             ("item", "Watched item or pet variant."),
             (
                 "now (d1)",
-                "Median unit price of the current UTC day-to-date — thin right after midnight.",
+                "Median unit price of the current UTC day-to-date — thin right after midnight. The \
+                 table opens sorted by this column, dearest first.",
             ),
             (
                 "median d7",
@@ -2463,12 +2484,20 @@ pub(crate) async fn watchlist_page(
             ("note", "Your free-form note."),
             ("added", "When the entry was added (UTC)."),
             ("", "Removal action (open mode only)."),
-        ] {
-            let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let state = if column == WATCHLIST_NOW_COLUMN {
+                " aria-sort=\"descending\""
+            } else {
+                ""
+            };
+            let _ = write!(body, "<th data-sortable{state}>{}</th>", tip(label, tip_text));
         }
         body.push_str("</tr></thead><tbody>");
         for row in &report {
-            let now = row.blocks.first().and_then(|block| block.as_ref()).map(|b| b.median);
+            let now = d1_median(row);
             let week = row.blocks.get(1).and_then(|block| block.as_ref());
             let delta = match (now, week) {
                 (Some(now), Some(week)) if week.median > 0 => {
@@ -2523,6 +2552,15 @@ pub(crate) async fn watchlist_page(
         );
     }
     page("watchlist", "watchlist", &body, Some(switcher))
+}
+
+/// The d1 median behind the watchlist's `now (d1)` column: the first block
+/// (`report` runs with `[Span::D1, Span::D7]`), `None` when the day has no
+/// data yet.
+fn d1_median(
+    row: &amtracker_core::services::watchlist_report::WatchlistReportEntry,
+) -> Option<i64> {
+    row.blocks.first().and_then(|block| block.as_ref()).map(|block| block.median)
 }
 
 // ---------------------------------------------------------------- priorities
@@ -3036,7 +3074,7 @@ pub(crate) async fn help_page() -> Response {
         ("stability", "Low MAD relative to the median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted sum of discount, reliability, churn and stability (weights from the config; only ratios matter for ranking)."),
-        ("watchlist", "Your curated per-target list. Drives feed-slim.lua — the addon consumes exactly those items."),
+        ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
         ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),
         ("cooldown", "A fired rule re-fires at most once per [alerts].cooldown_secs, so a persistently cheap item does not spam delivery. The anchor is the rule's last-fired stamp."),

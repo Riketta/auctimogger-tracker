@@ -46,6 +46,11 @@
         if (!av || !bv) return 0;
         var aVal = av.hasAttribute("data-v") ? parseFloat(av.getAttribute("data-v")) : NaN;
         var bVal = bv.hasAttribute("data-v") ? parseFloat(bv.getAttribute("data-v")) : NaN;
+        // A cell without a sortable number ("—") has no place in a numeric
+        // order: it sinks to the end whichever way the column is sorted, so
+        // a mostly-empty column still shows its real values on top.
+        if (!isNaN(aVal) && isNaN(bVal)) return -1;
+        if (isNaN(aVal) && !isNaN(bVal)) return 1;
         var cmp;
         if (!isNaN(aVal) && !isNaN(bVal)) {
           cmp = aVal - bVal;

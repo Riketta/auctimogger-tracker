@@ -527,6 +527,53 @@ async fn table_rows_carry_a_cell_for_every_header_column() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// The watchlist opens dearest first by the current day's median: rows sort
+/// by their d1 block descending, rows without one keep watchlist order at the
+/// end, and the `now (d1)` header alone carries the `aria-sort` state that
+/// app.js' click toggle continues from.
+#[tokio::test]
+async fn watchlist_page_opens_sorted_by_d1_median_descending() {
+    let (state, root) = test_state(None);
+    seed_history(&state); // item 2589: today's median 200
+    let target = TargetId(TARGET.into());
+    let today = utc_day(state.clock.now());
+    let save_fold_at = |item: &ItemRef, day: i64, price: i64, first_auction: i64| {
+        let mut fold = DayFold::new(item.clone());
+        let listings: Vec<NormalizedListing> =
+            (0..4).map(|n| listing(first_auction + n, item, price)).collect();
+        fold.apply(&listings);
+        state.history.save_fold(&target, item, day, Category::Commodity, &fold).expect("save fold");
+    };
+    // Dearest today: 300. And an item with no d1 block at all (yesterday
+    // only) — it must sink to the end however much its week was worth.
+    let dear = ItemRef::Item { item_id: 301 };
+    let cold = ItemRef::Item { item_id: 302 };
+    save_fold_at(&dear, today, 300, 2100);
+    save_fold_at(&cold, today - 1, 999_999, 2200);
+    // Watch order — cold, hot, dear — is none of the expected page order.
+    state.watchlist.add(&target, cold.clone(), None).expect("watch cold");
+    state.watchlist.add(&target, ItemRef::Item { item_id: 2589 }, None).expect("watch hot");
+    state.watchlist.add(&target, dear.clone(), None).expect("watch dear");
+
+    let (status, body) =
+        get(build_router_arc(Arc::clone(&state)), "/watchlist?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let sorted_at = body
+        .find("<th data-sortable aria-sort=\"descending\">")
+        .expect("the sorted header carries its state");
+    let now_at = body.find("now (d1)").expect("the d1 header");
+    assert!(
+        sorted_at < now_at && now_at - sorted_at < 400,
+        "the d1 header is the one marked sorted"
+    );
+    assert_eq!(body.matches("aria-sort=").count(), 1, "exactly one column carries the state");
+    let dear_at = body.find("/items/t1/301").expect("dear row");
+    let hot_at = body.find("/items/t1/2589").expect("hot row");
+    let cold_at = body.find("/items/t1/302").expect("cold row");
+    assert!(dear_at < hot_at && hot_at < cold_at, "dearest first, no-d1 rows last");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// Counts `<th>` headers and per-row `<td>` cells of one table by id. `<th `
 /// (trailing space) so `<thead>` never matches; colspan tables are out of
 /// scope — only whole-row tables assert through this helper.
