@@ -61,7 +61,8 @@ pub struct BuyVerdict {
     /// Cheapest UTC hour (0..=23, its typical price) plus the all-hour
     /// median it is compared against.
     pub hour: Option<(i64, i64)>,
-    /// Median across all observed hour-of-day typicals — the day reference.
+    /// Median of the eligible hours' typicals — the day reference, built
+    /// exactly like `week_median`.
     pub hour_median: i64,
 }
 
@@ -146,10 +147,17 @@ pub fn weekday_stats(rows: &[ItemDayRow]) -> Vec<WeekdayStat> {
     out
 }
 
+/// Distinct days an hour-of-day needs before it may be called the cheapest
+/// hour — the hour twin of the weekday rule: one cheap 03:00 on one Tuesday
+/// is not "03:00 is cheap".
+const MIN_HOUR_DAYS: usize = 2;
+
 /// Picks the cheapest weekday and hour-of-day against their reference
 /// medians. Weekdays need ≥ 2 days of evidence (one Sunday is not "Sundays
-/// are cheap"); hours always aggregate many snapshots per cell, so one hour
-/// bucket is enough to say something.
+/// are cheap"); an hour-of-day needs the same, however many snapshots those
+/// days hold. Both references are built the same way — the median of the
+/// per-weekday, resp. per-hour, medians — so often-observed hours do not
+/// out-weigh rarer ones.
 #[must_use]
 pub fn cheapest_window(weekdays: &[WeekdayStat], buckets: &[HourBucket]) -> BuyVerdict {
     let mut verdict = BuyVerdict::default();
@@ -161,19 +169,22 @@ pub fn cheapest_window(weekdays: &[WeekdayStat], buckets: &[HourBucket]) -> BuyV
             verdict.weekday = Some((best.weekday, best.median));
         }
     }
-    if !buckets.is_empty() {
-        // Median of each hour's typicals across days: the hour-of-day shape.
-        let mut per_hour: std::collections::BTreeMap<i64, Vec<i64>> =
-            std::collections::BTreeMap::new();
-        for bucket in buckets {
-            per_hour.entry(bucket.hour).or_default().push(bucket.typical);
-        }
-        let mut all: Vec<i64> = Vec::new();
-        let mut hour_medians: Vec<(i64, i64)> = Vec::new();
-        for (hour, mut typicals) in per_hour {
-            all.extend(typicals.iter().copied());
+    // Median of each hour's typicals across the days it was observed.
+    let mut per_hour: std::collections::BTreeMap<i64, (Vec<i64>, std::collections::BTreeSet<i64>)> =
+        std::collections::BTreeMap::new();
+    for bucket in buckets {
+        let (typicals, days) = per_hour.entry(bucket.hour).or_default();
+        typicals.push(bucket.typical);
+        days.insert(bucket.day);
+    }
+    let mut hour_medians: Vec<(i64, i64)> = Vec::new();
+    for (hour, (mut typicals, days)) in per_hour {
+        if days.len() >= MIN_HOUR_DAYS {
             hour_medians.push((hour, median_of(&mut typicals)));
         }
+    }
+    if !hour_medians.is_empty() {
+        let mut all: Vec<i64> = hour_medians.iter().map(|(_, typical)| *typical).collect();
         verdict.hour_median = median_of(&mut all);
         if let Some(&(hour, typical)) = hour_medians.iter().min_by_key(|(_, typical)| *typical) {
             verdict.hour = Some((hour, typical));
@@ -288,13 +299,29 @@ mod tests {
         let buckets = [
             HourBucket { day: 5, hour: 2, floor: 90, typical: 100, snapshots: 2 },
             HourBucket { day: 6, hour: 2, floor: 110, typical: 120, snapshots: 2 },
-            HourBucket { day: 5, hour: 14, floor: 190, typical: 200, snapshots: 2 },
+            // Hour 14 was seen on ONE day, however cheap: not a pattern.
+            HourBucket { day: 5, hour: 14, floor: 10, typical: 20, snapshots: 2 },
         ];
         let verdict = cheapest_window(&weekdays, &buckets);
         assert_eq!(verdict.weekday, Some((0, 100)), "Sunday wins; single-day Tuesday ignored");
         assert_eq!(verdict.week_median, 125, "midpoint of 100 and 150");
-        assert_eq!(verdict.hour, Some((2, 110)), "hour 2: median of (100,120) beats 200");
-        assert_eq!(verdict.hour_median, 120, "median of 100,120,200 = 120");
+        assert_eq!(verdict.hour, Some((2, 110)), "hour 2: median of (100,120)");
+        assert_eq!(verdict.hour_median, 110, "the median of the eligible hours' medians");
+    }
+
+    /// Every hour seen on a single day: nothing to say about the hour of day.
+    #[test]
+    fn single_day_hours_answer_nothing() {
+        let buckets = [
+            HourBucket { day: 5, hour: 2, floor: 90, typical: 100, snapshots: 2 },
+            HourBucket { day: 6, hour: 14, floor: 10, typical: 20, snapshots: 9 },
+        ];
+        let verdict = cheapest_window(&[], &buckets);
+        assert_eq!(
+            (verdict.hour, verdict.hour_median),
+            (None, 0),
+            "nine snapshots on one day is still one day"
+        );
     }
 
     /// No evidence → an all-`None` verdict; a single weekday alone says

@@ -44,8 +44,10 @@ use crate::{
 /// conditions read the same window, so an alert and the ranking never
 /// disagree about what an item is worth.
 pub const SCAN_WINDOW_DAYS: i64 = 7;
-/// Sale-rate window backing the reliability component (days).
-const SALE_RATE_WINDOW_DAYS: i64 = 14;
+/// Sale-rate window backing the reliability component (days). The one
+/// definition every 14-day sale figure reads — metric blocks, alerts and the
+/// ranking must describe the same fortnight.
+pub(crate) const SALE_RATE_WINDOW_DAYS: i64 = 14;
 /// Sold-price window backing the reference value (days): the sale-rate window,
 /// so "what buyers paid" and "how often it sells" describe the same
 /// fortnight.
@@ -391,6 +393,8 @@ struct ItemScan {
     seen_today: Option<(i64, i64)>,
     median_now: i64,
     median7: f64,
+    /// Count-weighted median of the days BEFORE today — the movers' baseline.
+    median_prev: f64,
     value7: f64,
     /// 14-day sold median (copper) once enough priced units sold; stamps in
     /// after the batched sold-price read, like the sale rates.
@@ -783,29 +787,34 @@ impl OpportunityService {
     fn scan_item(item: &ItemRef, day_rows: &[ItemDayRow], today: i64) -> ItemScan {
         let mut churn_sum = 0.0f64;
         let mut weighted: Vec<(i64, i64)> = Vec::new(); // (median, listing_count)
+                                                        // The movers' baseline: every day before today, same weighting.
+        let mut weighted_prev: Vec<(i64, i64)> = Vec::new();
         let mut mad_weight_sum = 0i64;
         let mut mad_weighted = 0.0f64;
-        let mut newest: Option<&ItemDayRow> = None;
         let mut seen_today: Option<(i64, i64)> = None;
+        // Only a fold today has a "now"; an item last seen yesterday is not
+        // moving, it is absent.
+        let mut median_now = 0;
         for row in day_rows {
             let count = i64::try_from(row.listing_count).unwrap_or(i64::MAX);
             churn_sum += row.listing_count as f64;
             weighted.push((row.median, count));
+            if row.day < today {
+                weighted_prev.push((row.median, count));
+            }
             mad_weight_sum = mad_weight_sum.saturating_add(count);
             mad_weighted += row.mad as f64 * row.listing_count as f64;
             if row.day == today {
                 seen_today = Some((row.min, row.min_qty.max(0)));
-            }
-            match newest {
-                Some(latest) if latest.day >= row.day => {}
-                _ => newest = Some(row),
+                median_now = row.median;
             }
         }
         weighted.sort_by_key(|(median, _)| *median);
+        weighted_prev.sort_by_key(|(median, _)| *median);
         let median7 = weighted_median(&weighted);
+        let median_prev = weighted_median(&weighted_prev);
         let mad7 = if mad_weight_sum > 0 { mad_weighted / mad_weight_sum as f64 } else { 0.0 };
         let (value7, samples7) = quantity_value(day_rows).unwrap_or((0.0, 0));
-        let median_now = newest.map_or(0, |row| row.median);
         // Window-denominator churn: days without a fold count as zero, so a
         // single busy day reads as that day's count spread over the window,
         // not as sustained per-day volume (the docs and the `min_churn`
@@ -818,6 +827,7 @@ impl OpportunityService {
             seen_today,
             median_now,
             median7,
+            median_prev,
             value7,
             sold_median: None,
             mad7,
@@ -888,17 +898,20 @@ impl OpportunityService {
     }
 
     fn mover_for(scan: &ItemScan, category: Category) -> Option<MoverRow> {
-        if scan.median_now <= 0 || scan.median7 <= 0.0 {
+        // Today against the days BEFORE it: a baseline that included today
+        // divided a real one-day move by the window length (~7x dampening),
+        // and an item without a fold today has no "now" to move from.
+        if scan.median_now <= 0 || scan.median_prev <= 0.0 {
             return None;
         }
         // Relative change only — magnitudes cancel, precision loss is fine.
         #[allow(clippy::cast_precision_loss)]
-        let change = scan.median_now as f64 / scan.median7 - 1.0;
+        let change = scan.median_now as f64 / scan.median_prev - 1.0;
         Some(MoverRow {
             item: scan.item.clone(),
             category,
             median_now: scan.median_now,
-            median_prev: scan.median7,
+            median_prev: scan.median_prev,
             change,
             churn_per_day: scan.churn_per_day,
         })
@@ -1138,6 +1151,41 @@ mod tests {
         assert_eq!(sold_reference(&[(300, 2), (100, 1)]), Some(300.0));
         // An even split lands between the two middle prices.
         assert_eq!(sold_reference(&[(100, 2), (300, 2)]), Some(200.0));
+    }
+
+    #[test]
+    fn movers_measure_today_against_the_days_before_it() {
+        let today = 100;
+        let row = |day: i64, median: i64| ItemDayRow {
+            item: item(1),
+            category: Category::Commodity,
+            day,
+            listing_count: 10,
+            qty_sum: 10,
+            min: median,
+            min_qty: 1,
+            p05: median,
+            median,
+            qty_median: median,
+            mad: 0,
+        };
+        // Yesterday 100, today 150: a +50% day. With today inside its own
+        // baseline it read as +20% — the move divided by the window.
+        let scan =
+            OpportunityService::scan_item(&item(1), &[row(today - 1, 100), row(today, 150)], today);
+        assert_eq!(scan.median7, 125.0, "the listing median still spans the whole window");
+        let mover = OpportunityService::mover_for(&scan, Category::Commodity).expect("a mover");
+        assert!((mover.change - 0.5).abs() < 1e-9, "change = {}", mover.change);
+        assert_eq!(mover.median_now, 150);
+        assert!((mover.median_prev - 100.0).abs() < 1e-9, "baseline = {}", mover.median_prev);
+
+        // No fold today: nothing is moving, the item is absent.
+        let stale = OpportunityService::scan_item(
+            &item(1),
+            &[row(today - 2, 100), row(today - 1, 90)],
+            today,
+        );
+        assert!(OpportunityService::mover_for(&stale, Category::Commodity).is_none());
     }
 
     #[test]

@@ -226,9 +226,9 @@ pub struct CompareRow {
     pub coverage: usize,
     /// Cells aligned with [`CompareReport::targets`].
     pub cells: Vec<CompareCell>,
-    /// Index of the best sell market: the highest current-day median,
-    /// falling back to the 7-day median when nothing trades today. `None`
-    /// when no target has any data for the identity.
+    /// Index of the best sell market: the target with the highest
+    /// current-day median. `None` when no target traded the identity today —
+    /// a cell shown as "—" is never the best market.
     pub best: Option<usize>,
 }
 
@@ -259,7 +259,8 @@ impl SellPriorityService {
         targets: &[TargetId],
         category: Category,
     ) -> Result<CompareReport, StoreError> {
-        // Union of watched identities, in stable first-seen order.
+        // Union of watched identities. The per-target sets iterate in hash
+        // order, so this list is NOT the row order — the sort below is.
         let mut items: Vec<ItemRef> = Vec::new();
         let mut seen: HashSet<ItemRef> = HashSet::new();
         let mut watched: Vec<HashSet<ItemRef>> = Vec::with_capacity(targets.len());
@@ -307,13 +308,11 @@ impl SellPriorityService {
             let best = argmax_price(&cells);
             rows.push(CompareRow { item: item.clone(), coverage, cells, best });
         }
-        // Broadest coverage first, then a stable identity order so pages
-        // and API agree byte-for-byte.
-        rows.sort_by(|a, b| {
-            b.coverage
-                .cmp(&a.coverage)
-                .then_with(|| identity_key(&a.item).cmp(&identity_key(&b.item)))
-        });
+        // Broadest coverage first, then the full identity order (items by id,
+        // then pets by species, level, quality and breed): the union itself
+        // comes out of hash-set iteration, so without a total order the pet
+        // variants of one species would shuffle between requests.
+        rows.sort_by(|a, b| b.coverage.cmp(&a.coverage).then_with(|| a.item.cmp(&b.item)));
         Ok(CompareReport { targets: targets.to_vec(), category, rows })
     }
 }
@@ -325,13 +324,15 @@ struct TargetBlocks {
     week: Vec<Option<MetricBlock>>,
 }
 
-/// Highest current-day median, falling back to the 7-day median when
-/// nothing trades today; ties prefer the earlier target (deterministic).
+/// Highest CURRENT-day median among the targets that traded the identity
+/// today; ties prefer the earlier target (deterministic). A cell without a
+/// current price renders as "—", so it is never the best market — and a row
+/// nothing traded anywhere today has no best at all (the 7-day medians still
+/// read in their cells).
 fn argmax_price(cells: &[CompareCell]) -> Option<usize> {
-    let price = |cell: &CompareCell| cell.now.or(cell.week_median);
     let mut best: Option<(usize, i64)> = None;
     for (index, cell) in cells.iter().enumerate() {
-        if let Some(value) = price(cell) {
+        if let Some(value) = cell.now {
             best = match best {
                 Some((_, best_value)) if best_value >= value => best,
                 _ => Some((index, value)),
@@ -339,12 +340,4 @@ fn argmax_price(cells: &[CompareCell]) -> Option<usize> {
         }
     }
     best.map(|(index, _)| index)
-}
-
-/// Deterministic identity ordering: items by id before pets by species.
-fn identity_key(item: &ItemRef) -> (i64, i64) {
-    match item {
-        ItemRef::Item { item_id } => (*item_id, 0),
-        ItemRef::Pet { species, .. } => (*species, 1),
-    }
 }

@@ -3338,7 +3338,7 @@ pub(crate) async fn alerts_page(
          <input name=\"breedID\" type=\"number\" placeholder=\"pet breed\" aria-label=\"pet breed id\">\
          <select name=\"type\" aria-label=\"condition\">\
          <option value=\"price-below\">d1 median ≤ copper</option>\
-         <option value=\"below-floor\">median ≤ floor percentile</option>\
+         <option value=\"below-floor\">d1 median at a span floor (flat market)</option>\
          <option value=\"floor-below\">live floor ≤ copper</option>\
          <option value=\"floor-below-value\">live floor ≤ % of 7d value</option>\
          <option value=\"new-listing-below\">new listing ≤ % of 7d value</option>\
@@ -3456,6 +3456,9 @@ pub(crate) async fn help_page() -> Response {
         ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
         ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),
+        ("below-floor", "A per-target condition that fires while today's d1 median sits at or under a longer span's p05/p25 floor. In a flat market the median and the floor coincide, so it fires continuously there: read it as a flat-market detector, not as a price-drop signal — floor-below-value and new-listing-below are the drop signals."),
+        ("sale credit", "How the ledger books a sale: a listing that vanishes well before its time-left band could have run out is credited as sold, at the unit price it was last seen asking. A cancellation early in the band is indistinguishable from a sale and counts as one; a listing that runs its full band and then disappears is an expiry and does not count. Commodity stacks also credit partial fills — a live stack shrinking — at the posted price."),
+        ("bid-only listing", "An item-auction listing with a bid and no buyout. It is valued at the unit price it carries like any other listing, and a credited close is booked at that price: the hammer price of a bid sale is never reported, so the listing's own price is the closest estimate."),
         ("cooldown", "A fired rule re-fires at most once per [alerts].cooldown_secs, so a persistently cheap item does not spam delivery. The anchor is the rule's last-fired stamp."),
         ("delivery", "Where fired alerts go: log (this page + JSON API only), discord (webhook message) or telegram (bot message). Webhook/token values are read from the named environment variables on every send, so rotating them needs no restart."),
         ("generatedAt / source modified", "The feed's freshness anchor: taken from the source's Last-Modified header so the addon can trust how current its data is."),

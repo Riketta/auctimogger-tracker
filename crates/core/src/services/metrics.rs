@@ -25,6 +25,7 @@ use crate::{
         PriceHistoryRepository,
         SalesRepository,
     },
+    services::opportunity::SALE_RATE_WINDOW_DAYS,
 };
 
 /// How long a memoized block may serve queries before recomputation. Ingest
@@ -33,8 +34,6 @@ use crate::{
 /// above all intra-day fold growth for untouched items.
 const MAX_CACHE_AGE_SECONDS: i64 = 300;
 
-/// Window for the sell-through rate attached to every block.
-const SALE_RATE_WINDOW_DAYS: i64 = 14;
 /// Slow demand window for `sale_rate_180d` — stable enough to validate
 /// (or discount) a fast-window spike, per the TSM `SaleRate` lesson.
 const SALE_RATE_SLOW_WINDOW_DAYS: i64 = 180;

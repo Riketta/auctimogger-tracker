@@ -4131,9 +4131,9 @@ impl PriceHistoryRepository for SqliteStore {
     }
 }
 
-/// Minimum, nearest-rank p05, nearest-rank median and MAD of one day's
-/// sorted prices (the display-table day-row statistics).
-/// Prices must be sorted ascending.
+/// Minimum, nearest-rank p05, median and MAD of one day's sorted prices (the
+/// display-table day-row statistics). Even counts take the midpoint, the
+/// same rule as the metrics engine's blocks. Prices must be sorted ascending.
 ///
 /// Direct indexing is safe here: `n > 0` is ensured by the early return and
 /// `mid` and the p05 rank lie in `1..=n`, so every index is valid — a
@@ -4149,11 +4149,21 @@ fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64, i64) {
     // n ≥ 1 always lands in [1, n] (≤ 20 listings degenerate p05 → min).
     let p05 = prices[n.div_ceil(20) - 1];
     let mid = n.div_ceil(2);
-    let median = prices[mid - 1];
+    // Midpoints on even counts, exactly like the metrics engine: a day row's
+    // median is the same statistic as its block's, so the chart and the block
+    // beside it never disagree by half a listing (the old lower-middle pick
+    // also shrank day-row MADs, inflating the ranking's stability component
+    // on thin even-count days).
+    let median =
+        if n % 2 == 1 { prices[mid - 1] } else { i64::midpoint(prices[mid - 1], prices[mid]) };
     let mad = {
         let mut deviations: Vec<i64> = prices.iter().map(|p| (p - median).abs()).collect();
         deviations.sort_unstable();
-        deviations[mid - 1]
+        if n % 2 == 1 {
+            deviations[mid - 1]
+        } else {
+            i64::midpoint(deviations[mid - 1], deviations[mid])
+        }
     };
     (prices[0], p05, median, mad)
 }

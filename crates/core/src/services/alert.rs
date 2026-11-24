@@ -40,15 +40,12 @@ use crate::{
             quantity_value,
             sold_reference,
             ValueSource,
+            SALE_RATE_WINDOW_DAYS,
             SCAN_WINDOW_DAYS,
             SOLD_PRICE_WINDOW_DAYS,
         },
     },
 };
-
-/// Trailing window (days) behind [`AlertCondition::SaleRateAbove`] — the same
-/// window every metric block's `sale_rate` uses.
-const SALE_RATE_WINDOW_DAYS: i64 = 14;
 
 /// Counters of one evaluation pass over one target's rules.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

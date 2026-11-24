@@ -502,7 +502,7 @@ fn spec_paths_watchlist_alerts(target: &Value) -> Value {
         "/api/watchlist/compare": {
             "get": get_op(
                 "Cross-target watchlist comparison",
-                "The union of all configured targets' watchlists as a matrix: one row per identity, one cell per target (watched flag, current-day median, 7-day median), best = index of the highest-paying market per row. No target parameter: compares every configured target.",
+                "The union of all configured targets' watchlists as a matrix: one row per identity, one cell per target (watched flag, current-day median, 7-day median), best = index of the market with the highest current-day median per row (null when nothing traded it anywhere today; rows in a fixed identity order). No target parameter: compares every configured target.",
                 vec![
                     json!({ "name": "category", "in": "query", "required": false, "description": "One market category; default item. Unknown names are rejected with 400.", "schema": { "type": "string" } }),
                 ],

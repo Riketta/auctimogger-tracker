@@ -110,11 +110,12 @@ pub fn block_from_histograms(
 }
 
 /// Quantity-weighted median unit price over merged histograms: the price at
-/// which half the listed quantity sits. For single-unit listings it is the
-/// nearest-rank median; for stackable goods it is the bulk price — where most
-/// of the supply trades — instead of the price of the median *listing* (a
-/// hundred one-unit stacks and five 200-unit stacks would otherwise read as
-/// the one-unit price). `None` when nothing carries quantity.
+/// which half the listed quantity sits (midpoint on even totals, like every
+/// other median here). For single-unit listings it is the plain median; for
+/// stackable goods it is the bulk price — where most of the supply trades —
+/// instead of the price of the median *listing* (a hundred one-unit stacks and
+/// five 200-unit stacks would otherwise read as the one-unit price). `None`
+/// when nothing carries quantity.
 #[must_use]
 pub fn quantity_weighted_median(histories: &[ItemDayHistogram]) -> Option<i64> {
     let mut weights: BTreeMap<i64, i64> = BTreeMap::new();
@@ -140,14 +141,27 @@ pub fn quantity_weighted_median(histories: &[ItemDayHistogram]) -> Option<i64> {
     // `(total + 1) / 2` is `total.div_ceil(2)`; total is positive and far
     // from the i64 edge (it sums per-day quantities).
     let target = (total + 1) / 2;
-    let mut seen = 0i64;
-    for (price, weight) in &weights {
-        seen = seen.saturating_add(*weight);
-        if seen >= target {
-            return Some(*price);
+    let value_at = |rank: i64| -> Option<i64> {
+        let mut seen = 0i64;
+        for (price, weight) in &weights {
+            seen = seen.saturating_add(*weight);
+            if seen >= rank {
+                return Some(*price);
+            }
         }
-    }
-    weights.last_key_value().map(|(price, _)| *price)
+        None
+    };
+    // Even totals take the midpoint of the two middle units, like every other
+    // median here (the metrics engine, the day rows and the ranking).
+    let median = if total % 2 == 0 {
+        match (value_at(target), value_at(target + 1)) {
+            (Some(low), Some(high)) => Some(i64::midpoint(low, high)),
+            (lower, _) => lower,
+        }
+    } else {
+        value_at(target)
+    };
+    median.or_else(|| weights.last_key_value().map(|(price, _)| *price))
 }
 
 #[cfg(test)]
@@ -273,14 +287,23 @@ mod tests {
         assert!(block_from_histograms(&[ItemDayHistogram::default()], BlockLedger::NONE).is_none());
     }
 
-    /// Single-unit listings: the quantity-weighted median IS the nearest-rank
-    /// median (lower-middle on even counts, the day-row convention).
+    /// Single-unit listings: the quantity-weighted median IS the metrics
+    /// engine's median — midpoints on even counts included, so the ranking's
+    /// value and the block beside it can never disagree by half a listing.
     #[test]
     fn quantity_weighted_median_matches_the_median_for_single_units() {
-        let one = hist_from_samples(&[(100, 1), (200, 1), (300, 1)]);
-        assert_eq!(quantity_weighted_median(&[one]), Some(200));
-        let even = hist_from_samples(&[(100, 1), (200, 1)]);
-        assert_eq!(quantity_weighted_median(&[even]), Some(100));
+        let agrees = |samples: &[(i64, i64)]| {
+            let histogram = hist_from_samples(samples);
+            let block = block_from_histograms(std::slice::from_ref(&histogram), BlockLedger::NONE);
+            assert_eq!(
+                quantity_weighted_median(std::slice::from_ref(&histogram)),
+                block.map(|block| block.median),
+                "samples {samples:?}"
+            );
+        };
+        agrees(&[(100, 1), (200, 1), (300, 1)]);
+        agrees(&[(100, 1), (200, 1)]);
+        agrees(&[(100, 1), (200, 1), (200, 1), (300, 1)]);
     }
 
     /// Stackable goods: the quantity decides, not the listing count. A hundred

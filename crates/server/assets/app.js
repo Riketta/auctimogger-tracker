@@ -316,13 +316,17 @@
       return node;
     }
 
-    // ---- weekday view: re-aggregate the raw day rows by LOCAL weekday.
+    // ---- weekday view: aggregate the raw day rows by weekday.
+    // A day row IS a UTC day: it cannot be split into local weekdays, and
+    // reading its UTC midnight in local time (`getDay`) filed every day under
+    // the previous weekday for anyone west of UTC. So the weekday is the UTC
+    // weekday, and the caption says so.
     var stats = null, weekMedian = null, weekdayBest = null;
     var weekdayMount = $("#when-weekday");
     if (weekdayMount && data.weekdayDays && data.weekdayDays.length) {
       var byWeekday = {};
       data.weekdayDays.forEach(function (row) {
-        var weekday = new Date(row.day * 86400000).getDay();
+        var weekday = new Date(row.day * 86400000).getUTCDay();
         if (!byWeekday[weekday]) byWeekday[weekday] = { medians: [], p05s: [] };
         byWeekday[weekday].medians.push(row.median);
         byWeekday[weekday].p05s.push(row.p05);
@@ -350,7 +354,7 @@
         var max = Math.max.apply(null, keys.map(function (w) { return stats[w].median; }));
         var svg = svgEl("svg", {
           viewBox: "0 0 " + W + " " + H, role: "img",
-          "aria-label": "price by weekday (local time)", style: "max-width:" + W + "px"
+          "aria-label": "price by weekday (UTC days)", style: "max-width:" + W + "px"
         });
         DISPLAY_ORDER.forEach(function (weekday, slot) {
           var x = slot * 40 + 8;
@@ -378,7 +382,7 @@
         weekdayMount.textContent = "";
         var caption = document.createElement("p");
         caption.className = "muted";
-        caption.textContent = "median by weekday · notch = p05 floor · your local weekdays";
+        caption.textContent = "median by UTC weekday · notch = p05 floor";
         weekdayMount.appendChild(caption);
         weekdayMount.appendChild(svg);
       }
@@ -390,6 +394,7 @@
     if (intradayMount && data.days && data.days.length) {
       var byHour = {};      // local hour -> typicals as % of the day's median
       var floorByHour = {}; // local hour -> floors as %
+      var daysByHour = {};  // local hour -> distinct UTC days it was seen on
       var perDay = [];      // faint single-day lines
       data.days.forEach(function (dayEntry) {
         if (!dayEntry.hours || !dayEntry.hours.length) return;
@@ -403,6 +408,8 @@
           var floor = cell.floor / dayMedian * 100;
           if (!byHour[hour]) byHour[hour] = [];
           if (!floorByHour[hour]) floorByHour[hour] = [];
+          if (!daysByHour[hour]) daysByHour[hour] = {};
+          daysByHour[hour][dayEntry.day] = true;
           byHour[hour].push(typical);
           floorByHour[hour].push(floor);
           points.push({ hour: hour, pct: typical });
@@ -413,10 +420,19 @@
           // once through midnight — unsorted, that wrap draws a long segment
           // back across the whole chart.
           points.sort(function (a, b) { return a.hour - b.hour; });
-          perDay.push({ label: new Date(dayEntry.day * 86400000).toLocaleDateString(), points: points });
+          // The line is one UTC day: label it with its UTC date (its midnight
+          // read in local time would show the previous date west of UTC).
+          perDay.push({
+            label: new Date(dayEntry.day * 86400000).toLocaleDateString(undefined, { timeZone: "UTC" }),
+            points: points
+          });
         }
       });
-      var hourKeys = Object.keys(byHour).map(Number).sort(function (a, b) { return a - b; });
+      // Same evidence floor as the weekday view and the server's verdict: an
+      // hour seen on a single day is not a pattern, however cheap it was.
+      var hourKeys = Object.keys(byHour).map(Number).filter(function (hour) {
+        return Object.keys(daysByHour[hour]).length >= 2;
+      }).sort(function (a, b) { return a - b; });
       if (hourKeys.length) {
         hourTypicals = hourKeys.map(function (hour) {
           return { hour: hour, typical: medianOf(byHour[hour]), floor: Math.min.apply(null, floorByHour[hour]) };
