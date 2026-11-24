@@ -3,13 +3,22 @@
 //! output — is priced exactly as the deal ranking prices it (the
 //! quantity-weighted 7-day median of the market with the most evidence, plus
 //! the newest snapshot's live floor), the output is scaled by how reliably it
-//! sells, and the auction-house cut comes off the top. Reads the scans the
-//! scheduler already prepares, so a request costs no store read of its own
-//! beyond the outputs' cached metric blocks.
+//! sells, and the auction-house cut comes off the top. A reagent the book itself
+//! crafts is sourced at the cheaper of its market price and its own craft cost,
+//! recursing through the book. Reads the scans the scheduler already prepares,
+//! so a request costs no store read of its own beyond the outputs' cached
+//! metric blocks. The book is held live: the composition root swaps it in place
+//! when the recipe file changes on disk (see [`CraftService::reload`]).
 
 use std::{
-    collections::BTreeMap,
-    sync::Arc,
+    collections::{
+        BTreeMap,
+        HashMap,
+    },
+    sync::{
+        Arc,
+        RwLock,
+    },
 };
 
 use crate::{
@@ -45,9 +54,14 @@ pub struct ReagentCost {
     /// The market the reagent was priced in (`None` = no reference price in
     /// any).
     pub category: Option<Category>,
-    /// Reference unit value (copper; 0 without a price): the 14-day sold
-    /// median once enough priced units sold, else the 7-day listing value.
+    /// Effective unit value (copper; 0 without a price): the lower of the
+    /// reference value (the 14-day sold median once enough priced units sold,
+    /// else the 7-day listing value) and `craft_cost`.
     pub unit_value: i64,
+    /// What one unit costs to craft from the book's own recipes, recursively
+    /// sourced, when the book makes it — the "craft it yourself" alternative
+    /// to buying.
+    pub craft_cost: Option<i64>,
     /// Cheapest listing in the newest snapshot (copper), when one is listed.
     pub live_unit_price: Option<i64>,
 }
@@ -112,7 +126,8 @@ pub struct CraftRow {
     pub reagents: Vec<ReagentCost>,
     /// The output's market facts (`None` = no 7-day price for it).
     pub output: Option<CraftOutput>,
-    /// Σ quantity × 7-day unit value; `None` when a reagent is unpriced.
+    /// Σ quantity × effective unit value (market or craft, whichever is
+    /// cheaper); `None` when a reagent is unpriced.
     pub cost: Option<i64>,
     /// The same at the newest snapshot's floors; `None` unless every reagent
     /// is listed right now.
@@ -148,29 +163,77 @@ pub struct CraftService {
     opportunities: Arc<OpportunityService>,
     metrics: Arc<MetricsService>,
     settings: CraftsConfig,
+    /// The live recipe book, in file order — replaced in place by a hot reload.
+    recipes: RwLock<Arc<Vec<Recipe>>>,
+    /// Why the last hot reload was refused; the book in `recipes` is the one
+    /// that loaded before it. `None` when the last reload (or the boot load)
+    /// succeeded.
+    reload_error: RwLock<Option<String>>,
 }
 
 impl CraftService {
     /// Wires the service to the ranking's prepared scans, the cached metric
-    /// blocks and the `[crafts]` settings.
+    /// blocks and the `[crafts]` settings (whose recipes form the first book).
     pub fn new(
         opportunities: Arc<OpportunityService>,
         metrics: Arc<MetricsService>,
         settings: &CraftsConfig,
     ) -> Self {
-        Self { opportunities, metrics, settings: settings.clone() }
+        Self {
+            opportunities,
+            metrics,
+            settings: settings.clone(),
+            recipes: RwLock::new(Arc::new(settings.recipes.clone())),
+            reload_error: RwLock::new(None),
+        }
     }
 
     /// Whether any recipe is configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.settings.recipes.is_empty()
+        self.recipes().is_empty()
+    }
+
+    /// How many recipes the live book holds.
+    #[must_use]
+    pub fn recipe_count(&self) -> usize {
+        self.recipes().len()
+    }
+
+    /// The live recipe book, in file order.
+    #[must_use]
+    pub fn recipes(&self) -> Arc<Vec<Recipe>> {
+        Arc::clone(&self.recipes.read().unwrap_or_else(std::sync::PoisonError::into_inner))
     }
 
     /// The configured recipe file path, for the view's provenance note.
     #[must_use]
     pub fn recipes_file(&self) -> Option<&str> {
         self.settings.recipes_file.as_deref()
+    }
+
+    /// Why the last hot reload was refused, when it was.
+    #[must_use]
+    pub fn reload_error(&self) -> Option<String> {
+        self.reload_error.read().unwrap_or_else(std::sync::PoisonError::into_inner).clone()
+    }
+
+    /// Applies a hot reload: a parsed, validated book replaces the live one
+    /// and clears any earlier error; a failure keeps the current book and
+    /// records why, so a half-edited file never silently empties the view.
+    pub fn reload(&self, outcome: Result<Vec<Recipe>, String>) {
+        match outcome {
+            Ok(recipes) => {
+                *self.recipes.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Arc::new(recipes);
+                *self.reload_error.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    None;
+            }
+            Err(error) => {
+                *self.reload_error.write().unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(error);
+            }
+        }
     }
 
     /// Evaluates every recipe against one target's market.
@@ -183,11 +246,12 @@ impl CraftService {
         let cut = self.settings.ah_cut_percent / 100.0;
         let min_sale_rate = self.settings.min_sale_rate;
         let mut report = CraftReport { cut, min_sale_rate, ..Default::default() };
-        if self.settings.recipes.is_empty() {
+        let recipes = self.recipes();
+        if recipes.is_empty() {
             return Ok(report);
         }
-        let priced = self.price(target)?;
-        for recipe in &self.settings.recipes {
+        let priced = self.price(target, &recipes)?;
+        for recipe in recipes.iter() {
             let row = evaluate(recipe, &priced, cut, min_sale_rate);
             if row.issue.is_none() {
                 report.ranked.push(row);
@@ -209,13 +273,18 @@ impl CraftService {
     /// the commodity house, where stackables trade) and that market's
     /// reference value — the 14-day sold median once enough priced units
     /// sold, else the 7-day listing value — and the outputs' cached 14-day
-    /// blocks add how many units they sell per day.
-    fn price(&self, target: &TargetId) -> Result<BTreeMap<ItemRef, PricedItem>, StoreError> {
+    /// blocks add how many units they sell per day. Reagents the book itself
+    /// crafts then learn their craft cost (see [`apply_craft_costs`]).
+    fn price(
+        &self,
+        target: &TargetId,
+        recipes: &[Recipe],
+    ) -> Result<BTreeMap<ItemRef, PricedItem>, StoreError> {
         let commodity = self.opportunities.market(target, Category::Commodity)?;
         let item = self.opportunities.market(target, Category::Item)?;
         let mut priced: BTreeMap<ItemRef, PricedItem> = BTreeMap::new();
         let mut outputs: BTreeMap<Category, Vec<ItemRef>> = BTreeMap::new();
-        for recipe in &self.settings.recipes {
+        for recipe in recipes {
             let mentioned =
                 std::iter::once(&recipe.item).chain(recipe.reagents.iter().map(|r| &r.item));
             for identity in mentioned {
@@ -238,6 +307,7 @@ impl CraftService {
                         unit_value: value.reference(),
                         sold_median14: value.sold_median14,
                         value_source: value.value_source(),
+                        craft_cost: None,
                         live_unit_price: value.live.map(|live| live.floor_price),
                         sale_rate: value.sale_rate,
                         units_sold_per_day: None,
@@ -245,6 +315,7 @@ impl CraftService {
                 );
             }
         }
+        apply_craft_costs(&mut priced, recipes);
         for (category, identities) in outputs {
             let blocks = self.metrics.blocks(target, &identities, category, Span::D14)?;
             for (identity, block) in identities.iter().zip(blocks.iter().flatten()) {
@@ -270,6 +341,10 @@ struct PricedItem {
     sold_median14: Option<i64>,
     /// Which value `unit_value` resolved to.
     value_source: ValueSource,
+    /// Cheapest way to craft one unit from the book's own recipes, when the
+    /// book makes the item — the sourcing alternative to `unit_value` for
+    /// reagents (never applied to an output's sale value).
+    craft_cost: Option<i64>,
     /// Cheapest listing in the newest snapshot (copper).
     live_unit_price: Option<i64>,
     /// 14-day sale rate (`None` = no credit-eligible evidence).
@@ -285,10 +360,129 @@ impl PricedItem {
             unit_value: 0,
             sold_median14: None,
             value_source: ValueSource::Listed,
+            craft_cost: None,
             live_unit_price: None,
             sale_rate: None,
             units_sold_per_day: None,
         }
+    }
+}
+
+/// Gives every item the book crafts its cheapest per-unit craft cost (see
+/// [`CraftPricer`]). Only items the book makes as OUTPUTS gain a cost; a
+/// reagent with none keeps its market price alone.
+fn apply_craft_costs(priced: &mut BTreeMap<ItemRef, PricedItem>, recipes: &[Recipe]) {
+    let outputs: Vec<ItemRef> = {
+        let mut outputs: Vec<ItemRef> = recipes.iter().map(|recipe| recipe.item.clone()).collect();
+        outputs.sort();
+        outputs.dedup();
+        outputs
+    };
+    let book = CraftBook::new(recipes);
+    let mut evaluator =
+        CraftPricer { priced, book: &book, memo: HashMap::new(), stack: Vec::new() };
+    let costs: Vec<(ItemRef, i64)> = outputs
+        .into_iter()
+        .filter_map(|output| evaluator.craft_cost(&output).map(|cost| (output, cost)))
+        .collect();
+    for (item, cost) in costs {
+        if let Some(entry) = priced.get_mut(&item) {
+            entry.craft_cost = Some(cost);
+        }
+    }
+}
+
+/// The recipe book as a routing table: which recipes make which item.
+struct CraftBook<'a> {
+    routes: BTreeMap<ItemRef, Vec<&'a Recipe>>,
+}
+
+impl<'a> CraftBook<'a> {
+    fn new(recipes: &'a [Recipe]) -> Self {
+        let mut routes: BTreeMap<ItemRef, Vec<&Recipe>> = BTreeMap::new();
+        for recipe in recipes {
+            routes.entry(recipe.item.clone()).or_default().push(recipe);
+        }
+        Self { routes }
+    }
+
+    /// The recipes that make `item`, in book order.
+    fn routes(&self, item: &ItemRef) -> &[&'a Recipe] {
+        self.routes.get(item).map_or(&[], Vec::as_slice)
+    }
+
+    /// Whether the book crafts `item` at all.
+    fn crafts(&self, item: &ItemRef) -> bool {
+        self.routes.contains_key(item)
+    }
+}
+
+/// Costs the book's crafts recursively: a reagent is sourced at the cheaper
+/// of its market price and its own craft cost, whose reagents are sourced the
+/// same way. `stack` holds the outputs being costed — a recipe whose output is
+/// already on it is skipped, so a book that refers to itself is priced at the
+/// market at the point of the loop and can never print money by looping (the
+/// validator refuses such a book; this is the defense). Results computed at
+/// the top of the stack are memoized; nested ones are not (they may rest on a
+/// cycle break that a different path would not hit).
+struct CraftPricer<'a> {
+    priced: &'a BTreeMap<ItemRef, PricedItem>,
+    book: &'a CraftBook<'a>,
+    memo: HashMap<ItemRef, Option<i64>>,
+    stack: Vec<ItemRef>,
+}
+
+impl CraftPricer<'_> {
+    /// The cheapest way to source one unit of `item` for a craft that
+    /// consumes it; `None` when it can be neither bought nor crafted.
+    fn source(&mut self, item: &ItemRef) -> Option<i64> {
+        let market = self.priced.get(item).map(|entry| entry.unit_value).filter(|value| *value > 0);
+        if !self.book.crafts(item) {
+            return market;
+        }
+        let crafted = self.craft_cost(item);
+        Some(match (market, crafted) {
+            (Some(market), Some(crafted)) => market.min(crafted),
+            (Some(market), None) => market,
+            (None, crafted) => crafted?,
+        })
+    }
+
+    /// The least per-unit cost of crafting `output` across the recipes that
+    /// make it (whole copper, rounded up — a cost never reads cheaper than it
+    /// is); `None` when some reagent of every route is unsourcable.
+    fn craft_cost(&mut self, output: &ItemRef) -> Option<i64> {
+        if let Some(cached) = self.memo.get(output) {
+            return *cached;
+        }
+        let routes = self.book.routes(output);
+        if routes.is_empty() || self.stack.contains(output) {
+            return None;
+        }
+        let top_level = self.stack.is_empty();
+        self.stack.push(output.clone());
+        let mut best: Option<i64> = None;
+        for recipe in routes {
+            let mut total = 0i64;
+            let mut sourcable = true;
+            for reagent in &recipe.reagents {
+                if let Some(unit) = self.source(&reagent.item) {
+                    total = total.saturating_add(reagent.qty.saturating_mul(unit));
+                } else {
+                    sourcable = false;
+                    break;
+                }
+            }
+            if sourcable {
+                let per_unit = total.saturating_add(recipe.makes - 1) / recipe.makes;
+                best = Some(best.map_or(per_unit, |best| best.min(per_unit)));
+            }
+        }
+        self.stack.pop();
+        if top_level {
+            self.memo.insert(output.clone(), best);
+        }
+        best
     }
 }
 
@@ -341,7 +535,14 @@ fn evaluate(
     let mut unpriced: Option<ItemRef> = None;
     for reagent in &recipe.reagents {
         let found = priced.get(&reagent.item);
-        let unit_value = found.map_or(0, |entry| entry.unit_value);
+        let reference = found.map_or(0, |entry| entry.unit_value);
+        let craft_cost = found.and_then(|entry| entry.craft_cost).filter(|cost| *cost > 0);
+        // Sourcing: craft the reagent when that beats buying it.
+        let unit_value = match craft_cost {
+            Some(craft_cost) if reference > 0 => reference.min(craft_cost),
+            Some(craft_cost) => craft_cost,
+            None => reference,
+        };
         let live_unit_price = found.and_then(|entry| entry.live_unit_price);
         if unit_value > 0 {
             cost = cost.saturating_add(reagent.qty.saturating_mul(unit_value));
@@ -360,6 +561,7 @@ fn evaluate(
             qty: reagent.qty,
             category: found.and_then(|entry| entry.category).filter(|_| unit_value > 0),
             unit_value,
+            craft_cost,
             live_unit_price: live_unit_price.filter(|_| unit_value > 0),
         });
     }
@@ -450,6 +652,7 @@ mod tests {
             unit_value,
             sold_median14: None,
             value_source: ValueSource::Listed,
+            craft_cost: None,
             live_unit_price: live,
             sale_rate,
             units_sold_per_day: sale_rate.map(|_| 3.5),
@@ -595,5 +798,92 @@ mod tests {
         assert_eq!(CraftIssue::NoSaleEvidence.as_str(), "no-sale-evidence");
         assert_eq!(CraftIssue::SlowSeller(0.1).as_str(), "slow-seller");
         assert_eq!(CraftIssue::NotProfitable.as_str(), "not-profitable");
+    }
+
+    /// A reagent the book crafts is sourced at the cheaper of its market price
+    /// and its craft cost, through however many levels the book nests.
+    #[test]
+    fn crafted_reagents_are_sourced_at_the_cheaper_route() {
+        // Item 2 (market 200) crafts from item 3 ×2 (100 each → 300, dearer:
+        // still bought); item 3 (market 100) crafts from item 4 ×3 (10 each →
+        // 30, cheaper: crafted), and item 2's cost follows that recursion
+        // (2 × 30 = 60 < 200 → crafted).
+        let mut priced = priced_book();
+        priced.insert(item(4), entry(Category::Commodity, 10, None, None));
+        let book =
+            vec![recipe(1, 1, &[(2, 1), (3, 2)]), recipe(2, 1, &[(3, 2)]), recipe(3, 1, &[(4, 3)])];
+        apply_craft_costs(&mut priced, &book);
+        assert_eq!(priced[&item(3)].craft_cost, Some(30));
+        assert_eq!(priced[&item(2)].craft_cost, Some(60), "2 × the crafted 30, not the market 100");
+        assert_eq!(priced[&item(4)].craft_cost, None, "a raw material has no craft route");
+        assert_eq!(priced[&item(1)].craft_cost, Some(120), "the output's own route: 60 + 2 × 30");
+
+        let row = evaluate(&book[0], &priced, CUT, FLOOR);
+        assert_eq!(row.cost, Some(120), "60 + 2 × 30: both reagents sourced by crafting");
+        assert_eq!(row.reagents[0].unit_value, 60);
+        assert_eq!(row.reagents[0].craft_cost, Some(60));
+        assert_eq!(row.reagents[0].live_unit_price, Some(180), "the live buy price is untouched");
+        assert_eq!(row.reagents[1].unit_value, 30);
+        assert_eq!(row.reagents[1].craft_cost, Some(30));
+    }
+
+    /// A reagent with no market price at all becomes priced through its craft,
+    /// and the output's sale value never reads its own craft cost.
+    #[test]
+    fn crafting_prices_an_unlisted_reagent_and_never_the_output() {
+        let mut priced = priced_book();
+        priced.insert(item(3), PricedItem::unpriced());
+        let book = vec![
+            recipe(1, 1, &[(2, 1), (3, 2)]),
+            recipe(3, 2, &[(2, 1)]), // 3 crafts from one 200 make → 100 per unit
+            recipe(1, 1, &[(2, 1), (3, 1)]), // a cheaper route for the output itself
+        ];
+        apply_craft_costs(&mut priced, &book);
+        assert_eq!(priced[&item(3)].craft_cost, Some(100));
+        assert_eq!(priced[&item(1)].craft_cost, Some(300), "200 + the crafted 100");
+
+        let row = evaluate(&book[0], &priced, CUT, FLOOR);
+        assert_eq!(row.issue, None, "the unlisted reagent is sourced by crafting");
+        assert_eq!(row.cost, Some(400), "item 2 at its 200 market price, item 3 crafted at 100 ×2");
+        assert_eq!(row.reagents[1].category, None, "no market priced it");
+        assert_eq!(
+            row.output.as_ref().map(|output| output.unit_value),
+            Some(1_000),
+            "the sale value is the market's, never the craft cost"
+        );
+    }
+
+    /// `makes` divides the craft cost per unit, rounding up; alternative
+    /// recipes for one output compete on cost; and a looping book terminates
+    /// with bounded values (the validator refuses such a book at load time —
+    /// this pins the defensive break-at-market path).
+    #[test]
+    fn craft_costs_round_up_and_loops_break_at_the_market() {
+        let mut priced = priced_book();
+        // 7 copper of materials over 3 makes: 2.33 → 3 per unit.
+        priced.insert(item(4), entry(Category::Commodity, 7, None, None));
+        let mut book = vec![recipe(3, 3, &[(4, 1)])];
+        apply_craft_costs(&mut priced, &book);
+        assert_eq!(priced[&item(3)].craft_cost, Some(3));
+
+        // A dearer alternative for the same output loses.
+        priced.insert(item(5), entry(Category::Commodity, 90, None, None));
+        book.push(recipe(3, 1, &[(5, 1)]));
+        apply_craft_costs(&mut priced, &book);
+        assert_eq!(priced[&item(3)].craft_cost, Some(3), "the cheapest route wins");
+
+        // A duplication loop: 6 ⇄ 7, each making two of the other. Item 6 is
+        // costed first: its route sources 7 at the market (crafting 7 would
+        // loop back into 6), so 6 reads 50 per unit; 7 then follows the memo.
+        priced.insert(item(6), entry(Category::Commodity, 100, None, None));
+        priced.insert(item(7), entry(Category::Commodity, 100, None, None));
+        book = vec![recipe(6, 2, &[(7, 1)]), recipe(7, 2, &[(6, 1)])];
+        apply_craft_costs(&mut priced, &book);
+        assert_eq!(priced[&item(6)].craft_cost, Some(25), "one 7 at market 100 → 2 × 6");
+        assert_eq!(
+            priced[&item(7)].craft_cost,
+            Some(13),
+            "one 6 at the crafted 25 → 2 × 7, rounded up"
+        );
     }
 }

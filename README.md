@@ -84,12 +84,13 @@ normal for this item, and how do I know this deal is real?"*.
   /api/missed-deals`) instead of passing as buyable. Ranked per market
   category (items, commodities, pets).
 - **Efficient crafts** — `/crafts` prices a hand-maintained recipe file
-  (`recipes.example.toml`) on each target: the reagents' quantity-weighted
-  7-day cost (and what they cost right now) against the crafted item's
-  value, less the auction-house cut, scaled by how reliably the item sells —
-  ranked by expected profit per make, with every recipe that misses a price,
-  lacks sale evidence, sells too slowly or loses money listed separately
-  with the reason.
+  (`recipes.example.toml`) on each target: the reagents at their cheapest
+  sourcing (7-day market value, or their own craft cost when the book crafts
+  them and that is cheaper — recursively) against the crafted item's value,
+  less the auction-house cut, scaled by how reliably the item sells — ranked
+  by expected profit per make, with every recipe that misses a price, lacks
+  sale evidence, sells too slowly or loses money listed separately with the
+  reason. The recipe file reloads when it changes on disk.
 - **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
   `feed.json`; atomic writes; `generatedAt` taken from the source's
   `Last-Modified` so the addon can trust freshness.
@@ -152,7 +153,7 @@ only — never put secrets in this file.
 | `metrics.spans` | `["d1","d7","d14","d30"]` | computed windows |
 | `opportunities.min_samples` | `30` | auction-days of 7-day evidence behind an item's value (per category): below it an item neither ranks nor lists as a gone-today deal, and `floor-below-value`/`new-listing-below` alerts do not fire |
 | `opportunities.weights` | discount .4 / sale .3 / churn .2 / stability .1 | exponents of the weighted-geometric-mean score (only ratios matter; a component at zero scores zero) |
-| `crafts.recipes` | absent | path of the manual recipe file (TOML, see `recipes.example.toml` and [Crafting](#crafting-recipe-file)); without it `/crafts` has no recipes |
+| `crafts.recipes` | absent | path of the manual recipe file (TOML, see `recipes.example.toml` and [Crafting](#crafting-recipe-file)); re-read when the file changes on disk. Without it `/crafts` has no recipes |
 | `crafts.min_sale_rate` | `0.2` | crafted items below this 14-day sale rate are not ranked as efficient crafts |
 | `crafts.ah_cut_percent` | `5.0` | auction-house cut taken off the output value |
 | `[logging]` | absent | optional file logging: `dir` (created at boot, failure aborts), `rotation` = `daily`\|`never`, independent `level` (EnvFilter directives) |
@@ -269,9 +270,9 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole JSON API + feed surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
-| `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents, the output's reference value (14-day sold median once ≥ 3 priced units sold, else 7-day listing value) and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out |
 | `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`, `soldMedian14`, `valueSource`) and the evidence next to them (`soldCount`, `expiredCount`, `supplyDays`, `lowRank30d`, `vendorPrice` — see “Evidence next to the deal rows”), and the response names the `snapshot` they come from. `discount = 1 - floorNow / reference`, the reference being `soldMedian14` once ≥ 3 priced units sold in 14 days, else `value7` (see “Sold prices and the reference value”). `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
 | `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first, with the sold/expired counts behind each row's rate — the same two response shapes as opportunities |
+| `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents (each at the lower of its reference value — 14-day sold median once ≥ 3 priced units sold, else 7-day listing value — and its recursive `craftCost` when the book crafts it), the output's reference value and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out; `recipeCount` and `reloadError` describe the live book (the file reloads when it changes) |
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7). The market is read once per category per 300 s; every `days` window is served from that read |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
@@ -385,19 +386,29 @@ makes = 1             # units per make (default 1)
 
 Point `[crafts].recipes` at the file (relative paths resolve against the
 working directory — `/work` in the container, so mount it beside
-`config.toml`) and restart; `config-check` validates it like the rest of
-the config. Unknown keys, non-numeric reagent keys, non-positive ids or
-quantities and a repeated reagent fail startup naming the recipe. Several
-recipes may craft one item (alternative reagent sets) — each is its own
-row. `recipes.example.toml` in the repository is a commented template.
+`config.toml`); `config-check` validates it like the rest of the config.
+The file is live: the tracker re-reads it whenever it changes on disk and the
+next `/crafts` view applies the new book — a broken save keeps the previous
+book and the page (and `reloadError` in the API) says why. Unknown keys,
+non-numeric reagent keys, non-positive ids or quantities, a repeated reagent
+and a chain that crafts back into its own output are refused naming the
+recipe. Several recipes may craft one item (alternative reagent sets) — each
+is its own row. `recipes.example.toml` in the repository is a commented
+template.
 
 `/crafts?target=` then prices every recipe on that target:
 
 - **value 7d** — the output's quantity-weighted 7-day median unit price,
   the same value the deal ranking discounts against (an item trading in
-  both houses is priced where it has more evidence);
-- **cost 7d / cost now** — the reagents at their 7-day values, and at the
-  newest snapshot's cheapest listings when every reagent is listed;
+  both houses is priced where it has more evidence; never the output's own
+  craft cost);
+- **cost 7d / cost now** — the reagents at their cheapest sourcing, and at
+  the newest snapshot's cheapest listings when every reagent is listed.
+  Sourcing is the lower of the reagent's 7-day value and its **craft cost**
+  when the book itself crafts it: one unit of a crafted reagent is costed
+  from its own recipe's reagents (sourced the same way, recursively; whole
+  copper, rounded up), so a chain of crafts prices end to end. The reagent
+tooltip and the API (`craftCost`) name both routes.
 - **profit** — value × makes − house cut (`crafts.ah_cut_percent`) − cost;
 - **expected profit** — profit × the output's 14-day sale rate, the ranking
   key; **ROI** — profit ÷ cost.

@@ -415,6 +415,118 @@ fn plain_item_id(item: &ItemRef) -> Option<i64> {
     }
 }
 
+/// Recipe-book checks shared by the boot loader and the hot reload: recipe
+/// ids, yields and quantities are sane, nothing repeats inside a recipe, an
+/// item is never its own reagent, and no recipe chain loops. Several recipes
+/// may craft one item (alternative reagent sets): each is its own row in the
+/// view.
+///
+/// # Errors
+///
+/// Returns a `ConfigError` for the first violated rule.
+pub fn validate_recipes(recipes: &[Recipe]) -> Result<(), ConfigError> {
+    for recipe in recipes {
+        let Some(item_id) = plain_item_id(&recipe.item) else {
+            return Err(ConfigError("recipes craft plain items, not pet variants".into()));
+        };
+        if item_id <= 0 {
+            return Err(ConfigError(format!("recipe item id must be positive (got {item_id})")));
+        }
+        if recipe.makes < 1 {
+            return Err(ConfigError(format!(
+                "recipe for item {item_id}: makes must be at least 1"
+            )));
+        }
+        if recipe.reagents.is_empty() {
+            return Err(ConfigError(format!(
+                "recipe for item {item_id}: at least one reagent is required"
+            )));
+        }
+        let mut reagents = std::collections::BTreeSet::new();
+        for reagent in &recipe.reagents {
+            let Some(reagent_id) = plain_item_id(&reagent.item) else {
+                return Err(ConfigError(format!(
+                    "recipe for item {item_id}: reagents are plain items, not pet variants"
+                )));
+            };
+            if reagent_id <= 0 || reagent.qty < 1 {
+                return Err(ConfigError(format!(
+                    "recipe for item {item_id}: reagent ids and quantities must be positive"
+                )));
+            }
+            if reagent_id == item_id {
+                return Err(ConfigError(format!(
+                    "recipe for item {item_id}: an item cannot be its own reagent"
+                )));
+            }
+            if !reagents.insert(reagent_id) {
+                return Err(ConfigError(format!(
+                    "recipe for item {item_id}: duplicate reagent {reagent_id} — combine the quantities"
+                )));
+            }
+        }
+    }
+    check_recipe_cycles(recipes)
+}
+
+/// A recipe chain must not loop: the recursive reagent pricing sources a
+/// reagent at the cheaper of its market price and its craft cost, so an item
+/// whose own reagents reach (through the book) an item that crafts it would be
+/// chasing its own tail. The pricer breaks such a loop at the market price as
+/// a defense, but a book like that is a typo, not a craft. Alternative recipes
+/// of one output are separate routes: a loop exists if ANY route of an item
+/// reaches that item.
+///
+/// # Errors
+///
+/// Returns a `ConfigError` naming the first recipe that loops.
+fn check_recipe_cycles(recipes: &[Recipe]) -> Result<(), ConfigError> {
+    let mut routes: std::collections::BTreeMap<i64, Vec<&Recipe>> =
+        std::collections::BTreeMap::new();
+    for recipe in recipes {
+        if let Some(output) = plain_item_id(&recipe.item) {
+            routes.entry(output).or_default().push(recipe);
+        }
+    }
+    for output in routes.keys().copied().collect::<Vec<_>>() {
+        if reaches(output, output, &routes, &mut vec![output]) {
+            return Err(ConfigError(format!(
+                "recipe for item {output} loops: its own reagents craft back into it"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Depth-first over "output → reagent that is itself an output" edges of a
+/// recipe book: whether any route of `from` consumes `target` directly or
+/// through further crafted reagents. `path` only guards against re-walking a
+/// shared sub-chain; the target check is the rule.
+fn reaches(
+    from: i64,
+    target: i64,
+    all: &std::collections::BTreeMap<i64, Vec<&Recipe>>,
+    path: &mut Vec<i64>,
+) -> bool {
+    for recipe in all.get(&from).into_iter().flatten() {
+        for reagent in &recipe.reagents {
+            let Some(id) = plain_item_id(&reagent.item) else { continue };
+            if id == target {
+                return true;
+            }
+            if path.contains(&id) {
+                continue;
+            }
+            path.push(id);
+            if reaches(id, target, all, path) {
+                return true;
+            }
+            path.pop();
+        }
+    }
+    false
+}
+
 /// Whether `id` is a valid target id: `[a-z0-9][a-z0-9._-]*`. Target ids are
 /// used as filesystem path segments (`feeds/<id>/`, raw archives), so the
 /// charset is restricted to lowercase ASCII alphanumerics plus `.`, `_`, `-`
@@ -537,10 +649,8 @@ fn validate_target_kind(target: &TargetConfig) -> Result<(), ConfigError> {
 }
 
 impl TrackerConfig {
-    /// Crafting checks: recipe ids, yields and quantities are sane, nothing
-    /// repeats inside a recipe, and an item is never its own reagent. Several
-    /// recipes may craft one item (alternative reagent sets): each is its own
-    /// row in the view.
+    /// Crafting checks: the sale-rate floor and cut are in range, and the
+    /// recipe book passes [`validate_recipes`].
     ///
     /// # Errors
     ///
@@ -557,50 +667,7 @@ impl TrackerConfig {
                 "[crafts].ah_cut_percent must be a finite number within 0.0..=100.0".into(),
             ));
         }
-        for recipe in &crafts.recipes {
-            let Some(item_id) = plain_item_id(&recipe.item) else {
-                return Err(ConfigError("recipes craft plain items, not pet variants".into()));
-            };
-            if item_id <= 0 {
-                return Err(ConfigError(format!(
-                    "recipe item id must be positive (got {item_id})"
-                )));
-            }
-            if recipe.makes < 1 {
-                return Err(ConfigError(format!(
-                    "recipe for item {item_id}: makes must be at least 1"
-                )));
-            }
-            if recipe.reagents.is_empty() {
-                return Err(ConfigError(format!(
-                    "recipe for item {item_id}: at least one reagent is required"
-                )));
-            }
-            let mut reagents = std::collections::BTreeSet::new();
-            for reagent in &recipe.reagents {
-                let Some(reagent_id) = plain_item_id(&reagent.item) else {
-                    return Err(ConfigError(format!(
-                        "recipe for item {item_id}: reagents are plain items, not pet variants"
-                    )));
-                };
-                if reagent_id <= 0 || reagent.qty < 1 {
-                    return Err(ConfigError(format!(
-                        "recipe for item {item_id}: reagent ids and quantities must be positive"
-                    )));
-                }
-                if reagent_id == item_id {
-                    return Err(ConfigError(format!(
-                        "recipe for item {item_id}: an item cannot be its own reagent"
-                    )));
-                }
-                if !reagents.insert(reagent_id) {
-                    return Err(ConfigError(format!(
-                        "recipe for item {item_id}: duplicate reagent {reagent_id} — combine the quantities"
-                    )));
-                }
-            }
-        }
-        Ok(())
+        validate_recipes(&crafts.recipes)
     }
 
     /// The configured target with the given id, if any.
@@ -623,8 +690,8 @@ impl TrackerConfig {
     /// `house_id` are not positive,
     /// `[metrics].spans` is empty, a score weight is negative/non-finite or
     /// the weights sum to zero, `[opportunities].min_samples` is zero, a
-    /// recipe names a non-positive id or quantity, repeats a reagent, or
-    /// crafts a pet, `[crafts].min_sale_rate` or `[crafts].ah_cut_percent`
+    /// recipe names a non-positive id or quantity, repeats a reagent,
+    /// crafts a pet, or loops back into its own output, `[crafts].min_sale_rate` or `[crafts].ah_cut_percent`
     /// is out of range, the `[catalog]` `source/locale/wowhead_base` are
     /// invalid, or a target flavor is empty.
     pub fn validate(&self) -> Result<(), ConfigError> {

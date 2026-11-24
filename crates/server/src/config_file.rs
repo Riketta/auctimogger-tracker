@@ -901,7 +901,7 @@ pub fn parse_config_str(text: &str) -> Result<LoadedConfig, ConfigLoadError> {
 }
 
 /// Loads and validates a TOML config file from disk, then the recipe book it
-/// points at (see [`parse_recipe_book`]).
+/// points at (see [`load_recipe_book`]).
 ///
 /// # Errors
 /// Returns [`ConfigLoadError::Io`] when either file cannot be read,
@@ -917,11 +917,24 @@ pub fn load_config(path: &Path) -> Result<LoadedConfig, ConfigLoadError> {
         let recipes_path = Path::new(&recipes_file);
         let text = std::fs::read_to_string(recipes_path)
             .map_err(|e| ConfigLoadError::Io(format!("{}: {e}", recipes_path.display())))?;
-        loaded.tracker.crafts.recipes = parse_recipe_book(&text)?;
-        // The structural recipe rules ride the model's validation.
-        loaded.tracker.validate().map_err(ConfigLoadError::Validation)?;
+        loaded.tracker.crafts.recipes = load_recipe_book(&text)?;
     }
     Ok(loaded)
+}
+
+/// Parses and validates a recipe book from its file text — the one path the
+/// boot loader and the hot reloader ([`crate::recipe_reload`]) share, so a
+/// reloaded file is held to exactly the boot-time rules (unknown keys,
+/// malformed reagents, structural faults, loops).
+///
+/// # Errors
+/// Returns [`ConfigLoadError::Toml`] for invalid TOML or an unknown key, and
+/// [`ConfigLoadError::Validation`] for a malformed or looping recipe.
+pub fn load_recipe_book(text: &str) -> Result<Vec<Recipe>, ConfigLoadError> {
+    let recipes = parse_recipe_book(text)?;
+    // The structural recipe rules ride the core's validator.
+    amtracker_core::config::validate_recipes(&recipes).map_err(ConfigLoadError::Validation)?;
+    Ok(recipes)
 }
 
 /// File shape of the recipe book: `[[recipe]]` entries and nothing else, so a

@@ -3536,6 +3536,33 @@ fn recipe_validation_rejects_malformed_books() {
         check(vec![recipe(-7, 1, &[(2, 1)])]).unwrap_err(),
         "recipe item id must be positive (got -7)"
     );
+    // A chain that crafts back into its own output is a typo, not a craft.
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(2, 1)]), recipe(2, 1, &[(1, 1)])]).unwrap_err(),
+        "recipe for item 1 loops: its own reagents craft back into it"
+    );
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(2, 1)]), recipe(2, 1, &[(3, 1)]), recipe(3, 1, &[(1, 1)]),])
+            .unwrap_err(),
+        "recipe for item 1 loops: its own reagents craft back into it",
+        "a three-step loop is still a loop"
+    );
+    // One looping ALTERNATIVE route is enough, even next to a clean one.
+    assert_eq!(
+        check(vec![recipe(1, 1, &[(5, 1)]), recipe(1, 1, &[(2, 1)]), recipe(2, 1, &[(1, 1)]),])
+            .unwrap_err(),
+        "recipe for item 1 loops: its own reagents craft back into it"
+    );
+    // A diamond that shares a sub-chain but never returns is fine.
+    assert_eq!(
+        check(vec![
+            recipe(1, 1, &[(2, 1), (3, 1)]),
+            recipe(2, 1, &[(4, 1)]),
+            recipe(3, 1, &[(4, 1)]),
+        ]),
+        Ok(()),
+        "shared reagents down a chain do not loop"
+    );
 
     let mut config = opportunity_config();
     config.crafts.min_sale_rate = 1.5;

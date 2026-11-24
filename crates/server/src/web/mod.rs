@@ -107,6 +107,9 @@ pub struct AppState {
     /// The manual recipe book evaluated against the prepared scans, behind
     /// the `/crafts` page and `/api/crafts`.
     pub crafts: Arc<CraftService>,
+    /// Applies a changed recipe file to `crafts` on the next `/crafts` view;
+    /// `None` when no recipe file is configured.
+    pub recipe_reloader: Option<Arc<crate::recipe_reload::RecipeReloader>>,
     /// Trailing sale ledger behind the item page's sold/expired counts (the
     /// ranking's and alerts' evidence, read for one identity).
     pub sales: Arc<dyn SalesRepository>,
@@ -564,6 +567,30 @@ pub(crate) fn mutations_open(config: &TrackerConfig) -> bool {
 /// the cause.
 pub(crate) fn log_failure(op: &'static str, error: impl std::fmt::Display) {
     tracing::error!(op, error = %error, "request failed");
+}
+
+/// Applies a changed recipe file (if one is configured and changed) before a
+/// `/crafts` view reads the book. Runs on the blocking pool with the rest of
+/// the handler's store reads: the first look after an edit pays one file
+/// stat, every other look a stat and nothing more.
+pub(crate) fn reload_recipes(state: &AppState) {
+    let Some(reloader) = &state.recipe_reloader else {
+        return;
+    };
+    match reloader.check(&state.crafts) {
+        crate::recipe_reload::Reload::Unchanged => {}
+        crate::recipe_reload::Reload::Reloaded(count) => {
+            tracing::info!(recipes = count, path = %reloader_path(reloader), "recipe file reloaded");
+        }
+        crate::recipe_reload::Reload::Failed(error) => {
+            tracing::warn!(path = %reloader_path(reloader), error = %error, "recipe file reload refused; keeping the previous book");
+        }
+    }
+}
+
+/// The watched recipe path, for the reload log lines.
+fn reloader_path(reloader: &crate::recipe_reload::RecipeReloader) -> std::path::Display<'_> {
+    reloader.path()
 }
 
 #[cfg(test)]

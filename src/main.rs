@@ -648,6 +648,11 @@ fn build_app_state(
         clock.clone(),
         config,
     ));
+    // Hot reload of the recipe file: applied on the next /crafts view.
+    let recipe_reloader =
+        config.crafts.recipes_file.as_ref().map(|path| {
+            Arc::new(amtracker_server::recipe_reload::RecipeReloader::new(path.clone()))
+        });
     Arc::new(AppState {
         config: config.clone(),
         clock: clock.clone(),
@@ -691,6 +696,7 @@ fn build_app_state(
             metrics.clone(),
             &config.crafts,
         )),
+        recipe_reloader,
         sales: store.clone(),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),

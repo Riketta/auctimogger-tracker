@@ -287,6 +287,18 @@ fn test_state_build(
     clock_override: Option<Arc<dyn ClockPort>>,
     mutate: impl FnOnce(&mut TrackerConfig),
 ) -> (Arc<AppState>, PathBuf) {
+    test_state_full(token_env, item_info, clock_override, mutate, None)
+}
+
+/// Same, with an optional recipe-file watcher attached (the hot-reload
+/// tests); every other fixture runs without one.
+fn test_state_full(
+    token_env: Option<String>,
+    item_info: Arc<dyn ItemInfoPort>,
+    clock_override: Option<Arc<dyn ClockPort>>,
+    mutate: impl FnOnce(&mut TrackerConfig),
+    recipe_reloader: Option<Arc<amtracker_server::recipe_reload::RecipeReloader>>,
+) -> (Arc<AppState>, PathBuf) {
     let root = temp_root("state");
     let mut config = config(token_env);
     mutate(&mut config);
@@ -342,6 +354,9 @@ fn test_state_build(
             metrics.clone(),
             &config.crafts,
         )),
+        // No file watcher in the fixtures: tests that exercise the hot
+        // reload attach one to a temp file of their own.
+        recipe_reloader,
         sales: store.clone(),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
             store.clone(),
@@ -2725,6 +2740,21 @@ fn recipe(output: i64, reagents: &[(i64, i64)]) -> amtracker_core::domain::Recip
 /// has a price but never sold, 2592 and 2593 were never seen. The state's
 /// recipe book holds five recipes covering every outcome.
 fn craft_state() -> (Arc<AppState>, PathBuf) {
+    craft_state_with(vec![
+        recipe(2589, &[(2590, 1), (2591, 2)]),
+        recipe(2589, &[(2590, 3)]),
+        recipe(2592, &[(2590, 1)]),
+        recipe(2594, &[(2590, 1)]),
+        recipe(2594, &[(2593, 1), (2590, 1)]),
+    ])
+}
+
+/// The craftable market behind the crafting tests with a caller-supplied
+/// recipe book: output 2589 sells at a 7-day value of 1 000 with two credited
+/// sales behind it, reagent 2590 at 200 and reagent 2591 at 100 (both listed in
+/// the newest snapshot), 2594 has a price but never sold, 2592 and 2593 were
+/// never seen.
+fn craft_state_with(recipes: Vec<amtracker_core::domain::Recipe>) -> (Arc<AppState>, PathBuf) {
     use amtracker_core::ports::{
         PriceHistoryRepository,
         SalesRepository,
@@ -2732,13 +2762,7 @@ fn craft_state() -> (Arc<AppState>, PathBuf) {
     };
 
     let (state, root) = test_state_with_config(None, Arc::new(NoItemInfo), |config| {
-        config.crafts.recipes = vec![
-            recipe(2589, &[(2590, 1), (2591, 2)]),
-            recipe(2589, &[(2590, 3)]),
-            recipe(2592, &[(2590, 1)]),
-            recipe(2594, &[(2590, 1)]),
-            recipe(2594, &[(2593, 1), (2590, 1)]),
-        ];
+        config.crafts.recipes = recipes;
         config.crafts.recipes_file = Some("recipes.toml".into());
     });
     let store = SqliteStore::open(
@@ -2905,6 +2929,105 @@ async fn crafts_api_reports_priced_recipes_ranked_first() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "unknown targets answer 400");
 
     std::fs::remove_dir_all(&root).ok();
+}
+
+/// A reagent the book itself crafts is sourced at the cheaper of its market
+/// price and its craft cost: the row's cost drops to the craft route, the API
+/// names both numbers and the reagent tooltip says which route was taken.
+#[tokio::test]
+async fn a_crafted_reagent_is_sourced_at_its_craft_cost() {
+    // 2590 (market 200) crafts from one 2591 (100): cheaper to make than to
+    // buy, so the 2589 recipe costs 100 + 2 × 100 instead of 200 + 200.
+    let (state, root) =
+        craft_state_with(vec![recipe(2589, &[(2590, 1), (2591, 2)]), recipe(2590, &[(2591, 1)])]);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router.clone(), "/api/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let best = &json["crafts"][0];
+    assert_eq!(best["cost"], 300, "the crafted route prices the reagent");
+    assert_eq!(best["costNow"], 400, "buying right now is still the market price");
+    assert_eq!(best["profit"], 650);
+    let reagents = best["reagents"].as_array().expect("reagents");
+    assert_eq!(reagents[0]["item"]["itemID"], 2590);
+    assert_eq!(reagents[0]["craftCost"], 100);
+    assert_eq!(reagents[0]["unitValue"], 100, "sourced at the craft route");
+    assert_eq!(reagents[0]["liveUnitPrice"], 200);
+    assert_eq!(reagents[1]["item"]["itemID"], 2591);
+    assert_eq!(reagents[1]["craftCost"], serde_json::Value::Null, "a raw material");
+    assert_eq!(reagents[1]["unitValue"], 100);
+    assert_eq!(json["recipeCount"], 2);
+    assert_eq!(json["reloadError"], serde_json::Value::Null);
+
+    let (status, page) = get(router, "/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(
+        page.contains(
+            "data-tip=\"item 2590 ×1 at crafted at 1s 0c each; item 2591 ×2 at 1s 0c each\""
+        ),
+        "the tooltip names the craft route: {page}"
+    );
+    assert!(page.contains("data-v=\"300\">3s 0c"), "the cost column: {page}");
+    assert!(page.contains("edit the file and reload this page to apply"), "{page}");
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The recipe file is live: a changed file is applied on the next `/crafts`
+/// view, a broken save keeps the previous book and says why, and a fixed file
+/// clears the error.
+#[tokio::test]
+async fn the_recipe_file_reloads_on_the_next_crafts_view() {
+    use amtracker_server::recipe_reload::RecipeReloader;
+
+    let file_root = temp_root("recipes");
+    let path = file_root.join("recipes.toml");
+    std::fs::write(
+        &path,
+        "[[recipe]]\nitem = 1\nreagents = { 2 = 1 }\n[[recipe]]\nitem = 3\nreagents = { 2 = 2 }\n",
+    )
+    .expect("write recipes");
+    let (state, root) = test_state_full(
+        None,
+        Arc::new(NoItemInfo),
+        None,
+        |config| config.crafts.recipes_file = Some(path.display().to_string()),
+        Some(Arc::new(RecipeReloader::new(&path))),
+    );
+    let router = build_router_arc(Arc::clone(&state));
+
+    // The first view reads the file: two recipes are live.
+    let (status, body) = get(router.clone(), "/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("(2 loaded"), "{body}");
+    assert!(!body.contains("recipe file not reloaded"), "{body}");
+
+    // A broken save (a non-numeric reagent key) is refused; the book stays.
+    std::fs::write(&path, "[[recipe]]\nitem = 1\nreagents = { 2 = 1 }\n[[recipe]]\nitem = 3\nreagents = { oops = 2 }\n")
+        .expect("write broken recipes");
+    let (status, body) = get(router.clone(), "/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK, "a refused reload is not a server error");
+    assert!(body.contains("recipe file not reloaded"), "{body}");
+    assert!(body.contains("(2 loaded"), "the previous book stays live: {body}");
+    assert!(body.contains("not an item id"), "{body}");
+    let (_, api) = get(router.clone(), "/api/crafts?target=t1").await;
+    let api: Value = serde_json::from_str(&api).expect("json");
+    assert_eq!(api["recipeCount"], 2);
+    assert!(api["reloadError"].as_str().is_some_and(|error| error.contains("not an item id")));
+
+    // The fix lands on the very next view and clears the error.
+    std::fs::write(&path, "[[recipe]]\nitem = 5\nreagents = { 2 = 3 }\n")
+        .expect("write fixed recipes");
+    let (status, body) = get(router.clone(), "/crafts?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("(1 loaded"), "{body}");
+    assert!(!body.contains("recipe file not reloaded"), "{body}");
+    let (_, api) = get(router, "/api/crafts?target=t1").await;
+    let api: Value = serde_json::from_str(&api).expect("json");
+    assert_eq!(api["crafts"][0]["item"]["itemID"], 5, "the new book is what is evaluated");
+    assert_eq!(api["reloadError"], serde_json::Value::Null);
+    std::fs::remove_dir_all(&root).ok();
+    std::fs::remove_dir_all(&file_root).ok();
 }
 
 /// Without a recipe book the page says how to configure one and the API

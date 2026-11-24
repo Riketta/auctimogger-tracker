@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod config_file;
+pub mod recipe_reload;
 pub mod scheduler;
 pub mod startup;
 pub mod web;

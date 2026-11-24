@@ -753,7 +753,10 @@ pub(crate) async fn api_crafts(
     let report = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.crafts.crafts(&target)
+        move || {
+            super::reload_recipes(&state);
+            state.crafts.crafts(&target)
+        }
     });
     match report.await {
         Ok(Ok(report)) => {
@@ -774,6 +777,7 @@ pub(crate) async fn api_crafts(
                         "qty": reagent.qty,
                         "category": reagent.category.map(|category| category.as_str()),
                         "unitValue": reagent.unit_value,
+                        "craftCost": reagent.craft_cost,
                         "liveUnitPrice": reagent.live_unit_price,
                     })).collect::<Vec<_>>(),
                     "cost": row.cost,
@@ -787,6 +791,8 @@ pub(crate) async fn api_crafts(
             Json(serde_json::json!({
                 "target": target.as_str(),
                 "recipesFile": state.config.crafts.recipes_file,
+                "recipeCount": state.crafts.recipe_count(),
+                "reloadError": state.crafts.reload_error(),
                 "ahCutPercent": state.config.crafts.ah_cut_percent,
                 "minSaleRate": state.config.crafts.min_sale_rate,
                 "crafts": report

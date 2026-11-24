@@ -3,7 +3,9 @@
 # The tracker prices everything (every reagent and the output) from its own
 # market data; it does not know which items craft into which. This file is
 # where you write that down, one [[recipe]] block per craft. Point
-# [crafts].recipes in config.toml at a copy of this file and restart.
+# [crafts].recipes in config.toml at a copy of this file; the tracker re-reads
+# it whenever it changes on disk (the next /crafts view applies it — no
+# restart).
 #
 #   item      the crafted item's id
 #   makes     units one make yields (optional, default 1)
@@ -14,9 +16,12 @@
 # how many — are on the item's Wowhead page ("Reagents" on the spell tab).
 #
 # Several recipes may craft the same item (alternative reagent sets); each is
-# its own row on /crafts. Unknown keys, non-numeric reagent keys, non-positive
-# ids/quantities and a repeated reagent inside one recipe fail startup with a
-# message naming the recipe.
+# its own row on /crafts. A reagent that is itself crafted in this book is
+# sourced at the cheaper of its market price and its own craft cost (recursively,
+# so chains of crafts price correctly). Unknown keys, non-numeric reagent keys,
+# non-positive ids/quantities, a repeated reagent inside one recipe and a chain
+# that crafts back into its own output are refused with a message naming the
+# recipe — at startup, or on reload (the previous book stays live until fixed).
 
 # [[recipe]]
 # item = 12345

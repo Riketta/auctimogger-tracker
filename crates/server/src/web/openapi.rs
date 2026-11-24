@@ -724,7 +724,9 @@ fn spec_schemas_secondary() -> Value {
             "type": "object",
             "properties": {
                 "target": { "type": "string" },
-                "recipesFile": { "type": ["string", "null"], "description": "Configured recipe file path; null when none is configured." },
+                "recipesFile": { "type": ["string", "null"], "description": "Configured recipe file path; null when none is configured. The file reloads when it changes on disk (applied on the next crafts request)." },
+                "recipeCount": { "type": "integer", "description": "Recipes in the live book." },
+                "reloadError": { "type": ["string", "null"], "description": "Why the last recipe-file reload was refused; the book in use is the one that loaded before it. null when the last load succeeded." },
                 "ahCutPercent": { "type": "number", "description": "House cut applied to the output value, in percent." },
                 "minSaleRate": { "type": "number", "description": "Outputs below this 14-day sale rate are not ranked." },
                 "crafts": { "type": "array", "items": { "$ref": "#/components/schemas/CraftRow" } }
@@ -739,7 +741,7 @@ fn spec_schemas_secondary() -> Value {
                 "ranked": { "type": "boolean", "description": "True for an efficient craft (priced, selling fast enough, profitable)." },
                 "issue": { "type": ["string", "null"], "enum": ["reagent-without-price", "output-without-price", "no-sale-evidence", "slow-seller", "not-profitable", null], "description": "The first reason the row did not rank; null when ranked." },
                 "outputCategory": { "type": ["string", "null"], "enum": ["item", "commodity", null], "description": "The market the output was priced in (the one with more 7-day evidence)." },
-                "outputValue": { "type": ["integer", "null"], "description": "Output's reference unit price: the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing value. Reagents are priced by the same rule." },
+                "outputValue": { "type": ["integer", "null"], "description": "Output's reference unit price: the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing value. Never the output's own craft cost." },
                 "outputValueSource": { "type": ["string", "null"], "enum": ["sold", "listed", null], "description": "Which value outputValue resolved to; null when the output has no price." },
                 "outputSoldMedian14": { "type": ["integer", "null"], "description": "The 14-day sold median behind outputValue, when outputValueSource is sold." },
                 "saleRate": { "type": ["number", "null"], "description": "Output's 14-day sale-through fraction 0..1; null = no credit-eligible evidence." },
@@ -752,12 +754,13 @@ fn spec_schemas_secondary() -> Value {
                             "item": { "$ref": "#/components/schemas/ItemRef" },
                             "qty": { "type": "integer" },
                             "category": { "type": ["string", "null"], "enum": ["item", "commodity", null] },
-                            "unitValue": { "type": "integer", "description": "Quantity-weighted 7-day unit value; 0 without a price." },
+                            "unitValue": { "type": "integer", "description": "Effective unit value used in cost: the lower of the reference value (14-day sold median once enough priced units sold, else 7-day listing value) and craftCost; 0 when the reagent is unpriced." },
+                            "craftCost": { "type": ["integer", "null"], "description": "Cheapest cost of crafting one unit from the book's own recipes, recursively sourced (whole copper, rounded up); null when the book does not craft the reagent." },
                             "liveUnitPrice": { "type": ["integer", "null"], "description": "Cheapest listing in the newest snapshot, when listed." }
                         }
                     }
                 },
-                "cost": { "type": ["integer", "null"], "description": "Reagents at 7-day values; null when a reagent is unpriced." },
+                "cost": { "type": ["integer", "null"], "description": "Reagents at their cheapest sourcing (7-day value or craft cost); null when a reagent is unpriced." },
                 "costNow": { "type": ["integer", "null"], "description": "Reagents at the newest snapshot's floors; null unless every reagent is listed." },
                 "gross": { "type": ["integer", "null"], "description": "Output value x makes, before the house cut." },
                 "profit": { "type": ["integer", "null"], "description": "Gross - cut - cost." },

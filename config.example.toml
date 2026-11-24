@@ -78,7 +78,9 @@ weights = { discount = 0.4, sale = 0.3, churn = 0.2, stability = 0.1 }
 # two knobs. The tracker prices every reagent and output from its own market
 # data; the file says which items craft into which (see recipes.example.toml).
 # Relative paths resolve against the working directory, like the storage
-# paths. Without the section the crafting views simply have no recipes.
+# paths. The file is re-read when it changes on disk (the next /crafts view
+# applies it); a broken save keeps the previous book and the view says why.
+# Without the section the crafting views simply have no recipes.
 # [crafts]
 # recipes = "recipes.toml"
 # min_sale_rate = 0.2     # outputs below this 14-day sale rate are not ranked

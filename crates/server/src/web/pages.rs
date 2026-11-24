@@ -2341,7 +2341,6 @@ fn money_rounded(copper: f64) -> String {
     money(copper.round() as i64)
 }
 
-/// A craft row's reagents as one cell: names with quantities, the tooltip
 /// A reference value for a table cell: the sold median carries a `*` when it
 /// is what the row's discount was measured against (the column tooltips
 /// explain the mark).
@@ -2424,10 +2423,13 @@ fn reagents_cell(
             summary.push_str(" · ");
             detail.push_str("; ");
         }
-        let value = if reagent.unit_value > 0 {
-            format!("{} each", money(reagent.unit_value))
-        } else {
-            "no 7-day price".to_string()
+        let value = match (reagent.unit_value, reagent.craft_cost) {
+            (0, _) => "no price".to_string(),
+            (value, Some(cost)) if value == cost => format!("crafted at {} each", money(cost)),
+            (value, Some(cost)) => {
+                format!("{} each (crafts for {})", money(value), money(cost))
+            }
+            (value, None) => format!("{} each", money(value)),
         };
         let _ = write!(summary, "{} ×{}", name(&reagent.item), reagent.qty);
         let _ = write!(detail, "{} ×{} at {value}", name(&reagent.item), reagent.qty);
@@ -2480,7 +2482,10 @@ pub(crate) async fn crafts_page(
     let report = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.crafts.crafts(&target)
+        move || {
+            super::reload_recipes(&state);
+            state.crafts.crafts(&target)
+        }
     });
     let report = match report.await {
         Ok(Ok(report)) => report,
@@ -2490,12 +2495,13 @@ pub(crate) async fn crafts_page(
         }
     };
     let switcher = target_switcher(&state.config, "/crafts", &target, &[]);
-    let crafts = &state.config.crafts;
-    let provenance = match crafts.recipes_file.as_deref() {
+    let recipes_file = state.crafts.recipes_file().map(str::to_string);
+    let recipe_count = state.crafts.recipe_count();
+    let provenance = match recipes_file.as_deref() {
         Some(file) => format!(
-            "recipes from <code>{}</code> ({} loaded — edit the file and restart to apply)",
+            "recipes from <code>{}</code> ({} loaded — edit the file and reload this page to apply)",
             html_escape(file),
-            crafts.recipes.len()
+            recipe_count
         ),
         None => "no recipe file configured".to_string(),
     };
@@ -2503,7 +2509,7 @@ pub(crate) async fn crafts_page(
         "<p class=\"muted\">{} target <code>{}</code> · {} · {}</p>",
         tip(
             "crafts",
-            "Every manual recipe priced on this target: the reagents and the output at their reference values (the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing median), less the house cut, scaled by how reliably the output sells."
+            "Every manual recipe priced on this target: the reagents and the output at their reference values (the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing median), less the house cut, scaled by how reliably the item sells. A reagent the book itself crafts is sourced at the cheaper of its market price and its craft cost, recursing through the book."
         ),
         html_escape(target.as_str()),
         provenance,
@@ -2518,8 +2524,17 @@ pub(crate) async fn crafts_page(
             ),
         ),
     );
+    if let Some(error) = state.crafts.reload_error() {
+        let _ = write!(
+            body,
+            "<p class=\"muted\">{} <strong>recipe file not reloaded</strong> — the previous {} recipes stay live. {}</p>",
+            tip("reload refused", "The recipe file changed but failed to load; the last book that loaded is still in use. Fix the file and reload this page."),
+            recipe_count,
+            html_escape(&error)
+        );
+    }
 
-    if crafts.recipes.is_empty() {
+    if recipe_count == 0 {
         body.push_str(
             "<div class=\"empty\">no recipes configured — point [crafts].recipes at a recipe file \
              (see recipes.example.toml in the repository) and restart.</div>",
@@ -2550,12 +2565,12 @@ pub(crate) async fn crafts_page(
             ("value", "The output's reference price: the 14-day sold median (what buyers paid) once at least 3 priced units sold — marked * — else its quantity-weighted 7-day listing median. What the craft is assumed to fetch per unit."),
             ("sale rate", "14-day sell-through of the output: the share of credit-eligible listings sold. — = no evidence."),
             ("sold/day", "Units the market absorbed per day over the last 14 days."),
-            ("cost 7d", "The reagents at their 7-day values, per make."),
+            ("cost 7d", "The reagents at their cheapest sourcing, per make: each at the lower of its 7-day value and its own craft cost (when the book crafts it)."),
             ("cost now", "The reagents at the newest snapshot's cheapest listings, per make; — unless every reagent is listed right now."),
             ("profit", "Value × makes − house cut − cost 7d: what one make nets if the output sells."),
             ("expected", "Profit × sale rate: what one make is worth given the risk the output does not sell. Sorted descending by default."),
             ("ROI", "Profit ÷ cost 7d."),
-            ("reagents", "What one make consumes; the tooltip carries each reagent's 7-day value."),
+            ("reagents", "What one make consumes; the tooltip carries each reagent's sourcing — its 7-day value, and its craft cost when crafting it is the cheaper route."),
         ] {
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
@@ -2620,9 +2635,9 @@ pub(crate) async fn crafts_page(
             ("sale rate", "14-day sell-through of the output. — = no evidence."),
             (
                 "cost 7d",
-                "The reagents at their 7-day values, per make, when every reagent has a price.",
+                "The reagents at their cheapest sourcing (7-day value or craft cost), per make, when every reagent has a price.",
             ),
-            ("reagents", "What one make consumes; the tooltip carries each reagent's 7-day value."),
+            ("reagents", "What one make consumes; the tooltip carries each reagent's sourcing."),
         ] {
             let _ = write!(body, "<th data-sortable>{}</th>", tip(label, tip_text));
         }
@@ -3553,7 +3568,7 @@ pub(crate) async fn help_page() -> Response {
         ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted geometric mean of discount, reliability, churn and stability (weights from the config, normalized; only ratios matter for ranking). Any component at zero scores zero: a liquid but undiscounted market cannot outrank a real deal."),
-        ("efficient crafts", "The /crafts ranking: every manual recipe with its reagents and output at their reference values, less the house cut, scaled by the output's 14-day sale rate. Recipes that miss a price, lack sale evidence, sell too slowly or lose money are listed separately with the reason."),
+        ("efficient crafts", "The /crafts ranking: every manual recipe with its reagents and output at their reference values, less the house cut, scaled by the output's 14-day sale rate. A reagent the book itself crafts is sourced at the cheaper of its market price and its craft cost, recursing through the book (a looping book is refused). Recipes that miss a price, lack sale evidence, sell too slowly or lose money are listed separately with the reason. The recipe file reloads when it changes on disk."),
         ("expected profit", "Per make: (output value × makes − house cut − reagent cost) × the output's sale rate — what one make is worth given the risk the output does not sell. The crafting ranking sorts on it."),
         ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
