@@ -66,6 +66,7 @@ use amtracker_core::{
         opportunity::{
             OpportunityService,
             OpportunitySort,
+            ValueSource,
         },
         snapshot_browse::SnapshotBrowseService,
         watchlist::WatchlistService,
@@ -2102,6 +2103,9 @@ impl PriceHistoryRepository for CountingHistory {
 struct CountingSales {
     sale_rate_each_calls: Mutex<usize>,
     fail_sale_rate_each: Mutex<bool>,
+    /// Optional per-item sold-price histograms served by `sold_price_each`
+    /// (default: none, like a ledger that predates sold prices).
+    sold: Mutex<HashMap<ItemRef, Vec<(i64, i64)>>>,
 }
 
 impl CountingSales {
@@ -2158,6 +2162,17 @@ impl SalesRepository for CountingSales {
             return Err(StoreError::Backend("sales store unavailable".into()));
         }
         Ok(items.iter().map(|i| if *i == item(1) { Some(0.25) } else { None }).collect())
+    }
+
+    fn sold_price_each(
+        &self,
+        _target: &TargetId,
+        items: &[ItemRef],
+        _days: i64,
+        _category: amtracker_core::domain::Category,
+    ) -> Result<Vec<Vec<(i64, i64)>>, StoreError> {
+        let sold = self.sold.lock().unwrap();
+        Ok(items.iter().map(|item| sold.get(item).cloned().unwrap_or_default()).collect())
     }
 
     fn qty_sold(
@@ -3296,4 +3311,61 @@ fn recipe_validation_rejects_malformed_books() {
     assert!(config.validate().unwrap_err().0.contains("ah_cut_percent"));
     let defaults = amtracker_core::config::CraftsConfig::default();
     assert_eq!((defaults.min_sale_rate, defaults.ah_cut_percent), (0.2, 5.0));
+}
+
+/// The sold median replaces the listing value as the discount reference once
+/// enough priced units sold — on the ranked rows and in the market view the
+/// crafting and alert lanes read — while thin sold evidence changes nothing.
+#[test]
+fn sold_median_becomes_the_reference_once_enough_units_sold() {
+    let target = TargetId("us-4".into());
+    let (service, _history, sales, clock) = opportunity_fixture(1_000_000);
+    let ranked = |service: &OpportunityService| {
+        service
+            .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+            .expect("ranked")
+            .into_iter()
+            .find(|row| row.item == item(1))
+            .expect("item 1 ranks")
+    };
+    // Fresh scans only: the refresh path debounces reads closer than 30 s.
+    let rescan = |clock: &MutableClock| {
+        clock.advance(31);
+        service.refresh(&target, Category::Commodity).expect("refresh");
+    };
+
+    // Baseline: the 7-day listing value is the reference (55k floor on 110k).
+    let row = ranked(&service);
+    assert_eq!(row.value_source, ValueSource::Listed);
+    assert_eq!((row.sold_median14, row.discount), (None, 0.5));
+
+    // Two units sold at a bargain price: under the evidence floor, so the
+    // listing value still rules.
+    sales.sold.lock().unwrap().insert(item(1), vec![(1_000, 2)]);
+    rescan(&clock);
+    let row = ranked(&service);
+    assert_eq!(row.value_source, ValueSource::Listed, "a thin sample is not a market");
+    assert!(row.sold_median14.is_none());
+
+    // Four units, half at 90k and half at 110k: the sold median (100k) is the
+    // reference, and the discount is measured against it.
+    sales.sold.lock().unwrap().insert(item(1), vec![(90_000, 2), (110_000, 2)]);
+    rescan(&clock);
+    let row = ranked(&service);
+    assert_eq!(row.value_source, ValueSource::Sold);
+    assert_eq!(row.sold_median14, Some(100_000));
+    assert_eq!(row.value7, 110_000, "the listing value is still published");
+    assert_eq!(row.discount, 0.45, "1 - 55k / 100k, not against the listing value");
+    let view = service.market(&target, Category::Commodity).expect("market view");
+    let value = view.get(&item(1)).expect("item 1 is scanned");
+    assert_eq!((value.reference(), value.value_source()), (100_000, ValueSource::Sold));
+
+    // Items without priced sales keep the listing reference.
+    let other = service
+        .opportunities(&target, Category::Commodity, 1.0, 50, OpportunitySort::Score)
+        .expect("ranked")
+        .into_iter()
+        .find(|row| row.item == item(2))
+        .expect("item 2 ranks");
+    assert_eq!(other.value_source, ValueSource::Listed);
 }

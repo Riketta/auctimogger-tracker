@@ -38,7 +38,10 @@ use crate::{
         metrics::MetricsService,
         opportunity::{
             quantity_value,
+            sold_reference,
+            ValueSource,
             SCAN_WINDOW_DAYS,
+            SOLD_PRICE_WINDOW_DAYS,
         },
     },
 };
@@ -328,9 +331,10 @@ impl AlertEvaluationService {
     }
 
     /// The live-deal conditions: the newest snapshot's listings against the
-    /// item's 7-day quantity-weighted value (see the variants' docs).
-    /// `newest` is the snapshot the freshness gate let through; `label`
-    /// prefixes the message.
+    /// item's reference value — the 14-day sold median once enough priced
+    /// units sold, else the 7-day quantity-weighted listing value (see the
+    /// variants' docs). `newest` is the snapshot the freshness gate let
+    /// through; `label` prefixes the message.
     fn observe_deal(
         &self,
         rule: &AlertRule,
@@ -358,7 +362,7 @@ impl AlertEvaluationService {
                 let Some(snapshot_id) = newest.map(|meta| meta.id) else {
                     return Ok(None);
                 };
-                let Some((value, _)) = self.deal_value(rule, category)? else {
+                let Some((value, _, value_label)) = self.deal_value(rule, category)? else {
                     return Ok(None);
                 };
                 match self.snapshots.floor(&rule.target, &rule.item, snapshot_id)? {
@@ -366,7 +370,7 @@ impl AlertEvaluationService {
                         Ok(Some(Observation {
                             value: Some(copper_as_f64(live.floor_price)),
                             message: format!(
-                                "{label}: live floor {} copper ≤ {}% of 7-day value {:.0}",
+                                "{label}: live floor {} copper ≤ {}% of {value_label} {:.0}",
                                 live.floor_price,
                                 percent(fraction),
                                 value
@@ -380,7 +384,7 @@ impl AlertEvaluationService {
                 let Some(snapshot) = newest else {
                     return Ok(None);
                 };
-                let Some((value, _)) = self.deal_value(rule, category)? else {
+                let Some((value, _, value_label)) = self.deal_value(rule, category)? else {
                     return Ok(None);
                 };
                 let listings = self.snapshots.listings_for_item(
@@ -412,7 +416,7 @@ impl AlertEvaluationService {
                 Ok(Some(Observation {
                     value: Some(copper_as_f64(cheapest)),
                     message: format!(
-                        "{label}: {} new listing(s) from {} copper (≤ {}% of 7-day value {:.0}), \
+                        "{label}: {} new listing(s) from {} copper (≤ {}% of {value_label} {:.0}), \
                          {units} units",
                         hits.len(),
                         cheapest,
@@ -426,14 +430,17 @@ impl AlertEvaluationService {
         }
     }
 
-    /// The rule item's 7-day quantity-weighted value behind the deal
-    /// conditions — the ranking's discount reference — admitted only with the
-    /// configured listing evidence behind it.
+    /// The rule item's reference value behind the deal conditions — the
+    /// ranking's discount reference, so an alert can never contradict the
+    /// page: the 14-day sold median once enough priced units sold, else the
+    /// 7-day quantity-weighted listing value. Admitted only with the
+    /// configured listing evidence behind it; the third element names the
+    /// value for the message.
     fn deal_value(
         &self,
         rule: &AlertRule,
         category: Category,
-    ) -> Result<Option<(f64, i64)>, StoreError> {
+    ) -> Result<Option<(f64, i64, &'static str)>, StoreError> {
         let today = utc_day(self.clock.now());
         let rows = self.history.item_day_rows_for_item(
             &rule.target,
@@ -441,7 +448,21 @@ impl AlertEvaluationService {
             today - SCAN_WINDOW_DAYS + 1,
             category,
         )?;
-        Ok(quantity_value(&rows).filter(|(_, samples)| *samples >= i64::from(self.min_samples)))
+        let Some((listed, samples)) =
+            quantity_value(&rows).filter(|(_, samples)| *samples >= i64::from(self.min_samples))
+        else {
+            return Ok(None);
+        };
+        let sold = self.sales.sold_price_each(
+            &rule.target,
+            std::slice::from_ref(&rule.item),
+            SOLD_PRICE_WINDOW_DAYS,
+            category,
+        )?;
+        Ok(match sold.first().and_then(|histogram| sold_reference(histogram)) {
+            Some(median) if median > 0.0 => Some((median, samples, ValueSource::Sold.label())),
+            _ => Some((listed, samples, ValueSource::Listed.label())),
+        })
     }
 
     /// Newest snapshot per payload kind for a target; a kind without any

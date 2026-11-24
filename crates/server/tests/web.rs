@@ -2041,6 +2041,73 @@ async fn api_history_reads_the_market_once_per_ttl() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// Sold prices end to end: once enough priced units sold, what buyers paid is
+/// the deal's reference — the same listing that was fairly priced against the
+/// asks becomes a deep discount against a higher sold median — and the API
+/// and the page say which value they used.
+#[tokio::test]
+async fn sold_prices_become_the_deal_reference() {
+    use amtracker_core::ports::SalesRepository;
+
+    let settable = Arc::new(SettableClock(Arc::new(std::sync::Mutex::new(1_760_000_000))));
+    let clock: Arc<dyn ClockPort> = settable.clone();
+    let (state, root) = test_state_build(None, Arc::new(NoItemInfo), Some(clock), |_| {});
+    seed_history(&state);
+    let router = build_router_arc(Arc::clone(&state));
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Item { item_id: 2589 };
+
+    // Nothing priced has sold: the listing value (150) rules, so the live
+    // floor of 150 is no deal.
+    let (status, body) =
+        get(router.clone(), "/api/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let row = &json["opportunities"][0];
+    assert_eq!(row["item"]["itemID"], 2589);
+    assert_eq!(row["value7"], 150);
+    assert_eq!(row["discount"], 0.0);
+    assert_eq!(row["valueSource"], "listed");
+    assert!(row["soldMedian14"].is_null(), "no priced sales yet");
+
+    // A stack of 12 at 300 is sighted and gone a minute later: a credited
+    // close records what it was last seen asking.
+    let seed = SqliteStore::open(
+        &root.join("db.sqlite3"),
+        &root.join("raw"),
+        Arc::new(SystemClock),
+        AutoVacuum::Off,
+    )
+    .expect("seed store");
+    let mut sold = listing(970_001, &item, 300);
+    sold.quantity = 12;
+    sold.time_left = TimeLeftBand::Medium;
+    seed.observe(&target, PayloadKind::Commodities, &[sold], 1, settable.now()).expect("observe");
+    let credits = seed
+        .close_missing(&target, PayloadKind::Commodities, 2, settable.now() + 60)
+        .expect("close");
+    assert_eq!(credits.len(), 1, "gone well inside its band: a sale");
+
+    // A fresh scan (past the refresh debounce) picks the sold median up: the
+    // listing value is still published, but the discount follows the sales.
+    settable.advance(31);
+    state.opportunities.refresh(&target, Category::Commodity).expect("refresh");
+    let (status, body) =
+        get(router.clone(), "/api/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    let json: Value = serde_json::from_str(&body).expect("json");
+    let row = &json["opportunities"][0];
+    assert_eq!(row["soldMedian14"], 300);
+    assert_eq!(row["valueSource"], "sold");
+    assert_eq!(row["value7"], 150, "the listing value is still published");
+    assert_eq!(row["discount"], 0.5, "1 - 150 / 300");
+
+    let (status, page) = get(router, "/opportunities?target=t1&category=commodity").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(page.contains("3s 0c*"), "the page marks the sold-based reference");
+    std::fs::remove_dir_all(&root).ok();
+}
+
 // --------------------------------------------------------- api discovery
 
 /// Fires one method at a concrete path and returns the status. Registration
@@ -2367,6 +2434,11 @@ async fn opportunities_api_reports_live_prices_and_missed_deals_separately() {
     assert_eq!(rows[0]["floorQty"], 200);
     assert_eq!(rows[0]["listedNow"], 4);
     assert_eq!(rows[0]["value7"], 150);
+    assert_eq!(rows[0]["valueSource"], "listed");
+    assert!(
+        rows[0]["soldMedian14"].is_null(),
+        "no priced sales: the listing value is the reference"
+    );
     assert_eq!(rows[0]["discount"], 0.0);
     assert!(rows[0]["reliability"].is_null(), "no sale evidence is null, never a zero");
 

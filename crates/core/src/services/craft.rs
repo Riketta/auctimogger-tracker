@@ -27,6 +27,7 @@ use crate::{
         opportunity::{
             MarketValue,
             OpportunityService,
+            ValueSource,
         },
     },
 };
@@ -41,9 +42,11 @@ pub struct ReagentCost {
     pub item: ItemRef,
     /// Units one make consumes.
     pub qty: i64,
-    /// The market the reagent was priced in (`None` = no 7-day price in any).
+    /// The market the reagent was priced in (`None` = no reference price in
+    /// any).
     pub category: Option<Category>,
-    /// Quantity-weighted 7-day unit value (copper; 0 without a price).
+    /// Reference unit value (copper; 0 without a price): the 14-day sold
+    /// median once enough priced units sold, else the 7-day listing value.
     pub unit_value: i64,
     /// Cheapest listing in the newest snapshot (copper), when one is listed.
     pub live_unit_price: Option<i64>,
@@ -54,9 +57,15 @@ pub struct ReagentCost {
 pub struct CraftOutput {
     /// The market the output was priced in.
     pub category: Category,
-    /// Quantity-weighted 7-day unit value (copper) — the price the craft is
-    /// assumed to fetch.
-    pub value7: i64,
+    /// Reference unit value (copper) — the price the craft is assumed to
+    /// fetch: the 14-day sold median once enough priced units sold, else the
+    /// 7-day listing value.
+    pub unit_value: i64,
+    /// The 14-day sold median behind `unit_value` when `value_source` is
+    /// `Sold`.
+    pub sold_median14: Option<i64>,
+    /// Which value `unit_value` resolved to.
+    pub value_source: ValueSource,
     /// 14-day sale rate (`None` = no credit-eligible evidence).
     pub sale_rate: Option<f64>,
     /// Units the market absorbed per day over the trailing 14 days.
@@ -197,8 +206,10 @@ impl CraftService {
 
     /// Prices every item the book mentions. Both auction houses' scans are
     /// read; each item takes the market with more 7-day evidence (ties keep
-    /// the commodity house, where stackables trade), and the outputs' cached
-    /// 14-day blocks add how many units they sell per day.
+    /// the commodity house, where stackables trade) and that market's
+    /// reference value — the 14-day sold median once enough priced units
+    /// sold, else the 7-day listing value — and the outputs' cached 14-day
+    /// blocks add how many units they sell per day.
     fn price(&self, target: &TargetId) -> Result<BTreeMap<ItemRef, PricedItem>, StoreError> {
         let commodity = self.opportunities.market(target, Category::Commodity)?;
         let item = self.opportunities.market(target, Category::Item)?;
@@ -224,7 +235,9 @@ impl CraftService {
                     identity.clone(),
                     PricedItem {
                         category: Some(category),
-                        unit_value: value.value7,
+                        unit_value: value.reference(),
+                        sold_median14: value.sold_median14,
+                        value_source: value.value_source(),
                         live_unit_price: value.live.map(|live| live.floor_price),
                         sale_rate: value.sale_rate,
                         units_sold_per_day: None,
@@ -251,8 +264,12 @@ impl CraftService {
 struct PricedItem {
     /// The market the item was priced in; `None` = no 7-day evidence.
     category: Option<Category>,
-    /// Quantity-weighted 7-day unit value (copper; 0 when unpriced).
+    /// Reference unit value (copper; 0 when unpriced).
     unit_value: i64,
+    /// The sold median behind `unit_value`, when it supplied it.
+    sold_median14: Option<i64>,
+    /// Which value `unit_value` resolved to.
+    value_source: ValueSource,
     /// Cheapest listing in the newest snapshot (copper).
     live_unit_price: Option<i64>,
     /// 14-day sale rate (`None` = no credit-eligible evidence).
@@ -266,6 +283,8 @@ impl PricedItem {
         Self {
             category: None,
             unit_value: 0,
+            sold_median14: None,
+            value_source: ValueSource::Listed,
             live_unit_price: None,
             sale_rate: None,
             units_sold_per_day: None,
@@ -348,11 +367,13 @@ fn evaluate(
     let output =
         priced.get(&recipe.item).filter(|entry| entry.unit_value > 0).map(|entry| CraftOutput {
             category: entry.category.unwrap_or(Category::Item),
-            value7: entry.unit_value,
+            unit_value: entry.unit_value,
+            sold_median14: entry.sold_median14,
+            value_source: entry.value_source,
             sale_rate: entry.sale_rate,
             units_sold_per_day: entry.units_sold_per_day,
         });
-    let gross = output.as_ref().map(|output| output.value7.saturating_mul(recipe.makes));
+    let gross = output.as_ref().map(|output| output.unit_value.saturating_mul(recipe.makes));
     let net = gross.map(|gross| gross - cut_copper(gross, cut));
     let profit = match (net, cost) {
         (Some(net), Some(cost)) => Some(net - cost),
@@ -427,6 +448,8 @@ mod tests {
         PricedItem {
             category: Some(category),
             unit_value,
+            sold_median14: None,
+            value_source: ValueSource::Listed,
             live_unit_price: live,
             sale_rate,
             units_sold_per_day: sale_rate.map(|_| 3.5),
@@ -546,6 +569,7 @@ mod tests {
     fn the_market_with_more_evidence_prices_an_item() {
         let value = |value7: i64, samples7: i64| MarketValue {
             value7,
+            sold_median14: None,
             samples7,
             sale_rate: None,
             live: None,

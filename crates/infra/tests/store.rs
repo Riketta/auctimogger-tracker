@@ -1923,7 +1923,7 @@ fn v7_category_migration_rebuilds_folds_from_retained_listings() {
         }
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 10, "the file is stamped at the new schema version");
+        assert_eq!(version, 11, "the file is stamped at the new schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -2399,6 +2399,72 @@ fn reopen_reverses_eligible_and_units_alongside_the_credit() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// v11 adds sold-price evidence to v10 files without disturbing the sight
+/// and sales rows: both columns come back nullable, and a sight opened before
+/// the migration carries no price, so its credited close sells unpriced.
+#[test]
+fn v11_migration_adds_sold_price_columns_preserving_ledger_rows() {
+    let dir = temp_dir("v11-sold-prices");
+    let db = dir.join("db.sqlite3");
+    let target = TargetId("us-4".into());
+    let item1 = item(1);
+    {
+        let store = open_store(&dir, 20_000);
+        let live = [listing(5, &item1, 100, 2), listing(6, &item1, 100, 1)];
+        store
+            .record(&snap(&target, PayloadKind::Commodities, 10_000, 2), &live, b"m1")
+            .expect("m1");
+        store.observe(&target, PayloadKind::Commodities, &live, 1, 10_000).expect("observe m1");
+    }
+    // Downgrade the file to v10 shape: drop both columns, stamp v10.
+    {
+        let conn = rusqlite::Connection::open(&db).expect("downgrade");
+        conn.execute("ALTER TABLE sight DROP COLUMN last_unit_price", [])
+            .expect("drop last_unit_price");
+        conn.execute("ALTER TABLE sales DROP COLUMN sold_prices", []).expect("drop sold_prices");
+        conn.pragma_update(None, "user_version", 10).expect("stamp v10");
+    }
+
+    // Reopening migrates back; the open sights survive, price-less.
+    let store = open_store(&dir, 20_000);
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect");
+        for (table, column) in [("sight", "last_unit_price"), ("sales", "sold_prices")] {
+            let present: i64 = conn
+                .query_row(
+                    &format!(
+                        "SELECT EXISTS (SELECT 1 FROM pragma_table_info('{table}') WHERE name = '{column}')"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .expect("column check");
+            assert_eq!(present, 1, "migration restored {table}.{column}");
+        }
+        let sights: i64 =
+            conn.query_row("SELECT COUNT(*) FROM sight", [], |row| row.get(0)).expect("count");
+        assert_eq!(sights, 2, "the open sights survive the migration");
+        let version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
+        assert_eq!(version, 11);
+    }
+
+    // Both pre-migration sights vanish inside their band: credited, but with
+    // no recorded price they sell unpriced — quantity only, empty histogram.
+    let credits = store.close_missing(&target, PayloadKind::Commodities, 2, 20_000).expect("close");
+    assert_eq!(credits.len(), 2, "both very-long listings vanished early: sales");
+    assert_eq!(
+        store
+            .sold_price_each(&target, std::slice::from_ref(&item1), 14, Category::Commodity)
+            .expect("sold prices"),
+        vec![Vec::<(i64, i64)>::new()],
+        "nothing before the migration can be back-priced"
+    );
+    assert_eq!(store.qty_sold(&target, &item1, 14, Category::Commodity).expect("qty"), Some(3));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// v10 re-adds `sales.eligible` to downgraded files without disturbing the
 /// ledger rows; the legacy row (eligible = 0) carries no eligible evidence
 /// and reads as `None`.
@@ -2439,7 +2505,7 @@ fn v10_migration_readds_eligible_preserving_ledger_rows() {
         assert_eq!(has_eligible, 1, "migration restored the column");
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
-        assert_eq!(version, 10);
+        assert_eq!(version, 11);
     }
     assert_eq!(store.sale_rate(&target, &item1, 14, Category::Commodity).expect("rate"), None);
 

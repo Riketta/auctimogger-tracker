@@ -2148,7 +2148,7 @@ pub(crate) async fn opportunities_page(
         tip("min churn", "Only items with at least this many listings churning per day rank — filters out thin, un-tradeable markets."),
         tip("rows", "Maximum number of rows per list."),
         tip("sort", "Row ordering: weighted score (default) or stalest-since-last-sale first."),
-        tip("min discount", "Gone-today floor in percent: only listings seen today at least this far under the item's 7-day value are listed. Every sold listing leaves today's cumulative floor under the live one — a deep gap is what separates a missed deal from ordinary turnover."),
+        tip("min discount", "Gone-today floor in percent: only listings seen today at least this far under the item's reference value are listed. Every sold listing leaves today's cumulative floor under the live one — a deep gap is what separates a missed deal from ordinary turnover."),
     );
 
     if data.is_empty() {
@@ -2163,10 +2163,10 @@ pub(crate) async fn opportunities_page(
         for (label, tip_text) in [
             ("item", "Item or pet variant the deal row describes — click for its full history."),
             ("score", "Weighted geometric mean of the components below (see the page tip). Sorted descending by default."),
-            ("discount", "1 − price now ÷ value 7d: how far the cheapest listed price sits under the item's quantity-weighted 7-day value."),
+            ("discount", "1 − price now ÷ reference value: how far the cheapest listed price sits under what the item is worth (see value)."),
             ("price now", "Cheapest unit price listed in the newest snapshot — buyable right now."),
             ("qty", "Units listed at exactly that price: how deep the deal is."),
-            ("value 7d", "Quantity-weighted 7-day median unit price: where half the listed quantity trades (the bulk price for stackables, the listing median for single units)."),
+            ("value", "Reference value: the 14-day sold median (what buyers actually paid) once at least 3 priced units sold — marked * — else the quantity-weighted 7-day listing median (where half the listed quantity trades)."),
             ("reliability", "14-day sell-through: share of credit-eligible listings sold. — = no evidence yet; such items rank at the market's median rate."),
             ("churn/day", "Average unique listings per day across the whole 7-day window."),
             ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
@@ -2182,6 +2182,8 @@ pub(crate) async fn opportunities_page(
         for o in &data {
             let reliability =
                 o.reliability.map_or_else(|| "—".to_string(), |rate| component_bar("rel", rate));
+            let value = o.sold_median14.filter(|median| *median > 0).unwrap_or(o.value7);
+            let value_cell = sold_marked(o.sold_median14, value);
             let _ = write!(
                 body,
                 "<tr>{}\
@@ -2206,8 +2208,8 @@ pub(crate) async fn opportunities_page(
                 money(o.floor_now),
                 o.floor_qty,
                 o.floor_qty,
-                o.value7,
-                money(o.value7),
+                value,
+                value_cell,
                 o.reliability.unwrap_or(-1.0),
                 reliability,
                 o.churn_per_day,
@@ -2241,11 +2243,11 @@ pub(crate) async fn opportunities_page(
         body.push_str("<div class=\"scroll-x\"><table id=\"missed-deals\"><thead><tr>");
         for (label, tip_text) in [
             ("item", "Item or pet variant the gone listing offered — click for its full history."),
-            ("discount", "1 − seen floor ÷ value 7d: how far the gone listing sat under the item's quantity-weighted 7-day value."),
+            ("discount", "1 − seen floor ÷ reference value: how far the gone listing sat under what the item is worth (see value)."),
             ("seen floor", "Cheapest price today's day fold holds — the gone listing's unit price. The fold never forgets a listing, so this outlives the listing itself."),
             ("qty", "Units that gone listing offered."),
             ("live floor", "Cheapest listing of the item in the newest snapshot; — = nothing of it is listed."),
-            ("value 7d", "Quantity-weighted 7-day median unit price, as on the live rows."),
+            ("value", "Reference value, as on the live rows: the 14-day sold median (*) once at least 3 priced units sold, else the quantity-weighted 7-day listing median."),
             ("reliability", "14-day sell-through; — = no credit-eligible evidence yet."),
             ("samples 7d", "Auction-days folded over the last 7 days — the evidence behind the value."),
         ] {
@@ -2256,6 +2258,8 @@ pub(crate) async fn opportunities_page(
             let reliability =
                 deal.reliability.map_or_else(|| "—".to_string(), |rate| format!("{rate:.2}"));
             let live_floor = deal.live_floor.map_or_else(|| "—".to_string(), money);
+            let value = deal.sold_median14.filter(|median| *median > 0).unwrap_or(deal.value7);
+            let value_cell = sold_marked(deal.sold_median14, value);
             let _ = write!(
                 body,
                 "<tr>{}<td data-v=\"{:.3}\">{}</td><td class=\"num\" data-v=\"{}\">{}</td>\
@@ -2271,8 +2275,8 @@ pub(crate) async fn opportunities_page(
                 deal.seen_floor_qty,
                 deal.live_floor.unwrap_or(-1),
                 live_floor,
-                deal.value7,
-                money(deal.value7),
+                value,
+                value_cell,
                 deal.reliability.unwrap_or(-1.0),
                 reliability,
                 deal.samples7,
@@ -2293,6 +2297,17 @@ fn money_rounded(copper: f64) -> String {
 }
 
 /// A craft row's reagents as one cell: names with quantities, the tooltip
+/// A reference value for a table cell: the sold median carries a `*` when it
+/// is what the row's discount was measured against (the column tooltips
+/// explain the mark).
+fn sold_marked(sold_median: Option<i64>, value: i64) -> String {
+    if sold_median.is_some_and(|median| median > 0) {
+        format!("{}*", money(value))
+    } else {
+        money(value)
+    }
+}
+
 /// carrying each reagent's 7-day value.
 fn reagents_cell(
     reagents: &[amtracker_core::services::craft::ReagentCost],
@@ -2390,7 +2405,7 @@ pub(crate) async fn crafts_page(
         "<p class=\"muted\">{} target <code>{}</code> · {} · {}</p>",
         tip(
             "crafts",
-            "Every manual recipe priced on this target: the reagents' quantity-weighted 7-day cost against the output's 7-day value, less the house cut, scaled by how reliably the output sells."
+            "Every manual recipe priced on this target: the reagents and the output at their reference values (the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing median), less the house cut, scaled by how reliably the output sells."
         ),
         html_escape(target.as_str()),
         provenance,
@@ -2434,7 +2449,7 @@ pub(crate) async fn crafts_page(
         for (label, tip_text) in [
             ("item", "The crafted item — click for its full history."),
             ("makes", "Units one make yields."),
-            ("value 7d", "The output's quantity-weighted 7-day median unit price: what the craft is assumed to fetch per unit."),
+            ("value", "The output's reference price: the 14-day sold median (what buyers paid) once at least 3 priced units sold — marked * — else its quantity-weighted 7-day listing median. What the craft is assumed to fetch per unit."),
             ("sale rate", "14-day sell-through of the output: the share of credit-eligible listings sold. — = no evidence."),
             ("sold/day", "Units the market absorbed per day over the last 14 days."),
             ("cost 7d", "The reagents at their 7-day values, per make."),
@@ -2466,8 +2481,8 @@ pub(crate) async fn crafts_page(
                 item_cell(&target, &row.recipe.item, &names, output.map(|output| output.category)),
                 row.recipe.makes,
                 row.recipe.makes,
-                output.map_or(-1, |output| output.value7),
-                money_or_dash(output.map(|output| output.value7)),
+                output.map_or(-1, |output| output.unit_value),
+                output.map_or_else(|| "—".to_string(), |output| sold_marked(output.sold_median14, output.unit_value)),
                 sale_rate.unwrap_or(-1.0),
                 percent(sale_rate),
                 sold_per_day.unwrap_or(-1.0),
@@ -2501,8 +2516,8 @@ pub(crate) async fn crafts_page(
             ("item", "The crafted item — click for its full history."),
             ("why", "The first reason the recipe did not rank, in order of severity."),
             (
-                "value 7d",
-                "The output's quantity-weighted 7-day median unit price, when it has one.",
+                "value",
+                "The output's reference price (14-day sold median once enough priced units sold, else its quantity-weighted 7-day listing median), when it has one.",
             ),
             ("sale rate", "14-day sell-through of the output. — = no evidence."),
             (
@@ -2530,8 +2545,10 @@ pub(crate) async fn crafts_page(
                     row.output.as_ref().map(|output| output.category)
                 ),
                 html_escape(&issue),
-                row.output.as_ref().map_or(-1, |output| output.value7),
-                row.output.as_ref().map_or_else(|| "—".to_string(), |output| money(output.value7)),
+                row.output.as_ref().map_or(-1, |output| output.unit_value),
+                row.output
+                    .as_ref()
+                    .map_or_else(|| "—".to_string(), |output| money(output.unit_value)),
                 sale_rate.unwrap_or(-1.0),
                 sale_rate.map_or_else(|| "—".to_string(), |rate| format!("{:.0}%", rate * 100.0)),
                 row.cost.unwrap_or(-1),
@@ -3281,7 +3298,7 @@ pub(crate) async fn alerts_page(
         body.push_str("<div class=\"scroll-x\"><table id=\"alert-rules\"><thead><tr>");
         for (label, tip_text) in [
             ("item", "The watched item or pet variant."),
-            ("condition", "What fires the rule. Price and floor conditions read the same cached blocks the item page shows; the live-floor and new-listing conditions read the newest snapshot's listings against the item's quantity-weighted 7-day value."),
+            ("condition", "What fires the rule. Price and floor conditions read the same cached blocks the item page shows; the live-floor and new-listing conditions read the newest snapshot's listings against the item's reference value (the 14-day sold median once enough priced units sold, else the 7-day listing value)."),
             ("note", "Your free-form label."),
             ("created", "When the rule was added (UTC)."),
             ("last fired", "The rule's cooldown anchor: null until it has fired once."),
@@ -3426,14 +3443,15 @@ pub(crate) async fn help_page() -> Response {
         ("live deals", "The /opportunities ranking: only items the newest snapshot still lists. A row's price is buyable at the moment of that fetch; listings that were merely seen earlier today are gone-today rows instead."),
         ("floor now", "Cheapest unit price of the item in the newest snapshot (copper) — what a buyer can buy right now."),
         ("value 7d", "Quantity-weighted 7-day median unit price: the price half the listed quantity sits at. For stackable goods it is the bulk price rather than the price of the median listing; for single-unit goods the two coincide."),
-        ("discount", "1 − floor now ÷ value 7d: how far the cheapest listed price sits under the item's quantity-weighted weekly value."),
+        ("reference value", "What a deal's discount is measured against: the 14-day sold median (the quantity-weighted median of what buyers actually paid) once at least 3 priced units sold in the window, else the value 7d listing median. Sold prices come from the ledger that records them, so a young ledger falls back to the listing value; tables mark sold-based values with *."),
+        ("discount", "1 − floor now ÷ reference value: how far the cheapest listed price sits under what the item is worth."),
         ("seen today, already gone", "A listing seen today under the item's value that the newest snapshot no longer lists (bought or cancelled). The day fold never forgets a listing, so its floor outlives the listing — these rows say so instead of passing it as buyable."),
         ("reliability", "Sell-through strength feeding the ranking — how confidently listings actually sell on this item. “—” = no credit-eligible evidence; the score then ranks the item at the market's median rate rather than at zero."),
         ("churn/day", "Average unique listings per day across the whole 7-day window — days without data count as zero, so a single-day spike reads as a spike, not sustained volume."),
         ("stability", "Low MAD relative to the 7-day listing median — tight, predictable pricing."),
         ("confidence", "Evidence vs. [opportunities].min_samples: 100% means the window holds at least that many unique listings."),
         ("score", "Weighted geometric mean of discount, reliability, churn and stability (weights from the config, normalized; only ratios matter for ranking). Any component at zero scores zero: a liquid but undiscounted market cannot outrank a real deal."),
-        ("efficient crafts", "The /crafts ranking: every manual recipe with its reagents at their quantity-weighted 7-day values against the output's 7-day value, less the house cut, scaled by the output's 14-day sale rate. Recipes that miss a price, lack sale evidence, sell too slowly or lose money are listed separately with the reason."),
+        ("efficient crafts", "The /crafts ranking: every manual recipe with its reagents and output at their reference values, less the house cut, scaled by the output's 14-day sale rate. Recipes that miss a price, lack sale evidence, sell too slowly or lose money are listed separately with the reason."),
         ("expected profit", "Per make: (output value × makes − house cut − reagent cost) × the output's sale rate — what one make is worth given the risk the output does not sell. The crafting ranking sorts on it."),
         ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),

@@ -259,7 +259,7 @@ fn spec_paths_market(target: &Value) -> Value {
         "/api/opportunities": {
             "get": get_op(
                 "Ranked live deals",
-                "Snipe candidates sorted by score descending — only items the newest snapshot still lists. discount = 1 - floorNow/value7 against the item's quantity-weighted 7-day value; the score is a weighted geometric mean of discount, 14-day sale-rate reliability, churn and stability (any component at zero scores zero). limit is uncapped enough for whole-ranking pulls (scores are ranking-only; deal gates use exact metric blocks). Deals seen today but already gone: /api/missed-deals.",
+                "Snipe candidates sorted by score descending — only items the newest snapshot still lists. discount = 1 - floorNow/reference, the reference being soldMedian14 (the 14-day quantity-weighted median of what actually sold) once at least 3 priced units sold in the window, else value7 (the quantity-weighted 7-day listing value); the score is a weighted geometric mean of discount, 14-day sale-rate reliability, churn and stability (any component at zero scores zero). limit is uncapped enough for whole-ranking pulls (scores are ranking-only; deal gates use exact metric blocks). Deals seen today but already gone: /api/missed-deals.",
                 vec![
                     target.clone(),
                     category_param(),
@@ -286,7 +286,7 @@ fn spec_paths_market(target: &Value) -> Value {
         "/api/crafts": {
             "get": get_op(
                 "Efficient crafts",
-                "The manual recipe book ([crafts].recipes) evaluated against the target: every recipe with its reagents priced at their quantity-weighted 7-day values (and the newest snapshot's floors), the output's value and 14-day sale rate, and the money fields per make in copper. Efficient crafts come first (ranked = true, highest expected profit first); the rest carry the first issue that kept them out.",
+                "The manual recipe book ([crafts].recipes) evaluated against the target: every recipe with its reagents and output priced at their reference value (the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing value; reagents also at the newest snapshot's floors), the output's 14-day sale rate, and the money fields per make in copper. Efficient crafts come first (ranked = true, highest expected profit first); the rest carry the first issue that kept them out.",
                 vec![target.clone()],
                 ok_json_ref("CraftsResponse"),
             ),
@@ -621,8 +621,10 @@ fn spec_schemas_market() -> Value {
                 "floorNow": { "type": "integer", "description": "Cheapest unit price listed in the newest snapshot (copper) — buyable at the time of that fetch." },
                 "floorQty": { "type": "integer", "description": "Units listed at exactly floorNow: how deep the deal is." },
                 "listedNow": { "type": "integer", "description": "Listings of the item in the newest snapshot." },
-                "value7": { "type": "integer", "description": "Quantity-weighted 7-day median unit price (copper): where half the listed quantity trades — the bulk price for stackables. The discount reference." },
-                "discount": { "type": "number", "description": "1 - floorNow/value7, clamped to [0,1]." },
+                "value7": { "type": "integer", "description": "Quantity-weighted 7-day median LISTING unit price (copper): where half the listed quantity trades — the bulk price for stackables. The discount reference whenever soldMedian14 is null." },
+                "soldMedian14": { "type": ["integer", "null"], "description": "14-day quantity-weighted median unit price of SOLD listings (copper) — what buyers actually paid; null when fewer than 3 priced units sold in the window or the ledger predates sold-price recording." },
+                "valueSource": { "type": "string", "enum": ["sold", "listed"], "description": "Which value the discount is measured against: soldMedian14 when present, else value7." },
+                "discount": { "type": "number", "description": "1 - floorNow/reference (soldMedian14 when present, else value7), clamped to [0,1]." },
                 "reliability": { "type": ["number", "null"], "description": "14-day sale-through fraction 0..1; null = no credit-eligible evidence (the score then uses the scan's median known rate)." },
                 "churnPerDay": { "type": "number", "description": "Average unique listings per day across the 7-day window." },
                 "stability": { "type": "number", "description": "1 - min(1, mad7/median7)." },
@@ -660,8 +662,10 @@ fn spec_schemas_market() -> Value {
                 "seenFloor": { "type": "integer", "description": "Today's cumulative fold minimum (copper) — what the gone listing asked." },
                 "seenFloorQty": { "type": "integer", "description": "Units that listing offered." },
                 "liveFloor": { "type": ["integer", "null"], "description": "Cheapest listing of the item in the newest snapshot (copper); null = nothing of it is listed." },
-                "value7": { "type": "integer", "description": "Quantity-weighted 7-day median unit price (copper), as on opportunities." },
-                "discount": { "type": "number", "description": "1 - seenFloor/value7, clamped to [0,1]." },
+                "value7": { "type": "integer", "description": "Quantity-weighted 7-day median listing unit price (copper), as on opportunities." },
+                "soldMedian14": { "type": ["integer", "null"], "description": "14-day sold-price median (copper), as on opportunities." },
+                "valueSource": { "type": "string", "enum": ["sold", "listed"], "description": "Which value the discount is measured against, as on opportunities." },
+                "discount": { "type": "number", "description": "1 - seenFloor/reference (soldMedian14 when present, else value7), clamped to [0,1]." },
                 "reliability": { "type": ["number", "null"], "description": "14-day sale-through fraction; null = no credit-eligible evidence." },
                 "samples7": { "type": "integer", "description": "Auction-days folded over the window — the evidence behind value7." }
             }
@@ -728,7 +732,9 @@ fn spec_schemas_secondary() -> Value {
                 "ranked": { "type": "boolean", "description": "True for an efficient craft (priced, selling fast enough, profitable)." },
                 "issue": { "type": ["string", "null"], "enum": ["reagent-without-price", "output-without-price", "no-sale-evidence", "slow-seller", "not-profitable", null], "description": "The first reason the row did not rank; null when ranked." },
                 "outputCategory": { "type": ["string", "null"], "enum": ["item", "commodity", null], "description": "The market the output was priced in (the one with more 7-day evidence)." },
-                "outputValue": { "type": ["integer", "null"], "description": "Output's quantity-weighted 7-day median unit price." },
+                "outputValue": { "type": ["integer", "null"], "description": "Output's reference unit price: the 14-day sold median once at least 3 priced units sold, else the quantity-weighted 7-day listing value. Reagents are priced by the same rule." },
+                "outputValueSource": { "type": ["string", "null"], "enum": ["sold", "listed", null], "description": "Which value outputValue resolved to; null when the output has no price." },
+                "outputSoldMedian14": { "type": ["integer", "null"], "description": "The 14-day sold median behind outputValue, when outputValueSource is sold." },
                 "saleRate": { "type": ["number", "null"], "description": "Output's 14-day sale-through fraction 0..1; null = no credit-eligible evidence." },
                 "unitsSoldPerDay": { "type": ["number", "null"], "description": "Units the market absorbed per day over the trailing 14 days." },
                 "reagents": {

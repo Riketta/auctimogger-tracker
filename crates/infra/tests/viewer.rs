@@ -600,7 +600,7 @@ fn v8_migration_adds_viewer_surface_and_preserves_data() {
         assert_eq!(has_summary, 1, "snapshot_class_summary exists after migration");
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 10, "the file is stamped at the new schema version");
+        assert_eq!(version, 11, "the file is stamped at the new schema version");
         let sale_rows: i64 =
             conn.query_row("SELECT COUNT(*) FROM sales", [], |row| row.get(0)).expect("sales");
         assert_eq!(
@@ -785,7 +785,7 @@ fn pre_v7_files_still_rebuild_their_aggregates() {
         assert_eq!(rebuilt, 1, "day folds rebuild from the retained raw listings");
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 10, "the file lands at the current schema version");
+        assert_eq!(version, 11, "the file lands at the current schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();
@@ -997,7 +997,7 @@ fn v8_file_gains_the_time_rank_index_on_upgrade() {
         assert_eq!(has_time_index, 1, "the v9 time-rank index exists after upgrade");
         let version: i64 =
             conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version stamp");
-        assert_eq!(version, 10, "the v8 file lands at the new schema version");
+        assert_eq!(version, 11, "the v8 file lands at the new schema version");
     }
 
     std::fs::remove_dir_all(&dir).ok();

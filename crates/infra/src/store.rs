@@ -100,8 +100,10 @@ use rusqlite::Connection;
 /// serves the order instead.
 ///
 /// Current schema shape. v10 added `sales.eligible` (the credit-eligible
-/// sale-rate denominator); the ALTER is shape-guarded at the call site, so
-/// upgraded files converge with fresh ones. Post-v10 additive shapes — the
+/// sale-rate denominator) and v11 sold-price evidence (`sight.last_unit_price`,
+/// `sales.sold_prices`); each is a shape-guarded ALTER at the call site, so
+/// upgraded files converge with fresh ones, and pre-upgrade rows read as
+/// "no such evidence". Post-v10 additive shapes — the
 /// `item_hour` intraday fold with its `idx_item_hour_day` retention index and
 /// the `snapshot_item_floor` live-summary table — ride the unconditional
 /// idempotent `SCHEMA` batch instead of a gated migration: each converges by
@@ -111,7 +113,7 @@ use rusqlite::Connection;
 /// `SnapshotRepository::floors`). The `idx_item_day_window` scan index is
 /// created after the migration ladder instead — it needs the v7 `category`
 /// column and must reach current-version files too.
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
 /// primary keys to `(flavor, id)` keys and gain the enrichment columns.
@@ -350,6 +352,9 @@ CREATE TABLE IF NOT EXISTS sight (
     last_seen_at INTEGER NOT NULL,
     band TEXT NOT NULL,
     quantity INTEGER NOT NULL,
+    -- v11: unit price (copper) at the last sighting — what a credited sale
+    -- is booked at. NULL on rows closed before the column existed.
+    last_unit_price INTEGER,
     closed_at INTEGER,
     credited INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (target_id, auction_id, kind)
@@ -366,6 +371,8 @@ CREATE TABLE IF NOT EXISTS sales (
     credited INTEGER NOT NULL DEFAULT 0,
     qty_sold INTEGER NOT NULL DEFAULT 0,
     eligible INTEGER NOT NULL DEFAULT 0,
+    -- v11: JSON [[unit price, quantity], ..] of the day's priced sold units.
+    sold_prices TEXT,
     PRIMARY KEY (target_id, item_ref_id, day, category)
 );
 
@@ -664,6 +671,30 @@ impl SqliteStore {
                     "ALTER TABLE sales ADD COLUMN eligible INTEGER NOT NULL DEFAULT 0",
                 )
                 .map_err(|e| backend("migrate sales.eligible", e))?;
+            }
+            // v11 added sold-price evidence: the unit price a sight was last
+            // seen at, and each sales row's histogram of priced sold units.
+            // Rows written before it keep NULL in both — nothing older can be
+            // back-priced — and read as "no sold-price evidence".
+            if !column_exists(&conn, "sight", "last_unit_price")? {
+                if !fresh {
+                    tracing::debug!(
+                        from_version = version,
+                        "migrating: adding sight.last_unit_price (v11)"
+                    );
+                }
+                conn.execute_batch("ALTER TABLE sight ADD COLUMN last_unit_price INTEGER")
+                    .map_err(|e| backend("migrate sight.last_unit_price", e))?;
+            }
+            if !column_exists(&conn, "sales", "sold_prices")? {
+                if !fresh {
+                    tracing::debug!(
+                        from_version = version,
+                        "migrating: adding sales.sold_prices (v11)"
+                    );
+                }
+                conn.execute_batch("ALTER TABLE sales ADD COLUMN sold_prices TEXT")
+                    .map_err(|e| backend("migrate sales.sold_prices", e))?;
             }
             conn.pragma_update(None, "user_version", SCHEMA_VERSION)
                 .map_err(|e| backend("user_version", e))?;
@@ -1586,29 +1617,32 @@ impl SalesRepository for SqliteStore {
         // dumps (thousands of rows), so per-row `prepare` calls dominated.
         let mut update_open = tx
             .prepare(
-                "UPDATE sight SET last_seen_snapshot = ?4, last_seen_at = ?5, band = ?6, quantity = ?7
+                "UPDATE sight SET last_seen_snapshot = ?4, last_seen_at = ?5, band = ?6, quantity = ?7,
+                         last_unit_price = ?8
                  WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3 AND closed_at IS NULL",
             )
             .map_err(|e| backend("prepare observe update", e))?;
         let mut select_prior = tx
             .prepare(
                 "SELECT s.closed_at, s.credited, s.quantity, s.first_seen_at, s.item_ref_id,
-                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, s.band
+                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, s.band,
+                        s.last_unit_price
                  FROM sight s JOIN item_ref r ON r.id = s.item_ref_id
                  WHERE s.target_id = ?1 AND s.auction_id = ?2 AND s.kind = ?3",
             )
             .map_err(|e| backend("prepare observe prior", e))?;
         let mut insert_sight = tx
             .prepare(
-                "INSERT INTO sight (target_id, auction_id, kind, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8)",
+                "INSERT INTO sight (target_id, auction_id, kind, item_ref_id, first_seen_snapshot, last_seen_snapshot, first_seen_at, last_seen_at, band, quantity, last_unit_price)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?5, ?6, ?6, ?7, ?8, ?9)",
             )
             .map_err(|e| backend("prepare observe insert", e))?;
         let mut reopen_sight = tx
             .prepare(
                 "UPDATE sight SET closed_at = NULL, credited = 0, item_ref_id = ?8,
                          first_seen_snapshot = ?4, last_seen_snapshot = ?4,
-                         first_seen_at = ?5, last_seen_at = ?5, band = ?6, quantity = ?7
+                         first_seen_at = ?5, last_seen_at = ?5, band = ?6, quantity = ?7,
+                         last_unit_price = ?9
                  WHERE target_id = ?1 AND auction_id = ?2 AND kind = ?3",
             )
             .map_err(|e| backend("prepare observe reopen", e))?;
@@ -1620,10 +1654,10 @@ impl SalesRepository for SqliteStore {
             .map_err(|e| backend("prepare observe open qty", e))?;
         let mut item_ref_ids: HashMap<ItemRef, i64> = HashMap::new();
         // New sights per (ref, category), booked as listing counts after the
-        // loop. Commodity partial fills: (ref, category) -> units bought off
-        // live listings this cycle.
+        // loop. Commodity partial fills: (ref, category) -> posted unit price
+        // -> units bought off live listings this cycle.
         let mut new_sights: HashMap<(i64, Category), i64> = HashMap::new();
-        let mut partial_fills: HashMap<(i64, Category), i64> = HashMap::new();
+        let mut partial_fills: HashMap<(i64, Category), BTreeMap<i64, i64>> = HashMap::new();
         for listing in listings {
             let item_ref_id = if let Some(id) = item_ref_ids.get(&listing.item_ref) {
                 *id
@@ -1654,8 +1688,11 @@ impl SalesRepository for SqliteStore {
                         other => Err(backend("observe open qty", other)),
                     })?;
                 if let Some(prior_qty) = prior_qty.filter(|prior| *prior > listing.quantity) {
-                    *partial_fills.entry((item_ref_id, category)).or_insert(0) +=
-                        prior_qty - listing.quantity;
+                    *partial_fills
+                        .entry((item_ref_id, category))
+                        .or_default()
+                        .entry(listing.unit_price)
+                        .or_insert(0) += prior_qty - listing.quantity;
                 }
             }
             // A listing sighted in a previous kind cycle must never match
@@ -1669,6 +1706,7 @@ impl SalesRepository for SqliteStore {
                     at,
                     listing.time_left.as_str(),
                     listing.quantity,
+                    listing.unit_price,
                 ])
                 .map_err(|e| backend("observe update", e))?;
             if updated == 0 {
@@ -1704,8 +1742,12 @@ impl SalesRepository for SqliteStore {
         }
         // Partial-fill volume books on the observation day - the day the
         // units left the market - exactly like credited vanish quantities
-        // book on their close day.
-        for ((item_ref_id, category), units) in partial_fills {
+        // book on their close day, and at the listing's posted unit price.
+        for ((item_ref_id, category), fills) in partial_fills {
+            let units = fills.values().copied().fold(0i64, i64::saturating_add);
+            if units <= 0 {
+                continue;
+            }
             bump_sales_row(
                 &tx,
                 target,
@@ -1714,6 +1756,7 @@ impl SalesRepository for SqliteStore {
                 category,
                 &SalesDelta { listings: 0, closed: 0, credited: 0, qty_sold: units, eligible: 0 },
             )?;
+            add_sold_prices(&tx, target, item_ref_id, utc_day(at), category, &fills)?;
         }
         // Statements borrow `tx`; release them before the commit move.
         drop(update_open);
@@ -1738,7 +1781,7 @@ impl SalesRepository for SqliteStore {
         let mut statement = tx
             .prepare(
                 "SELECT s.auction_id, s.item_ref_id, s.first_seen_at, s.last_seen_at, s.band, s.quantity,
-                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed
+                        r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed, s.last_unit_price
                  FROM sight s JOIN item_ref r ON r.id = s.item_ref_id
                  WHERE s.target_id = ?1 AND s.kind = ?2 AND s.closed_at IS NULL AND s.last_seen_snapshot != ?3",
             )
@@ -1760,6 +1803,7 @@ impl SalesRepository for SqliteStore {
                     row.get::<_, i64>(9)?,
                     row.get::<_, i64>(10)?,
                     row.get::<_, i64>(11)?,
+                    row.get::<_, Option<i64>>(12)?,
                 ))
             })
             .collect::<Result<Vec<_>, _>>()
@@ -1780,6 +1824,7 @@ impl SalesRepository for SqliteStore {
             pet_level,
             pet_quality,
             pet_breed,
+            last_unit_price,
         ) in rows
         {
             let band = amtracker_core::domain::TimeLeftBand::parse(&band);
@@ -1871,6 +1916,18 @@ impl SalesRepository for SqliteStore {
                 },
             )?;
             if credited {
+                // Priced when the sight's last sighting recorded one; a sight
+                // last seen before v11 sells unpriced (quantity only).
+                if let Some(price) = last_unit_price {
+                    add_sold_prices(
+                        &tx,
+                        target,
+                        item_ref_id,
+                        utc_day(at),
+                        category,
+                        &BTreeMap::from([(price, quantity)]),
+                    )?;
+                }
                 credits.push(SaleCredit { auction_id, item, quantity, at });
             }
         }
@@ -1973,6 +2030,30 @@ impl SalesRepository for SqliteStore {
                     }
                 })
             })
+            .collect())
+    }
+
+    fn sold_price_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Vec<Vec<(i64, i64)>>, StoreError> {
+        let conn = self.open_transaction();
+        // Positional resolution (None = unknown item), so the result stays
+        // aligned with `items`; an unknown identity or a day without priced
+        // sales reads as an empty histogram.
+        let ids = item_ids_in_order(&conn, items)?;
+        let known: Vec<i64> = ids.iter().filter_map(|id| *id).collect();
+        if known.is_empty() {
+            return Ok(vec![Vec::new(); items.len()]);
+        }
+        let now_day = utc_day(self.clock.now());
+        let sold = sold_prices_by_id(&conn, target, &known, now_day - days + 1, category)?;
+        Ok(ids
+            .iter()
+            .map(|id| id.and_then(|id| sold.get(&id)).cloned().unwrap_or_default())
             .collect())
     }
 
@@ -2255,6 +2336,54 @@ fn sale_rates_by_id(
     Ok(out)
 }
 
+/// Priced sold units per `item_ref` id over the window, as (unit price,
+/// quantity) buckets sorted by price — the batched fuel for
+/// `sold_price_each`. Every day's histogram of the window merges into one;
+/// ids without a priced sale are absent from the result.
+fn sold_prices_by_id(
+    conn: &Connection,
+    target: &TargetId,
+    ids: &[i64],
+    cutoff_day: i64,
+    category: Category,
+) -> Result<HashMap<i64, Vec<(i64, i64)>>, StoreError> {
+    /// Same chunking rationale as [`sale_rates_by_id`].
+    const SOLD_PRICE_CHUNK: usize = 500;
+    let mut out: HashMap<i64, BTreeMap<i64, i64>> = HashMap::new();
+    for chunk in ids.chunks(SOLD_PRICE_CHUNK) {
+        let placeholders = std::iter::repeat_n("?", chunk.len()).collect::<Vec<_>>().join(", ");
+        let sql = format!(
+            "SELECT item_ref_id, sold_prices FROM sales
+             WHERE target_id = ? AND item_ref_id IN ({placeholders}) AND day >= ? AND category = ?
+               AND sold_prices IS NOT NULL"
+        );
+        let mut params: Vec<rusqlite::types::Value> = Vec::with_capacity(chunk.len() + 3);
+        params.push(rusqlite::types::Value::Text(target.as_str().to_string()));
+        for id in chunk {
+            params.push(rusqlite::types::Value::Integer(*id));
+        }
+        params.push(rusqlite::types::Value::Integer(cutoff_day));
+        params.push(rusqlite::types::Value::Text(category.as_str().to_string()));
+        let mut statement = conn.prepare(&sql).map_err(|e| backend("prepare sold_prices", e))?;
+        let rows = statement
+            .query(rusqlite::params_from_iter(params.iter()))
+            .map_err(|e| backend("query sold_prices", e))?
+            .mapped(|row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)))
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| backend("sold_prices row", e))?;
+        for (id, json) in rows {
+            let pairs: Vec<(i64, i64)> =
+                serde_json::from_str(&json).map_err(|e| backend("parse sold prices", e))?;
+            let histogram = out.entry(id).or_default();
+            for (price, qty) in pairs {
+                let next = histogram.get(&price).copied().unwrap_or(0).saturating_add(qty);
+                histogram.insert(price, next);
+            }
+        }
+    }
+    Ok(out.into_iter().map(|(id, histogram)| (id, histogram.into_iter().collect())).collect())
+}
+
 /// Units credited as sold per `item_ref` id over the window, in one chunked
 /// grouped query per batch (the batched fuel for `qty_sold_each` and
 /// `qty_sold_multi`). Ids with no sales rows at all are absent from the
@@ -2433,6 +2562,19 @@ fn save_rebuilt_group(
     Ok(())
 }
 
+/// Whether `table` already has a column named `column` (the migration
+/// ladder's shape guard: a fresh file gains the column from `SCHEMA`, an
+/// upgraded one from the ALTER, and both converge).
+fn column_exists(conn: &Connection, table: &str, column: &str) -> Result<bool, StoreError> {
+    conn.query_row(
+        "SELECT EXISTS (SELECT 1 FROM pragma_table_info(?1) WHERE name = ?2)",
+        rusqlite::params![table, column],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|flag| flag == 1)
+    .map_err(|e| backend("inspect table schema", e))
+}
+
 /// Sales-aggregate deltas for one (target, item, day, category) row.
 struct SalesDelta {
     listings: i64,
@@ -2477,6 +2619,70 @@ fn bump_sales_row(
     Ok(())
 }
 
+/// Books priced sold units onto a sales row's `sold_prices` histogram (JSON
+/// `[[unit price, quantity], ..]`, sorted by price). `fills` may carry
+/// negative quantities: a reopened sight reverses its phantom sale exactly
+/// where the close booked it. A bucket emptied that way drops out, and a
+/// histogram left empty reverts to NULL — "no priced evidence". The row must
+/// already exist: every caller books the matching `qty_sold` delta first.
+fn add_sold_prices(
+    tx: &rusqlite::Transaction<'_>,
+    target: &TargetId,
+    item_ref_id: i64,
+    day: i64,
+    category: Category,
+    fills: &BTreeMap<i64, i64>,
+) -> Result<(), StoreError> {
+    if fills.is_empty() {
+        return Ok(());
+    }
+    // NULL until the day's first priced sale: read as an option, never a string.
+    let current: Option<String> = tx
+        .query_row(
+            "SELECT sold_prices FROM sales\n             WHERE target_id = ?1 AND item_ref_id = ?2 AND day = ?3 AND category = ?4",
+            rusqlite::params![target.as_str(), item_ref_id, day, category.as_str()],
+            |row| row.get(0),
+        )
+        .map_err(|e| backend("read sold prices", e))?;
+    let mut histogram: BTreeMap<i64, i64> = current
+        .as_deref()
+        .map(serde_json::from_str::<Vec<(i64, i64)>>)
+        .transpose()
+        .map_err(|e| backend("parse sold prices", e))?
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    for (price, qty) in fills {
+        let next = histogram.get(price).copied().unwrap_or(0).saturating_add(*qty);
+        if next <= 0 {
+            histogram.remove(price);
+        } else {
+            histogram.insert(*price, next);
+        }
+    }
+    // An empty histogram is stored as NULL, like a day that never priced a
+    // sale, so the read path sees one spelling of "no evidence".
+    let stored = if histogram.is_empty() {
+        None
+    } else {
+        let pairs: Vec<(i64, i64)> = histogram.into_iter().collect();
+        Some(serde_json::to_string(&pairs).map_err(|e| backend("serialize sold prices", e))?)
+    };
+    let changed = tx
+        .execute(
+            "UPDATE sales SET sold_prices = ?5
+             WHERE target_id = ?1 AND item_ref_id = ?2 AND day = ?3 AND category = ?4",
+            rusqlite::params![target.as_str(), item_ref_id, day, category.as_str(), stored],
+        )
+        .map_err(|e| backend("book sold prices", e))?;
+    if changed != 1 {
+        return Err(StoreError::Backend(format!(
+            "sold prices: no sales row for item ref {item_ref_id} on day {day}"
+        )));
+    }
+    Ok(())
+}
+
 /// Inserts a brand-new sight or reopens a closed one for the same
 /// (target, auction, kind). Reversing the previous close under the SIGHT'S
 /// OWN identity (not the incoming listing's) keeps the sales ledger honest:
@@ -2515,6 +2721,7 @@ fn observe_new_or_reopen(
         i64,
         i64,
         String,
+        Option<i64>,
     )> = select_prior
         .query_row(rusqlite::params![target.as_str(), listing.auction_id, kind.as_str()], |row| {
             Ok((
@@ -2530,6 +2737,7 @@ fn observe_new_or_reopen(
                 row.get(9)?,
                 row.get(10)?,
                 row.get(11)?,
+                row.get(12)?,
             ))
         })
         .map(Some)
@@ -2550,6 +2758,7 @@ fn observe_new_or_reopen(
         prior_quality,
         prior_breed,
         prior_band,
+        prior_price,
     )) = prior
     else {
         insert_sight
@@ -2562,6 +2771,7 @@ fn observe_new_or_reopen(
                 at,
                 listing.time_left.as_str(),
                 listing.quantity,
+                listing.unit_price,
             ])
             .map_err(|e| backend("observe insert", e))?;
         return Ok(true);
@@ -2597,6 +2807,18 @@ fn observe_new_or_reopen(
                 eligible: 0,
             },
         )?;
+        // A credited close's priced units leave the close day's sold histogram
+        // together with its quantity.
+        if let Some(prior_price) = prior_price.filter(|_| credited == 1) {
+            add_sold_prices(
+                tx,
+                target,
+                prior_item_ref_id,
+                utc_day(closed_at),
+                prior_category,
+                &BTreeMap::from([(prior_price, -prior_qty)]),
+            )?;
+        }
         bump_sales_row(
             tx,
             target,
@@ -2622,6 +2844,7 @@ fn observe_new_or_reopen(
             listing.time_left.as_str(),
             listing.quantity,
             item_ref_id,
+            listing.unit_price,
         ])
         .map_err(|e| backend("observe reopen", e))?;
     Ok(item_ref_id != prior_item_ref_id)
@@ -3937,7 +4160,10 @@ fn price_stats_sorted(prices: &[i64]) -> (i64, i64, i64, i64) {
 
 // ------------------------------------------------------------------ helpers
 
-use std::collections::HashMap;
+use std::collections::{
+    BTreeMap,
+    HashMap,
+};
 
 fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
@@ -4718,10 +4944,15 @@ mod tests {
     }
 
     fn test_store_auto(name: &str, auto_vacuum: AutoVacuum) -> (std::path::PathBuf, SqliteStore) {
+        // A per-process counter on top of the pid: an aborted run leaves its
+        // directory behind, and Windows recycles pids eagerly enough for a
+        // later run to reopen that stale database.
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "amtracker-{name}-{}-{}",
+            "amtracker-{name}-{}-{}-{}",
             std::process::id(),
-            line!()
+            line!(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
         std::fs::create_dir_all(&dir).expect("temp dir");
         let store = SqliteStore::open(
@@ -4786,6 +5017,123 @@ mod tests {
         assert!(folds[1].is_empty(), "unknown identity loads empty");
         assert!(folds[2].is_empty(), "out-of-window fold filtered");
         assert_eq!(folds[3].len(), 1, "last chunk entry loaded");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A commodity listing row with an explicit auction id, band and price.
+    fn priced_listing(auction_id: i64, item: &ItemRef, price: i64, qty: i64) -> NormalizedListing {
+        NormalizedListing {
+            auction_id,
+            item_ref: item.clone(),
+            kind: ListingKind::Commodity,
+            quantity: qty,
+            unit_price: price,
+            bid: None,
+            time_left: TimeLeftBand::Medium,
+            context: None,
+            bonus_lists: Vec::new(),
+        }
+    }
+
+    /// v11 sold prices: a credited close books its sight's last-seen price and
+    /// a partial fill its posted one; a reopened sight reverses the phantom
+    /// sale's priced units; a sight last seen without a price (a pre-v11 row)
+    /// sells unpriced. The histogram and `qty_sold` stay in step throughout.
+    #[test]
+    fn sold_prices_follow_credited_closes_fills_and_reversals() {
+        let (dir, store) = test_store("sold-prices");
+        let target = TargetId("eu-1602".into());
+        let item = ItemRef::Item { item_id: 194_784 };
+        // Near the real clock: the read path applies a trailing-day window.
+        let at = i64::try_from(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_or(0, |since| since.as_secs()),
+        )
+        .unwrap_or(0);
+        let sold = |store: &SqliteStore, category: Category| -> Vec<(i64, i64)> {
+            store
+                .sold_price_each(&target, std::slice::from_ref(&item), 14, category)
+                .expect("sold prices")
+                .pop()
+                .unwrap_or_default()
+        };
+        let commodity = Category::Commodity;
+
+        // Two live stacks: A (10 at 120) and B (5 at 150).
+        store
+            .observe(
+                &target,
+                PayloadKind::Commodities,
+                &[priced_listing(1, &item, 120, 10), priced_listing(2, &item, 150, 5)],
+                1,
+                at,
+            )
+            .expect("observe 1");
+        // A drops to 4 units (6 bought at 120); C appears (2 at 300). B is gone.
+        store
+            .observe(
+                &target,
+                PayloadKind::Commodities,
+                &[priced_listing(1, &item, 120, 4), priced_listing(3, &item, 300, 2)],
+                2,
+                at + 60,
+            )
+            .expect("observe 2");
+        // B vanished a minute after a MEDIUM sighting: credited at 150.
+        let credits =
+            store.close_missing(&target, PayloadKind::Commodities, 2, at + 60).expect("close 2");
+        assert_eq!(credits.len(), 1, "B's vanish credits");
+        assert_eq!(sold(&store, commodity), vec![(120, 6), (150, 5)]);
+        assert_eq!(store.qty_sold(&target, &item, 14, commodity), Ok(Some(11)));
+
+        // B is back: the reopen reverses the phantom sale, priced units included.
+        store
+            .observe(
+                &target,
+                PayloadKind::Commodities,
+                &[priced_listing(2, &item, 150, 5)],
+                3,
+                at + 120,
+            )
+            .expect("observe 3");
+        assert_eq!(sold(&store, commodity), vec![(120, 6)]);
+        assert_eq!(store.qty_sold(&target, &item, 14, commodity), Ok(Some(6)));
+
+        // C was last seen before prices were recorded (a pre-v11 row): when
+        // everything vanishes it sells unpriced, the others at their prices.
+        store
+            .open_transaction()
+            .execute(
+                "UPDATE sight SET last_unit_price = NULL
+                 WHERE target_id = ?1 AND auction_id = 3 AND kind = ?2",
+                rusqlite::params![target.as_str(), PayloadKind::Commodities.as_str()],
+            )
+            .expect("strip the recorded price");
+        let credits =
+            store.close_missing(&target, PayloadKind::Commodities, 4, at + 180).expect("close 4");
+        assert_eq!(credits.len(), 3, "A, B and C all credit");
+        assert_eq!(
+            sold(&store, commodity),
+            vec![(120, 10), (150, 5)],
+            "no 300 bucket: C sold unpriced"
+        );
+        assert_eq!(store.qty_sold(&target, &item, 14, commodity), Ok(Some(17)));
+
+        // Positional alignment: an unknown identity reads as an empty histogram,
+        // and another category's ledger is separate.
+        let unknown = ItemRef::Item { item_id: 999_999 };
+        let rows = store
+            .sold_price_each(&target, &[item.clone(), unknown], 14, commodity)
+            .expect("sold prices");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec![(120, 10), (150, 5)]);
+        assert_eq!(rows[1], Vec::<(i64, i64)>::new());
+        assert_eq!(
+            sold(&store, Category::Item),
+            Vec::<(i64, i64)>::new(),
+            "the item-AH ledger holds nothing"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 

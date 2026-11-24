@@ -551,6 +551,29 @@ pub trait SalesRepository: Send + Sync {
         }
         Ok(rates)
     }
+    /// Credited sale PRICES for each of the given identities, positionally
+    /// aligned (`sold[i]` belongs to `items[i]`): the window's priced sold
+    /// units as `(unit price, quantity)` buckets sorted by price. A credited
+    /// vanish counts at the unit price its sight was last seen asking, a
+    /// commodity partial fill at the listing's posted price. Empty when
+    /// nothing priced was sold in the window (no sales, or a ledger that
+    /// predates sold-price recording). Scoped to one category.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the credit statistics cannot be
+    /// read.
+    fn sold_price_each(
+        &self,
+        target: &TargetId,
+        items: &[ItemRef],
+        days: i64,
+        category: Category,
+    ) -> Result<Vec<Vec<(i64, i64)>>, StoreError> {
+        // Correct-by-default: no priced sales, like an empty ledger.
+        let _ = (target, days, category);
+        Ok(vec![Vec::new(); items.len()])
+    }
     /// Units credited as sold within the trailing day window, for one
     /// identity and category — credited vanish quantities plus commodity
     /// partial-fill deltas. `Ok(None)` when the identity has no sales rows

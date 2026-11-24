@@ -46,6 +46,14 @@ use crate::{
 pub const SCAN_WINDOW_DAYS: i64 = 7;
 /// Sale-rate window backing the reliability component (days).
 const SALE_RATE_WINDOW_DAYS: i64 = 14;
+/// Sold-price window backing the reference value (days): the sale-rate window,
+/// so "what buyers paid" and "how often it sells" describe the same
+/// fortnight.
+pub(crate) const SOLD_PRICE_WINDOW_DAYS: i64 = SALE_RATE_WINDOW_DAYS;
+/// Priced units that must have sold in the window before the sold median
+/// replaces the listing value as an item's reference: a thinner sample is one
+/// bargain or one outlier, not a market.
+pub(crate) const SOLD_REFERENCE_MIN_UNITS: i64 = 3;
 /// How long a prepared scan stays fresh before the scheduler refreshes it;
 /// stale snapshots keep serving until the refreshed one lands.
 pub const SCAN_TTL_SECONDS: i64 = 300;
@@ -66,6 +74,35 @@ const CHURN_ANCHOR: f64 = 50.0;
 /// cumulative floor under the live one, and only a deep gap separates a deal
 /// from ordinary turnover.
 pub const DEFAULT_MIN_MISSED_DISCOUNT: f64 = 0.25;
+
+/// Which of an item's two values its discount is measured against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ValueSource {
+    /// The 14-day sold median: enough priced units sold.
+    Sold,
+    /// The 7-day listing value: too little sold evidence.
+    Listed,
+}
+
+impl ValueSource {
+    /// Wire/UI spelling of the source.
+    #[must_use]
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Sold => "sold",
+            Self::Listed => "listed",
+        }
+    }
+
+    /// The reference it names, for alert messages.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Sold => "14-day sold median",
+            Self::Listed => "7-day value",
+        }
+    }
+}
 
 /// One ranked live snipe candidate. All components are 0..1-normalized except
 /// the raw price fields; `score` is ranking-only and never gates deals. Rows
@@ -89,11 +126,20 @@ pub struct Opportunity {
     pub floor_qty: i64,
     /// Listings of the item in the newest snapshot.
     pub listed_now: u64,
-    /// Quantity-weighted 7-day median unit price (copper): the price half the
-    /// listed quantity sits at — the bulk price for stackable goods, the
-    /// listing median for single units. The discount reference.
+    /// Quantity-weighted 7-day median LISTING unit price (copper): the price
+    /// half the listed quantity sits at — the bulk price for stackable goods,
+    /// the listing median for single units. The reference whenever too few
+    /// priced units sold (see `sold_median14`).
     pub value7: i64,
-    /// `1 - floor_now / value7`, clamped to [0, 1] and rounded to 3 decimals.
+    /// 14-day quantity-weighted median of SOLD unit prices (copper); `None`
+    /// when fewer than `SOLD_REFERENCE_MIN_UNITS` priced units sold in the
+    /// window, or the ledger predates sold-price recording.
+    pub sold_median14: Option<i64>,
+    /// Which value `discount` is measured against: what buyers paid when
+    /// enough of them did, else what sellers ask.
+    pub value_source: ValueSource,
+    /// `1 - floor_now / reference`, clamped to [0, 1] and rounded to 3
+    /// decimals — `sold_median14` when known, else `value7`.
     pub discount: f64,
     /// 14-day sale rate: share of credit-eligible listings credited as sold.
     /// `None` = no credit-eligible evidence; the score then ranks the item at
@@ -143,9 +189,14 @@ pub struct MissedDeal {
     /// Cheapest listing of the item in the newest snapshot (copper); `None`
     /// when nothing of the item is listed at all.
     pub live_floor: Option<i64>,
-    /// Quantity-weighted 7-day median unit price (copper), as on live rows.
+    /// Quantity-weighted 7-day median listing price (copper), as on live rows.
     pub value7: i64,
-    /// `1 - seen_floor / value7`, clamped to [0, 1] and rounded to 3 decimals.
+    /// 14-day sold-price median (copper), as on live rows.
+    pub sold_median14: Option<i64>,
+    /// Which value `discount` is measured against, as on live rows.
+    pub value_source: ValueSource,
+    /// `1 - seen_floor / reference`, clamped to [0, 1] and rounded to 3
+    /// decimals (the same reference rule as live rows).
     pub discount: f64,
     /// 14-day sale rate (`None` = no credit-eligible evidence).
     pub reliability: Option<f64>,
@@ -169,15 +220,39 @@ pub struct LiveSnapshot {
 /// the deal ranking prices them.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MarketValue {
-    /// Quantity-weighted 7-day median unit price (copper); 0 without evidence.
+    /// Quantity-weighted 7-day median listing unit price (copper); 0 without
+    /// evidence.
     pub value7: i64,
-    /// Auction-days of evidence behind it.
+    /// 14-day quantity-weighted median of SOLD unit prices (copper); `None`
+    /// under the sold-evidence floor (see [`Opportunity::sold_median14`]).
+    pub sold_median14: Option<i64>,
+    /// Auction-days of evidence behind `value7`.
     pub samples7: i64,
     /// 14-day sale rate (`None` = no credit-eligible evidence).
     pub sale_rate: Option<f64>,
     /// The item's listing summary in the newest snapshot (`None` = not
     /// listed there).
     pub live: Option<SnapshotFloor>,
+}
+
+impl MarketValue {
+    /// The pricing reference — the value a deal's discount is measured
+    /// against and a craft's output is assumed to fetch: what buyers paid
+    /// when enough priced units sold, else what sellers ask.
+    #[must_use]
+    pub fn reference(&self) -> i64 {
+        self.sold_median14.filter(|median| *median > 0).unwrap_or(self.value7)
+    }
+
+    /// Which of the two values [`Self::reference`] resolved to.
+    #[must_use]
+    pub fn value_source(&self) -> ValueSource {
+        if self.sold_median14.is_some_and(|median| median > 0) {
+            ValueSource::Sold
+        } else {
+            ValueSource::Listed
+        }
+    }
 }
 
 /// Read-only view of one category's prepared scan, keyed by identity.
@@ -195,6 +270,7 @@ impl MarketView {
         let index = self.scan.rows.binary_search_by(|row| row.item.cmp(item)).ok()?;
         Some(MarketValue {
             value7: as_copper(self.scan.rows.get(index)?.value7),
+            sold_median14: self.scan.rows.get(index)?.sold_median,
             samples7: self.scan.rows.get(index)?.samples7,
             sale_rate: self.scan.rates.get(index).copied().flatten(),
             live: self.scan.floors.get(item).copied(),
@@ -316,7 +392,28 @@ struct ItemScan {
     median_now: i64,
     median7: f64,
     value7: f64,
+    /// 14-day sold median (copper) once enough priced units sold; stamps in
+    /// after the batched sold-price read, like the sale rates.
+    sold_median: Option<i64>,
     mad7: f64,
+}
+
+impl ItemScan {
+    /// The discount reference: the sold median when the window holds one, else
+    /// the 7-day listing value.
+    #[allow(clippy::cast_precision_loss)] // copper prices into ranking math only
+    fn reference(&self) -> f64 {
+        self.sold_median.filter(|median| *median > 0).map_or(self.value7, |median| median as f64)
+    }
+
+    /// Which of the two values [`Self::reference`] resolved to.
+    fn value_source(&self) -> ValueSource {
+        if self.sold_median.is_some_and(|median| median > 0) {
+            ValueSource::Sold
+        } else {
+            ValueSource::Listed
+        }
+    }
 }
 
 /// Cached scan per (target, category): computed-at stamp plus the shared
@@ -442,10 +539,11 @@ impl OpportunityService {
             if live_floor.is_some_and(|live| seen_floor >= live) {
                 continue;
             }
-            if row.samples7 < i64::from(self.min_samples) || row.value7 <= 0.0 || seen_floor <= 0 {
+            let reference = row.reference();
+            if row.samples7 < i64::from(self.min_samples) || reference <= 0.0 || seen_floor <= 0 {
                 continue;
             }
-            let discount = discount_of(seen_floor, row.value7);
+            let discount = discount_of(seen_floor, reference);
             if discount < min_discount {
                 continue;
             }
@@ -456,6 +554,8 @@ impl OpportunityService {
                 seen_floor_qty,
                 live_floor,
                 value7: as_copper(row.value7),
+                sold_median14: row.sold_median,
+                value_source: row.value_source(),
                 discount,
                 reliability: *rate,
                 samples7: row.samples7,
@@ -623,6 +723,17 @@ impl OpportunityService {
         let items: Vec<ItemRef> = scans.iter().map(|scan| scan.item.clone()).collect();
         let rates = self.sales.sale_rate_each(target, &items, SALE_RATE_WINDOW_DAYS, category)?;
         let recencies = self.sales.sale_recency_each(target, &items, category)?;
+        // What buyers actually paid: the discount reference for every item
+        // with enough priced sales in the window.
+        let sold = self.sales.sold_price_each(target, &items, SOLD_PRICE_WINDOW_DAYS, category)?;
+        debug_assert_eq!(
+            scans.len(),
+            sold.len(),
+            "sold_price_each must stay positionally aligned with the scan rows"
+        );
+        for (scan, histogram) in scans.iter_mut().zip(sold.iter()) {
+            scan.sold_median = sold_reference(histogram).map(as_copper);
+        }
         debug_assert_eq!(
             scans.len(),
             rates.len(),
@@ -708,6 +819,7 @@ impl OpportunityService {
             median_now,
             median7,
             value7,
+            sold_median: None,
             mad7,
         }
     }
@@ -726,10 +838,11 @@ impl OpportunityService {
         recency: Option<SaleRecency>,
         category: Category,
     ) -> Option<Opportunity> {
-        if scan.median7 <= 0.0 || scan.value7 <= 0.0 || floor.floor_price <= 0 {
+        let reference = scan.reference();
+        if scan.median7 <= 0.0 || scan.value7 <= 0.0 || reference <= 0.0 || floor.floor_price <= 0 {
             return None;
         }
-        let discount = discount_of(floor.floor_price, scan.value7);
+        let discount = discount_of(floor.floor_price, reference);
         let churn_score = (scan.churn_per_day / CHURN_ANCHOR).min(1.0);
         let stability = 1.0 - (scan.mad7 / scan.median7).min(1.0);
         // Confidence compares evidence against the u32 floor; f64 is exact at
@@ -759,6 +872,8 @@ impl OpportunityService {
             floor_qty: floor.floor_qty.max(0),
             listed_now: floor.listing_count,
             value7,
+            sold_median14: scan.sold_median,
+            value_source: scan.value_source(),
             discount,
             reliability: rate,
             churn_per_day: scan.churn_per_day,
@@ -916,6 +1031,22 @@ fn weighted_median(pairs: &[(i64, i64)]) -> f64 {
     ((i128::from(low) + i128::from(high)) as f64) / 2.0
 }
 
+/// The reference-worthy sold median of a sold-price histogram: the
+/// quantity-weighted median of its `(unit price, quantity)` buckets once at
+/// least [`SOLD_REFERENCE_MIN_UNITS`] priced units sold, else `None` — one
+/// bargain is not a market.
+pub(crate) fn sold_reference(sold: &[(i64, i64)]) -> Option<f64> {
+    let units = sold.iter().map(|(_, qty)| *qty).fold(0i64, i64::saturating_add);
+    if units < SOLD_REFERENCE_MIN_UNITS {
+        return None;
+    }
+    // The store hands buckets over sorted; a defensive sort keeps the
+    // weighted median correct whatever a future adapter returns.
+    let mut pairs = sold.to_vec();
+    pairs.sort_by_key(|(price, _)| *price);
+    Some(weighted_median(&pairs))
+}
+
 #[cfg(test)]
 mod tests {
     // Test construction is allowed to unwrap/expect/index: fixed synthetic
@@ -947,6 +1078,8 @@ mod tests {
             floor_qty: 1,
             listed_now: 1,
             value7: 100,
+            sold_median14: None,
+            value_source: ValueSource::Listed,
             discount: 0.0,
             reliability: None,
             churn_per_day: 0.0,
@@ -992,6 +1125,19 @@ mod tests {
         // Day 8 listed more units, so its per-unit price is the window value.
         assert_eq!(scan.value7, 110_000.0);
         assert_eq!(OpportunityService::scan_item(&item(1), &rows, 9).seen_today, None);
+    }
+
+    #[test]
+    fn sold_reference_needs_the_evidence_floor_and_weighs_by_quantity() {
+        assert_eq!(sold_reference(&[]), None, "nothing sold");
+        // Two units: under the floor, whatever their price.
+        assert_eq!(sold_reference(&[(100, 2)]), None);
+        // Three units, quantity-weighted: the median unit sits at 200.
+        assert_eq!(sold_reference(&[(100, 1), (200, 2)]), Some(200.0));
+        // Unsorted buckets are still a correct median.
+        assert_eq!(sold_reference(&[(300, 2), (100, 1)]), Some(300.0));
+        // An even split lands between the two middle prices.
+        assert_eq!(sold_reference(&[(100, 2), (300, 2)]), Some(200.0));
     }
 
     #[test]

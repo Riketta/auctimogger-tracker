@@ -264,9 +264,9 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/openapi.json` · `/api/docs` | OpenAPI 3.1 contract for the whole JSON API + feed surface, and a server-rendered HTML reference built from it (includes a Python quickstart) |
 | `GET /api/health` | liveness probe (uptime monitoring) |
 | `GET /api/search?q=…&limit=&offset=` | id/name search over items and pet species (kind-aware hits); page with `offset` until `hasMore` is false |
-| `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`) and the response names the `snapshot` they come from. `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
+| `GET /api/opportunities` · `/api/overview?limit=` | live ranked deals, market dynamics — per market `category` (`item\|commodity\|pet`); without `category`, one response keyed by all three (overview rows 1–50, default 15). With `category`, deal rows carry the live price fields (`floorNow`, `floorQty`, `listedNow`, `value7`, `soldMedian14`, `valueSource`) and the response names the `snapshot` they come from. `discount = 1 - floorNow / reference`, the reference being `soldMedian14` once ≥ 3 priced units sold in 14 days, else `value7` (see “Sold prices and the reference value”). `&sort=last_sale` orders stalest-since-last-sale first (default `score`) |
 | `GET /api/missed-deals?target=&category=&min_discount=&limit=` | listings seen today that the newest snapshot no longer lists, at least `min_discount` percent (default 25) under the item's quantity-weighted 7-day value, deepest first — the same two response shapes as opportunities |
-| `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents, the output's value and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out |
+| `GET /api/crafts?target=` | the manual recipe book priced on the target: every recipe with its priced reagents, the output's reference value (14-day sold median once ≥ 3 priced units sold, else 7-day listing value) and 14-day sale rate, and per-make cost, live cost, profit, expected profit and ROI in copper — efficient crafts first (`ranked: true`), the rest carrying the first `issue` that kept them out |
 | `GET /api/history?target=&days=&category=` | bulk analysis payload: every item/pet day aggregate in the window (listingCount, qtySum, min/p05/median/mad — integer copper, UTC day numbers, `category` per row); one call covers the whole market (rows ordered by day, then item), `days` clamps to 1–30 (default 7). The market is read once per category per 300 s; every `days` window is served from that read |
 | `GET /api/items/{target}/{item}/metrics?category=` | span blocks for one item in one market (`item` or `commodity`); without `category`, keyed by category |
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
@@ -318,6 +318,25 @@ scheduler tick — not by the TTL alone. Two inline fallbacks remain: a
 completely cold cache (e.g. the very first request before the scheduler's
 initial refresh lands) and, as a self-heal backstop, any scan that ages past
 six scan TTLs (which would take a dead or persistently failing scheduler).
+
+### Sold prices and the reference value
+
+A deal's discount is measured against the item's **reference value**: the
+**14-day sold median** — the quantity-weighted median of what buyers actually
+paid — once at least **3 priced units** sold in the window, otherwise the
+quantity-weighted 7-day listing median (`value7`). One bargain is not a
+market, so thinner sold evidence never overrides the asks. The ranking, the
+gone-today list, the crafts view and the value-relative alert conditions all
+read the same reference; rows and tables mark sold-based values (`valueSource
+= "sold"`, a `*` in the UI).
+
+Sold prices come from the sale ledger (schema v11): every credited sale stores
+the unit price its listing was last seen asking, and a commodity partial fill
+the listing's posted price. A reopened listing reverses its phantom sale,
+priced units included. Nothing recorded before the upgrade can be
+back-priced — those sales still count toward quantities and sale rates but
+carry no price, so the reference only switches to "sold" as fresh evidence
+accumulates after the deploy.
 
 ## Crafting (recipe file)
 
