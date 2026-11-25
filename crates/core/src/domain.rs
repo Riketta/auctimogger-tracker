@@ -974,6 +974,177 @@ pub struct PublishedFeed {
     pub size: u64,
 }
 
+// ------------------------------------------------------------ database feed (v4)
+
+/// One market's complete database feed: the content of one carrier file and
+/// of its JSON twin (contract: `addon/SPEC.md`, section 5). Built by the
+/// tracker's export service and rendered through the `FeedRenderer` port.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatabaseSnapshot {
+    /// The target the snapshot was built for: the market's key.
+    pub target: TargetId,
+    /// The market's static identity, mirrored from the target's configuration.
+    pub market: MarketMeta,
+    /// Version of the tracker that built the snapshot (diagnostics only).
+    pub tracker_version: String,
+    /// The market's freshness stamp (unix seconds): the newest source
+    /// `Last-Modified` across payload kinds, else the publish time.
+    pub generated_at: i64,
+    /// Fetch time of the newest auctions snapshot, when one is stored.
+    pub auctions_at: Option<i64>,
+    /// Fetch time of the newest commodities snapshot, when one is stored.
+    pub commodities_at: Option<i64>,
+    /// Every record of the market, sorted by item identity, then category.
+    pub entries: Vec<DatabaseEntry>,
+}
+
+impl DatabaseSnapshot {
+    /// Contract version written into every carrier and JSON twin; the addon
+    /// accepts no other.
+    pub const FEED_VERSION: u32 = 4;
+}
+
+/// The market's static identity, mirrored from the tracker's target
+/// configuration into every carrier header.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarketMeta {
+    /// API region slug (for example `eu`), when the target declares one.
+    pub region: Option<String>,
+    /// Forever ruleset id, when the target declares one.
+    pub ruleset_id: Option<i64>,
+    /// Forever auction house id, when the target declares one.
+    pub house_id: Option<i64>,
+    /// Connected-realm id (retail targets), when the target declares one.
+    pub connected_realm_id: Option<i64>,
+    /// Catalog flavor: which game version's item ids the market trades.
+    pub flavor: Flavor,
+}
+
+/// One record of a database snapshot: an identity's statistics in one market
+/// category.
+#[derive(Clone, Debug, PartialEq)]
+pub struct DatabaseEntry {
+    /// The item, or the pet species, the record describes, at canonical grain
+    /// (a pet's level, quality and breed are zeroed).
+    pub item: ItemRef,
+    /// Which auction house's evidence the record carries: an item trading in
+    /// both exports one record per category.
+    pub category: Category,
+    /// The statistics themselves, as one packed record carries them.
+    pub record: ItemRecord,
+}
+
+/// Every statistic of one identity in one market category: the content of one
+/// packed record. An optional group is absent, never zero, when the tracker
+/// has no evidence for it, and the decoder returns it absent again.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ItemRecord {
+    /// Metric block per span. A record always carries at least one span.
+    pub spans: BTreeMap<Span, MetricBlock>,
+    /// What the newest snapshot lists, and what was seen today and is gone.
+    pub live: Option<LiveQuote>,
+    /// The item's value: what buyers paid once enough of them did, else what
+    /// sellers ask.
+    pub value: Option<ValueQuote>,
+    /// Listings credited sold over the trailing 14 days; absent without
+    /// credit-eligible evidence, which stays distinct from a genuine zero.
+    pub sold_count: Option<i64>,
+    /// Credit-eligible closes over the same window that ran out unsold.
+    pub expired_count: Option<i64>,
+    /// Days the listed stock takes to clear at the window's sale pace,
+    /// saturating at 65535; absent without sold evidence, or when nothing
+    /// sold (such stock never clears).
+    pub supply_days: Option<u16>,
+    /// Lowest ask of the previous 30 days (copper).
+    pub low30: Option<i64>,
+    /// Share of those 30 days whose lowest ask sat above the live floor, in
+    /// basis points; needs a live floor and at least five days of history.
+    pub low_rank_30d_bp: Option<u16>,
+    /// The previous 30 days' lowest asks, oldest first, each stored as
+    /// `clamp(round(low * 128 / reference), 0, 255)`: a sparkline, not prices.
+    pub lows: Option<Vec<u8>>,
+    /// Vendor sell price (copper) when the catalog knows one.
+    pub vendor_price: Option<i64>,
+    /// The best-ranked recipe that makes this item.
+    pub craft: Option<CraftQuote>,
+    /// Where the live listing ranks among its category's deals; ranked live
+    /// deals only.
+    pub deal: Option<DealMark>,
+}
+
+/// The `live` group: what the newest snapshot lists, and what was seen today
+/// and is no longer listed. The group exists when either is known.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveQuote {
+    /// The item's listings in the newest snapshot; `None` when nothing of the
+    /// item is listed there.
+    pub listed: Option<LiveListing>,
+    /// Today's cheapest listing that is no longer listed (bought or
+    /// cancelled); `None` when everything seen today is still listed.
+    pub seen: Option<SeenListing>,
+}
+
+/// An item's listings in the newest snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LiveListing {
+    /// Cheapest unit price listed right now (copper).
+    pub floor: i64,
+    /// Quantity listed at exactly that price.
+    pub floor_qty: i64,
+    /// Listings of the item in the snapshot.
+    pub listed: i64,
+    /// Total quantity listed.
+    pub qty_sum: Option<i64>,
+}
+
+/// A listing seen earlier today that the newest snapshot no longer lists.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SeenListing {
+    /// The price it asked (copper).
+    pub floor: i64,
+    /// The quantity it offered.
+    pub qty: i64,
+}
+
+/// The `value` group: what the item is worth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValueQuote {
+    /// Quantity-weighted 7-day median listing price (copper); always above
+    /// zero, since without one there is no value group.
+    pub value7: i64,
+    /// Unique listings behind `value7`.
+    pub samples7: i64,
+    /// 14-day quantity-weighted median of sold prices (copper); present only
+    /// once enough priced units sold.
+    pub sold_median14: Option<i64>,
+    /// Today's listing median against the previous six days, in basis points
+    /// (signed).
+    pub trend_bp: Option<i64>,
+}
+
+/// The `craft` group: what one make of the item costs and earns.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CraftQuote {
+    /// Reagent cost per make (copper).
+    pub cost: i64,
+    /// Output value minus the house cut and the cost, per make (copper); a
+    /// loss is negative.
+    pub profit: i64,
+    /// Profit times the sale rate, rounded (copper); a loss is negative.
+    pub expected_profit: i64,
+}
+
+/// The `deal` group: where a live listing ranks among its category's deals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DealMark {
+    /// 1-based rank by score.
+    pub rank: u32,
+    /// The ranking score, in basis points.
+    pub score_bp: u32,
+    /// `1 - floor / reference`, in basis points.
+    pub discount_bp: u32,
+}
+
 // ---------------------------------------------------------------- catalog / watchlist
 
 /// Human-readable catalog record for one item id.

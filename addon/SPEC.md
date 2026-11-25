@@ -1,9 +1,11 @@
 # SPEC — AuctiMogger Database
 
-Status: **planned**. Nothing in this document is implemented yet; implementation
-follows the batches in §11. This file is the single source of truth for the
-AuctiMogger Database addon and for the tracker feed (v4) it consumes. When this
-file and the code disagree, the code wins — fix the doc in the same change.
+Status: **in progress**. Batch 1 is implemented: the domain types, the record
+codec, the carrier and JSON-twin renderers and the golden fixtures. Nothing else
+is; the rest follows the batches in §11. This file is the single source of
+truth for the AuctiMogger Database addon and for the tracker feed (v4) it
+consumes. When this file and the code disagree, the code wins — fix the doc in
+the same change.
 
 Scope: everything under `addon/` plus the tracker-side feed export, publication
 and sync command. The sniper addon (`Riketta/AuctiMogger`) has its own SPEC; §8
@@ -191,9 +193,29 @@ Market header fields:
   `ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz+."`
   (index 0–63). The alphabet contains no quote, backslash, bracket, space or
   control character.
-- **End of record:** after the last field fewer than 8 bits remain and they
-  are all zero. Anything else is a malformed record.
-- All values are integers below 2^53, so Lua 5.1 doubles hold them exactly.
+- **End of record:** after the last field at most 4 bits remain — a byte stream
+  is padded with 0, 2 or 4 zero bits — and they are all zero. Anything else is a
+  malformed record.
+- **Integers:** every value is below 2^53 in magnitude, signed or not, so Lua
+  5.1 doubles hold it exactly. A zigzag code is up to `2^54 − 2`: a decoder
+  keeps the sign bit apart and accumulates `floor(code / 2)`, so no
+  intermediate exceeds 2^53.
+
+The Rust decoder (`crates/infra/src/record.rs`) is the reference; the addon's
+Lua decoder refuses exactly the same things:
+
+| Malformed when |
+|---|---|
+| A character is not in `ALPHABET`. |
+| A varint is longer than 10 bytes, or not minimal (a trailing zero group, as in `80 00`). |
+| An integer is `2^53` or more in magnitude. |
+| The padding is more than 4 bits or not all zero. |
+| A flag word sets a bit with no meaning, or `qtySum` is set without `listed`. |
+| `supplyDays` or `lowRank30d` is above 65535; `rank`, `scoreBp` or `discountBp` is above `2^32 − 1`; the `lows` count is above 30. |
+| No span is present, or bytes follow the last field. |
+
+Every text the decoder accepts re-encodes to exactly the same text, which is
+how the two decoders are held equal.
 
 ### 5.5 Record layout
 
@@ -212,7 +234,9 @@ live:
   lflags  varint   0x01 listed  0x02 qtySum  0x04 seenToday
   [floor] [floorQty] [listed]      [qtySum]      [seenFloor] [seenQty]
 
-value:      [value7] [soldMedian14] [samples7] [trendBp zigzag]
+value:
+  vflags  varint   0x01 soldMedian14  0x02 trendBp
+  [value7] [soldMedian14] [samples7] [trendBp zigzag]
 
 evidence:
   eflags  varint   0x01 soldCount  0x02 expiredCount  0x04 supplyDays
@@ -231,6 +255,16 @@ deal:       [rank] [scoreBp] [discountBp]
 
 The span block carries exactly the seventeen v3 fields, so the sniper's math is
 unchanged. A record exists only when it has at least one span.
+
+Brackets mark a field that is written when its flag is set; the other fields
+of a present group are always written. Three flags cover more than one field,
+or depend on another:
+
+- `listed` writes `floor`, `floorQty` and `listed` together. An item seen today
+  and already gone has a `live` group without it, and then has no floor.
+- `qtySum` describes that listing summary, so it is only written inside a
+  `listed` group.
+- `seenToday` writes `seenFloor` and `seenQty` together.
 
 ### 5.6 Field definitions
 
@@ -265,7 +299,8 @@ the tracker has no evidence — never zero.
 
 Rules the encoder guarantees:
 
-- The `value` group is present only when `value7` is present.
+- The `value` group exists only with a `value7` above zero, and always carries
+  `samples7`; `soldMedian14` and `trendBp` ride along when known.
 - The `position` group is present only when the `value` group is (the sparkline
   needs a reference) and the item has at least one daily low.
 - The `craft` group attaches to the output's record in the category the craft
@@ -273,6 +308,12 @@ Rules the encoder guarantees:
 - The `deal` group attaches only to ranked live deals.
 - A pet species pooled from several variants exports spans only (no other
   group). A species with a single variant gets full groups.
+- The record encoder never fails and never wraps. A negative value in an
+  unsigned field (a tracker bug, never real data) is written as 0; a value
+  above `2^53 − 1`, and a signed value beyond `±(2^53 − 1)`, saturates there. A
+  non-finite rate is left absent rather than written as a zero rate.
+- `supplyDays` and `lowRank30d` are `u16` on both sides; `rank`, `scoreBp` and
+  `discountBp` are `u32`.
 
 ### 5.7 Absence semantics
 
@@ -282,7 +323,9 @@ Absent and zero are different for every optional field:
 - `live` present without `listed` — seen today, already gone.
 - `soldCount` absent — no credit-eligible evidence. `soldCount = 0` — evidence
   exists and nothing sold.
-- `supplyDays` absent — no sold evidence. `65535` — nothing sold (never clears).
+- `supplyDays` absent — no sold evidence, or nothing sold: such stock never
+  clears and is shown as ∞. `65535` — at least 65535 days of stock, also shown
+  as ∞.
 - `daysSinceLastSale` absent — the ledger never credited a sale.
 - `lowRank30d` absent — fewer than 5 days of history or no live floor.
 - The decoder returns `nil`, never `false` or `0`, for an absent field.
@@ -353,20 +396,50 @@ old" is more useful than an empty one, and the age is always visible.
 Pets use `"kind": "pet", "speciesID": 2546` instead of `itemID`. Absent groups
 are `null`; absent scalars are omitted.
 
+The twin is rendered from the decoded records, so it shows exactly what a
+decoder reads: a rate the ranking computes as `34 / 94` appears as `0.3617`. A
+record seen today and gone has `"live": { "seenFloor": …, "seenQty": … }` and
+no floor. Keys come in the order shown above (top level, market, entry, span
+block `n` … `qtySold`, live, craft, deal), and span blocks as `d1`, `d7`,
+`d14`, `d30`. The file is pretty-printed with two-space indentation and no
+trailing newline.
+
 ### 5.11 Golden fixtures
 
 Three committed files under `fixtures/`, all rendered from one hand-written
-snapshot that exercises every flag, both signs, the saturation values, pets and
-a dual-category id:
+snapshot (`crates/infra/tests/database_golden.rs`): the market
+`forever-eu-pvp-alliance` with nine records.
 
-| File | Consumer |
+| File | Content | Consumer |
+|---|---|---|
+| `database_v4.lua` | The carrier. | The Lua spec decodes every record. |
+| `database_v4.json` | Its JSON twin. | Humans, agents, the Rust JSON test. |
+| `database_v4_decoded.lua` | The oracle: `return { meta = {…}, items = { [id] = record, … }, commodities = {…}, pets = {…} }` — every record as a decoder must read it, rates written as `bp / 10000`. | The Lua spec compares field for field. |
+
+The nine records:
+
+| Table and key | What it exercises |
 |---|---|
-| `database_v4.lua` | The Lua spec decodes every record. |
-| `database_v4.json` | Humans, agents, the Rust JSON test. |
-| `database_v4_decoded.lua` | The Lua spec's oracle: a plain Lua table of the expected records. |
+| `items[25]` | A steady seller: four spans, listed, a rising trend, sold evidence, a 12-day sparkline, a vendor price. |
+| `items[117]` | A listing that never sells: prices near 10 000 000 000 copper (five-byte varints), a present zero sale rate and zero sold, `supplyDays` 65535, a trend of 0, the top deal. |
+| `items[2589]` | Seen today and gone: a `live` group with `seenFloor`/`seenQty` and no floor; a sold-source value. |
+| `items[194784]` | One side of the dual-category id: spans only, never a credited sale. |
+| `commodities[191460]` | A losing craft, a listing without `qtySum`, a one-day sparkline, a rising trend. |
+| `commodities[191461]` | Bulk: quantities past a billion, a full 30-day sparkline, `lowRank30d` 10000, a falling trend. |
+| `commodities[194784]` | The other side of the dual id, and the record with every group: the example of §5.10. |
+| `pets[293]` | A pooled species: one span, no ledger field. |
+| `pets[2546]` | A single-variant species with full groups. |
 
 - A Rust test re-renders all three and asserts they are byte-identical to the
-  committed files. Setting `AMTRACKER_UPDATE_GOLDEN=1` rewrites them.
+  committed files. `AMTRACKER_UPDATE_GOLDEN=1 cargo test -p amtracker-infra
+  --test database_golden` rewrites them.
+- Two more Rust tests keep the fixture honest: every carrier record must decode
+  back to the snapshot, and an edit that drops a case (a flag never set, a sign
+  never used) fails a coverage test.
+- `.gitattributes` keeps the three files LF in every working tree; the byte
+  comparison would otherwise fail on a CRLF checkout.
+- Checked under Lua 5.1.5: the carrier loads through `A.BeginMarket`, its
+  header arrives intact, and all nine words use the alphabet only.
 - A Lua spec loads `database_v4.lua`, decodes each record and asserts
   field-for-field equality with `database_v4_decoded.lua`.
 - Any change to the layout therefore fails one side unless both move together.
@@ -375,7 +448,8 @@ a dual-category id:
 
 ### 6.1 Domain types
 
-In `crates/core/src/domain.rs`, replacing the v3 payload types:
+In `crates/core/src/domain.rs` (added in batch 1; the v3 payload types leave in
+batch 2):
 
 ```rust
 pub struct DatabaseSnapshot {
@@ -387,6 +461,7 @@ pub struct DatabaseSnapshot {
     pub commodities_at: Option<i64>,
     pub entries: Vec<DatabaseEntry>,          // sorted by item, then category
 }
+// `DatabaseSnapshot::FEED_VERSION` is the contract version, 4.
 pub struct MarketMeta {
     pub region: Option<String>,
     pub ruleset_id: Option<i64>,
@@ -401,11 +476,8 @@ pub struct DatabaseEntry {
 }
 pub struct ItemRecord {
     pub spans: BTreeMap<Span, MetricBlock>,   // unchanged v3 block
-    pub live: Option<LiveQuote>,              // floor, floor_qty, listed, qty_sum, seen_floor, seen_qty
-    pub value7: Option<i64>,
-    pub sold_median14: Option<i64>,
-    pub samples7: Option<i64>,
-    pub trend_bp: Option<i64>,
+    pub live: Option<LiveQuote>,
+    pub value: Option<ValueQuote>,
     pub sold_count: Option<i64>,
     pub expired_count: Option<i64>,
     pub supply_days: Option<u16>,
@@ -416,21 +488,65 @@ pub struct ItemRecord {
     pub craft: Option<CraftQuote>,            // cost, profit, expected_profit
     pub deal: Option<DealMark>,               // rank, score_bp, discount_bp
 }
+
+// A group whose fields always travel together is one struct, so the encoder
+// cannot be handed half of it. The JSON twin and the Lua record stay flat.
+pub struct LiveQuote {
+    pub listed: Option<LiveListing>,          // None: seen today, already gone
+    pub seen: Option<SeenListing>,
+}
+pub struct LiveListing {
+    pub floor: i64,
+    pub floor_qty: i64,
+    pub listed: i64,
+    pub qty_sum: Option<i64>,
+}
+pub struct SeenListing {
+    pub floor: i64,                           // seenFloor on the wire
+    pub qty: i64,                             // seenQty on the wire
+}
+pub struct ValueQuote {
+    pub value7: i64,                          // always above zero
+    pub samples7: i64,
+    pub sold_median14: Option<i64>,
+    pub trend_bp: Option<i64>,
+}
+pub struct CraftQuote {
+    pub cost: i64,
+    pub profit: i64,
+    pub expected_profit: i64,
+}
+pub struct DealMark {
+    pub rank: u32,
+    pub score_bp: u32,
+    pub discount_bp: u32,
+}
 ```
 
-Removed: `FeedEntry`, `FeedSnapshot`. Kept under their names because they are
-generic transport ports: `FeedFormat`, `FeedRenderer`, `FeedPublisher`,
+Batch 2 removes `FeedEntry` and `FeedSnapshot`. Kept under their names because
+they are generic transport ports: `FeedFormat`, `FeedRenderer`, `FeedPublisher`,
 `PublishedFeed`.
 
 ### 6.2 Codec modules
 
-- `crates/infra/src/pack.rs` — `put_varint`, `put_zigzag`, `to_text`,
-  `from_text`, `basis_points(f64) -> u32`, `saturate_u16`.
+- `crates/infra/src/pack.rs` — `ALPHABET`, `MAX_INTEGER`, `put_varint`,
+  `put_zigzag`, `zigzag`/`unzigzag`, `to_text`, `from_text`, a `Reader`
+  (`varint`, `zigzag`, `uint`, `byte`, `flag`, `finish`), `basis_points`,
+  `saturate_u16` and `PackError`. The raw varint reader is exact over the whole
+  `u64` range; the `2^53 − 1` ceiling is applied to the integer a field carries.
 - `crates/infra/src/record.rs` — `encode(&ItemRecord) -> String` and
   `decode(&str) -> Result<ItemRecord, PackError>`. The decoder is the Rust
   reference used by tests; the game runs the Lua one.
-- `crates/infra/src/feed.rs` — `FeedCodec` renders a `DatabaseSnapshot` to the
-  carrier and the JSON twin; `FileFeedPublisher` is unchanged.
+- `crates/infra/src/feed.rs` — `FeedCodec::carrier` and `FeedCodec::json_twin`
+  render a `DatabaseSnapshot` (batch 1). The `FeedRenderer` implementation on
+  `FeedCodec` still renders v3 until batch 2 moves the port to
+  `DatabaseSnapshot`; `FileFeedPublisher` is unchanged.
+- Both renderers refuse a snapshot that would publish a wrong file rather than
+  publish it: an identity filed under the wrong table, a pet below species
+  grain, a record without a span, or keys that do not ascend (in Lua a
+  duplicate key would silently overwrite another record).
+- Header strings come from configuration, so they are escaped into pure ASCII
+  (`lua_string_literal`): no value can end its line, or the file, early.
 
 ### 6.3 Export service
 
@@ -982,9 +1098,15 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 **Rust**
 
 - `pack.rs`: varint and zigzag round-trips at 0, 127, 128, 2^32 and the
-  maximum; text round-trip; alphabet membership; padding cases.
-- `record.rs`: encode → decode round-trip over a matrix covering every flag,
-  both signs, both saturations; malformed inputs are errors, never panics.
+  maximum; the documented byte layout; text vectors pinned against the Lua
+  prototype; alphabet membership; padding; non-minimal and over-long varints.
+- `record.rs`: encode → decode round-trip over 2^17 flag combinations and over
+  every span set with every span flag; both signs, both saturations, a present
+  zero; the wire layout written field by field. Malformed inputs are errors,
+  never panics: every proper prefix of a record, every one-symbol mutation of
+  a full record, and every text of up to three symbols (266 304 of them).
+- `feed.rs`: the documented carrier text, table and key order, ASCII escaping,
+  every refusal, and the twin's nulls, omissions and key order.
 - Golden fixtures byte-stable (§5.11).
 - `DatabaseExportService`: group attachment rules, pet pooling, rank and
   craft selection, entries without spans omitted, deterministic order.
@@ -1037,6 +1159,11 @@ Each batch ends with every gate green and one commit in its repository.
 5. Gates. v3 still publishes.
 
 Done when the fixtures are committed and the Rust gates pass.
+
+**Status: done.** It also closed two gaps this spec had in §5: `floor` and
+`floorQty` now ride under the `listed` flag (a record seen today and gone has
+no floor to carry), and the `value` group gained a flag word for
+`soldMedian14` and `trendBp`.
 
 ### Batch 2 — tracker: v4 export, publish, serve; delete v3
 

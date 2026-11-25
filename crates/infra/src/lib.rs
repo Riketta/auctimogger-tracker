@@ -12,5 +12,7 @@ pub mod blizzard_oauth;
 pub mod blizzard_source;
 pub mod clock;
 pub mod feed;
+pub mod pack;
+pub mod record;
 pub mod store;
 pub mod wowhead_item_info;
