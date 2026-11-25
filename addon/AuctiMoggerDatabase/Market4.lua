@@ -1,0 +1,1 @@
+-- AuctiMogger Database market slot 4 (empty). Copy a tracker-generated feed.lua over this file, then /reload.

@@ -164,7 +164,7 @@ Market header fields:
 |---|---|---|---|
 | `version` | integer | yes | Contract version; only `4` is accepted. |
 | `trackerVersion` | string | yes | Tracker version that generated the file (diagnostics). |
-| `target` | string | yes | Tracker target id — the market's key. |
+| `target` | string | yes | Tracker target id — the market's key. It must match `[a-z0-9][a-z0-9._-]*`, the tracker's own id grammar; anything else is a malformed header. |
 | `flavor` | string | no | Catalog flavor: `forever` or `retail`. |
 | `region` | string | no | API region slug. |
 | `rulesetId` | integer | no | Forever ruleset id. |
@@ -215,6 +215,7 @@ Lua decoder refuses exactly the same things:
 | An integer is `2^53` or more in magnitude. |
 | The padding is more than 4 bits or not all zero. |
 | A flag word sets a bit with no meaning, or `qtySum` is set without `listed`. |
+| An `evidence` or `position` group is announced in `flags` with a flag word of zero: the encoder leaves such a group out. |
 | `supplyDays` or `lowRank30d` is above 65535; `rank`, `scoreBp` or `discountBp` is above `2^32 − 1`; the `lows` count is above 30. |
 | No span is present, or bytes follow the last field. |
 
@@ -356,12 +357,17 @@ Applied by the addon when a carrier registers:
 | Condition | Result |
 |---|---|
 | `version` missing or ≠ 4 | Market rejected; reported in chat and `/amdb status`. |
-| Required header field missing or malformed | Market rejected, reported. |
+| Required header field missing or malformed, or `target` outside the tracker's id grammar | Market rejected, reported. An optional field of the wrong type is dropped instead. |
 | `generatedAt` more than 5 minutes in the future | Market rejected (diverged generator), reported. |
 | `generatedAt` older than 24 hours | Market **kept and flagged stale**: tooltips render with a red age badge; `GetSpans` answers `nil` so the sniper gets no stale evidence. |
-| Same `target` already registered from another slot | The later slot replaces the earlier one; reported. |
+| Same `target` already registered from another slot | The later slot replaces the earlier one, keeps its own (later) slot number and moves to the end of the slot order; reported as a warning. |
 | A record fails to decode | That record is dropped and counted; the market stays. Reported once per market at login. |
 | Slot file is a placeholder or fails to compile | Nothing registers; a slot that fails to compile shows the client's own load error. |
+
+Every commit takes the next slot number in load order, a rejected one included,
+so the numbers match `Market1.lua` … `Market6.lua`. A rejected market is
+remembered for `/amdb status`. A commit's reports are recorded while the slot
+files load and printed once at login.
 
 Stale data is shown rather than hidden on purpose: a tooltip saying "2 days
 old" is more useful than an empty one, and the age is always visible.
@@ -703,10 +709,14 @@ folder with placeholder slots) for manual installs.
 ```
 addon/
   SPEC.md                       this file
-  .luacheckrc  .luarc.json  .stylua.toml
+  .luacheckrc  .luarc.json  .stylua.toml  .styluaignore
   spec/                         busted specs
+    helpers/                    loader (the client's `...` for specs) and encode
+                                (a spec-side encoder; never shipped)
   scripts/                      check_toc, check_compat, run_tests,
                                 assert_lls_clean, ci_local, bootstrap-tools
+  tools/                        gitignored: bootstrap-tools puts StyLua and
+                                LuaLS here
   AuctiMoggerDatabase/          deployable folder (symlink into Interface/AddOns)
     AuctiMoggerDatabase.toc
     bootstrap.lua               composition root, loads last
@@ -737,7 +747,7 @@ Core/resolve.lua
 Core/tooltip_lines.lua
 Core/anchor.lua
 
-# Market registration (no game API; must load before the slots)
+# Market registration (must load before the slots)
 Adapters/market_files.lua
 
 # Market data slots (generated files land here - see addon/SPEC.md)
@@ -762,33 +772,55 @@ bootstrap.lua
 A slot placeholder is one line:
 `-- AuctiMogger Database market slot N (empty). Copy a tracker-generated feed.lua over this file, then /reload.`
 
+The block above is the complete TOC. A line is added by the batch that creates
+its file, because `scripts/check_toc.lua` requires every listed file to exist:
+batch 3 ships it without the five tooltip and options lines, which batch 4
+adds with their files.
+
+`addon/.styluaignore` exempts `AuctiMoggerDatabase/Market*.lua` from the
+formatter: a carrier's record lines are longer than 120 columns by design, and
+the tracker, not StyLua, owns their layout.
+
 ### 7.2 Module conventions
 
 Carried over from the sniper's house style:
 
-- Lua 5.1 only. Every module starts with `local ADDON, A = ...`, registers into
-  the namespace (`A.Core.Pack = Pack`) **and** returns its table, so specs can
-  `require("AuctiMoggerDatabase.Core.pack")` from `addon/`.
+- Lua 5.1 only. Every module starts with `local _, A = ...` (or
+  `local ADDON, A = ...` where it reads the addon name: an unread binding fails
+  the unused-variable gates), registers into the namespace (`A.Core.Pack =
+  Pack`) **and** returns its table. Nothing calls `require`: the client loads
+  by TOC order. Specs load modules the way the client does, through
+  `spec/helpers/loader.lua` (`loadfile(path)("AuctiMoggerDatabase",
+  namespace)`), each from a fresh namespace, so a module that creates state at
+  load time is re-created per spec.
 - `Core/` references no game global; CI fails on any.
 - EmmyLua classes with complete `@field` lists; `@param`/`@return` everywhere;
   no bare `table`/`any` where a shape is known.
 - StyLua is canonical: spaces, indent 4, double quotes, column 120, LF.
 - Every game API used is listed in `Adapters/compat.lua` and in the
-  `.luacheckrc` / `.luarc.json` allowlists; a CI guard diffs usage against the
-  manifest.
+  `.luacheckrc` / `.luarc.json` allowlists. luacheck (a real scope analysis,
+  with an empty allowlist for `Core/`) and LuaLS enforce that code uses
+  nothing else; `scripts/check_compat.lua` diffs the three lists against each
+  other and scans the TOC-loaded files for unlisted events and `C_`
+  namespaces. The global table is reached through `rawget` / `rawset`, never
+  as `_G` by name.
 - All persisted input is treated as untrusted: validated, dropped or clamped,
   never fatal at login.
+- The clock is a seam: adapters read `A.clock()`, Core takes `now` as a
+  parameter, and nothing else reads `time`.
+- Comments and identifiers are plain ASCII. A user-facing string may carry the
+  UTF-8 punctuation this spec shows (the em dash of §7.11).
 
 ### 7.3 Core modules
 
 | Module | Responsibility |
 |---|---|
-| `Core/pack.lua` | `ALPHABET`; a `Reader` over a record string: `varint()`, `zigzag()`, `byte()`, `finish()`. |
-| `Core/record.lua` | `Record.decode(text) -> record, error`. Produces `AmdbRecord` (§7.3.1) with the derived methods of §5.8. |
-| `Core/market.lua` | `Market` (one loaded market) and `Store` (all markets): registration, lookups, primary binding, freshness tiers, change callbacks. Pure: `now` is a parameter. |
-| `Core/settings.lua` | Defaults, strict coercion, presets, per-line visibility. |
-| `Core/format.lua` | Money, percent, signed percent, count and age text with the house colors. No game API. |
-| `Core/resolve.lua` | Item identity from a number, hyperlink or `item:`/`battlepet:` string. |
+| `Core/pack.lua` | `ALPHABET`, `MAX_INTEGER`; `fromText(text)` / `toText(bytes)`; `new(text)` gives a reader over one record: `varint(field)`, `zigzag(field)`, `uint(field, maximum)`, `byte(field)`, `flag(field, allowed)`, `finish()`. A reader raises on malformed input, with the Rust `PackError` text. |
+| `Core/record.lua` | `Record.decode(text) -> record, nil` or `nil, message`; it never throws. Produces `AmdbRecord` (§7.3.1) with the derived methods of §5.8 and refuses exactly what the Rust decoder refuses. |
+| `Core/market.lua` | `Market` (one loaded market) and `Store` (all markets): header validation, registration, lookups, primary binding, freshness tiers, change callbacks (§7.3.2). Pure: `now` is a parameter. |
+| `Core/settings.lua` | `Settings.defaults()`, `coerce(saved)`, `coerceCharacter(saved)`, the per-line and switch setters, `applyPreset(settings, name)`. |
+| `Core/format.lua` | `Format.money`, `moneySigned`, `percent`, `percentBp`, `signedPercentBp`, `count`, `rate`, `age`, `days`, `supplyDays`; `COLORS` (the §7.5.4 table as escape strings), `PREFIX`, `colorize(name, text)`; the tiers `ageTier(seconds)` (muted, warn, hot, stale at 2 h, 12 h, 24 h), `rateTier(fraction)` (good at 0.5 and up, warn at 0.2 and up, else bad) and `trendTier(bp)`. |
+| `Core/resolve.lua` | `Resolve.item(value)`, `Resolve.species(value)` and `Resolve.resolve(value) -> kind, id` from a number, a hyperlink or an `item:` / `battlepet:` string. |
 | `Core/tooltip_lines.lua` | Pure line builder: record + context → lines. |
 | `Core/anchor.lua` | Pure side decision for the attached frame. |
 
@@ -813,37 +845,67 @@ Carried over from the sniper's house style:
 ---@field deal AmdbDeal|nil              -- rank, scoreBp, discountBp
 ```
 
+An absent field is `nil`, never `false` or 0 (§5.7). The derived values of §5.8
+are methods of this class: `reference()`, `valueSource()`, `saleRate14()`,
+`saleRate180d()`, `daysSinceLastSale()`, `closuresSinceLastSale()`,
+`soldPerDay()`, `atVendorFloor()` and `supplyUnbounded()`.
+
 #### 7.3.2 `Store`
 
-- `Store.new()`; `Store:begin(meta) -> builder` with `items`, `commodities`,
-  `pets`; `Store:commit()` validates and registers (§5.9) and assigns the next
-  slot number in load order.
-- `Store:markets()`, `Store:primary()`, `Store:setPrimary(target)`,
-  `Store:setExplicitPrimary(target|nil)`.
-- Primary market resolution: the explicit per-character choice; else the only
-  loaded market; else slot 1. With several markets and no choice, the login
-  status line says how to choose.
+- `Store.new()`; `Store:begin(meta) -> builder, replaced` with `items`,
+  `commodities`, `pets` (`replaced` is true when an unclosed builder was
+  discarded); `Store:commit(now) -> market|nil, reports` validates and
+  registers (§5.9). Every record is decoded once at commit: an undecodable
+  entry is dropped, counted in `market.dropped`, and not kept. A rejected
+  market is remembered: `Store:rejected()` returns `{ slot, target, reason }`
+  entries.
+- `Store:markets()` (slot order), `Store:get(target)`, `Store:primary()`,
+  `Store:primaryTarget()`, `Store:explicitPrimary()`,
+  `Store:primaryIsAmbiguous()`, `Store:setPrimary(target) -> ok, message` (the
+  user action: it fails when the target is not loaded) and
+  `Store:setExplicitPrimary(target|nil)` (the raw setter for a saved choice).
+- Primary market resolution: the explicit per-character choice when that
+  target is loaded; else the only loaded market; else the first market in slot
+  order. With several markets and no choice the login status line says how to
+  choose.
+- A market replaced by a later slot keeps the later slot number and moves to
+  the end of the slot order.
 - `Store:record(itemID, category|nil, target|nil)` and
   `Store:petRecord(speciesID, target|nil)` decode on each call — about 30 µs,
   so there is no cache to invalidate. Callers get fresh tables and may keep
   them.
-- `Store:onUpdate(callback)`; fired once after login and whenever the set of
-  markets changes.
+- `Store:onUpdate(callback) -> unsubscribe()`; `Store:fireUpdate()` runs the
+  callbacks and returns the errors they raised (one failing callback is
+  contained and the rest still run). Fired once after login, whenever the set
+  of markets changes, and when `setPrimary` changes the effective primary.
 - `Market:ageSeconds(now)` uses `generatedAt`;
   `Market:snapshotAge(kind, now)` uses `auctionsAt` / `commoditiesAt`;
   `Market:isStale(now)` is `age > 24 h`.
-- `Store:stats()` — per market: slot, target, record counts, age, stale,
-  dropped records.
+- `Store:stats(now)` — per market: slot, target, record counts (total and per
+  table), age, stale, dropped records. The `Market` itself carries `slot`,
+  `target`, the validated `meta`, `generatedAt` and `dropped`.
 
 ### 7.4 Adapters
 
-**`Adapters/market_files.lua`** — creates the `Store` at load time and
-publishes `A.BeginMarket(meta)` / `A.EndMarket()`, the only functions a carrier
-calls. `BeginMarket` replaces an unclosed builder (malformed file) and reports
-it. Reports go through one `say(text)` sink, silent unless verbose.
+**`Adapters/market_files.lua`** — creates the `Store` at load time (`A.store`)
+and publishes `A.BeginMarket(meta)` / `A.EndMarket()`, the only functions a
+carrier calls. `BeginMarket` replaces an unclosed builder (malformed file) and
+reports it; `EndMarket` commits under `pcall`, so a store error is reported
+and never fails the slot file. The module owns the seams every other adapter
+reads: the clock (`A.clock()`, the only reader of `time`), the chat sink
+(`A.chat`) and the report sink. Reports go through `A.Say(text, level)` with
+level `info`, `warn` or `bad`: each is recorded in `A.reports` and printed at
+once only when `A.verbose` is set; otherwise the bootstrap prints them once at
+login through `A.TakeReports()`. `A.FormatReport(text, level)` is the one
+place a report becomes a chat line.
 
 **`Adapters/compat.lua`** — the manifest of every game surface the addon
-touches, in tiers, plus a `check()` used by `/amdb status`:
+touches, in tiers, plus `check(env|nil) -> { ok, missing, absentOptional }`
+for `/amdb status` (it reads the global table through `rawget` and never
+throws). The module publishes the tiers as `A.Compat.requiredGlobals`,
+`requiredEvents`, `optionalGlobals`, `optionalEvents`, `authored`, the same
+five arrays under `A.Compat.manifest` (what `scripts/check_compat.lua` reads)
+and a `fallbacks` table with one sentence per optional entry:
 
 | Tier | Surface |
 |---|---|
@@ -853,8 +915,7 @@ touches, in tiers, plus a `check()` used by `/amdb status`:
 | Optional events | `MODIFIER_STATE_CHANGED`, `PLAYER_LOGOUT` |
 | Authored | `SLASH_AMDB1`, `SLASH_AMDB2`, the namespace table `AuctiMoggerDatabase` |
 
-Each optional entry has a documented fallback. No `C_AuctionHouse` function
-appears anywhere.
+No `C_AuctionHouse` function appears anywhere, not even in a string.
 
 **`Adapters/extra_tip.lua`** — the attached frame.
 
@@ -873,11 +934,15 @@ appears anywhere.
 **`Adapters/options.lua`** — the `/amdb` slash command and the settings panel
 (§7.7, §7.8).
 
-**`Adapters/public_api.lua`** — publishes the namespace table as the global `AuctiMoggerDatabase` (§7.9).
+**`Adapters/public_api.lua`** — publishes the namespace table as the global `AuctiMoggerDatabase`, and `GetAuctionBuyout` as a global function of its own (§7.9).
 
-**`bootstrap.lua`** — builds the adapters in order; owns the SavedVariables
-lifecycle (`ADDON_LOADED` → load settings; `PLAYER_LOGIN` → create the frame,
-register hooks and the panel, print the status line, fire update callbacks).
+**`bootstrap.lua`** — the composition root; builds the adapters in order and
+owns the SavedVariables lifecycle (`ADDON_LOADED` → load settings;
+`PLAYER_LOGIN` → create the frame, register hooks and the panel, print the
+status line, fire update callbacks). Batch 3 ships the `PLAYER_LOGIN` half:
+one frame, the status line of §7.11 (a pure function of the store and `now`),
+the recorded reports, then `fireUpdate()` with each callback error reported
+once in bad.
 
 ### 7.5 Tooltip design
 
@@ -942,13 +1007,13 @@ Standard level, every optional line on:
 ```
  AuctiMogger Database                    forever-eu-pvp-alliance · 25m
  Min buyout                 380g 50s  ×214   ≤ vendor
- Market value               412g 35s  sold  -3%
+ Market value               402g 10s  sold  -3%
  Sale rate (14d)            36%   (34 of 94 sold)
  Sold                       2.4/day · supply 39d
  Last sale                  2d ago
  30-day low                 350g  · 80% of days higher
  30 days                    [ sparkline: 30 bars, lowest daily ask ]
- Crafting                   210g → +190g  (exp. +68g)
+ Crafting                   2100g → +1900g  (exp. +684g)
  Deal                       #12 · 38% under value · score 0.71
  forever-eu-pvp-horde       455g   +10%
  forever-eu-pvp-blackwater  391g   -5%
@@ -1025,6 +1090,9 @@ data-driven and the panel height follows the row count: enable, preset
 buttons, one checkbox per optional line, Shift detail, the primary-market
 dropdown (loaded markets) and a status line. Without the `Settings` API the
 panel is skipped with a one-time note; the slash command covers everything.
+The adapter binds `Core/settings.lua` under another name (say `Preferences`):
+a local named `Settings` would shadow the client's global in the one file that
+calls it.
 
 ### 7.9 Public API
 
@@ -1045,7 +1113,10 @@ The addon's namespace table, published as the global `AuctiMoggerDatabase`:
 | `GetAuctionBuyout(item)` | The reference value in copper (Tekkub's convention). Chains to a previously defined `GetAuctionBuyout` when unknown. |
 
 `item` is an item id, an item link or an `item:` string; pets take a
-`battlepet:` link or a species id through `GetMarketInfo`'s `opts.species`.
+`battlepet:` link or a species id through `GetMarketInfo`'s `opts.species`; for
+a pet `itemID` is the species id and `category` is `pet`.
+`snapshotAgeSeconds` is the age of the record's own snapshot (auctions;
+commodities for a commodity), nil when the header lacks that stamp.
 
 `AmdbMarketInfo` is flat, camelCase and fresh per call: `itemID`, `category`,
 `market`, `generatedAt`, `ageSeconds`, `snapshotAgeSeconds`, `stale`,
@@ -1053,7 +1124,9 @@ The addon's namespace table, published as the global `AuctiMoggerDatabase`:
 `trend`, `soldMedian14`, `saleRate`, `saleRate180d`, `soldCount`,
 `expiredCount`, `soldPerDay`, `supplyDays`, `daysSinceLastSale`,
 `closuresSinceLastSale`, `low30`, `lowRank30d`, `vendorPrice`, `craft`, `deal`,
-`spans`. Fractions are plain numbers; absent fields are `nil`.
+`spans`. Fractions are plain numbers; absent fields are `nil`. `craft`, `deal`
+and `spans` are fresh copies. Only `GetSpans` goes silent on a stale market:
+`GetMarketInfo` still answers, with `stale` set.
 
 ### 7.10 SavedVariables
 
@@ -1065,6 +1138,12 @@ Only settings are persisted. No market data ever reaches SavedVariables.
 - No data: `AuctiMogger Database: no market data — copy the tracker's feed.lua over Market1.lua` (bad).
 - Several markets, no choice: append `· several markets loaded, pick one: /amdb market <id>`.
 - Stale market: `· forever-eu-pvp-horde is 2d old — resync` (hot).
+
+The count reads `1 market` or `N markets`. The age is the primary's, colored by
+its age tier (§7.5.4). The resync suffix is appended once per stale market
+other than the primary, whose age the line already shows. The reports recorded
+while the slot files loaded follow on their own lines, each in the color of its
+level, and the update callbacks run after them.
 
 ## 8. Sniper migration
 
@@ -1116,7 +1195,7 @@ addon, was deleted in batch 2):
 
 ```sh
 stylua --check addon
-luacheck addon
+(cd addon && luacheck .)   # luacheck reads .luacheckrc only from the current directory
 (cd addon && busted --verbose)
 lua addon/scripts/check_toc.lua addon/AuctiMoggerDatabase/AuctiMoggerDatabase.toc
 lua addon/scripts/check_compat.lua
@@ -1129,6 +1208,14 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `addon/scripts/bootstrap-tools.sh` downloads StyLua and LuaLS into the
   gitignored `tools/`; `addon/scripts/ci_local.sh` runs everything, with the
   Unix gates in WSL.
+- `addon/.styluaignore` exempts the generated `Market*.lua` slots: their record
+  lines are longer than 120 columns by design. Their luacheck rule lifts the
+  line-length limit for the same reason.
+- `.luarc.json` ignores the tool tree with `workspace.ignoreDir` (3.19.1 has
+  no `ignore` key); the `.gitignore` line `/addon/tools/` covers the checker
+  as well.
+- `addon/scripts/run_tests.lua` is a plain-Lua harness with the busted API, for
+  a machine without rocks. CI uses the real tools.
 - CI: a new `addon` job on `ubuntu-latest` with the same pins; the `docker`
   job then needs `linux` **and** `addon`.
 
@@ -1163,8 +1250,11 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `format`, `resolve`, `anchor`: table tests.
 - `tooltip_lines`: one test per line for shown and omitted, Shift detail,
   collapsed owner, each toggle.
-- `market_files`: a carrier loaded through a fake `...`; malformed header;
-  unclosed builder.
+- `market_files`: the golden carrier loaded through a fake `...` and decoded by
+  the real decoder; malformed header; unclosed builder; dropped records; the
+  report sink; the clock.
+- `compat`: the manifest tiers, a fallback per optional entry, `check()`.
+- `bootstrap`: the status line and the login flow through a stubbed frame.
 - `tooltip`: registration on both paths, lifecycle (hidden when the owner is
   not shown, hidden on clear), Shift rebuild, busy guard, errors reported once.
 - `public_api`: fresh tables per call, `GetAuctionBuyout` chaining, absent
@@ -1256,16 +1346,53 @@ negative zigzag code decodes.
    public API, market files.
 5. Lint and type configs; `addon/scripts/*`; CI `addon` job; docker `needs`.
 
-After batch 2 the repository holds no other Lua, so the gates cover every
-`.lua` file in the tree.
+After batch 2 the repository holds no other hand-written Lua (the two `.lua`
+golden fixtures are Rust test outputs and stay outside the addon's gates), so
+the gates cover every addon file.
 
 Done when every Lua gate passes locally and in CI.
+
+**Status: done.** Every §9 gate is green through
+`addon/scripts/ci_local.sh` (574 tests); the CI `addon` job first runs with
+this commit. Measured under Lua 5.1.5 on batch 2's live
+`forever-eu-pvp-alliance` carrier (7,570 records, 1.89 MB):
+
+| Quantity | Value |
+|---|---|
+| Load of the addon files before the slots | about 4 ms |
+| Slot file: compile, validate and decode every record | 276 ms, 0 dropped |
+| `Store:record` | about 32 µs, as §7.3.2 assumed |
+
+The Lua decoder was also diffed once against the Rust decoder, in a throwaway
+harness kept only in `target/`: 693,232 texts (every text up to three symbols,
+every prefix and single-symbol mutation of ten records, random byte streams,
+boundary records). Same verdict on every input, same message on every refusal,
+identical fields on all 152,464 accepted records, and every accepted text
+re-encodes to itself.
+
+It also settled details this spec had left open:
+
+- The module header is `local _, A = ...` unless the addon name is read, and
+  specs load modules through the loader rather than `require` (§7.2).
+- A TOC line arrives with the file it loads (§7.1).
+- luacheck must run from `addon/`, generated slots are exempt from StyLua and
+  the line-length limit, and LuaLS ignores the tool tree through
+  `workspace.ignoreDir` (§9).
+- Every commit takes a slot number, a rejected one included; a replaced market
+  keeps its later slot; `setPrimary` fires the update callbacks (§5.9, §7.3.2).
+- A carrier's `target` must match the tracker's id grammar (§5.2).
+- An `evidence` or `position` group announced with a zero flag word is refused
+  by both decoders, so every accepted text is an encoder's output (§5.4).
+- The reader's methods take the field name, and `supplyUnbounded()` names the
+  unbounded-supply rule of §5.8 (§7.3).
+- The report sink's surface and the `PLAYER_LOGIN` half of the bootstrap (§7.4).
 
 ### Batch 4 — addon tooltip
 
 1. `Core/anchor.lua`, `Core/tooltip_lines.lua`.
 2. `Adapters/extra_tip.lua`, `Adapters/tooltip.lua`.
 3. `Adapters/options.lua` slash command; SavedVariables.
+4. The five TOC lines of §7.1, with their files.
 4. Specs. In-game validation (§10).
 
 ### Batch 5 — addon options panel

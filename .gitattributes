@@ -5,3 +5,8 @@
 fixtures/database_v4.lua text eol=lf
 fixtures/database_v4.json text eol=lf
 fixtures/database_v4_decoded.lua text eol=lf
+
+# The addon tree is read by the Lua toolchain: StyLua checks Unix line
+# endings, and luacheck / busted run in WSL and on CI. Keep it LF in every
+# working tree.
+addon/** text eol=lf

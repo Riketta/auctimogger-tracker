@@ -57,6 +57,12 @@ pub enum PackError {
         /// The bits without meaning.
         bits: u64,
     },
+    /// A group announced in `flags` whose flag word is zero: nothing in it is
+    /// set, and no encoder writes such a group.
+    EmptyGroup {
+        /// The group's flag word.
+        field: &'static str,
+    },
     /// A value above what its field can hold.
     OutOfRange {
         /// The field being read.
@@ -81,6 +87,9 @@ impl fmt::Display for PackError {
             Self::Overflow => write!(f, "varint is longer than ten bytes or above 2^53 - 1"),
             Self::UnknownFlag { field, bits } => {
                 write!(f, "`{field}` sets undefined bits {bits:#x}")
+            }
+            Self::EmptyGroup { field } => {
+                write!(f, "`{field}` is zero in an announced group")
             }
             Self::OutOfRange { field, value } => write!(f, "`{field}` holds {value}, out of range"),
             Self::NoSpans => write!(f, "record has no span"),

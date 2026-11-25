@@ -1,0 +1,46 @@
+{
+	"runtime.version": "Lua 5.1",
+	"workspace.checkThirdParty": false,
+	"workspace.ignoreDir": [
+		"tools/**",
+		".luarocks/**"
+	],
+	"diagnostics.globals": [
+		"after_each",
+		"arg",
+		"AuctiMoggerDatabase",
+		"before_each",
+		"C_Timer",
+		"CreateFrame",
+		"describe",
+		"Enum",
+		"expose",
+		"GameTooltip",
+		"GetAuctionBuyout",
+		"insulate",
+		"issecretvalue",
+		"IsShiftKeyDown",
+		"it",
+		"ItemRefTooltip",
+		"lazy_setup",
+		"lazy_teardown",
+		"match",
+		"mock",
+		"pending",
+		"print",
+		"Settings",
+		"setup",
+		"SlashCmdList",
+		"SLASH_AMDB1",
+		"SLASH_AMDB2",
+		"spy",
+		"stub",
+		"teardown",
+		"time",
+		"TooltipDataProcessor",
+		"UIParent"
+	],
+	"diagnostics.severity": {
+		"unused-local": "Warning"
+	}
+}

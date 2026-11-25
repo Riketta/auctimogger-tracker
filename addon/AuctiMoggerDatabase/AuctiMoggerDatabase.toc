@@ -1,0 +1,34 @@
+## Interface: 16001, 120100
+## Title: AuctiMogger Database
+## Notes: Auction house market database with detailed item tooltips.|n|cffff7d0a/amdb|r for options.
+## Author: Riketta
+## Version: 0.1.0
+## Category: Auctions
+## SavedVariables: AuctiMoggerDatabaseSettings
+## SavedVariablesPerCharacter: AuctiMoggerDatabaseCharacter
+
+# Core (pure Lua - no game API, CI-enforced)
+Core/pack.lua
+Core/record.lua
+Core/market.lua
+Core/settings.lua
+Core/format.lua
+Core/resolve.lua
+
+# Market registration (must load before the slots)
+Adapters/market_files.lua
+
+# Market data slots (generated files land here - see addon/SPEC.md)
+Market1.lua
+Market2.lua
+Market3.lua
+Market4.lua
+Market5.lua
+Market6.lua
+
+# Adapters
+Adapters/compat.lua
+Adapters/public_api.lua
+
+# Composition root (must be last)
+bootstrap.lua

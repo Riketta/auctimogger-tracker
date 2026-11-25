@@ -338,7 +338,8 @@ fn put_position(out: &mut Vec<u8>, record: &ItemRecord) {
 /// Returns [`PackError`] for every malformed record and never panics: a
 /// character outside the alphabet, wrong padding, a field cut short, bytes
 /// after the last field, a value above `2^53 - 1` or above its field's range,
-/// a flag bit with no meaning, more than 30 lows, or no span at all.
+/// a flag bit with no meaning, an announced group with nothing in it, more
+/// than 30 lows, or no span at all.
 pub fn decode(text: &str) -> Result<ItemRecord, PackError> {
     let bytes = pack::from_text(text)?;
     let mut reader = Reader::new(&bytes);
@@ -467,6 +468,11 @@ type Evidence = (Option<i64>, Option<i64>, Option<u16>);
 
 fn read_evidence(reader: &mut Reader<'_>) -> Result<Evidence, PackError> {
     let eflags = reader.flag("evidence.eflags", EFLAG_MASK)?;
+    // The encoder leaves the whole group out when nothing is set, so a zero
+    // flag word cannot be its output.
+    if eflags == 0 {
+        return Err(PackError::EmptyGroup { field: "evidence.eflags" });
+    }
     let sold_count = if eflags & EFLAG_SOLD_COUNT != 0 {
         Some(reader.uint("evidence.soldCount")?)
     } else {
@@ -489,6 +495,10 @@ type Position = (Option<i64>, Option<u16>, Option<Vec<u8>>);
 
 fn read_position(reader: &mut Reader<'_>) -> Result<Position, PackError> {
     let pflags = reader.flag("position.pflags", PFLAG_MASK)?;
+    // As the evidence group: the encoder writes no empty position group.
+    if pflags == 0 {
+        return Err(PackError::EmptyGroup { field: "position.pflags" });
+    }
     let low30 = if pflags & PFLAG_LOW30 != 0 { Some(reader.uint("position.low30")?) } else { None };
     let low_rank_30d_bp =
         if pflags & PFLAG_LOW_RANK != 0 { Some(reader.uint("position.lowRank30d")?) } else { None };
@@ -1158,6 +1168,38 @@ mod tests {
             decode_bytes(&orphan),
             Err(PackError::UnknownFlag { field: "live.lflags", bits: LFLAG_QTY_SUM })
         );
+    }
+
+    /// A group announced in `flags` whose flag word is zero holds nothing. The
+    /// encoder leaves such a group out entirely, so the word is not an
+    /// encoder's output and is refused: every accepted text re-encodes to itself.
+    #[test]
+    fn an_announced_group_with_nothing_in_it_is_refused() {
+        let cases: [(Vec<u8>, PackError); 4] = [
+            (
+                [opening(GROUP_EVIDENCE), vec![0x00]].concat(),
+                PackError::EmptyGroup { field: "evidence.eflags" },
+            ),
+            (
+                [opening(GROUP_EVIDENCE | GROUP_VENDOR), vec![0x00, 0x00]].concat(),
+                PackError::EmptyGroup { field: "evidence.eflags" },
+            ),
+            (
+                [opening(GROUP_POSITION), vec![0x00]].concat(),
+                PackError::EmptyGroup { field: "position.pflags" },
+            ),
+            (
+                [opening(GROUP_POSITION | GROUP_VENDOR), vec![0x00, 0x00]].concat(),
+                PackError::EmptyGroup { field: "position.pflags" },
+            ),
+        ];
+        for (bytes, expected) in cases {
+            assert_eq!(decode_bytes(&bytes), Err(expected), "{bytes:02x?}");
+        }
+        // One set flag is a group: a present zero sold count is still evidence.
+        let present = [opening(GROUP_EVIDENCE), vec![0x01, 0x00]].concat();
+        let record = decode_bytes(&present).expect("a zero sold count is evidence");
+        assert_eq!(record.sold_count, Some(0));
     }
 
     #[test]

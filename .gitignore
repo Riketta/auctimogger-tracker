@@ -6,3 +6,6 @@ config.toml
 *.sqlite3
 *.sqlite3-wal
 *.sqlite3-shm
+/addon/tools/
+/addon/lls.log
+/addon/.luacheckcache
