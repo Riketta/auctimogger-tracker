@@ -1,15 +1,16 @@
 # SPEC — AuctiMogger Database
 
-Status: **in progress**. Batches 1 to 7 are implemented: the domain types,
+Status: **in progress**. All eight batches are implemented: the domain types,
 the record codec, the carrier and JSON-twin renderers, the golden fixtures,
 the tracker side that feeds them — the export service, publication and
 the v4 routes, feed v3 being gone — the addon's core, its tooltip, the
 `/amdb` command and the options panel, the tracker's addon bundle with
-the `addon-sync` command, and the sniper reading the database through its
-`MarketDatabasePort`. The sniper's tooltip removal (batch 8) follows in
-§11. This file is the single source of truth for the AuctiMogger Database
-addon and for the tracker feed (v4) it consumes. When this file and the code
-disagree, the code wins — fix the doc in the same change.
+the `addon-sync` command, the sniper reading the database through its
+`MarketDatabasePort`, and the sniper's own tooltip removed (§8). The
+in-game validation of §10 remains the owner's. This file is the single
+source of truth for the AuctiMogger Database addon and for the tracker feed
+(v4) it consumes. When this file and the code disagree, the code wins — fix
+the doc in the same change.
 
 Scope: everything under `addon/` plus the tracker-side feed export, publication
 and sync command. The sniper addon (`Riketta/AuctiMogger`) has its own SPEC; §8
@@ -1399,13 +1400,26 @@ ring and its seen marks. Everything that stored tracker data moves out.
 - The sniper's SPEC.md, AGENTS.md (rule 2: one write path) and README are
   updated.
 
-**Batch 8 — remove the sniper's tooltip**
+**Batch 8 — remove the sniper's tooltip** (done in `Riketta/AuctiMogger`)
 
-- Delete `ui/item_tooltip.lua` and its spec; drop the Session-tab "Item tips"
-  button, the `/am tooltip` command and the `AuctiMoggerUI.itemTooltip` key
-  (pruned on load).
-- Remove the tooltip's manifest and allowlist entries. (CI already packages
-  only `AuctiMogger`, and `/am ingest` left with batch 7.)
+- Deleted `ui/item_tooltip.lua` and its spec, with the Session-tab "Item tips"
+  button, the `/am tooltip` command and the GUI's `itemTooltip` dependency;
+  the `AuctiMoggerUI` class lost its `itemTooltip` field.
+- `bootstrap.lua` prunes the obsolete `AuctiMoggerUI.itemTooltip` key as soon
+  as the SavedVariables are anchored, so a blob saved by the previous build
+  stops carrying it at the next logout. Nothing else reads the key.
+- The compat manifest lost the four surfaces only the tooltip used:
+  `issecretvalue` (optional globals), `TooltipDataProcessor` and
+  `ItemRefTooltip` (GUI-deferred) and `MODIFIER_STATE_CHANGED` (optional
+  events). `GameTooltip` and `IsShiftKeyDown` stay listed: the GUI's own
+  hover tooltips and the list tab's shift-click use them. The lint and type
+  allowlists (`.luacheckrc`, `.luarc.json`) lost the same three names, and
+  the compat spec's "tooltip surface is deferred, never GUI-gating" test
+  left with the surface.
+- The item-detail popup is now the sniper's one display path for an old
+  entry's spans.
+- The sniper's SPEC.md, AGENTS.md and README are updated; the README's
+  install step names the database addon as the source of item tooltips.
 
 ## 9. Quality gates
 
@@ -1535,6 +1549,13 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   adapter and history store — every record equal to the oracle, the
   valuations and the evidence ceiling on real numbers.
 
+**Sniper (batch 8, in its own repository)**
+
+- The full suite without the tooltip: its eleven specs are gone, and
+  `compat_spec` keeps the manifest tiers without the tooltip's own test.
+- The prune of `AuctiMoggerUI.itemTooltip` has no spec: `bootstrap.lua` does
+  not load under busted. In-game step 8 covers it.
+
 **In game** (owner, on Forever, `/console scriptErrors 1`)
 
 1. Install the addon folder; copy one carrier over `Market1.lua`; add two more
@@ -1554,6 +1575,10 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
    age; tracked items value on `tracker-d1`; a deal still arms; settings and
    the snipe list survive `/reload`; with the database addon disabled the
    sniper still values on its live tail and says the database is not loaded.
+   No **Item tips** button on the Session tab, `/am tooltip` prints the
+   usage, a hovered item shows the database addon's market block alone (no
+   second, inline block), and after a logout `AuctiMoggerUI.itemTooltip` is
+   gone from the SavedVariables.
 9. Retail client, if available: steps 1–3 and 7.
 
 ## 11. Batches and steps
@@ -1784,6 +1809,18 @@ spec had left open:
   version is still wiped.
 
 ### Batch 8 — sniper tooltip removal and cleanup (§8)
+
+**Status: done**, in `Riketta/AuctiMogger`: every gate of that repository is
+green through its own `scripts/ci_local.sh` (827 tests — the tooltip's eleven
+and the compat manifest's one left with the code). In-game validation (§10,
+step 8) is the owner's and was not run. It also settled a detail this spec
+had left open:
+
+- "Pruned on load" is one line in the composition root, written through the
+  SavedVariables global rather than its typed alias, so the class carries no
+  obsolete field (§8).
+- The button was the last link of the Session tab's toggle chain, so the
+  chain closes up without a change to its anchoring.
 
 ## 12. Risks and mitigations
 
