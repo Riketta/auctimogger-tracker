@@ -178,7 +178,7 @@ jobs:
     # Runs on version tags and on manual dispatch (to keep the pipeline warm);
     # artifacts are only PUBLISHED from tags (see the publish job).
     if: github.ref_type == 'tag' || github.event_name == 'workflow_dispatch'
-    needs: [linux]
+    needs: [linux, addon]
     strategy:
       fail-fast: false
       matrix:
@@ -224,6 +224,15 @@ jobs:
           Copy-Item config.example.toml, recipes.example.toml "dist/$name/"
           Compress-Archive -Path "dist/$name" -DestinationPath "dist/$name.zip"
           Remove-Item -Recurse -Force "dist/$name"
+
+      # The addon ships with the release (addon/SPEC.md, section 6.7): the
+      # deployable folder with its placeholder slots, zipped once (the Linux
+      # leg) with the folder at the archive root, so it extracts straight into
+      # Interface/AddOns. The checkout keeps it LF through .gitattributes.
+      - name: Package (addon)
+        if: runner.os == 'Linux'
+        run: zip -r -X ../dist/AuctiMoggerDatabase.zip AuctiMoggerDatabase
+        working-directory: addon
 
       - uses: actions/upload-artifact@v4
         with:

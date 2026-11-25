@@ -6,7 +6,9 @@ use std::{
         Path,
         PathBuf,
     },
+    str::FromStr,
     sync::Arc,
+    time::Duration,
 };
 
 use amtracker_core::{
@@ -23,6 +25,11 @@ use amtracker_core::{
         SpaceMaintenance,
     },
     services::{
+        addon_sync::{
+            MarketPlacement,
+            ADDON_NAME,
+            SLOT_COUNT,
+        },
         chain::ChainedItemInfo,
         cycle::IngestCycleService,
         database_export::{
@@ -152,6 +159,63 @@ enum Commands {
         #[arg(long)]
         rebuild_since: Option<i64>,
     },
+    /// Install or update the `AuctiMogger` Database addon from a running
+    /// tracker: the addon's own files into `<addons-dir>/AuctiMoggerDatabase/`,
+    /// then every market the tracker reports into the six slots. A carrier is
+    /// verified before it replaces a slot, so nothing lands that the addon
+    /// would refuse at load. `/reload` in game loads the new files.
+    AddonSync {
+        /// Base URL of the tracker (for example `http://127.0.0.1:8080`)
+        #[arg(long)]
+        url: String,
+        /// The game's Interface/AddOns directory
+        #[arg(long)]
+        addons_dir: PathBuf,
+        /// Bind one market to one slot, as <target>=<slot> (1-6); repeatable.
+        /// Every other market fills the free slots in the tracker's order.
+        #[arg(long = "market", value_name = "TARGET=SLOT")]
+        market: Vec<MarketArg>,
+        /// Leave the addon's own files alone and sync the markets only
+        #[arg(long)]
+        no_addon: bool,
+        /// Leave the market slots alone and sync the addon's files only
+        #[arg(long)]
+        no_markets: bool,
+        /// Report what would change and write nothing
+        #[arg(long)]
+        dry_run: bool,
+        /// HTTP timeout of one request, in seconds
+        #[arg(long, default_value_t = 60)]
+        timeout_secs: u64,
+    },
+}
+
+/// One `--market <target>=<slot>` placement of `addon-sync`.
+#[derive(Clone, Debug)]
+struct MarketArg {
+    target: String,
+    slot: u8,
+}
+
+impl FromStr for MarketArg {
+    type Err = String;
+
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        let (target, slot) = text
+            .split_once('=')
+            .ok_or_else(|| format!("expected <target>=<slot>, got '{text}'"))?;
+        let slot = slot
+            .trim()
+            .parse::<u8>()
+            .map_err(|_| format!("the slot of '{text}' is not a whole number"))?;
+        if !(1..=SLOT_COUNT).contains(&slot) {
+            return Err(format!("the slot of '{text}' is {slot}; the addon has 1-{SLOT_COUNT}"));
+        }
+        if !amtracker_core::config::is_valid_target_id(target) {
+            return Err(format!("'{target}' is not a tracker target id ([a-z0-9][a-z0-9._-]*)"));
+        }
+        Ok(Self { target: target.to_owned(), slot })
+    }
 }
 
 fn main() {
@@ -184,6 +248,23 @@ fn main() {
                 run_backfill_item_hours(&loaded.tracker, rebuild_since)
             })
         }
+        Commands::AddonSync {
+            url,
+            addons_dir,
+            market,
+            no_addon,
+            no_markets,
+            dry_run,
+            timeout_secs,
+        } => run_addon_sync(
+            &url,
+            &addons_dir,
+            market.into_iter().map(MarketPlacement::from).collect(),
+            !no_addon,
+            !no_markets,
+            dry_run,
+            timeout_secs,
+        ),
     };
     exit(code);
 }
@@ -905,6 +986,145 @@ fn run_export_feed(
         return 1;
     }
     0
+}
+
+impl From<MarketArg> for MarketPlacement {
+    fn from(arg: MarketArg) -> Self {
+        Self { slot: arg.slot, target: arg.target }
+    }
+}
+
+/// Install or update the `AuctiMogger` Database addon from a running tracker
+/// (`addon/SPEC.md`, section 6.7). Needs no config and no store: the tracker
+/// is read over HTTP and the game's addons folder is written. A file is
+/// replaced only when it differs; a market replaces its slot only after its
+/// carrier passed verification; a dry run writes nothing. Exit status 0 only
+/// when nothing failed.
+fn run_addon_sync(
+    url: &str,
+    addons_dir: &Path,
+    placements: Vec<MarketPlacement>,
+    sync_addon: bool,
+    sync_markets: bool,
+    dry_run: bool,
+    timeout_secs: u64,
+) -> i32 {
+    use amtracker_core::services::addon_sync::{
+        AddonSyncService,
+        SyncOptions,
+    };
+
+    // The game's own folder is never created: a mistyped path must not grow
+    // an AddOns tree of its own. Only the addon's folder below it is.
+    if !addons_dir.is_dir() {
+        eprintln!(
+            "error: --addons-dir '{}' is not a directory (the folder that holds Interface/AddOns is one level too high)",
+            addons_dir.display()
+        );
+        return 1;
+    }
+    let remote = match amtracker_infra::addon_sync::HttpTrackerAddon::new(
+        url,
+        Duration::from_secs(timeout_secs),
+    ) {
+        Ok(remote) => remote,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    let folder = amtracker_infra::addon_sync::AddonFolder::new(addons_dir.join(ADDON_NAME));
+    let service = AddonSyncService::new(Arc::new(remote), Arc::new(folder), Arc::new(SystemClock));
+    let options = SyncOptions { placements, sync_addon, sync_markets, dry_run };
+    let report = match service.run(&options) {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("error: {error}");
+            return 1;
+        }
+    };
+    print_sync_report(&report, url, dry_run);
+    i32::from(!report.is_clean())
+}
+
+/// The sync's table: what was written, what each slot holds and its age, then
+/// every failure on stderr.
+fn print_sync_report(
+    report: &amtracker_core::services::addon_sync::SyncReport,
+    url: &str,
+    dry_run: bool,
+) {
+    use amtracker_core::services::addon_sync::{
+        format_age,
+        ChangeKind,
+    };
+
+    let wrote = if dry_run { "to write" } else { "wrote" };
+    let written = if dry_run { "to write" } else { "written" };
+    if report.addon_skipped {
+        println!("addon files: skipped (--no-addon)");
+    } else if let Some(manifest) = &report.manifest {
+        println!(
+            "{} {} (feed v{}): {} file(s) from {url} - {} {}, {} unchanged",
+            manifest.addon,
+            manifest.version,
+            manifest.feed_version,
+            manifest.files.len(),
+            report.addon_count(ChangeKind::Written) + report.addon_count(ChangeKind::WouldWrite),
+            written,
+            report.addon_count(ChangeKind::Unchanged)
+        );
+    }
+    for file in &report.addon {
+        if matches!(file.change.kind(), ChangeKind::Written | ChangeKind::WouldWrite) {
+            println!("  {wrote} {} ({} bytes)", file.path, thousands(file.bytes));
+        }
+    }
+    if report.markets_skipped {
+        println!("markets: skipped (--no-markets)");
+    } else {
+        println!(
+            "markets: {} {}, {} unchanged",
+            report.market_count(ChangeKind::Written) + report.market_count(ChangeKind::WouldWrite),
+            written,
+            report.market_count(ChangeKind::Unchanged)
+        );
+        if !report.markets.is_empty() {
+            println!("  {:>4}  {:<28} {:>12}  {:>5}", "slot", "target", "bytes", "age");
+        }
+        for market in &report.markets {
+            println!(
+                "  {:>4}  {:<28} {:>12}  {:>5}",
+                market.slot,
+                market.target,
+                thousands(market.bytes),
+                market.age_seconds.map_or_else(|| "-".to_owned(), format_age)
+            );
+        }
+    }
+    for failure in report.failures() {
+        eprintln!("error: {failure}");
+    }
+    if dry_run {
+        println!("dry run: nothing was written.");
+    } else if report.is_clean() {
+        println!("done - /reload in game loads the new market files.");
+    } else {
+        eprintln!("addon-sync finished with failures; every file that failed is as it was.");
+    }
+}
+
+/// `1234567` as `1,234,567`.
+fn thousands(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 fn run_metrics(

@@ -2398,13 +2398,16 @@ async fn api_is_agent_discoverable_index_openapi_and_docs() {
     assert_eq!(index_paths, spec_paths, "/api must list exactly the spec's paths");
 
     // The spec matches the router's route table in both directions: same
-    // path set, same methods per path.
+    // path set, same methods per path. The router spells its one wildcard
+    // route `{*path}` (axum's syntax); the spec spells the same route `{path}`.
     let table = api_routes();
-    let mut table_paths: Vec<&str> = table.iter().map(|(path, _, _)| *path).collect();
+    let spelled: Vec<String> =
+        table.iter().map(|(path, _, _)| path.replace("{*path}", "{path}")).collect();
+    let mut table_paths: Vec<&str> = spelled.iter().map(String::as_str).collect();
     table_paths.sort_unstable();
     assert_eq!(spec_paths, table_paths, "spec paths must equal the router table");
     for (path, methods, _) in &table {
-        let ops = &spec["paths"][*path];
+        let ops = &spec["paths"][path.replace("{*path}", "{path}")];
         assert!(ops.is_object(), "undocumented route: {path}");
         let spec_methods: Vec<&str> =
             ops.as_object().expect("path operations").keys().map(String::as_str).collect();
@@ -2418,7 +2421,8 @@ async fn api_is_agent_discoverable_index_openapi_and_docs() {
         let concrete = path
             .replace("{target_id}", TARGET)
             .replace("{item_id}", "2589")
-            .replace("{species_id}", "264");
+            .replace("{species_id}", "264")
+            .replace("{*path}", "AuctiMoggerDatabase.toc");
         for method in ["GET", "POST", "DELETE"] {
             let status = probe_status(&router, method, &concrete).await;
             if methods.contains(&method.to_lowercase().as_str()) {
@@ -3151,5 +3155,208 @@ async fn crafts_page_without_recipes_says_so() {
     assert_eq!(json["crafts"].as_array().map(std::vec::Vec::len), Some(0));
     assert!(json["recipesFile"].is_null());
 
+    std::fs::remove_dir_all(&root).ok();
+}
+
+// ---------------------------------------------------------- addon bundle
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    use sha2::{
+        Digest,
+        Sha256,
+    };
+    let digest = Sha256::digest(bytes);
+    let mut out = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        // `String`'s `fmt::Write` impl is infallible.
+        let _ = write!(out, "{byte:02x}");
+    }
+    out
+}
+
+/// The addon routes serve the bundle the binary was built with: the manifest
+/// is what the sync's own client parses, every listed file answers with its
+/// manifest hash and size, and nothing else does — the lookup reads the
+/// embedded table, so no path reaches outside it.
+#[tokio::test]
+async fn addon_routes_serve_the_embedded_bundle() {
+    let (state, root) = test_state(None);
+    let router = build_router_arc(Arc::clone(&state));
+
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder().uri("/api/addon/manifest").body(Body::empty()).expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("application/json")
+    );
+    let body = response.into_body().collect().await.expect("body").to_bytes();
+    let manifest = amtracker_infra::addon_sync::parse_manifest(&body)
+        .expect("the sync client parses the served manifest");
+    assert_eq!(manifest.addon, "AuctiMoggerDatabase");
+    assert_eq!(manifest.feed_version, 4);
+    assert_eq!(manifest.version, amtracker_server::addon_bundle::toc_version());
+    assert!(manifest.files.iter().any(|file| file.path == "Core/pack.lua"), "nested paths");
+    assert!(manifest.files.iter().any(|file| file.path == "Market1.lua"), "slot placeholders");
+
+    for file in &manifest.files {
+        let (status, body) = get(router.clone(), &format!("/api/addon/file/{}", file.path)).await;
+        assert_eq!(status, StatusCode::OK, "{}", file.path);
+        assert_eq!(body.len(), usize::try_from(file.size).expect("size"), "{}", file.path);
+        assert_eq!(sha256_hex(body.as_bytes()), file.sha256, "{}", file.path);
+    }
+
+    // Verbatim, the way the tree holds them, under the right content type.
+    let (status, body) = get(router.clone(), "/api/addon/file/AuctiMoggerDatabase.toc").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body, include_str!("../../../addon/AuctiMoggerDatabase/AuctiMoggerDatabase.toc"));
+    let response = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/addon/file/Core/pack.lua")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get("content-type").and_then(|value| value.to_str().ok()),
+        Some("text/x-lua; charset=utf-8")
+    );
+    let body = response.into_body().collect().await.expect("body").to_bytes();
+    assert_eq!(
+        body.as_ref(),
+        include_str!("../../../addon/AuctiMoggerDatabase/Core/pack.lua").as_bytes()
+    );
+
+    // A percent-encoded slash names the same file.
+    let (status, _) = get(router.clone(), "/api/addon/file/Core%2Fpack.lua").await;
+    assert_eq!(status, StatusCode::OK);
+
+    for path in ["nope.lua", "../Cargo.toml", "Core/../../README.md", "Market0.lua", ""] {
+        let (status, _) = get(router.clone(), &format!("/api/addon/file/{path}")).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{path}");
+    }
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// `addon-sync` end to end against a live socket: the real HTTP client and
+/// the real on-disk folder talk to this very router. One run installs the
+/// addon and every market; a second has nothing left to write; a slot that
+/// holds a market is never replaced by its placeholder.
+#[tokio::test]
+async fn addon_sync_installs_the_bundle_and_the_markets_from_a_live_server() {
+    use amtracker_core::services::addon_sync::{
+        AddonSyncService,
+        ChangeKind,
+        SyncOptions,
+    };
+    use amtracker_infra::addon_sync::{
+        AddonFolder,
+        HttpTrackerAddon,
+    };
+
+    let (state, root) = test_state(None);
+    let snapshot = DatabaseSnapshot {
+        target: TargetId(TARGET.into()),
+        market: MarketMeta {
+            region: Some("us".into()),
+            ruleset_id: None,
+            house_id: None,
+            connected_realm_id: Some(4),
+            flavor: Flavor::default(),
+        },
+        tracker_version: "0.1.0-test".into(),
+        generated_at: state.clock.now() - 1_500,
+        auctions_at: None,
+        commodities_at: None,
+        entries: Vec::new(),
+    };
+    let lua = FeedCodec.render(&snapshot, FeedFormat::Lua).expect("render");
+    state.publisher.publish(&TargetId(TARGET.into()), FeedFormat::Lua, &lua).expect("publish");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let base = format!("http://{}", listener.local_addr().expect("address"));
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, build_router_arc(state)).await;
+    });
+
+    // The sync is blocking (ureq); it runs off the runtime that serves.
+    let run = |base: String, addons_dir: PathBuf, options: SyncOptions| {
+        tokio::task::spawn_blocking(move || {
+            AddonSyncService::new(
+                Arc::new(
+                    HttpTrackerAddon::new(&base, std::time::Duration::from_secs(30))
+                        .expect("client"),
+                ),
+                Arc::new(AddonFolder::new(addons_dir.join("AuctiMoggerDatabase"))),
+                Arc::new(SystemClock),
+            )
+            .run(&options)
+        })
+    };
+    let addons_dir = root.join("AddOns");
+    let first = run(base.clone(), addons_dir.clone(), SyncOptions::default())
+        .await
+        .expect("join")
+        .expect("run");
+    assert!(first.is_clean(), "{:#?}", first.failures());
+    assert_eq!(
+        first.addon_count(ChangeKind::Written),
+        first.manifest.as_ref().expect("manifest").files.len()
+    );
+    assert_eq!(first.markets.len(), 1);
+    assert_eq!(first.markets[0].slot, 1);
+    assert_eq!(first.markets[0].target, TARGET);
+
+    let addon = addons_dir.join("AuctiMoggerDatabase");
+    assert_eq!(
+        std::fs::read(addon.join("AuctiMoggerDatabase.toc")).expect("toc"),
+        include_str!("../../../addon/AuctiMoggerDatabase/AuctiMoggerDatabase.toc").as_bytes()
+    );
+    assert_eq!(
+        std::fs::read(addon.join("Core/pack.lua")).expect("nested file"),
+        include_str!("../../../addon/AuctiMoggerDatabase/Core/pack.lua").as_bytes()
+    );
+    assert_eq!(std::fs::read(addon.join("Market1.lua")).expect("the market"), lua.as_slice());
+    assert_eq!(
+        std::fs::read(addon.join("Market2.lua")).expect("placeholder 2"),
+        include_str!("../../../addon/AuctiMoggerDatabase/Market2.lua").as_bytes()
+    );
+
+    // The second run: nothing left to write, and the filled slot still holds
+    // its market rather than the placeholder.
+    let second =
+        run(base, addons_dir.clone(), SyncOptions::default()).await.expect("join").expect("run");
+    assert!(second.is_clean(), "{:#?}", second.failures());
+    assert_eq!(
+        second.addon_count(ChangeKind::Unchanged),
+        second.manifest.as_ref().expect("manifest").files.len()
+    );
+    assert_eq!(second.market_count(ChangeKind::Unchanged), 1);
+    assert_eq!(std::fs::read(addon.join("Market1.lua")).expect("the market"), lua.as_slice());
+
+    server.abort();
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The dashboard's feed section points at the addon manifest and names the
+/// command that installs it.
+#[tokio::test]
+async fn dashboard_links_the_addon_manifest() {
+    let (state, root) = test_state(None);
+    let (status, body) = get(build_router_arc(Arc::clone(&state)), "/").await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(body.contains("href=\"/api/addon/manifest\""), "manifest link missing");
+    assert!(body.contains("addon-sync --url"), "the install command is named");
     std::fs::remove_dir_all(&root).ok();
 }

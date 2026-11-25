@@ -19,6 +19,9 @@ amtracker-core = { path = "../core" }
 axum = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# SHA-256 of the embedded addon files for /api/addon/manifest (the same
+# version the infrastructure crate hashes snapshot archives with).
+sha2 = "0.10"
 thiserror = "2"
 time = { version = "0.3", features = ["formatting", "macros"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }

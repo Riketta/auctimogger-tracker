@@ -3,6 +3,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addon_bundle;
 pub mod config_file;
 pub mod recipe_reload;
 pub mod scheduler;

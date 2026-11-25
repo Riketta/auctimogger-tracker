@@ -324,6 +324,15 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
     }
     body.push_str("</div>");
 
+    // The addon itself comes from this tracker: one line to its manifest and
+    // to the command that installs it.
+    let _ = write!(
+        body,
+        "<p class=\"muted\" style=\"margin:.2rem 0 0\">The addon itself: <a href=\"/api/addon/manifest\">/api/addon/manifest</a> — \
+         install or update it in game with <code>auctimogger-tracker addon-sync --url &lt;this tracker&gt; \
+         --addons-dir &lt;Interface/AddOns&gt;</code>.</p>"
+    );
+
     body.push_str("<h2>recent cycles</h2>");
     if cycles.is_empty() {
         body.push_str(

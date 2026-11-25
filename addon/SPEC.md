@@ -1,14 +1,14 @@
 # SPEC — AuctiMogger Database
 
-Status: **in progress**. Batches 1 to 5 are implemented: the domain types,
+Status: **in progress**. Batches 1 to 6 are implemented: the domain types,
 the record codec, the carrier and JSON-twin renderers, the golden fixtures,
 the tracker side that feeds them — the export service, publication and
-the v4 routes, feed v3 being gone — and the addon's core, its tooltip, the
-`/amdb` command and the options panel. The tracker's addon bundle and sync
-command, and the sniper's migration follow in the batches of §11. This file
-is the single source of truth for the AuctiMogger Database addon and for the
-tracker feed (v4) it consumes. When this file and the code disagree, the code
-wins — fix the doc in the same change.
+the v4 routes, feed v3 being gone — the addon's core, its tooltip, the
+`/amdb` command and the options panel, and the tracker's addon bundle with
+the `addon-sync` command. The sniper's migration follows in the batches of
+§11. This file is the single source of truth for the AuctiMogger Database
+addon and for the tracker feed (v4) it consumes. When this file and the code
+disagree, the code wins — fix the doc in the same change.
 
 Scope: everything under `addon/` plus the tracker-side feed export, publication
 and sync command. The sniper addon (`Riketta/AuctiMogger`) has its own SPEC; §8
@@ -638,32 +638,44 @@ the live group comes from the snapshot directly.
 | `GET /feed.lua?target=` | Serves the v4 carrier. Unchanged path and content type. |
 | `GET /api/feed.json?target=` | Serves the v4 JSON twin. |
 | `GET /feed-slim.lua` | **Removed.** |
-| `GET /api/addon/manifest` | New (§6.7). |
-| `GET /api/addon/file/<path>` | New (§6.7). |
+| `GET /api/addon/manifest` | The embedded addon bundle's manifest (§6.7). |
+| `GET /api/addon/file/{path}` | One embedded addon file (§6.7). |
 
 `ResponseCache::slim_feed` is removed, and with it the watchlist revision
-counter that keyed the slim feed's cache (`WatchlistService::revision`). The
-OpenAPI document, the `/api` directory, the dashboard's feed links and the
-drift test are updated.
+counter that keyed the slim feed's cache (`WatchlistService::revision`).
+`GET /api` links the addon manifest, the dashboard's feed section points at
+it and at `addon-sync`, and the OpenAPI document, the `/api` directory and
+the drift test cover every route: the file route is axum's wildcard
+`{*path}` on the router and `{path}` in the document.
 
 ### 6.6 CLI
 
 - `export-feed` loses `--slim`; it writes `feed.lua` and `feed.json` under
   `<out>/<target>/`.
-- New `addon-sync` (§6.7).
+- New `addon-sync` (§6.7): it needs no config and no store, only a running
+  tracker and the game's addons folder.
 
 ### 6.7 Addon bundle and sync command
 
 The server binary embeds the addon's static files with `include_str!` in
-`crates/server/src/addon_bundle.rs`, so the served addon always matches the
-served feed format.
+`crates/server/src/addon_bundle.rs` — the TOC and every file it loads, the six
+slot placeholders included — so the served addon always matches the served
+feed format.
 
 - `GET /api/addon/manifest` —
   `{ "addon": "AuctiMoggerDatabase", "version": "0.1.0", "feedVersion": 4,
-  "files": [ { "path", "sha256", "size" } ] }`.
-- `GET /api/addon/file/<path>` — one embedded file; any other path is 404.
+  "files": [ { "path", "sha256", "size" } ] }`. `version` is the addon's
+  own version, read from its TOC (`## Version:`) and pinned by a test to the
+  addon's `A.VERSION`; `feedVersion` is `DatabaseSnapshot::FEED_VERSION`. The
+  files are listed in the table's order, the TOC first.
+- `GET /api/addon/file/{path}` — one embedded file, verbatim: `text/x-lua`
+  for a `.lua` file, `text/plain` for the TOC, `Cache-Control: no-cache` (the
+  URLs carry no version, so every cache asks again). Any other path is 404:
+  the lookup reads the embedded table and never the filesystem.
 - A test fails when the embedded table and `addon/AuctiMoggerDatabase/` on
-  disk disagree in either direction.
+  disk disagree in either direction — a file on one side only, or bytes that
+  differ — and when a file the TOC loads is missing from the table. A new
+  addon file is added to the table in the change that creates it.
 
 ```
 auctimogger-tracker addon-sync --url <base> --addons-dir <Interface/AddOns>
@@ -671,18 +683,46 @@ auctimogger-tracker addon-sync --url <base> --addons-dir <Interface/AddOns>
                               [--no-markets] [--dry-run] [--timeout-secs N]
 ```
 
-1. Write the addon's static files into `<addons-dir>/AuctiMoggerDatabase/`
-   when their hash differs (atomic: temp file, then rename). Slots are written
-   as placeholders, so a fresh install is complete.
-2. Markets: `--market` placements first; then every target reported by
-   `GET /api/health`, in order, into the free slots 1–6.
-3. For each market fetch `feed.lua?target=` and verify before replacing:
-   header line present, `version = 4`, `target` as expected.
-4. Print a table (slot, target, bytes, age) and remind to `/reload`.
-   Non-zero exit on any failure; HTTP through the `ureq` already in `infra`.
+The use case is `crates/core/src/services/addon_sync.rs`, run over two
+ports: the tracker over HTTP (`HttpTrackerAddon`, `crates/infra/src/addon_sync.rs`,
+`ureq`) and the addon folder on disk (`AddonFolder`: a temporary file beside
+the target, then a rename). Placement and verification are therefore
+unit-tested without a network or a disk.
 
-The release workflow additionally attaches `AuctiMoggerDatabase.zip` (the addon
-folder with placeholder slots) for manual installs.
+1. Write the addon's static files into `<addons-dir>/AuctiMoggerDatabase/`
+   when their bytes differ from what the folder holds. The sync's client hands
+   a download to the service only after it matched its manifest entry's
+   SHA-256, and the service holds it to the entry's size besides.
+   A slot file is the exception: it holds a market between syncs, so its
+   placeholder is written only where no file exists — which is what
+   completes a fresh install. The addons directory itself is never created:
+   a mistyped path must not grow an AddOns tree of its own.
+2. Markets: `--market` placements first; then every target reported by
+   `GET /api/health`, in order, into the free slots 1–6. A target that finds
+   no free slot is a failure of the run (choose with `--market`), never a
+   silent skip. Slots no run claims are left as they are.
+3. For each market fetch `feed.lua?target=` and verify before replacing,
+   as the addon verifies at load (§5.2, §5.9): the banner line present,
+   `version = 4`, `target` as expected and a tracker target id, a non-empty
+   `trackerVersion`, `generatedAt` no more than five minutes ahead of the
+   clock, and the closing `A.EndMarket()` (a truncated download). A carrier
+   that fails leaves its slot exactly as it was.
+4. Print a table (slot, target, bytes, age) and remind to `/reload`. Exit
+   status 1 on any failure; whatever can still run after a failure runs.
+   `--dry-run` reports what it would write and writes nothing;
+   `--timeout-secs` (60) bounds each request. The manifest must name this
+   addon and feed version 4, or nothing is done.
+
+Tests: slot assignment, carrier verification and every path of the service
+over in-memory ports (core); the wire decoders, the hash check, the folder,
+and a carrier rendered by the real codec passing the verifier (infra); the
+routes, the drift and the manifest read back by the sync's own client, and a
+sync against a live loopback server (server).
+
+The release workflow attaches `AuctiMoggerDatabase.zip` (the addon folder
+with placeholder slots, zipped by its Linux leg, which waits for the addon
+gates) for manual installs. The Docker build context keeps only the deployable
+addon folder.
 
 ### 6.8 Deletions
 
@@ -700,8 +740,8 @@ folder with placeholder slots) for manual installs.
 - The README's Forever example pairs `forever-eu-pvp-alliance` with
   `house_id = 113`, which is the Horde house (Alliance is 111): fix it.
 - `crates/server/src/web/openapi.rs`.
-- The README rows for the two addon routes land with batch 6, when the routes
-  exist.
+- The README's CLI table row for `addon-sync` and its API table rows for the
+  two addon routes landed with batch 6, with the routes.
 
 ## 7. Addon implementation
 
@@ -1405,7 +1445,19 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `DatabaseExportService`: group attachment rules, pet pooling, rank and
   craft selection, entries without spans omitted, deterministic order.
 - Scheduler: scans refresh before the feed publishes.
-- Addon bundle: embedded table matches the folder.
+- Addon bundle: the embedded table matches the folder in both directions,
+  byte for byte; every file the TOC loads is embedded; the TOC's version is
+  the addon's `VERSION`; the manifest carries each file's hash and size, and
+  the sync's own client parses it back.
+- `addon-sync`: slot assignment (explicit placements first, the tracker's
+  order, a repeated target, conflicting claims, no free slot); carrier
+  verification (every refusal of §6.7, and the renderer's string escapes read
+  back); the service over in-memory ports (a fresh install, an unchanged
+  run, a changed and a failed file, a filled slot, markets, a dry run, the
+  switches, a manifest of another feed version); the wire decoders, the
+  download hash, the folder; a carrier rendered by the real codec through
+  the verifier; the routes; and one sync against a live loopback router.
+- Dashboard: the feed section links the addon manifest.
 
 **Lua**
 
@@ -1642,6 +1694,31 @@ for this batch. It also settled details this spec had left open:
 4. Release workflow attaches the addon zip.
 5. README.
 
+**Status: done.** Every §9 gate is green: nightly `fmt --check`, clippy with
+`-D warnings` over all targets, `cargo test --workspace` and
+`cargo deny check`. The command was also run by hand against a local `serve`
+(a fresh install of the 23 files, a slot pinned with `--market`, a dry run,
+and unpublished markets reported as failures). It also settled details this
+spec had left open:
+
+- The file route is a wildcard: axum's `{*path}` on the router, `{path}` in
+  the OpenAPI document; the drift test normalizes the two spellings (§6.5).
+- The manifest's `version` is the addon's own, read from its TOC, and a test
+  pins it to the addon's `A.VERSION` (§6.7).
+- A slot's placeholder is written only where the slot is empty, so the addon
+  step never replaces a market; slots no run claims are left as they are.
+- Verification mirrors the addon's header rules: the closing line, the
+  target grammar, a non-empty tracker version and the clock skew join the
+  version and the market (§6.7).
+- The sync is a core service over two ports, `TrackerAddonPort` and
+  `AddonFolderPort`; its errors are `SyncError`; the tracker validates a
+  download against its manifest entry before the service ever sees it.
+- The addons directory is never created, a market without a free slot is a
+  failure of the run, and a target list that cannot be read does not undo
+  the addon step.
+- The release job waits for the addon gates, and the Docker build context
+  keeps only the deployable addon folder.
+
 ### Batch 7 — sniper reads the database (§8)
 
 ### Batch 8 — sniper tooltip removal and cleanup (§8)
@@ -1657,6 +1734,8 @@ for this batch. It also settled details this spec had left open:
 | A market file copied into a git checkout over a tracked slot shows as modified. | Same as today's `feed.lua`; `git checkout` restores the placeholder. Documented in the README. |
 | The attached frame mis-anchors under UI scale. | Side decision is a pure function over effective-scale-corrected numbers; clamped to screen; checked in step 6 of §10. |
 | Addon code on the Settings window's open or close path can get Log Out and Exit blocked (Mastercraft's finding on Forever). | The canvas frame has no `OnShow`, `OnHide`, `OnRefresh`, `OnCommit` or `OnDefault`; it refreshes on its own `OnUpdate` (§7.8). Checked in step 7 of §10. |
+| A new addon file is never added to the embedded table. | The drift test walks the folder and fails in both directions until it is, and `include_str!` rebuilds the server whenever an embedded file changes (§6.7). |
+| A bad download replaces a working addon file or market. | The tracker verifies each addon download against its manifest hash, and the service verifies each carrier before it replaces a slot; a failure leaves the file as it was (§6.7). |
 | Export reads a scan that lags the newest snapshot. | Live group is read from the snapshot directly; scheduler refreshes scans before publishing. |
 | Tooltip font lacks special glyphs on Forever. | Signs are `+` / `-` text; the sparkline is textures. |
 
@@ -1685,6 +1764,13 @@ for this batch. It also settled details this spec had left open:
   disagrees with the owner's API-verified house ids (the README's example
   uses the verified ones).
 - Retail is compatible by construction but untested in game.
+- `addon-sync` places every target the tracker reports: `--market` pins a
+  market to a slot but cannot leave one out, and a slot no run claims is
+  never reset to its placeholder (delete the file, or copy one from the
+  release zip).
+- The addon routes send no validator (no ETag), and every sync downloads
+  each addon file and carrier in full: about 300 KB for the whole addon and
+  up to a few MB per market.
 
 ## Appendix A — research evidence
 

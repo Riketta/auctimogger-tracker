@@ -4303,7 +4303,7 @@ use std::collections::{
     HashMap,
 };
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     use std::fmt::Write as _;
 
     use sha2::{

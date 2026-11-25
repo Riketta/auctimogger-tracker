@@ -14,3 +14,7 @@ config.docker.toml
 .env*
 README.md
 AGENTS.md
+# The image needs only the deployable addon folder (it is embedded with
+# include_str!): not the specs, the scripts, or the gitignored Lua tool tree.
+addon/*
+!addon/AuctiMoggerDatabase

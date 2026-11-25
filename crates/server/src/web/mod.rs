@@ -251,6 +251,10 @@ pub fn api_routes() -> Vec<ApiRoute> {
         ("/api/alerts/evaluate", &["post"], post(api::api_alerts_evaluate)),
         ("/api/fetch", &["post"], post(api::api_fetch)),
         ("/feed.lua", &["get"], get(api::feed_lua)),
+        // The wildcard is axum's `{*path}`; the OpenAPI document spells the
+        // same route `{path}` (the drift test normalizes the two).
+        ("/api/addon/manifest", &["get"], get(api::addon_manifest)),
+        ("/api/addon/file/{*path}", &["get"], get(api::addon_file)),
     ]
 }
 

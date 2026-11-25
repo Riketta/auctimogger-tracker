@@ -141,3 +141,34 @@ impl fmt::Display for AlertDispatchError {
 }
 
 impl std::error::Error for AlertDispatchError {}
+
+/// Failures of the `addon-sync` command (`services::addon_sync`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncError {
+    /// A command argument cannot be used (a URL without a scheme).
+    Config(String),
+    /// The tracker could not be reached, answered an error status, or sent
+    /// something that could not be decoded.
+    Remote(String),
+    /// A download is not what it claims to be: a file off its manifest hash,
+    /// a manifest of another feed version, a carrier the addon would refuse.
+    Verify(String),
+    /// The addons folder could not be read or written.
+    Io(String),
+    /// The market placement asked for cannot be satisfied.
+    Placement(String),
+}
+
+impl fmt::Display for SyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SyncError::Config(m) => write!(f, "invalid argument: {m}"),
+            SyncError::Remote(m) => write!(f, "tracker error: {m}"),
+            SyncError::Verify(m) => write!(f, "verification failed: {m}"),
+            SyncError::Io(m) => write!(f, "addons folder error: {m}"),
+            SyncError::Placement(m) => write!(f, "cannot place the markets: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for SyncError {}

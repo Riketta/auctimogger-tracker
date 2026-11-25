@@ -534,7 +534,8 @@ fn reaches(
 /// control characters, the leading-character rule rejects `.`/`..` as ids,
 /// and the `..` contains-check rejects interior empty segments (`a..b`).
 /// Plain char checks, no regex dependency.
-fn is_valid_target_id(id: &str) -> bool {
+#[must_use]
+pub fn is_valid_target_id(id: &str) -> bool {
     let mut chars = id.chars();
     let Some(first) = chars.next() else { return false };
     if !(first.is_ascii_lowercase() || first.is_ascii_digit()) {

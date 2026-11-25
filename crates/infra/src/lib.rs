@@ -4,6 +4,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod addon_sync;
 pub mod alert_discord;
 pub mod alert_telegram;
 pub mod blizzard_forever;

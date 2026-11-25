@@ -1,5 +1,6 @@
-//! JSON API surface, feed downloads, and the token-gated mutation endpoints
-//! (watchlist add/remove, manual fetch). Page handlers live in [`pages`].
+//! JSON API surface, feed downloads, the embedded addon bundle, and the
+//! token-gated mutation endpoints (watchlist add/remove, manual fetch). Page
+//! handlers live in [`pages`].
 
 #![allow(clippy::unused_async)]
 
@@ -152,6 +153,43 @@ pub(crate) async fn feed_lua(
     }
 }
 
+// ------------------------------------------------------------ addon bundle
+
+/// `GET /api/addon/manifest` — the manifest of the `AuctiMogger` Database
+/// addon embedded in this binary (`addon/SPEC.md`, section 6.7): every file
+/// with its
+/// path, SHA-256 and size. It is what `auctimogger-tracker addon-sync`
+/// installs from, so the addon a tracker hands out always reads the feed
+/// format that tracker serves.
+pub(crate) async fn addon_manifest() -> Response {
+    (
+        [
+            (header::CONTENT_TYPE, "application/json"),
+            (header::CACHE_CONTROL, crate::addon_bundle::CACHE_CONTROL),
+        ],
+        crate::addon_bundle::manifest(),
+    )
+        .into_response()
+}
+
+/// `GET /api/addon/file/{*path}` — one embedded addon file, verbatim. Only a
+/// path of the manifest answers; anything else — an unknown name, a `..`
+/// segment — is 404, because the lookup reads the embedded table and never
+/// the filesystem.
+pub(crate) async fn addon_file(Path(path): Path<String>) -> Response {
+    match crate::addon_bundle::lookup(&path) {
+        Some(file) => (
+            [
+                (header::CONTENT_TYPE, crate::addon_bundle::content_type(file.path)),
+                (header::CACHE_CONTROL, crate::addon_bundle::CACHE_CONTROL),
+            ],
+            file.bytes,
+        )
+            .into_response(),
+        None => (StatusCode::NOT_FOUND, "no such addon file\n").into_response(),
+    }
+}
+
 // -------------------------------------------------------------------- api
 
 /// `GET /api/health` — per-target snapshot freshness for scripts/monitors.
@@ -288,6 +326,7 @@ pub(crate) async fn api_index() -> Response {
         "openapi": "/api/openapi.json",
         "docs": "/api/docs",
         "feeds": ["/feed.lua", "/api/feed.json"],
+        "addon": "/api/addon/manifest",
         "endpoints": endpoints,
     }))
     .into_response()

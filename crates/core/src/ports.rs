@@ -40,8 +40,13 @@ use crate::{
         RenderError,
         SourceError,
         StoreError,
+        SyncError,
     },
     fold::DayFold,
+    services::addon_sync::{
+        AddonManifest,
+        ManifestFile,
+    },
 };
 
 /// Time injection.
@@ -1225,6 +1230,63 @@ pub trait SpaceMaintenance: Send + Sync {
     ///
     /// # Errors
     ///
-    /// Returns `StoreError::Backend` when readers block the checkpoint.
+    /// Returns `StoreError::Backend` when the pragma fails.
     fn checkpoint_wal(&self) -> Result<(), StoreError>;
+}
+
+/// Outbound: the tracker's addon surface as the `addon-sync` command reads it
+/// (`addon/SPEC.md`, section 6.7). The manifest, the addon files and the
+/// carriers come from one tracker, so what is installed always matches what
+/// is served. Implemented over HTTP by the infrastructure crate.
+pub trait TrackerAddonPort: Send + Sync {
+    /// `GET /api/addon/manifest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Remote` when the tracker cannot be reached or the
+    /// document cannot be decoded.
+    fn manifest(&self) -> Result<AddonManifest, SyncError>;
+    /// One addon file of the manifest, verified against that entry's size and
+    /// SHA-256 before it is returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Remote` on a transport failure, and
+    /// `SyncError::Verify` when the bytes do not match the manifest entry.
+    fn addon_file(&self, file: &ManifestFile) -> Result<Vec<u8>, SyncError>;
+    /// The targets of `GET /api/health`, in the tracker's own order.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Remote` when the tracker cannot be reached or the
+    /// document cannot be decoded.
+    fn market_targets(&self) -> Result<Vec<String>, SyncError>;
+    /// The published carrier (`feed.lua`) of one target, as the tracker
+    /// serves it; verification is the service's ([`crate::services::addon_sync`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Remote` on a transport failure or an error status
+    /// (404 until the target's first publication).
+    fn carrier(&self, target: &str) -> Result<Vec<u8>, SyncError>;
+}
+
+/// Outbound: the addon's folder inside `Interface/AddOns`, addressed by the
+/// manifest's relative paths. Implemented on disk by the infrastructure crate.
+pub trait AddonFolderPort: Send + Sync {
+    /// A file's bytes; `None` when no such file exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Io` when the path is not a plain addon path or the
+    /// file cannot be read.
+    fn read(&self, path: &str) -> Result<Option<Vec<u8>>, SyncError>;
+    /// Creates or replaces a file atomically: a temporary file beside it, then
+    /// a rename, so the game never loads a half-written file.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SyncError::Io` when the path is not a plain addon path or the
+    /// file cannot be written.
+    fn write(&self, path: &str, bytes: &[u8]) -> Result<(), SyncError>;
 }

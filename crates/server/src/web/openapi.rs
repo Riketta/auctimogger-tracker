@@ -146,7 +146,8 @@ fn build_spec() -> Value {
         "servers": [ { "url": "/" } ],
         "tags": [
             { "name": "api", "description": "JSON API" },
-            { "name": "feeds", "description": "Addon feed downloads" }
+            { "name": "feeds", "description": "Addon feed downloads" },
+            { "name": "addon", "description": "Addon bundle (AuctiMogger Database)" }
         ],
     });
     let mut paths = serde_json::Map::new();
@@ -154,6 +155,7 @@ fn build_spec() -> Value {
         spec_paths_discovery(),
         spec_paths_market(&target),
         spec_paths_items_and_feeds(),
+        spec_paths_addon(),
         spec_paths_watchlist_alerts(&target),
     ] {
         if let Value::Object(map) = chunk {
@@ -428,6 +430,40 @@ fn spec_paths_items_and_feeds() -> Value {
                     "404": { "description": "No feed published yet for the target." }
                 }
             }),
+        },
+    })
+}
+
+/// The addon bundle the `addon-sync` command installs. The file route is a
+/// wildcard on the router (axum's `{*path}`); here it is spelled `{path}`
+/// and documented as allowing slashes, which is what the drift test compares.
+fn spec_paths_addon() -> Value {
+    json!({
+        "/api/addon/manifest": {
+            "get": {
+                "tags": ["addon"],
+                "summary": "Addon bundle manifest",
+                "description": "The AuctiMogger Database addon embedded in this binary, file by file: path, SHA-256 and size. This is the contract `auctimogger-tracker addon-sync --url <base> --addons-dir <Interface/AddOns>` installs from, so the addon a tracker hands out always reads the feed format that tracker serves (contract: addon/SPEC.md, section 6.7). version is the addon's own version (its TOC) and feedVersion the carrier version it reads. Each file is served by /api/addon/file/{path}.",
+                "parameters": [],
+                "responses": { "200": ok_json_ref("AddonManifest") }
+            },
+        },
+        "/api/addon/file/{path}": {
+            "get": {
+                "tags": ["addon"],
+                "summary": "One addon file",
+                "description": "One file of the bundle, verbatim: a path from the manifest, slashes included (Core/pack.lua). Anything else answers 404 — the lookup reads the embedded table and never the filesystem, so no path reaches outside the bundle.",
+                "parameters": [
+                    json!({ "name": "path", "in": "path", "required": true, "description": "A path from the manifest.", "schema": { "type": "string" } })
+                ],
+                "responses": {
+                    "200": { "description": "OK", "content": {
+                        "text/x-lua": { "schema": { "type": "string" } },
+                        "text/plain": { "schema": { "type": "string" } }
+                    } },
+                    "404": { "description": "No such file in the bundle." }
+                }
+            },
         },
     })
 }
@@ -707,6 +743,27 @@ fn spec_schemas_market() -> Value {
 #[allow(clippy::too_many_lines)]
 fn spec_schemas_secondary() -> Value {
     json!({
+        "AddonManifest": {
+            "description": "GET /api/addon/manifest: the embedded AuctiMogger Database addon, file by file.",
+            "type": "object",
+            "required": ["addon", "version", "feedVersion", "files"],
+            "properties": {
+                "addon": { "type": "string", "const": "AuctiMoggerDatabase", "description": "The addon's folder name inside Interface/AddOns." },
+                "version": { "type": "string", "description": "The addon's own version, as its TOC declares it." },
+                "feedVersion": { "type": "integer", "description": "The carrier (feed) version this addon reads." },
+                "files": { "type": "array", "items": { "$ref": "#/components/schemas/AddonFile" } }
+            }
+        },
+        "AddonFile": {
+            "description": "One file of the addon bundle. Market1.lua … Market6.lua are the empty slot placeholders: a market carrier replaces one of them after a sync.",
+            "type": "object",
+            "required": ["path", "sha256", "size"],
+            "properties": {
+                "path": { "type": "string", "description": "Path inside the addon folder, /-separated (the same string addresses /api/addon/file/{path})." },
+                "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lower-case hex SHA-256 of the file's bytes." },
+                "size": { "type": "integer", "description": "Size in bytes." }
+            }
+        },
         "CraftsResponse": {
             "description": "The recipe book evaluated against one target; ranked rows first, then the unranked ones in recipe order.",
             "type": "object",
@@ -810,6 +867,7 @@ fn spec_schemas_secondary() -> Value {
                 "openapi": { "type": "string", "description": "Link to /api/openapi.json." },
                 "docs": { "type": "string" },
                 "feeds": { "type": "array", "items": { "type": "string" } },
+                "addon": { "type": "string", "description": "Link to /api/addon/manifest." },
                 "endpoints": {
                     "type": "array",
                     "items": {
