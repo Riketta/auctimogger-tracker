@@ -36,16 +36,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install Lua (feed contract verifier)
-        run: sudo apt-get update && sudo apt-get install -y lua5.4
-
       - name: Format (nightly rustfmt options)
         run: cargo +nightly fmt --all --check
 
       - name: "Clippy (workspace lints: pedantic + denied unwrap/expect/panic/indexing/slicing)"
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: Tests (incl. hexagonal boundary checks + feed verifier)
+      - name: Tests (incl. hexagonal boundary checks)
         run: cargo test --workspace
 
       - name: Deny (licenses / advisories / bans / sources)
@@ -66,8 +63,6 @@ jobs:
       - name: Clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
-      # No lua interpreter on Windows runners: the feed-verifier test hooks
-      # detect that and skip themselves (see crates/infra/tests/feed.rs).
       - name: Tests
         run: cargo test --workspace
 

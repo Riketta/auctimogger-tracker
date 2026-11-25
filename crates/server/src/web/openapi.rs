@@ -405,8 +405,8 @@ fn spec_paths_items_and_feeds() -> Value {
         "/api/feed.json": {
             "get": json!({
                 "tags": ["feeds"],
-                "summary": "Full market feed (JSON)",
-                "description": "Per-item metric blocks and identities for the whole market — the addon feed in JSON form. Served from the copy the scheduler publishes after each successful cycle (throttled by server.feed_publish_secs), exactly like /feed.lua; a request never rebuilds the market.",
+                "summary": "Market database feed (JSON twin)",
+                "description": "The whole market as the AuctiMogger Database addon reads it, decoded: per identity and category the span metric blocks plus the live listing, value, sold/expired evidence, 30-day position, vendor price, craft and deal groups (contract: addon/SPEC.md, section 5). Served from the copy the scheduler publishes after each successful cycle (throttled by server.feed_publish_secs), exactly like /feed.lua; a request never rebuilds the market.",
                 "parameters": vec![feed_target_param()],
                 "responses": {
                     "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } },
@@ -419,25 +419,13 @@ fn spec_paths_items_and_feeds() -> Value {
         "/feed.lua": {
             "get": json!({
                 "tags": ["feeds"],
-                "summary": "Full addon feed (Lua)",
-                "description": "The complete market feed the addon consumes, Lua-table serialization. Same data as /api/feed.json.",
+                "summary": "Market database feed (Lua carrier)",
+                "description": "The market file the AuctiMogger Database addon loads: a Lua chunk with the market header and one packed record per identity (contract: addon/SPEC.md, section 5). The same data as /api/feed.json, packed into printable records.",
                 "parameters": vec![feed_target_param()],
                 "responses": {
                     "200": { "description": "OK", "content": { "text/x-lua": { "schema": { "type": "string" } } } },
                     "400": { "description": "Unknown target." },
                     "404": { "description": "No feed published yet for the target." }
-                }
-            }),
-        },
-        "/feed-slim.lua": {
-            "get": json!({
-                "tags": ["feeds"],
-                "summary": "Watchlist-only addon feed (Lua)",
-                "description": "Slim feed covering exactly the target's watchlist entries. Built on demand, then cached for the feed publish interval; a watchlist change shows on the next request.",
-                "parameters": vec![feed_target_param()],
-                "responses": {
-                    "200": { "description": "OK", "content": { "text/x-lua": { "schema": { "type": "string" } } } },
-                    "400": { "description": "Unknown target." }
                 }
             }),
         },

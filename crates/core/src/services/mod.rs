@@ -7,7 +7,7 @@ pub mod catalog;
 pub mod chain;
 pub mod craft;
 pub mod cycle;
-pub mod feed_export;
+pub mod database_export;
 pub mod health;
 pub mod metrics;
 pub mod opportunity;

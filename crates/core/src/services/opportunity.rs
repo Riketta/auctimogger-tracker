@@ -9,9 +9,10 @@
 //! blocks). Alongside the score, every live row carries the evidence a buyer
 //! wants next to it: the sold/expired ledger counts behind the sale rate, days
 //! of supply at the current sale pace, where the live price sits against the
-//! previous month's daily lows, and the vendor floor — informational fields,
-//! never score inputs.
-
+/// previous month's daily lows, and the vendor floor — informational fields,
+/// never score inputs. The same prepared scans feed the database export
+/// through a read-only fact view ([`ScanFacts`]), so a feed record and the
+/// ranking can never disagree about an item.
 use std::{
     collections::{
         BTreeMap,
@@ -349,6 +350,98 @@ impl MarketView {
     }
 }
 
+/// One identity's market facts, read off a prepared scan: everything the
+/// database feed attaches to a record besides its span blocks. Every figure is
+/// the ranking's own, so a record and the deals page can never disagree about
+/// an item.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ItemFacts<'a> {
+    /// Quantity-weighted 7-day median listing unit price (copper); 0 without
+    /// evidence.
+    pub value7: i64,
+    /// Unique listings behind `value7`.
+    pub samples7: i64,
+    /// 14-day quantity-weighted median of SOLD unit prices (copper); `None`
+    /// under the sold-evidence floor.
+    pub sold_median14: Option<i64>,
+    /// Listing-level median of the newest day in the window (copper); 0 when
+    /// the item has no fold today.
+    pub median_now: i64,
+    /// Count-weighted median unit price of the days BEFORE today (copper) —
+    /// the movers' baseline, and the denominator of the feed's trend.
+    pub median_prev: f64,
+    /// Today's cumulative fold floor and the quantity that listing offered;
+    /// `None` when the item has no fold today.
+    pub seen_today: Option<(i64, i64)>,
+    /// The 14-day ledger counts behind the sale rate; `None` = no
+    /// credit-eligible evidence.
+    pub counts: Option<SaleCounts>,
+    /// Units credited sold over the supply window; `None` = no sales rows.
+    pub sold_units: Option<i64>,
+    /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest asks, oldest day
+    /// first; empty without hour-fold history.
+    pub lows: &'a [i64],
+    /// Vendor sell price (copper) when the catalog knows one for the item.
+    pub vendor_price: Option<i64>,
+}
+
+impl Default for ItemFacts<'_> {
+    /// No facts at all: what an identity without a scan row carries into a
+    /// record.
+    fn default() -> Self {
+        Self {
+            value7: 0,
+            samples7: 0,
+            sold_median14: None,
+            median_now: 0,
+            median_prev: 0.0,
+            seen_today: None,
+            counts: None,
+            sold_units: None,
+            lows: &[],
+            vendor_price: None,
+        }
+    }
+}
+
+/// Read-only view of one category's prepared scan, keyed by identity — the
+/// database feed's fact source. Facts read from one view, and the ranks
+/// derived from it through [`OpportunityService::opportunities_in`], all
+/// describe the same market state, whatever a concurrent refresh does.
+#[derive(Clone, Debug)]
+pub struct ScanFacts {
+    scan: Arc<ScanSnapshot>,
+}
+
+impl ScanFacts {
+    /// One identity's facts; `None` when the scan holds no row for it.
+    #[must_use]
+    pub fn get(&self, item: &ItemRef) -> Option<ItemFacts<'_>> {
+        // `rows` is built in BTreeMap order, so it is sorted by identity and
+        // the aligned evidence vectors share the index.
+        let index = self.scan.rows.binary_search_by(|row| row.item.cmp(item)).ok()?;
+        let row = self.scan.rows.get(index)?;
+        Some(ItemFacts {
+            value7: as_copper(row.value7),
+            samples7: row.samples7,
+            sold_median14: row.sold_median,
+            median_now: row.median_now,
+            median_prev: row.median_prev,
+            seen_today: row.seen_today,
+            counts: self.scan.counts.get(index).copied().flatten(),
+            sold_units: self.scan.sold_units.get(index).copied().flatten(),
+            lows: self.scan.lows.get(item).map_or(&[], Vec::as_slice),
+            vendor_price: self.scan.vendor.get(item).copied(),
+        })
+    }
+
+    /// When the scan was computed (unix seconds).
+    #[must_use]
+    pub fn computed_at(&self) -> i64 {
+        self.scan.computed_at
+    }
+}
+
 /// Row ordering for [`OpportunityService::opportunities`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpportunitySort {
@@ -444,8 +537,9 @@ pub struct ScanSnapshot {
     /// stand-in that ranks items without evidence.
     reliability_prior: f64,
     /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest ask per identity,
-    /// ascending; shared across the categories of one payload kind and
-    /// refreshed hourly (see [`OpportunityService::low_context`]).
+    /// oldest day first (only days with a listing appear); shared across the
+    /// categories of one payload kind and refreshed hourly (see
+    /// [`OpportunityService::low_context`]).
     lows: Arc<HashMap<ItemRef, Vec<i64>>>,
     /// Vendor sell prices (copper) of the listed items that carry one.
     vendor: Arc<HashMap<ItemRef, i64>>,
@@ -579,7 +673,29 @@ impl OpportunityService {
         limit: usize,
         sort: OpportunitySort,
     ) -> Result<Vec<Opportunity>, StoreError> {
-        let scan = self.scan(target, category)?;
+        Ok(self.opportunities_in(
+            &self.facts(target, category)?,
+            category,
+            min_churn_per_day,
+            limit,
+            sort,
+        ))
+    }
+
+    /// [`Self::opportunities`] over a scan the caller already holds (see
+    /// [`Self::facts`]): the ranks and every other fact read from that view
+    /// describe one market state, whatever a concurrent refresh does to the
+    /// cache. No store read.
+    #[must_use]
+    pub fn opportunities_in(
+        &self,
+        facts: &ScanFacts,
+        category: Category,
+        min_churn_per_day: f64,
+        limit: usize,
+        sort: OpportunitySort,
+    ) -> Vec<Opportunity> {
+        let scan = &facts.scan;
         let mut out: Vec<Opportunity> = Vec::new();
         // Sale evidence and recencies come with the prepared snapshot,
         // positionally aligned with the rows; requests never re-query the
@@ -620,7 +736,7 @@ impl OpportunityService {
         }
         apply_sort(&mut out, sort);
         out.truncate(limit.max(1));
-        Ok(out)
+        out
     }
 
     /// Deals seen today that the newest snapshot no longer lists, deepest
@@ -749,6 +865,20 @@ impl OpportunityService {
     /// poisoned.
     pub fn market(&self, target: &TargetId, category: Category) -> Result<MarketView, StoreError> {
         Ok(MarketView { scan: self.scan(target, category)? })
+    }
+
+    /// One category's prepared scan as a read-only fact view (value, sold
+    /// median, trend baseline, ledger evidence, daily lows and vendor price per
+    /// identity). Serves from the cache like the ranking does; a cold cache
+    /// computes inline.
+    ///
+    /// # Errors
+    ///
+    /// Returns `StoreError::Backend` when the cold-start inline scan cannot
+    /// read history rows, live floors or sale rates, or the scan cache is
+    /// poisoned.
+    pub fn facts(&self, target: &TargetId, category: Category) -> Result<ScanFacts, StoreError> {
+        Ok(ScanFacts { scan: self.scan(target, category)? })
     }
 
     /// Recomputes the full scan artifact for one target — history read,
@@ -947,8 +1077,12 @@ impl OpportunityService {
     }
 
     /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest ask per identity,
-    /// ascending. Today is left out on purpose: the live floor is compared
-    /// against the days BEFORE it (today's own low can only match it).
+    /// oldest day first. Today is left out on purpose: the live floor is
+    /// compared against the days BEFORE it (today's own low can only match it).
+    /// The store hands the days over grouped per identity, but their order is
+    /// the store's business — the series is sorted by day here, because the
+    /// feed's sparkline reads it as a time series while the low indicator only
+    /// counts it.
     fn read_low_context(
         &self,
         target: &TargetId,
@@ -956,16 +1090,19 @@ impl OpportunityService {
         today: i64,
     ) -> Result<HashMap<ItemRef, Vec<i64>>, StoreError> {
         let lows = self.history.daily_lows(target, kind, today - LOW_RANK_WINDOW_DAYS)?;
-        let mut by_item: HashMap<ItemRef, Vec<i64>> = HashMap::new();
+        let mut by_item: HashMap<ItemRef, Vec<(i64, i64)>> = HashMap::new();
         for low in lows {
             if low.day < today {
-                by_item.entry(low.item).or_default().push(low.min);
+                by_item.entry(low.item).or_default().push((low.day, low.min));
             }
         }
-        for mins in by_item.values_mut() {
-            mins.sort_unstable();
-        }
-        Ok(by_item)
+        Ok(by_item
+            .into_iter()
+            .map(|(item, mut days)| {
+                days.sort_unstable_by_key(|(day, _)| *day);
+                (item, days.into_iter().map(|(_, min)| min).collect())
+            })
+            .collect())
     }
 
     /// Vendor sell prices of the snapshot's listed plain items, keyed by
@@ -1221,12 +1358,12 @@ fn discount_of(price: i64, value: f64) -> f64 {
     ((1.0 - price as f64 / value).clamp(0.0, 1.0) * 1000.0).round() / 1000.0
 }
 
-/// Share of `mins` (an identity's daily lows before today, ascending) that sit
-/// strictly above `price`, rounded to 3 decimals; `None` under the history
-/// floor ([`LOW_RANK_MIN_DAYS`]) — a handful of days cannot place a price
-/// inside a month.
+/// Share of `mins` (an identity's daily lows before today) that sit strictly
+/// above `price`, rounded to 3 decimals; `None` under the history floor
+/// ([`LOW_RANK_MIN_DAYS`]) — a handful of days cannot place a price inside a
+/// month. Order-insensitive: it counts, never plots.
 #[allow(clippy::cast_precision_loss)] // counts into a display ratio
-fn low_rank(mins: &[i64], price: i64) -> Option<f64> {
+pub(crate) fn low_rank(mins: &[i64], price: i64) -> Option<f64> {
     if mins.len() < LOW_RANK_MIN_DAYS {
         return None;
     }
@@ -1238,7 +1375,7 @@ fn low_rank(mins: &[i64], price: i64) -> Option<f64> {
 /// window, rounded to 2 decimals; `None` without sold evidence or when nothing
 /// sold — such stock never clears at the current demand.
 #[allow(clippy::cast_precision_loss)] // quantities into a display ratio
-fn supply_days(quantity: i64, sold_units: Option<i64>) -> Option<f64> {
+pub(crate) fn supply_days(quantity: i64, sold_units: Option<i64>) -> Option<f64> {
     let units = sold_units?;
     if units <= 0 || quantity <= 0 {
         return None;

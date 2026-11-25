@@ -57,7 +57,7 @@ use amtracker_core::{
     },
     error::StoreError,
     services::{
-        feed_export::ExportOptions,
+        database_export::ExportOptions,
         opportunity::SCAN_TTL_SECONDS,
     },
 };
@@ -663,13 +663,16 @@ fn maintenance_loop(state: &Arc<AppState>, queue: &SharedMaintenanceQueue) {
 }
 
 /// Operational side effects after a successful cycle for one target.
+///
 /// Alerts run FIRST: a fresh dump may carry a listing that is gone minutes
-/// later, and a sniper alert is worth nothing queued behind a whole-market
-/// feed build and three scan refreshes — it only needs the cycle's own
-/// writes (snapshot floors, day folds, sightings), which have already
-/// landed. Then once-per-UTC-day retention pruning, throttled feed
-/// publication, and a refresh of the target's prepared opportunity scan
-/// (new folds/credits just landed). All are best effort — a failure is
+/// later, and a sniper alert is worth nothing queued behind three scan
+/// refreshes and a whole-market feed build — it only needs the cycle's own
+/// writes (snapshot floors, day folds, sightings), which have already landed.
+/// Then once-per-UTC-day retention pruning, a refresh of the target's prepared
+/// opportunity scans (new folds/credits just landed), and only then the
+/// throttled feed publication — so the feed's facts and ranks describe the
+/// market as of this cycle, never the one before it (the live group is read
+/// from the newest snapshot either way). All are best effort — a failure is
 /// logged and retried on a later pass. (Name warm-up is not among them: it
 /// runs on its own dedicated warmer thread, decoupled from the ingest
 /// cadence.)
@@ -683,6 +686,11 @@ fn run_pass(
 
     run_prune_if_due(state, config, maintenance, target);
 
+    // Categories are refreshed wholesale (cheap, debounced per category).
+    for category in Category::ALL {
+        refresh_opportunities(state, &TargetId(target.to_string()), category);
+    }
+
     let publish_due = maintenance
         .feed_publish
         .get(target)
@@ -690,12 +698,6 @@ fn run_pass(
     if publish_due {
         maintenance.feed_publish.insert(target.to_string(), Instant::now());
         publish_feed(state, config, target);
-    }
-
-    // New folds/credits just landed for this cycle's payload kind, but
-    // categories are refreshed wholesale (cheap, debounced per category).
-    for category in Category::ALL {
-        refresh_opportunities(state, &TargetId(target.to_string()), category);
     }
 }
 
@@ -1362,7 +1364,7 @@ fn panic_message(payload: &(dyn Any + Send)) -> String {
 
 /// Runs the after-cycle side effects for one target right now, without the
 /// maintenance worker's once-per-day/throttle bookkeeping: alert evaluation,
-/// retention pruning, feed publication, and an opportunity scan refresh,
+/// retention pruning, an opportunity scan refresh, and feed publication,
 /// exactly as a successful scheduled cycle would trigger them.
 /// Used by the manual `/api/fetch` path, whose successful cycles must show
 /// up in `/feed.lua` and the ranking pages immediately instead of waiting
@@ -1403,40 +1405,62 @@ fn refresh_opportunities(state: &Arc<AppState>, target: &TargetId, category: Cat
     }
 }
 
-/// Builds and publishes the full feed (lua + json) for one target.
+/// Builds and publishes the database feed (the carrier and its JSON twin) for
+/// one target. The export reads the prepared scans the pass refreshed just
+/// before and the newest snapshots directly, so what it publishes describes
+/// the market as of the cycle that triggered it.
 fn publish_feed(
     state: &Arc<AppState>,
     config: &amtracker_core::config::TrackerConfig,
     target: &str,
 ) {
-    let target_id = amtracker_core::domain::TargetId(target.to_string());
-    let options = ExportOptions { spans: config.metrics.spans.clone(), watchlist_only: false };
-    match state.feed_export.build_feed(&target_id, &options) {
-        Ok(feed) => {
-            for format in [FeedFormat::Lua, FeedFormat::Json] {
-                match state.renderer.render(&feed, format) {
-                    Ok(bytes) => {
-                        if let Err(error) = state.publisher.publish(&target_id, format, &bytes) {
-                            tracing::error!(
-                                target,
-                                format = ?format,
-                                error = %error,
-                                "feed publish failed"
-                            );
-                        }
-                    }
-                    Err(error) => tracing::error!(
-                        target,
-                        format = ?format,
-                        error = %error,
-                        "feed render failed"
-                    ),
-                }
-            }
-            tracing::info!(target, items = feed.entries.len(), "feed published");
+    let Some(target_config) = config.targets.iter().find(|candidate| candidate.id.0 == target)
+    else {
+        tracing::warn!(target, "feed publish skipped: target is not configured");
+        return;
+    };
+    let target_id = TargetId(target.to_string());
+    let options = ExportOptions { spans: config.metrics.spans.clone() };
+    let started = Instant::now();
+    let snapshot = match state.feed_export.build(target_config, &options) {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            tracing::warn!(target, error = %error, "feed export failed");
+            return;
         }
-        Err(error) => tracing::warn!(target, error = %error, "feed export failed"),
+    };
+    let export_ms = started.elapsed().as_millis();
+    let mut sizes: Vec<(FeedFormat, usize)> = Vec::with_capacity(2);
+    for format in [FeedFormat::Lua, FeedFormat::Json] {
+        match state.renderer.render(&snapshot, format) {
+            Ok(bytes) => match state.publisher.publish(&target_id, format, &bytes) {
+                Ok(()) => sizes.push((format, bytes.len())),
+                Err(error) => tracing::error!(
+                    target,
+                    format = ?format,
+                    error = %error,
+                    "feed publish failed"
+                ),
+            },
+            Err(error) => tracing::error!(
+                target,
+                format = ?format,
+                error = %error,
+                "feed render failed"
+            ),
+        }
     }
+    let size_of = |format: FeedFormat| {
+        sizes.iter().find(|(published, _)| *published == format).map_or(0, |(_, bytes)| *bytes)
+    };
+    tracing::info!(
+        target,
+        entries = snapshot.entries.len(),
+        export_ms,
+        lua_bytes = size_of(FeedFormat::Lua),
+        json_bytes = size_of(FeedFormat::Json),
+        "feed published"
+    );
 }
 
 #[cfg(test)]

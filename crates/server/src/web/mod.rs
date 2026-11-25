@@ -51,7 +51,7 @@ use amtracker_core::{
     services::{
         craft::CraftService,
         cycle::IngestCycleService,
-        feed_export::FeedExportService,
+        database_export::DatabaseExportService,
         health::{
             HealthService,
             TargetHealth,
@@ -96,7 +96,7 @@ pub struct AppState {
     /// Discount/opportunity ranking behind the opportunities pages, served
     /// from scans the scheduler prepares in the background.
     pub opportunities: Arc<OpportunityService>,
-    /// User-curated watch list that drives the slim feed export.
+    /// User-curated watch list behind the watchlist pages and APIs.
     pub watchlist: Arc<WatchlistService>,
     /// Whole-watchlist market reports (blocks, sale rates, trends) behind
     /// the live watchlist page and `/api/watchlist/metrics`.
@@ -116,15 +116,17 @@ pub struct AppState {
     /// Alert rule evaluation + CRUD behind the scheduler's post-cycle pass
     /// and the `/alerts` page/API.
     pub alerts: Arc<amtracker_core::services::alert::AlertEvaluationService>,
-    /// Feed assembly behind the scheduler's full-feed publish and the
-    /// on-demand slim Lua download.
-    pub feed_export: Arc<FeedExportService>,
-    /// Request-time caches for the whole-market read paths: the slim Lua
-    /// feed and `/api/history`'s day rows (see [`cache`]).
+    /// Database feed assembly behind the scheduler's publish (`addon/SPEC.md`,
+    /// section 6.3): the carrier and its JSON twin are rendered from what it
+    /// builds and served as published.
+    pub feed_export: Arc<DatabaseExportService>,
+    /// Request-time caches for the whole-market read paths (`/api/history`'s
+    /// day rows; see [`cache`]).
     pub response_cache: cache::ResponseCache,
-    /// Published feed bytes backing the cached `/feed.lua` download.
+    /// Published feed bytes backing the cached `/feed.lua` and
+    /// `/api/feed.json` downloads.
     pub publisher: Arc<dyn FeedPublisher>,
-    /// Feed serialization into Lua/JSON byte payloads.
+    /// Database feed serialization into the carrier and its JSON twin.
     pub renderer: Arc<dyn FeedRenderer>,
     /// Runs one ingestion cycle (fetch, fold, credit) against a source.
     pub cycle: Arc<IngestCycleService>,
@@ -249,7 +251,6 @@ pub fn api_routes() -> Vec<ApiRoute> {
         ("/api/alerts/evaluate", &["post"], post(api::api_alerts_evaluate)),
         ("/api/fetch", &["post"], post(api::api_fetch)),
         ("/feed.lua", &["get"], get(api::feed_lua)),
-        ("/feed-slim.lua", &["get"], get(api::feed_slim_lua)),
     ]
 }
 

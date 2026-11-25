@@ -25,7 +25,10 @@ use amtracker_core::{
     services::{
         chain::ChainedItemInfo,
         cycle::IngestCycleService,
-        feed_export::FeedExportService,
+        database_export::{
+            DatabaseExportService,
+            ExportOptions,
+        },
         metrics::MetricsService,
     },
 };
@@ -107,7 +110,7 @@ enum Commands {
         #[arg(long, default_value = "item")]
         category: String,
     },
-    /// Export the tracker feed for a target (lua + json).
+    /// Export the market database feed for a target (lua + json).
     ExportFeed {
         #[arg(long)]
         config: PathBuf,
@@ -115,9 +118,6 @@ enum Commands {
         target: Option<String>,
         #[arg(long, default_value = "feeds")]
         out: PathBuf,
-        /// Export only the target's watchlist items.
-        #[arg(long, default_value_t = false)]
-        slim: bool,
     },
     /// Compact the database file now: rebuild it without the retained free
     /// pages and truncate the WAL. Safe to attempt against a live `serve`,
@@ -170,11 +170,9 @@ fn main() {
                 run_metrics(&loaded.tracker, &target, item, &span, &category)
             })
         }
-        Commands::ExportFeed { config, target, out, slim } => {
-            with_observability(&config, |loaded| {
-                run_export_feed(&loaded.tracker, target.as_deref(), &out, slim)
-            })
-        }
+        Commands::ExportFeed { config, target, out } => with_observability(&config, |loaded| {
+            run_export_feed(&loaded.tracker, target.as_deref(), &out)
+        }),
         Commands::Vacuum { config } => {
             with_observability(&config, |loaded| run_vacuum(&loaded.tracker))
         }
@@ -638,8 +636,8 @@ fn build_app_state(
     item_info: &Arc<dyn ItemInfoPort>,
     metrics: Arc<MetricsService>,
 ) -> Arc<AppState> {
-    // The crafting view reads the ranking's prepared scans, so both services
-    // share one opportunity service instance.
+    // The crafting view and the database feed read the ranking's prepared
+    // scans, so all three services share one opportunity service instance.
     let opportunities = Arc::new(amtracker_core::services::opportunity::OpportunityService::new(
         store.clone(),
         store.clone(),
@@ -647,6 +645,11 @@ fn build_app_state(
         store.clone(),
         clock.clone(),
         config,
+    ));
+    let crafts = Arc::new(amtracker_core::services::craft::CraftService::new(
+        opportunities.clone(),
+        metrics.clone(),
+        &config.crafts,
     ));
     // Hot reload of the recipe file: applied on the next /crafts view.
     let recipe_reloader =
@@ -691,11 +694,7 @@ fn build_app_state(
             store.clone(),
             clock.clone(),
         )),
-        crafts: Arc::new(amtracker_core::services::craft::CraftService::new(
-            opportunities.clone(),
-            metrics.clone(),
-            &config.crafts,
-        )),
+        crafts: Arc::clone(&crafts),
         recipe_reloader,
         sales: store.clone(),
         alerts: Arc::new(amtracker_core::services::alert::AlertEvaluationService::new(
@@ -710,20 +709,18 @@ fn build_app_state(
             i64::try_from(config.alerts.max_data_age_secs).unwrap_or(i64::MAX),
             config.opportunities.min_samples,
         )),
-        feed_export: Arc::new(FeedExportService::new(
-            store.clone(),
+        feed_export: Arc::new(DatabaseExportService::new(
             store.clone(),
             store.clone(),
             metrics,
+            opportunities,
+            crafts,
             clock.clone(),
+            env!("CARGO_PKG_VERSION"),
         )),
         publisher: Arc::new(FileFeedPublisher::new(PathBuf::from(&config.storage.feed_dir))),
         renderer: Arc::new(FeedCodec),
-        // Request-time caches; the slim feed follows the publish interval.
-        response_cache: ResponseCache::new(
-            clock.clone(),
-            i64::try_from(config.server.feed_publish_secs).unwrap_or(i64::MAX),
-        ),
+        response_cache: ResponseCache::new(clock.clone()),
         cycle: Arc::new(IngestCycleService::new(
             Arc::new(BlizzardSource::new()),
             store.clone(),
@@ -806,11 +803,14 @@ fn backup_summary(config: &amtracker_core::config::TrackerConfig) -> String {
     }
 }
 
+/// One-off export of the database feed (the carrier and its JSON twin) for
+/// every configured target, or `--target` only, into `<out>/<target>/` — the
+/// same files `serve` publishes. The sibling services are wired exactly as
+/// `serve` wires them, so a manual export prices and ranks like the server.
 fn run_export_feed(
     config: &amtracker_core::config::TrackerConfig,
     only_target: Option<&str>,
     out_dir: &std::path::Path,
-    slim: bool,
 ) -> i32 {
     use amtracker_core::ports::FeedPublisher;
 
@@ -824,7 +824,28 @@ fn run_export_feed(
     };
     let metrics =
         Arc::new(MetricsService::new(store.clone(), store.clone(), store.clone(), clock.clone()));
-    let export = FeedExportService::new(store.clone(), store.clone(), store, metrics, clock);
+    let opportunities = Arc::new(amtracker_core::services::opportunity::OpportunityService::new(
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        store.clone(),
+        clock.clone(),
+        config,
+    ));
+    let crafts = Arc::new(amtracker_core::services::craft::CraftService::new(
+        opportunities.clone(),
+        metrics.clone(),
+        &config.crafts,
+    ));
+    let export = DatabaseExportService::new(
+        store.clone(),
+        store,
+        metrics,
+        opportunities,
+        crafts,
+        clock,
+        env!("CARGO_PKG_VERSION"),
+    );
     let publisher = FileFeedPublisher::new(out_dir.to_path_buf());
     let codec = FeedCodec;
 
@@ -835,17 +856,14 @@ fn run_export_feed(
                 continue;
             }
         }
-        let options = amtracker_core::services::feed_export::ExportOptions {
-            spans: config.metrics.spans.clone(),
-            watchlist_only: slim,
-        };
-        match export.build_feed(&target.id, &options) {
-            Ok(feed) => {
+        let options = ExportOptions { spans: config.metrics.spans.clone() };
+        match export.build(target, &options) {
+            Ok(snapshot) => {
                 for format in [
                     amtracker_core::domain::FeedFormat::Lua,
                     amtracker_core::domain::FeedFormat::Json,
                 ] {
-                    match codec.render(&feed, format) {
+                    match codec.render(&snapshot, format) {
                         Ok(bytes) => {
                             if let Err(error) = publisher.publish(&target.id, format, &bytes) {
                                 failures += 1;
@@ -870,8 +888,8 @@ fn run_export_feed(
                 }
                 tracing::info!(
                     target = %target.id.0,
-                    items = feed.entries.len(),
-                    generated_at = feed.generated_at,
+                    entries = snapshot.entries.len(),
+                    generated_at = snapshot.generated_at,
                     "feed exported"
                 );
             }

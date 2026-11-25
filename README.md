@@ -2,8 +2,8 @@
 
 Standalone **market memory** for the AuctiMogger ecosystem: it polls
 Blizzard-format auction dumps, stores the full history in SQLite, computes
-per-item analytics over rolling windows, publishes the tracker feed consumed
-by the in-game AuctiMogger addon (separate repo), and serves a
+per-item analytics over rolling windows, publishes the market database
+consumed by the in-game AuctiMogger Database addon (in `addon/`), and serves a
 decision-support web UI — all in one process.
 
 Where the addon answers *"buy this now?"*, the tracker answers *"what is
@@ -17,7 +17,7 @@ normal for this item, and how do I know this deal is real?"*.
 - [CLI reference](#cli-reference)
 - [Web UI & JSON API](#web-ui--json-api)
 - [Crafting (recipe file)](#crafting-recipe-file)
-- [Feed contract (v3)](#feed-contract-v3)
+- [Feed contract (v4)](#feed-contract-v4)
 - [For developers](#for-developers)
   - [Architecture](#architecture)
   - [Project structure](#project-structure)
@@ -28,7 +28,7 @@ normal for this item, and how do I know this deal is real?"*.
   - [Configure](#configure)
   - [Run](#run)
   - [Use it](#use-it)
-  - [Feed the addon](#feed-the-addon)
+  - [AuctiMogger Database](#auctimogger-database)
   - [Update, stop, reset](#update-stop-reset)
   - [Without building](#without-building)
 - [Deployment (Linux server)](#deployment-linux-server)
@@ -91,9 +91,13 @@ normal for this item, and how do I know this deal is real?"*.
   by expected profit per make, with every recipe that misses a price, lacks
   sale evidence, sells too slowly or loses money listed separately with the
   reason. The recipe file reloads when it changes on disk.
-- **Tracker feed v3** — `feed.lua` (full), `feed-slim.lua` (watchlist only),
-  `feed.json`; atomic writes; `generatedAt` taken from the source's
-  `Last-Modified` so the addon can trust freshness.
+- **Market database feed (v4)** — per target, `feed.lua` (the packed carrier
+  the AuctiMogger Database addon loads as a market file, about 250 bytes per
+  item) and `feed.json` (the same records, decoded); atomic writes;
+  `generatedAt` taken from the source's `Last-Modified` so the addon can trust
+  freshness. Every record carries the span blocks, the live listing, the
+  item's value and trend, the sold/expired evidence, the 30-day position, the
+  vendor price and — where they apply — the craft and the deal rank.
 - **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below` and `below-floor` on the cached blocks; `floor-below`, `floor-below-value` and `new-listing-below` on the newest snapshot's live listings — the sniper operands, each fired listing counted once; `sale-rate-above` and `days-since-last-sale-above` on the ledger) are evaluated first after every ingest cycle, with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Each market category only observes while its own feed is younger than `[alerts].max_data_age_secs` (48 h by default, `0` disables) — commodity rules gate on the commodities feed, item/pet rules on the auctions feed — so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
   completions, item detail with interactive 30-day price-band chart (p05–p95,
@@ -116,7 +120,8 @@ export AMT_API_TOKEN=<random string>                # gates mutating API endpoin
 ```
 
 `serve` is self-contained: after each successful ingest cycle the scheduler
-re-renders and publishes `feed.lua` + `feed.json` to
+refreshes the prepared market scans, then re-renders and publishes
+`feed.lua` + `feed.json` to
 `./feeds/<target-id>/` (**relative to the working directory**; throttled by
 `server.feed_publish_secs`, default 300), applies raw-listing retention once
 per UTC day, and keeps the poll loop running. The DB path comes from the
@@ -201,7 +206,7 @@ id = "forever-eu-pvp-alliance"
 kind = "blizzard-forever"
 region = "eu"         # us | eu | kr | tw (CN has no Forever API)
 ruleset_id = 1        # the realm replacement
-house_id = 113        # one house within the ruleset
+house_id = 111        # one house within the ruleset (111 = the EU PvP Alliance house)
 poll = { commodities_secs = 3600, auctions_secs = 1800 }
 ```
 
@@ -234,7 +239,7 @@ fail loudly rather than silently disable the setting it was meant to set.
 | `fetch --config <p> [--target <id>]` | run one ingestion cycle now |
 | `serve --config <p>` | poll scheduler + web UI/API (the service mode) |
 | `metrics --config <p> --target <id> --item <id> [--span d1]` | print one analytics block (debug aid) |
-| `export-feed --config <p> [--target <id>] [--out feeds] [--slim]` | write feed.lua + feed.json without serving |
+| `export-feed --config <p> [--target <id>] [--out feeds]` | write feed.lua + feed.json (the v4 market database) without serving |
 | `forever-rulesets --config <p>` | list Forever rulesets + auction houses via the config's credentials (discovery aid for `blizzard-forever` targets) |
 | `backfill-item-hours --config <p> [--rebuild-since <utc day>] | rebuild the when-to-buy hour fold from the raw window (skips hours already folded; `serve` runs it at boot). `--rebuild-since` first clears the fold from that UTC day on — clamped to the raw window — and rebuilds exactly that range: the repair for an interrupted pass or hours known to be incomplete. Run it with `serve` stopped |
 
@@ -278,7 +283,7 @@ switcher in the top bar works on every target-scoped page.
 | `GET /api/items/{target}/pet/{species}/metrics?level=&quality=&breed=` | the same, for one pet variant (all three identity parameters required) |
 | `GET /api/browse?target=&kind=&snapshot=&q=&item=&class=&quality=&sort=&dir=&page=` | one page (50 rows) of a stored snapshot's listings joined to their catalog identity; without `snapshot` the newest for the pair serves; `sort=price\|qty\|time` (default price asc, `dir=desc` flips) |
 | `GET /api/snapshots?target=&kind=&limit=` | snapshot metadata rows, newest first (`kind=commodities\|auctions`) |
-| `GET /api/feed.json` | the published `feed.json` — the same file the scheduler writes after each successful cycle (throttled by `server.feed_publish_secs`), never rebuilt per request; 404 until the first publish |
+| `GET /api/feed.json` | the published `feed.json` — the v4 market database decoded (contract: [`addon/SPEC.md`](addon/SPEC.md), section 5): the same file the scheduler writes after each successful cycle (throttled by `server.feed_publish_secs`), never rebuilt per request; 404 until the first publish |
 | `GET+POST /api/watchlist`, `DELETE /api/watchlist` | watchlist; POST and DELETE share one body: `{"target": "…", "type": "item", "itemID": 1}` (token-gated) |
 | `GET /api/watchlist/metrics?target=&span=&sale_days=&trend_days=` | every watchlist entry joined to its metric blocks, sale rate and 30-day trend — one batched read (the live watchlist page's contract) |
 | `GET /api/priorities?target=&category=` | the watchlist ranked best sell first: score (50% liquidity + 30% momentum + 20% recency) with components, current-day median, week block and trend rows (the `/priorities` page's contract; default category `item`) |
@@ -287,7 +292,7 @@ switcher in the top bar works on every target-scoped page.
 | `POST /api/alerts` · `DELETE /api/alerts` | add/remove rules (token-gated); condition is a tagged union: `{"type":"price-below","copper":10000}` \| `{"type":"below-floor","span":"d7","percentile":"p05"}` \| `{"type":"floor-below","copper":10000}` \| `{"type":"floor-below-value","fraction":0.5}` \| `{"type":"new-listing-below","fraction":0.5}` \| `{"type":"sale-rate-above","rate":0.3}` \| `{"type":"days-since-last-sale-above","days":14}` |
 | `POST /api/alerts/evaluate?target=` | run one evaluation pass now (token-gated) |
 | `POST /api/fetch` | trigger a cycle (token-gated; a JSON body is required — `{}` suffices — so cross-site forms cannot fire it in open mode); on success it also republishes the target's feed immediately. Unknown `?target=` values answer 400 |
-| `GET /feed.lua` · `/feed-slim.lua` | feed downloads; `?target=<id>` optional (defaults to the first configured target). `feed-slim.lua` is built on demand, cached for `server.feed_publish_secs`, and refreshed on the next request after any watchlist change |
+| `GET /feed.lua` | the published `feed.lua` — the v4 carrier the AuctiMogger Database addon loads (the same data as `/api/feed.json`, packed); `?target=<id>` optional (defaults to the first configured target); 404 until the first publish |
 
 The API is designed to be driven by agents and scripts: `GET /api` is a
 discoverable index, `/api/openapi.json` serves the OpenAPI 3.1 contract
@@ -419,50 +424,62 @@ the craft is profitable. Everything else is listed below with the first
 reason it missed: a reagent or the output without a price, no sale evidence
 yet, a slow seller, or reagents that cost as much as the output nets.
 
-## Feed contract (v3)
+## Feed contract (v4)
+
+Per target the tracker publishes two files under `storage.feed_dir`:
+`<target>/feed.lua`, the packed carrier the **AuctiMogger Database** addon
+loads as a market file, and `<target>/feed.json`, the same records decoded.
+[`addon/SPEC.md`](addon/SPEC.md) is the single source of truth for the
+contract — its section 5 defines the files, the record layout and the
+absence rules — and the tracker implements it in
+`crates/core/src/services/database_export.rs` (what a record carries),
+`crates/infra/src/record.rs` and `pack.rs` (how it is packed) and
+`crates/infra/src/feed.rs` (the carrier and its JSON twin).
 
 ```lua
-AuctiMoggerTrackerFeed = {
-  version = 3,
-  generatedAt = 1760000000,                 -- newest source Last-Modified (unix secs)
-  items = {
-    { itemID = 194784, category = "commodity", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200,
-      median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366,
-      qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000,
-      daysSinceLastSale = 9, closuresSinceLastSale = 14, qtySold = 220 } } },
-    { kind = "pet", speciesID = 2546, level = 1, qualityID = 3, breedID = 11,
-      category = "pet",
-      metrics = { /* same block shape */ } },
-  },
-}
+-- AuctiMogger Database market file - GENERATED by auctimogger-tracker 0.1.0. Do not hand-edit.
+local _, A = ...
+local m = A.BeginMarket({
+    version = 4,
+    trackerVersion = "0.1.0",
+    target = "forever-eu-pvp-alliance",
+    flavor = "forever",
+    region = "eu",
+    rulesetId = 1,
+    houseId = 111,
+    generatedAt = 1795607640,      -- newest source Last-Modified (unix secs)
+    auctionsAt = 1795607700,
+    commoditiesAt = 1795607700,
+})
+m.items[25] = "…"                  -- one packed record per identity
+m.commodities[191460] = "…"
+m.pets[2546] = "…"                 -- pets are keyed by species
+A.EndMarket()
 ```
 
-v3 added `category` to every entry (`item`, `commodity` or `pet`). The three
-categories are separate evidence pools — items and commodities split the
-auction houses, pets split off the item-AH rows by identity — so an item
-trading in both auction houses exports once per category, each entry carrying
-only its own market's metrics. Entries without metrics are omitted; the
-in-game addon's ingestor parses this strictly. Additive v3 fields: each span
-block may also carry `saleRate180d` (the same sell-through estimator over 180
-days — the slow demand window), and the ledger-recency pair
-`daysSinceLastSale` / `closuresSinceLastSale` (days since the ledger last
-credited a sale, and how many listings closed after it — the "stopped
-selling" churn signal; the TSM `NumExpires` analog; counted from the sold
-listing's first-sighting day, so it includes the listing's time on market).
-`qtySold` (estimated units sold over the span window — credited vanish
-quantities plus commodity partial fills, booked on the day the units left
-the market; the direct "how fast does this market absorb stock" volume
-signal; `null`/absent when the identity has no sales rows at all — never
-confused with a genuine zero). `saleRate`'s denominator counts only
-credit-eligible listings (last seen in a band whose lower bound clears the
-one-hour poll cadence, or actually credited): SHORT/MEDIUM last sightings
-can never produce a credit at that cadence and would dilute the rate.
-In the Lua feed all four are **absent when the ledger has no evidence** —
-never zero, so "missing" and "genuinely zero" stay distinguishable; the
-JSON feed and the metrics API serialize the same absence as explicit
-`null`s. The executable source of truth:
-`crates/infra/src/feed.rs`, `scripts/verify_feed.lua`, and the addon's
-`spec/metrics_parity_spec.lua`.
+A record holds the four span blocks (`d1`/`d7`/`d14`/`d30`: `n, min, p05,
+p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`, `saleRate`,
+`saleRate180d`, `daysSinceLastSale`, `closuresSinceLastSale`, `qtySold`) and
+the groups behind them: the `live` listing (floor, quantity at the floor,
+listings, total quantity, and today's sighting that is already gone), the
+`value` (7-day listing value, 14-day sold median, today's trend in basis
+points), the sold/expired `evidence` with days of supply, the 30-day
+`position` (lowest ask, share of days above the live floor, a one-byte-per-day
+sparkline), the vendor price, the best craft and the deal rank. Every
+optional field is **absent when the tracker has no evidence — never zero** —
+in the carrier and in the JSON twin alike.
+
+The three categories are separate evidence pools — items and commodities
+split the auction houses, pets split off the item-AH rows by identity — so an
+item trading in both auction houses exports one record per category. Pets
+pool every variant onto their species; a species with several variants
+exports spans only. Records without a span are omitted.
+
+`feed.json` mirrors what a decoder reads (rates as `bp / 10000`, saturated
+values as saturated) and is the oracle of the cross-language test that pins
+the addon's Lua decoder to the Rust reference decoder; the golden fixtures
+under `fixtures/database_v4.*` are rendered by
+`crates/infra/tests/database_golden.rs`.
 
 ## For developers
 
@@ -493,13 +510,14 @@ in both repos and fail either side on drift.
 
 ```
 crates/core/     domain, ports, services (+ tests: boundary, services)
-crates/infra/    sqlite, blizzard source/item/pet-info, feed, clock (+ tests)
+crates/infra/    sqlite, blizzard source/item/pet-info, feed codec + record packing, clock (+ tests)
 crates/server/   axum web (pages/api/render/assets modules), scheduler, config ACL (+ tests)
 crates/server/assets/  embedded UI stylesheet + enhancement script (include_str!)
 src/main.rs      CLI + wiring
+addon/           AuctiMogger Database addon (in progress) — its SPEC.md is the feed contract's source of truth
 deploy/          systemd unit
-scripts/         verify_feed.lua, install-release.sh
-fixtures/        real trimmed dumps incl. the corrupted-prefix fixture
+scripts/         install-release.sh
+fixtures/        real trimmed dumps incl. the corrupted-prefix fixture; the v4 golden trio (`database_v4.*`)
 docs/            frontend-swap plan (future WASM UI decision doc)
 ```
 
@@ -510,9 +528,7 @@ Run all four before pushing — CI runs exactly these:
 ```sh
 cargo +nightly fmt --all -- --check      # nightly-only rustfmt.toml options
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace                   # 118 specs incl. golden vectors +
-                                         # boundary checks; lua5.4 enables the
-                                         # feed-verifier hooks (skipped if absent)
+cargo test --workspace                   # 448 specs incl. golden vectors + boundary checks
 cargo deny check                         # licenses / advisories / bans / sources
 ```
 
@@ -525,8 +541,8 @@ only where an index is proven in bounds.
 
 ### GitHub CI & releases
 
-- **Linux lane**: fmt (nightly rustfmt) → clippy → tests (+ lua verifier) →
-  cargo-deny. **Windows lane**: clippy → tests → build.
+- **Linux lane**: fmt (nightly rustfmt) → clippy → tests → cargo-deny.
+  **Windows lane**: clippy → tests → build.
 - **Release** (tag `v*`, or manual dispatch): `--release --locked` builds for
   `x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, packaged with
   `config.example.toml`; tags additionally publish a GitHub release. The
@@ -643,23 +659,24 @@ curl -s -X POST 'http://localhost:8080/api/fetch?target=wowforever-main' \
 
 Pets use `"type":"pet"` with `speciesID`/`level`/`qualityID`/`breedID`.
 
-### Feed the addon
+### AuctiMogger Database
 
 ```sh
 curl -sf -o feed.lua 'http://localhost:8080/feed.lua?target=wowforever-main'
 # `?target` is optional and defaults to the first configured target.
-# Watchlist-only variant:
-curl -sf -o feed-slim.lua 'http://localhost:8080/feed-slim.lua?target=wowforever-main'
+# `feed.json` (same route family: /api/feed.json) is the same market decoded.
 
-cp feed.lua <wow>/Interface/AddOns/AuctiMogger/AuctiMoggerTracker/feed.lua
+cp feed.lua <wow>/Interface/AddOns/AuctiMoggerDatabase/Market1.lua
 ```
 
-`<wow>` is the client root (the folder containing `Interface/`).
+`<wow>` is the client root (the folder containing `Interface/`). The addon
+lives in [`addon/`](addon/SPEC.md) of this repository; it has six market
+slots (`Market1.lua` … `Market6.lua`), and a carrier is installed by copying
+it over a slot.
 
-In-game, `/reload` makes the AuctiMoggerTracker sub-addon ingest the file
-at load; `/auctimogger ingest` re-reads it anytime without a reload. A 404
-means nothing has been published for that target yet — wait for a green
-cycle. The files also live in the `amtracker-feeds` volume:
+In-game, `/reload` loads the market file; `GET /feed.lua` and
+`/api/feed.json` answer 404 until the first successful cycle has published —
+wait for a green cycle. The files also live in the `amtracker-feeds` volume:
 `docker compose cp tracker:/work/feeds/wowforever-main/feed.lua .`
 
 ### Update, stop, reset
@@ -816,5 +833,5 @@ may briefly delay a poll cycle — size `backup_secs` accordingly.
   start with an unset/empty token on a non-loopback bind unless
   `[server].allow_open = true`. For LAN access, bind `0.0.0.0` only behind a
   reverse proxy with TLS + auth.
-- The addon consumes `feed.lua` / `feed-slim.lua`; `feed.json` is the seam
-  for the future companion client.
+- The AuctiMogger Database addon consumes `feed.lua`; `feed.json` is the same
+  market decoded, for reading and for scripts.

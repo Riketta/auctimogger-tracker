@@ -1,17 +1,14 @@
 //! Feed rendering and publication to the feed directory served to the
-//! in-game addons.
+//! in-game addon.
 //!
-//! Two contracts live here. The tracker feed v3 is what `FeedRenderer::render`
-//! produces: a Lua table literal and its JSON document. The database feed v4
-//! ([`FeedCodec::carrier`] and [`FeedCodec::json_twin`]) is the packed carrier
-//! of `addon/SPEC.md` and its decoded twin.
-//!
-//! v3 added `category` to every entry: an item trading in both auction
-//! houses exports once per category, each entry carrying only its own
-//! market's evidence. v4 keeps that split as three record tables.
+//! The database feed (v4) is the contract: [`FeedCodec::carrier`] renders a
+//! [`DatabaseSnapshot`] as the packed Lua carrier the `AuctiMoggerDatabase`
+//! addon loads as one market's file, and [`FeedCodec::json_twin`] as its
+//! decoded JSON twin. Both are pure functions over the snapshot; `FeedRenderer::render`
+//! is the port the scheduler and the CLI publish through (`addon/SPEC.md`,
+//! section 5), and [`FileFeedPublisher`] writes the rendered bytes to disk.
 
 use std::{
-    collections::BTreeMap,
     fmt::Write as _,
     path::PathBuf,
     sync::Mutex,
@@ -22,164 +19,40 @@ use amtracker_core::{
         Category,
         DatabaseEntry,
         DatabaseSnapshot,
-        FeedEntry,
         FeedFormat,
-        FeedSnapshot,
         ItemRef,
-        MetricBlock,
         PublishedFeed,
-        Span,
         TargetId,
     },
     error::{
         RenderError,
         StoreError,
     },
-    ports::FeedPublisher,
+    ports::{
+        FeedPublisher,
+        FeedRenderer,
+    },
 };
 
 use crate::record;
 
-/// Renders feed snapshots into the two contract serializations.
+/// Renders database snapshots into the two contract serializations.
 pub struct FeedCodec;
 
-impl amtracker_core::ports::FeedRenderer for FeedCodec {
-    fn render(&self, feed: &FeedSnapshot, format: FeedFormat) -> Result<Vec<u8>, RenderError> {
+impl FeedRenderer for FeedCodec {
+    fn render(
+        &self,
+        snapshot: &DatabaseSnapshot,
+        format: FeedFormat,
+    ) -> Result<Vec<u8>, RenderError> {
         match format {
-            FeedFormat::Lua => Ok(render_lua(feed)),
-            FeedFormat::Json => render_json(feed),
+            FeedFormat::Lua => Self::carrier(snapshot),
+            FeedFormat::Json => Self::json_twin(snapshot),
         }
     }
 }
 
-fn metric_fields_lua(block: &MetricBlock) -> String {
-    let mut out = format!(
-        "n = {}, min = {}, p05 = {}, p25 = {}, median = {}, p75 = {}, p95 = {}, max = {}, mad = {}, vwap = {}, qtySum = {}, listingCount = {}",
-        block.n, block.min, block.p05, block.p25, block.median, block.p75, block.p95, block.max, block.mad, block.vwap, block.qty_sum, block.listing_count
-    );
-    if let Some(rate) = block.sale_rate {
-        // `String`'s `fmt::Write` impl is infallible.
-        let _ = write!(out, ", saleRate = {rate:.4}");
-    }
-    // Additive v3 fields (the addon's ingestor validates known keys and
-    // ignores unknown ones): absent when the ledger has no evidence — never
-    // zero, so "missing" and "genuinely zero" stay distinguishable.
-    if let Some(rate) = block.sale_rate_180d {
-        let _ = write!(out, ", saleRate180d = {rate:.4}");
-    }
-    if let Some(days) = block.days_since_last_sale {
-        let _ = write!(out, ", daysSinceLastSale = {days}");
-    }
-    if let Some(closures) = block.closures_since_last_sale {
-        let _ = write!(out, ", closuresSinceLastSale = {closures}");
-    }
-    if let Some(units) = block.qty_sold {
-        let _ = write!(out, ", qtySold = {units}");
-    }
-    out
-}
-
-fn metrics_lua(metrics: &BTreeMap<Span, MetricBlock>) -> String {
-    let spans: Vec<String> = metrics
-        .iter()
-        .map(|(span, block)| format!("{} = {{ {} }}", span.name(), metric_fields_lua(block)))
-        .collect();
-    format!("metrics = {{ {} }}", spans.join(", "))
-}
-
-fn entry_lua(entry: &FeedEntry) -> String {
-    let identity = match &entry.item {
-        ItemRef::Item { item_id } => format!("itemID = {item_id}"),
-        ItemRef::Pet {
-            species,
-            level,
-            quality,
-            breed,
-        } => format!(
-            "kind = \"pet\", speciesID = {species}, level = {level}, qualityID = {quality}, breedID = {breed}"
-        ),
-    };
-    format!(
-        "{{ {identity}, category = \"{}\", {} }}",
-        entry.category.as_str(),
-        metrics_lua(&entry.metrics)
-    )
-}
-
-fn render_lua(feed: &FeedSnapshot) -> Vec<u8> {
-    let items: Vec<String> = feed
-        .entries
-        .iter()
-        .filter(|entry| !entry.metrics.is_empty()) // empty entries would fail the addon's strict ingestor
-        .map(entry_lua)
-        .collect();
-    let lua = format!(
-        "AuctiMoggerTrackerFeed = {{\n  version = 3,\n  generatedAt = {},\n  items = {{\n    {}\n  }},\n}}\n",
-        feed.generated_at,
-        items.join(",\n    ")
-    );
-    lua.into_bytes()
-}
-
-// --------------------------------------------------------------- JSON side
-
-fn metric_json(block: &MetricBlock) -> serde_json::Value {
-    serde_json::json!({
-        "n": block.n,
-        "min": block.min,
-        "p05": block.p05,
-        "p25": block.p25,
-        "median": block.median,
-        "p75": block.p75,
-        "p95": block.p95,
-        "max": block.max,
-        "mad": block.mad,
-        "vwap": block.vwap,
-        "qtySum": block.qty_sum,
-        "listingCount": block.listing_count,
-        "saleRate": block.sale_rate,
-        "saleRate180d": block.sale_rate_180d,
-        "daysSinceLastSale": block.days_since_last_sale,
-        "closuresSinceLastSale": block.closures_since_last_sale,
-        "qtySold": block.qty_sold,
-    })
-}
-
-fn entry_json(entry: &FeedEntry) -> serde_json::Value {
-    let mut metrics = serde_json::Map::new();
-    for (span, block) in &entry.metrics {
-        metrics.insert(span.name().to_string(), metric_json(block));
-    }
-    let mut object = serde_json::Map::new();
-    match &entry.item {
-        ItemRef::Item { item_id } => {
-            object.insert("itemID".into(), serde_json::json!(item_id));
-        }
-        ItemRef::Pet { species, level, quality, breed } => {
-            object.insert("kind".into(), serde_json::json!("pet"));
-            object.insert("speciesID".into(), serde_json::json!(species));
-            object.insert("level".into(), serde_json::json!(level));
-            object.insert("qualityID".into(), serde_json::json!(quality));
-            object.insert("breedID".into(), serde_json::json!(breed));
-        }
-    }
-    object.insert("category".into(), serde_json::json!(entry.category.as_str()));
-    object.insert("metrics".into(), serde_json::Value::Object(metrics));
-    serde_json::Value::Object(object)
-}
-
-fn render_json(feed: &FeedSnapshot) -> Result<Vec<u8>, RenderError> {
-    let items: Vec<serde_json::Value> =
-        feed.entries.iter().filter(|entry| !entry.metrics.is_empty()).map(entry_json).collect();
-    let value = serde_json::json!({
-        "version": 3,
-        "generatedAt": feed.generated_at,
-        "items": items,
-    });
-    serde_json::to_vec(&value).map_err(|e| RenderError(format!("json render: {e}")))
-}
-
-// ------------------------------------------------- database feed (v4) renderers
+// ------------------------------------------------------------------ renderers
 
 /// The three record tables of a carrier, in the order the file lists them.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,167 +645,6 @@ fn now_unix() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
-}
-
-#[cfg(test)]
-mod tests {
-    // Test assertions may unwrap: fixture-driven, deterministic inputs.
-    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::indexing_slicing)]
-
-    use amtracker_core::{
-        domain::Category,
-        ports::FeedRenderer,
-    };
-
-    use super::*;
-
-    fn sample_feed() -> FeedSnapshot {
-        let block = MetricBlock {
-            n: 5,
-            min: 100,
-            p05: 100,
-            p25: 200,
-            median: 300,
-            p75: 400,
-            p95: 500,
-            max: 500,
-            mad: 100,
-            vwap: 366,
-            qty_sum: 150,
-            listing_count: 5,
-            sale_rate: Some(0.25),
-            sale_rate_180d: Some(0.2),
-            days_since_last_sale: Some(9),
-            closures_since_last_sale: Some(14),
-            qty_sold: Some(220),
-        };
-        let mut metrics = BTreeMap::new();
-        metrics.insert(Span::D1, block.clone());
-        let mut pet_metrics = BTreeMap::new();
-        pet_metrics.insert(Span::D1, block);
-        FeedSnapshot {
-            target: TargetId("us-4".into()),
-            generated_at: 1_760_000_000,
-            entries: vec![
-                FeedEntry {
-                    item: ItemRef::Item { item_id: 194_784 },
-                    category: Category::Commodity,
-                    metrics,
-                },
-                FeedEntry {
-                    item: ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 },
-                    category: Category::Pet,
-                    metrics: pet_metrics,
-                },
-            ],
-        }
-    }
-
-    #[test]
-    fn lua_render_matches_the_contract_shape() {
-        let mut feed = sample_feed();
-        // entries with no metrics are omitted upstream; drop here to test the
-        // renderer against well-formed input only
-        feed.entries.truncate(1);
-        let lua = FeedCodec.render(&feed, FeedFormat::Lua).expect("render");
-        let text = String::from_utf8(lua).expect("utf-8");
-        let expected = "AuctiMoggerTrackerFeed = {\n  \
-            version = 3,\n  generatedAt = 1760000000,\n  items = {\n    \
-            { itemID = 194784, category = \"commodity\", metrics = { d1 = { n = 5, min = 100, p05 = 100, p25 = 200, median = 300, p75 = 400, p95 = 500, max = 500, mad = 100, vwap = 366, qtySum = 150, listingCount = 5, saleRate = 0.2500, saleRate180d = 0.2000, daysSinceLastSale = 9, closuresSinceLastSale = 14, qtySold = 220 } } }\n  },\n}\n";
-        assert_eq!(text, expected);
-    }
-
-    /// Ledger evidence absent from a block must render ABSENT, never zero:
-    /// the zero-vs-missing lesson from TSM's `value > 0 and value or nil`.
-    #[test]
-    fn ledger_absence_renders_absent_not_zero() {
-        let mut feed = sample_feed();
-        feed.entries.truncate(1);
-        let d1 = feed.entries[0].metrics.remove(&Span::D1).expect("d1");
-        feed.entries[0].metrics.insert(
-            Span::D1,
-            MetricBlock {
-                sale_rate: None,
-                sale_rate_180d: None,
-                days_since_last_sale: None,
-                closures_since_last_sale: None,
-                qty_sold: None,
-                ..d1
-            },
-        );
-        let lua = String::from_utf8(FeedCodec.render(&feed, FeedFormat::Lua).expect("render"))
-            .expect("utf-8");
-        assert!(lua.contains("listingCount = 5 }"), "no trailing fields after listingCount: {lua}");
-        assert!(!lua.contains("saleRate180d"), "{lua}");
-        assert!(!lua.contains("daysSinceLastSale"), "{lua}");
-        assert!(!lua.contains("closuresSinceLastSale"), "{lua}");
-        assert!(!lua.contains("qtySold"), "{lua}");
-    }
-
-    /// JSON pins the same absence as explicit `null`s: the keys are always
-    /// present, only the Lua feed omits them.
-    #[test]
-    fn json_absence_renders_null_not_missing() {
-        let mut feed = sample_feed();
-        feed.entries.truncate(1);
-        let d1 = feed.entries[0].metrics.remove(&Span::D1).expect("d1");
-        feed.entries[0].metrics.insert(
-            Span::D1,
-            MetricBlock {
-                sale_rate: None,
-                sale_rate_180d: None,
-                days_since_last_sale: None,
-                closures_since_last_sale: None,
-                qty_sold: None,
-                ..d1
-            },
-        );
-        let bytes = FeedCodec.render(&feed, FeedFormat::Json).expect("render");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
-        let d1 = &value["items"][0]["metrics"]["d1"];
-        assert_eq!(d1["saleRate"], serde_json::Value::Null);
-        assert_eq!(d1["saleRate180d"], serde_json::Value::Null);
-        assert_eq!(d1["daysSinceLastSale"], serde_json::Value::Null);
-        assert_eq!(d1["closuresSinceLastSale"], serde_json::Value::Null);
-        assert_eq!(d1["qtySold"], serde_json::Value::Null);
-    }
-
-    #[test]
-    fn pet_entries_render_the_contract_identity() {
-        let mut feed = sample_feed();
-        feed.entries.truncate(2);
-        let d1_block = feed.entries[0].metrics[&Span::D1].clone();
-        feed.entries[1].metrics.insert(Span::D7, MetricBlock { sale_rate: None, ..d1_block });
-        let lua = String::from_utf8(FeedCodec.render(&feed, FeedFormat::Lua).expect("render"))
-            .expect("utf-8");
-        assert!(
-            lua.contains(
-                "kind = \"pet\", speciesID = 2546, level = 1, qualityID = 3, breedID = 11"
-            ),
-            "{lua}"
-        );
-        assert!(lua.contains("d7 = { n = 5"), "{lua}");
-    }
-
-    #[test]
-    fn json_render_round_trips_through_serde() {
-        let feed = sample_feed();
-        let bytes = FeedCodec.render(&feed, FeedFormat::Json).expect("render");
-        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("valid json");
-        assert_eq!(value["version"], 3);
-        assert_eq!(value["generatedAt"], 1_760_000_000);
-        assert_eq!(value["items"][0]["itemID"], 194_784);
-        assert_eq!(value["items"][0]["category"], "commodity");
-        assert_eq!(value["items"][0]["metrics"]["d1"]["median"], 300);
-        assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate"], 0.25);
-        assert_eq!(value["items"][0]["metrics"]["d1"]["saleRate180d"], 0.2);
-        assert_eq!(value["items"][0]["metrics"]["d1"]["daysSinceLastSale"], 9);
-        assert_eq!(value["items"][0]["metrics"]["d1"]["closuresSinceLastSale"], 14);
-        assert_eq!(value["items"][0]["metrics"]["d1"]["qtySold"], 220);
-        assert_eq!(value["items"][1]["kind"], "pet");
-        assert_eq!(value["items"][1]["category"], "pet");
-        assert_eq!(value["items"][1]["speciesID"], 2546);
-    }
 }
 
 #[cfg(test)]

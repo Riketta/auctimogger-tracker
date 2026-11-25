@@ -11,8 +11,8 @@ use crate::{
         CatalogCounts,
         Category,
         ClassSummary,
+        DatabaseSnapshot,
         FeedFormat,
-        FeedSnapshot,
         FetchOutcome,
         Flavor,
         ItemDayLow,
@@ -1083,15 +1083,20 @@ pub trait AlertDispatchPort: Send + Sync {
     ) -> Result<(), crate::error::AlertDispatchError>;
 }
 
-/// Outbound: feed rendering (lua / json).
+/// Outbound: database feed rendering (the v4 carrier and its JSON twin).
 pub trait FeedRenderer: Send + Sync {
-    /// Serializes `feed` into `format`.
+    /// Serializes `snapshot` into `format`.
     ///
     /// # Errors
     ///
     /// Returns `RenderError` when the snapshot cannot be represented in the
-    /// requested serialization.
-    fn render(&self, feed: &FeedSnapshot, format: FeedFormat) -> Result<Vec<u8>, RenderError>;
+    /// requested serialization: an identity filed under the wrong table, a
+    /// pet below species grain, a record without a span, or keys out of order.
+    fn render(
+        &self,
+        snapshot: &DatabaseSnapshot,
+        format: FeedFormat,
+    ) -> Result<Vec<u8>, RenderError>;
 }
 
 /// Outbound: feed publication (disk + in-memory for HTTP).

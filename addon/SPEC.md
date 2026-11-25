@@ -1,11 +1,13 @@
 # SPEC — AuctiMogger Database
 
-Status: **in progress**. Batch 1 is implemented: the domain types, the record
-codec, the carrier and JSON-twin renderers and the golden fixtures. Nothing else
-is; the rest follows the batches in §11. This file is the single source of
-truth for the AuctiMogger Database addon and for the tracker feed (v4) it
-consumes. When this file and the code disagree, the code wins — fix the doc in
-the same change.
+Status: **in progress**. Batches 1 and 2 are implemented: the domain
+types, the record codec, the carrier and JSON-twin renderers, the golden fixtures,
+and the tracker side that feeds them — the export service, publication and
+the v4 routes; feed v3 is gone. The addon itself is not yet; the rest follows
+the batches in §11. This file is the single source of truth for the
+AuctiMogger Database addon and for the tracker feed (v4) it consumes. When
+this file and the code disagree, the code wins — fix the doc in the same
+change.
 
 Scope: everything under `addon/` plus the tracker-side feed export, publication
 and sync command. The sniper addon (`Riketta/AuctiMogger`) has its own SPEC; §8
@@ -198,8 +200,10 @@ Market header fields:
   malformed record.
 - **Integers:** every value is below 2^53 in magnitude, signed or not, so Lua
   5.1 doubles hold it exactly. A zigzag code is up to `2^54 − 2`: a decoder
-  keeps the sign bit apart and accumulates `floor(code / 2)`, so no
-  intermediate exceeds 2^53.
+  keeps the sign bit apart and accumulates `floor(code / 2)` as the magnitude,
+  so no intermediate exceeds 2^53. That accumulated magnitude is not yet the
+  value: a code with the sign bit set decodes to `−(magnitude + 1)` — codes
+  `1, 3, 5` are `−1, −2, −3` — never to `−magnitude`.
 
 The Rust decoder (`crates/infra/src/record.rs`) is the reference; the addon's
 Lua decoder refuses exactly the same things:
@@ -448,8 +452,8 @@ The nine records:
 
 ### 6.1 Domain types
 
-In `crates/core/src/domain.rs` (added in batch 1; the v3 payload types leave in
-batch 2):
+In `crates/core/src/domain.rs` (added in batch 1; batch 2 removed the v3
+payload types):
 
 ```rust
 pub struct DatabaseSnapshot {
@@ -523,24 +527,28 @@ pub struct DealMark {
 }
 ```
 
-Batch 2 removes `FeedEntry` and `FeedSnapshot`. Kept under their names because
+Batch 2 removed `FeedEntry` and `FeedSnapshot`. Kept under their names because
 they are generic transport ports: `FeedFormat`, `FeedRenderer`, `FeedPublisher`,
-`PublishedFeed`.
+`PublishedFeed`; `FeedRenderer::render` takes a `DatabaseSnapshot`. `CraftQuote`
+and `DealMark` are `Copy`.
 
 ### 6.2 Codec modules
 
 - `crates/infra/src/pack.rs` — `ALPHABET`, `MAX_INTEGER`, `put_varint`,
   `put_zigzag`, `zigzag`/`unzigzag`, `to_text`, `from_text`, a `Reader`
-  (`varint`, `zigzag`, `uint`, `byte`, `flag`, `finish`), `basis_points`,
-  `saturate_u16` and `PackError`. The raw varint reader is exact over the whole
-  `u64` range; the `2^53 − 1` ceiling is applied to the integer a field carries.
+  (`varint`, `zigzag`, `uint`, `byte`, `flag`, `finish`) and `PackError`. The raw
+  varint reader is exact over the whole `u64` range; the `2^53 − 1` ceiling is
+  applied to the integer a field carries. `basis_points` and `saturate_u16`
+  are defined in `crates/core/src/domain.rs` — the export service converts
+  ranks and rates with the same definitions the codec writes — and
+  re-exported here.
 - `crates/infra/src/record.rs` — `encode(&ItemRecord) -> String` and
   `decode(&str) -> Result<ItemRecord, PackError>`. The decoder is the Rust
   reference used by tests; the game runs the Lua one.
 - `crates/infra/src/feed.rs` — `FeedCodec::carrier` and `FeedCodec::json_twin`
-  render a `DatabaseSnapshot` (batch 1). The `FeedRenderer` implementation on
-  `FeedCodec` still renders v3 until batch 2 moves the port to
-  `DatabaseSnapshot`; `FileFeedPublisher` is unchanged.
+  render a `DatabaseSnapshot`; `FeedCodec` implements `FeedRenderer` over them
+  (`Lua` is the carrier, `Json` the twin) and `FileFeedPublisher` is unchanged.
+  The v3 renderers are deleted.
 - Both renderers refuse a snapshot that would publish a wrong file rather than
   publish it: an identity filed under the wrong table, a pet below species
   grain, a record without a span, or keys that do not ascend (in Lua a
@@ -551,8 +559,12 @@ they are generic transport ports: `FeedFormat`, `FeedRenderer`, `FeedPublisher`,
 ### 6.3 Export service
 
 `crates/core/src/services/database_export.rs` replaces `feed_export.rs`:
-`DatabaseExportService { history, snapshots, metrics, opportunities, crafts, clock }`
-with `build(target, &ExportOptions { spans }) -> Result<DatabaseSnapshot, _>`.
+`DatabaseExportService { history, snapshots, metrics, opportunities, crafts,
+clock, tracker_version }` with
+`build(&TargetConfig, &ExportOptions { spans }) -> Result<DatabaseSnapshot, _>`.
+The target configuration supplies the market header (`MarketMeta`: region,
+ruleset, house or connected realm, flavor); the composition root passes the
+tracker version it writes into every header.
 
 Algorithm:
 
@@ -560,27 +572,48 @@ Algorithm:
    of each payload kind's newest snapshot.
 2. Per category: identities from `history.items_with_data` over the longest
    span window; group by feed grain (pets by species); span blocks through the
-   cached bulk paths — all exactly as v3.
-3. Facts from the prepared scan through a new read accessor on
-   `OpportunityService` exposing, per identity: `value7`, `sold_median14`,
-   `samples7`, `median_now` and `median_prev` (for the trend), sold/expired
-   counts, sold units, recency, the 30 daily lows and the vendor price.
+   cached bulk paths — all exactly as v3. A group without any span block is
+   omitted.
+3. Facts from the prepared scan through a read accessor on
+   `OpportunityService`: `facts(target, category)` answers a `ScanFacts` view
+   and its `get(&identity)` an `ItemFacts` — `value7`, `sold_median14`,
+   `samples7`, `median_now` and `median_prev` (for the trend), today's
+   sighting, sold/expired counts, sold units, the 30 daily lows (oldest day
+   first) and the vendor price. An identity without a scan row has no facts
+   and carries only what the snapshot knows. (The ledger recency is not
+   exposed: the span blocks already carry `daysSinceLastSale` and
+   `closuresSinceLastSale`.)
 4. Live group from `snapshots.floors(target, kind, snapshot_id)` of the newest
    snapshot — **read directly, not from the scan**, so the min buyout never
-   lags an ingest cycle.
-5. `low30` and `lowRank30d` computed with the ranking's own `low_rank`.
-6. Crafts: `crafts.crafts(target).ranked`, first row per output.
-7. Deals: `opportunities.opportunities(target, category, 0.0, MAX, Score)`,
-   the index in that order is the rank.
+   lags an ingest cycle. `seenFloor`/`seenQty` attach when today's fold floor
+   undercuts the live floor (an equal floor is that listing, still up) and
+   the newest snapshot lists anything at all — an empty snapshot proves
+   nothing is gone, exactly as in the missed-deals list.
+5. `low30` and `lowRank30d` computed with the ranking's own `low_rank`; the
+   sparkline scales each low as `round(low × 128 ÷ reference)`, so the
+   reference sits at mid-scale and anything above twice it reads as 255.
+6. Crafts: `crafts.crafts(target).ranked`, first row per output, attached to
+   the output's record in the category the craft was priced in.
+7. Deals: `opportunities_in(&facts, category, 0.0, MAX, Score)` — the ranking
+   over the very view the facts came from, so both describe one scan — the
+   index in that order is the rank.
 8. Attach groups per the rules of §5.6, sort, return.
 
 Cost: span blocks and scan facts are cached; the only new store reads are the
-two floor queries per publish.
+two floor queries per publish. Measured on a 7,570-record market: about 11 s
+for the first export of a market (every span block computed), about 2 s
+afterwards.
+
+Tests: the attachment rules over hand-built facts (`database_export.rs`);
+store-level integration tests of every group, pet pooling, dual categories,
+crafts and the lossless render (`crates/infra/tests/database_export.rs`); the
+scheduler's ordering and the routes (`crates/server/tests/web.rs`).
 
 ### 6.4 Freshness and scheduler ordering
 
-Today `scheduler::run_pass` publishes the feed **before** refreshing the
-prepared scans, and the manual `/api/fetch` path reuses `run_pass`. New order:
+Before batch 2 `scheduler::run_pass` published the feed **before** refreshing
+the prepared scans, and the manual `/api/fetch` path reuses `run_pass`. The
+order since batch 2:
 
 ```
 evaluate_alerts → run_prune_if_due → refresh scans (all categories)
@@ -601,8 +634,10 @@ the live group comes from the snapshot directly.
 | `GET /api/addon/manifest` | New (§6.7). |
 | `GET /api/addon/file/<path>` | New (§6.7). |
 
-`ResponseCache::slim_feed` is removed. The OpenAPI document, the `/api`
-directory, the dashboard's feed links and the drift test are updated.
+`ResponseCache::slim_feed` is removed, and with it the watchlist revision
+counter that keyed the slim feed's cache (`WatchlistService::revision`). The
+OpenAPI document, the `/api` directory, the dashboard's feed links and the
+drift test are updated.
 
 ### 6.6 CLI
 
@@ -647,6 +682,8 @@ folder with placeholder slots) for manual installs.
 - v3 renderers and their tests; `ExportOptions.watchlist_only`.
 - `scripts/verify_feed.lua`; the `generated_lua_passes_the_contract_verifier`
   test; the CI step that installs lua5.4 for it.
+- `WatchlistService`'s revision counter (it existed for the slim feed cache).
+- `crates/infra/tests/feed_export.rs`, replaced by `database_export.rs`.
 
 ### 6.9 Documentation to update
 
@@ -656,6 +693,8 @@ folder with placeholder slots) for manual installs.
 - The README's Forever example pairs `forever-eu-pvp-alliance` with
   `house_id = 113`, which is the Horde house (Alliance is 111): fix it.
 - `crates/server/src/web/openapi.rs`.
+- The README rows for the two addon routes land with batch 6, when the routes
+  exist.
 
 ## 7. Addon implementation
 
@@ -1072,8 +1111,8 @@ them.
 
 **Addon (Lua)** — every gate scoped to `addon/`, because the tree also holds
 Lua these gates must not judge: foreign copies and probes in the gitignored
-`target/`, and the differently styled `scripts/verify_feed.lua` until batch 2
-deletes it:
+`target/` (`scripts/verify_feed.lua`, the one tracked Lua file outside the
+addon, was deleted in batch 2):
 
 ```sh
 stylua --check addon
@@ -1180,6 +1219,32 @@ no floor to carry), and the `value` group gained a flag word for
 Done when a generated carrier is at most about 3 MB per market and decodes
 losslessly.
 
+**Status: done.** Measured on the live `forever-eu-pvp-alliance` market
+(7,570 records, 29,916 span blocks; see the note below):
+
+| Quantity | Value |
+|---|---|
+| Carrier | 1,888,151 bytes — about 250 per record, the largest record line 342 |
+| JSON twin | 19.1 MB (pretty-printed, decoded) |
+| Lua 5.1.5 load of the carrier | 17–20 ms |
+| Lua 5.1.5 decode | every record field-for-field equal to `feed.json` |
+| Export | about 11 s for a market's first export, about 2 s afterwards |
+
+The development machine held no usable database (its copy predates the
+v2 sighting schema), so the store was seeded from the market's real
+`/api/history?days=30` day rows — every fold, the daily lows and the listing
+counts are the live ones; the ledger and the live snapshot's quantities are
+synthetic. On a real ledger far fewer records carry sold evidence. The
+carrier was checked by a Lua 5.1 decoder written for the check and kept only
+in the gitignored `target/` (`verify_v4.lua`);
+the addon's own decoder (batch 3) is held to the golden trio instead.
+
+It also settled four details this section had left open: the facts accessor
+exposes no ledger recency (no field reads it); `basis_points` and
+`saturate_u16` live in the core; the scan's daily lows are ordered by day,
+oldest first, as the sparkline reads them; and §5.4 now spells out how a
+negative zigzag code decodes.
+
 ### Batch 3 — addon core, specs, gates, CI
 
 1. Folder, TOC, slot placeholders.
@@ -1234,8 +1299,15 @@ Done when every Lua gate passes locally and in CI.
 
 ## 13. Known limitations and later work
 
-- The sparkline is a gap-blind series of observed days: daily lows carry no
-  day stamps. Day-stamped lows need a new bulk read.
+- The sparkline is a gap-blind series of the observed days, oldest first: the
+  daily lows carry no day stamps, so a day without a listing leaves no gap.
+  Day-stamped lows need a new bulk read.
+- The value, evidence and position groups need a scan row — a listing inside
+  the ranking's 7-day window. An identity last seen 8–30 days ago exports
+  its span blocks and nothing else.
+- `vendorPrice` reaches a record only while the item is listed in the newest
+  snapshot: the ranking's scan loads the vendor prices of the listed items
+  alone, and the export adds no catalog read of its own.
 - No "best time to buy" line: the buy-timing service is per item only; a
   whole-market export needs a pre-aggregate.
 - Pets are per species; a multi-variant species exports spans only. The
@@ -1246,8 +1318,9 @@ Done when every Lua gate passes locally and in CI.
 - No in-game inspector window, deals browser or live auction-house refresh.
 - Each market is a slot file. Per-market load-on-demand addons would avoid
   overwriting tracked placeholders.
-- Automatic house detection is not attempted: OribosExchange's table and the
-  tracker's README both disagree with the owner's API-verified house ids.
+- Automatic house detection is not attempted: OribosExchange's table
+  disagrees with the owner's API-verified house ids (the README's example
+  uses the verified ones).
 - Retail is compatible by construction but untested in game.
 
 ## Appendix A — research evidence

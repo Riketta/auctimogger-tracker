@@ -35,12 +35,13 @@ use amtracker_core::{
     domain::{
         utc_day,
         Category,
+        DatabaseSnapshot,
         FeedFormat,
-        FeedSnapshot,
         FetchOutcome,
         Flavor,
         ItemRef,
         ListingKind,
+        MarketMeta,
         NewSnapshot,
         NormalizedListing,
         PayloadKind,
@@ -59,7 +60,7 @@ use amtracker_core::{
     services::{
         catalog::CatalogService,
         cycle::IngestCycleService,
-        feed_export::FeedExportService,
+        database_export::DatabaseExportService,
         health::HealthService,
         metrics::MetricsService,
         opportunity::OpportunityService,
@@ -322,6 +323,11 @@ fn test_state_full(
         clock.clone(),
         &config,
     ));
+    let crafts = Arc::new(amtracker_core::services::craft::CraftService::new(
+        opportunities.clone(),
+        metrics.clone(),
+        &config.crafts,
+    ));
     let state = AppState {
         config: config.clone(),
         clock: clock.clone(),
@@ -349,11 +355,7 @@ fn test_state_full(
             store.clone(),
             clock.clone(),
         )),
-        crafts: Arc::new(amtracker_core::services::craft::CraftService::new(
-            opportunities.clone(),
-            metrics.clone(),
-            &config.crafts,
-        )),
+        crafts: Arc::clone(&crafts),
         // No file watcher in the fixtures: tests that exercise the hot
         // reload attach one to a temp file of their own.
         recipe_reloader,
@@ -370,19 +372,18 @@ fn test_state_full(
             0,
             config.opportunities.min_samples,
         )),
-        feed_export: Arc::new(FeedExportService::new(
-            store.clone(),
+        feed_export: Arc::new(DatabaseExportService::new(
             store.clone(),
             store.clone(),
             metrics,
+            opportunities,
+            crafts,
             clock.clone(),
+            "0.1.0-test",
         )),
         publisher: Arc::new(FileFeedPublisher::new(root.join("feeds"))),
         renderer: Arc::new(FeedCodec),
-        response_cache: amtracker_server::web::cache::ResponseCache::new(
-            clock.clone(),
-            i64::try_from(config.server.feed_publish_secs).unwrap_or(i64::MAX),
-        ),
+        response_cache: amtracker_server::web::cache::ResponseCache::new(clock.clone()),
         cycle: Arc::new(IngestCycleService::new(
             Arc::new(OfflineSource),
             store.clone(),
@@ -1972,65 +1973,166 @@ async fn warmer_rechecks_named_ids_on_the_slow_ring() {
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// `/api/feed.json` serves the copy the scheduler publishes — never a
-/// per-request whole-market rebuild — and, like `/feed.lua`, answers 404
-/// until the first publication.
+/// `/api/feed.json` and `/feed.lua` serve the copies the scheduler publishes
+/// — never a per-request whole-market rebuild — and answer 404 until the
+/// first publication.
 #[tokio::test]
-async fn api_feed_json_serves_the_published_copy() {
+async fn feed_downloads_serve_the_published_copies() {
     let (state, root) = test_state(None);
     let router = build_router_arc(Arc::clone(&state));
     let (status, _) = get(router.clone(), "/api/feed.json?target=t1").await;
     assert_eq!(status, StatusCode::NOT_FOUND, "nothing published yet");
+    let (status, _) = get(router.clone(), "/feed.lua?target=t1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing published yet");
 
-    let published = FeedCodec
-        .render(
-            &FeedSnapshot {
-                target: TargetId(TARGET.into()),
-                generated_at: 1_760_000_000,
-                entries: Vec::new(),
-            },
-            FeedFormat::Json,
-        )
-        .expect("render");
-    state
-        .publisher
-        .publish(&TargetId(TARGET.into()), FeedFormat::Json, &published)
-        .expect("publish");
-    // A rebuild would see this fold; the published copy must win.
+    let snapshot = DatabaseSnapshot {
+        target: TargetId(TARGET.into()),
+        market: MarketMeta {
+            region: Some("us".into()),
+            ruleset_id: None,
+            house_id: None,
+            connected_realm_id: Some(4),
+            flavor: Flavor::default(),
+        },
+        tracker_version: "0.1.0-test".into(),
+        generated_at: 1_760_000_000,
+        auctions_at: None,
+        commodities_at: None,
+        entries: Vec::new(),
+    };
+    let json = FeedCodec.render(&snapshot, FeedFormat::Json).expect("render");
+    let lua = FeedCodec.render(&snapshot, FeedFormat::Lua).expect("render");
+    state.publisher.publish(&TargetId(TARGET.into()), FeedFormat::Json, &json).expect("publish");
+    state.publisher.publish(&TargetId(TARGET.into()), FeedFormat::Lua, &lua).expect("publish");
+    // A rebuild would see this fold; the published copies must win.
     seed_history(&state);
 
-    let (status, body) = get(router, "/api/feed.json?target=t1").await;
+    let (status, body) = get(router.clone(), "/api/feed.json?target=t1").await;
     assert_eq!(status, StatusCode::OK);
-    assert_eq!(body.as_bytes(), published.as_slice(), "served verbatim");
+    assert_eq!(body.as_bytes(), json.as_slice(), "served verbatim");
+    let twin: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(twin["version"], 4, "the v4 twin, not the v3 feed");
+
+    let response = router
+        .oneshot(
+            Request::builder().uri("/feed.lua?target=t1").body(Body::empty()).expect("request"),
+        )
+        .await
+        .expect("response");
+    assert_eq!(response.status(), StatusCode::OK);
+    let content_type = response
+        .headers()
+        .get("content-type")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert_eq!(content_type, "text/x-lua; charset=utf-8");
+    let body = response.into_body().collect().await.expect("body").to_bytes();
+    assert_eq!(body.as_ref(), lua.as_slice(), "the carrier, served verbatim");
     std::fs::remove_dir_all(&root).ok();
 }
 
-/// The slim feed is cached between requests, and a watchlist change shows on
-/// the very next request — long before the publish interval would expire the
-/// cached copy.
+/// The watchlist-only feed is gone with the v3 contract: the route answers
+/// 404, and a watchlist change no longer feeds anything.
 #[tokio::test]
-async fn feed_slim_lua_is_cached_and_refreshed_by_watchlist_changes() {
+async fn the_slim_feed_route_is_gone() {
     let (state, root) = test_state(None);
     seed_history(&state);
-    // A second tradable item, not watched yet.
-    save_item_fold(&state, 2590, utc_day(state.clock.now()));
-    let target = TargetId(TARGET.into());
-    state.watchlist.add(&target, ItemRef::Item { item_id: 2589 }, None).expect("watch item");
+    state
+        .watchlist
+        .add(&TargetId(TARGET.into()), ItemRef::Item { item_id: 2589 }, None)
+        .expect("watch item");
+    let router = build_router_arc(Arc::clone(&state));
+    let (status, _) = get(router, "/feed-slim.lua?target=t1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The scheduler's post-cycle pass publishes the v4 feed: after one pass both
+/// files exist, the carrier carries the market's records under the addon's
+/// loader, and the twin decodes to the same market — with the scan refresh
+/// ordered before the publish, the live listing and the rank are the cycle's.
+#[tokio::test]
+async fn the_scheduler_pass_publishes_the_v4_feed() {
+    let (state, root) = test_state(None);
+    seed_history(&state);
+    amtracker_server::scheduler::after_cycle_now(&state, TARGET);
     let router = build_router_arc(Arc::clone(&state));
 
-    let (status, first) = get(router.clone(), "/feed-slim.lua?target=t1").await;
+    let (status, lua) = get(router.clone(), "/feed.lua?target=t1").await;
     assert_eq!(status, StatusCode::OK);
-    assert!(first.contains("itemID = 2589"), "the watched item is exported");
-    assert!(!first.contains("itemID = 2590"), "unwatched items stay out");
-    let (_, again) = get(router.clone(), "/feed-slim.lua?target=t1").await;
-    assert_eq!(again, first, "unchanged watchlist: the cached copy");
+    assert!(
+        lua.starts_with(
+            "-- AuctiMogger Database market file - GENERATED by auctimogger-tracker 0.1.0-test."
+        ),
+        "{lua}"
+    );
+    assert!(lua.contains("    target = \"t1\",\n"), "{lua}");
+    assert!(lua.contains("m.commodities[2589] = \""), "the seeded item's record: {lua}");
+    assert!(lua.ends_with("A.EndMarket()\n"), "{lua}");
 
-    // Straight through the service, as the mutation handlers do: the cached
-    // copy was rendered from another watchlist revision.
-    state.watchlist.add(&target, ItemRef::Item { item_id: 2590 }, None).expect("watch second item");
-    let (_, grown) = get(router, "/feed-slim.lua?target=t1").await;
-    assert!(grown.contains("itemID = 2590"), "the new entry shows at once");
-    assert!(grown.contains("itemID = 2589"), "and the earlier one stays");
+    let (status, body) = get(router.clone(), "/api/feed.json?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    let twin: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(twin["version"], 4);
+    assert_eq!(twin["target"], TARGET);
+    assert_eq!(twin["market"]["connectedRealmId"], 4);
+    let record = &twin["items"][0];
+    assert_eq!(record["itemID"], 2589);
+    assert_eq!(record["category"], "commodity");
+    assert_eq!(record["live"]["floor"], 150, "the newest snapshot's floor, read directly");
+    assert_eq!(record["live"]["listed"], 4);
+    assert_eq!(record["value7"], 150);
+    assert_eq!(record["deal"]["rank"], 1, "the one rankable listing of the market");
+    assert_eq!(record["spans"]["d1"]["median"], 200);
+    assert_eq!(record["spans"]["d7"]["median"], 150);
+
+    // Both files are on disk under the feed directory, named for the target.
+    let dir = root.join("feeds").join(TARGET);
+    assert_eq!(std::fs::read(dir.join("feed.lua")).expect("feed.lua"), lua.as_bytes());
+    assert!(std::fs::read(dir.join("feed.json")).expect("feed.json").len() > 2);
+    std::fs::remove_dir_all(&root).ok();
+}
+
+/// The pass refreshes the prepared scans BEFORE it publishes: a scan that is
+/// still served from cache (inside its hard staleness, past the refresh
+/// debounce) and disagrees with the store must not leak into the feed — the
+/// published record shows the refreshed facts.
+#[tokio::test]
+async fn the_scheduler_pass_refreshes_scans_before_it_publishes() {
+    let settable = Arc::new(SettableClock(Arc::new(std::sync::Mutex::new(1_760_000_000))));
+    let clock: Arc<dyn ClockPort> = settable.clone();
+    let (state, root) = test_state_build(None, Arc::new(NoItemInfo), Some(clock), |_| {});
+    seed_history(&state);
+    let target = TargetId(TARGET.into());
+    let item = ItemRef::Item { item_id: 2589 };
+
+    // The ranking's scan is prepared, then the market moves underneath it: a
+    // stack of 12 at 300 is sighted and sold a minute later.
+    state.opportunities.refresh(&target, Category::Commodity).expect("refresh");
+    let mut sold = listing(970_001, &item, 300);
+    sold.quantity = 12;
+    sold.time_left = TimeLeftBand::Medium;
+    state
+        .sales
+        .observe(&target, PayloadKind::Commodities, &[sold], 1, settable.now())
+        .expect("observe");
+    let credits = state
+        .sales
+        .close_missing(&target, PayloadKind::Commodities, 2, settable.now() + 60)
+        .expect("close");
+    assert_eq!(credits.len(), 1, "gone well inside its band: a sale");
+
+    // Past the refresh debounce the cached scan still answers the old facts —
+    // which is exactly what a publish-before-refresh pass would ship.
+    settable.advance(31);
+    let cached = state.opportunities.facts(&target, Category::Commodity).expect("facts");
+    assert_eq!(cached.get(&item).expect("a scan row").sold_median14, None);
+
+    amtracker_server::scheduler::after_cycle_now(&state, TARGET);
+    let (_, body) = get(build_router_arc(Arc::clone(&state)), "/api/feed.json?target=t1").await;
+    let twin: Value = serde_json::from_str(&body).expect("json");
+    assert_eq!(twin["items"][0]["soldMedian14"], 300, "published from the refreshed scan");
     std::fs::remove_dir_all(&root).ok();
 }
 

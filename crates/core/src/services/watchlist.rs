@@ -1,12 +1,6 @@
 //! Watchlist management (D8): add/remove/list per target.
 
-use std::sync::{
-    atomic::{
-        AtomicU64,
-        Ordering,
-    },
-    Arc,
-};
+use std::sync::Arc;
 
 use crate::{
     domain::{
@@ -23,10 +17,6 @@ use crate::{
 pub struct WatchlistService {
     repo: Arc<dyn WatchlistRepository>,
     clock: Arc<dyn crate::ports::ClockPort>,
-    /// Bumped by every successful add/remove (any target): the change signal
-    /// derived data keyed to the watchlist — the cached slim feed — is
-    /// validated against, so no mutation path can leave it stale.
-    revision: AtomicU64,
 }
 
 impl WatchlistService {
@@ -36,21 +26,7 @@ impl WatchlistService {
         repo: Arc<dyn WatchlistRepository>,
         clock: Arc<dyn crate::ports::ClockPort>,
     ) -> Self {
-        Self { repo, clock, revision: AtomicU64::new(0) }
-    }
-
-    /// How many watchlist changes (adds and removals, across every target)
-    /// have gone through this service. Derived data that depends on the
-    /// watchlist stores the revision it was built from and rebuilds when the
-    /// two disagree.
-    #[must_use]
-    pub fn revision(&self) -> u64 {
-        self.revision.load(Ordering::Acquire)
-    }
-
-    /// Marks every watchlist-derived copy as outdated.
-    fn bump(&self) {
-        self.revision.fetch_add(1, Ordering::Release);
+        Self { repo, clock }
     }
 
     /// Adds an item to a target's watchlist.
@@ -65,9 +41,7 @@ impl WatchlistService {
         item: ItemRef,
         note: Option<String>,
     ) -> Result<WatchlistEntry, StoreError> {
-        self.repo
-            .add(&NewWatchlistEntry { target: target.clone(), item, note })
-            .inspect(|_| self.bump())
+        self.repo.add(&NewWatchlistEntry { target: target.clone(), item, note })
     }
 
     /// Removes an item from a target's watchlist; returns whether an entry
@@ -77,11 +51,7 @@ impl WatchlistService {
     ///
     /// Returns `StoreError::Backend` when entries cannot be deleted.
     pub fn remove(&self, target: &TargetId, item: &ItemRef) -> Result<bool, StoreError> {
-        self.repo.remove(target, item).inspect(|removed| {
-            if *removed {
-                self.bump();
-            }
-        })
+        self.repo.remove(target, item)
     }
 
     /// Lists a target's watchlist in insertion order.

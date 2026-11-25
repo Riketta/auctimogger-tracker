@@ -320,25 +320,13 @@ fn group_is_redundant(shift: u32, value: u64) -> bool {
     shift > 0 && value >> shift == 0
 }
 
-/// A fraction stored as an integer: `round(fraction * 10000)`, half away from
-/// zero. Not a number, and anything at or below zero, read as zero; a value
-/// beyond a `u32` saturates at `u32::MAX`.
-#[must_use]
-pub fn basis_points(fraction: f64) -> u32 {
-    // The float-to-integer `as` cast saturates: not a number and anything at
-    // or below zero read as zero, anything beyond `u32` as `u32::MAX`.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    ((fraction * 10_000.0).round() as u32)
-}
-
-/// Rounds `value` into a `u16`, saturating at both ends. Not a number, and
-/// anything at or below zero, read as zero.
-#[must_use]
-pub fn saturate_u16(value: f64) -> u16 {
-    // Saturating for the same reason as `basis_points`.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    (value.round() as u16)
-}
+// The wire's two integer scalars live in the core, next to the domain types
+// they serialize: the database feed's export service converts with the very
+// definitions the record codec writes.
+pub use amtracker_core::domain::{
+    basis_points,
+    saturate_u16,
+};
 
 // ------------------------------------------------------------------- symbols
 
@@ -617,45 +605,6 @@ mod tests {
                 corrupted.push('1');
                 assert_eq!(from_text(&corrupted), Err(PackError::Padding), "{text}");
             }
-        }
-    }
-
-    #[test]
-    fn basis_points_rounds_half_away_from_zero_and_saturates() {
-        let cases = [
-            (0.25, 2_500),
-            (0.8889, 8_889),
-            (0.3617, 3_617),
-            (1.0, 10_000),
-            (0.000_050_001, 1),
-            (0.000_049_999, 0),
-            (0.3333, 3_333),
-            (2.5, 25_000),
-            (0.0, 0),
-            (-0.5, 0),
-            (f64::NAN, 0),
-            (f64::INFINITY, u32::MAX),
-            (f64::MAX, u32::MAX),
-        ];
-        for (fraction, expected) in cases {
-            assert_eq!(basis_points(fraction), expected, "bp({fraction})");
-        }
-    }
-
-    #[test]
-    fn saturate_u16_clamps_at_both_ends() {
-        let cases = [
-            (39.44, 39),
-            (0.4, 0),
-            (65_535.4, u16::MAX),
-            (70_000.0, u16::MAX),
-            (0.0, 0),
-            (-1.0, 0),
-            (f64::NAN, 0),
-            (f64::INFINITY, u16::MAX),
-        ];
-        for (value, expected) in cases {
-            assert_eq!(saturate_u16(value), expected, "u16({value})");
         }
     }
 

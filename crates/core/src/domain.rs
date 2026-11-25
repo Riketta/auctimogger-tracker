@@ -931,38 +931,14 @@ impl BlockLedger {
 
 // ---------------------------------------------------------------- feed
 
-/// Which serialization a feed publisher should emit.
+/// Which serialization of a database snapshot a feed publisher emits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum FeedFormat {
-    /// Lua table literal, loadable by the in-game addon.
+    /// The carrier (`feed.lua`): a Lua chunk the `AuctiMoggerDatabase`
+    /// addon loads as one market's file.
     Lua,
-    /// JSON document.
+    /// The JSON twin (`feed.json`): the same records, decoded.
     Json,
-}
-
-/// One feed contract entry (tracker feed v3): an item or pet identity plus its
-/// per-span metric blocks.
-#[derive(Clone, Debug, PartialEq)]
-pub struct FeedEntry {
-    /// The tracked item or pet identity (canonical grain).
-    pub item: ItemRef,
-    /// Which market the entry's metrics describe: an item trading in both
-    /// auction houses exports one entry per category.
-    pub category: Category,
-    /// Metric block per span; spans without data are absent.
-    pub metrics: BTreeMap<Span, MetricBlock>,
-}
-
-/// The full feed snapshot for one target (`AuctiMoggerTrackerFeed` payload).
-#[derive(Clone, Debug, PartialEq)]
-pub struct FeedSnapshot {
-    /// The target the feed was built for.
-    pub target: TargetId,
-    /// Data freshness stamp (unix seconds) — newest source `Last-Modified`
-    /// across the target's payload kinds, or the publish time if unknown.
-    pub generated_at: i64,
-    /// Feed entries, sorted by item identity.
-    pub entries: Vec<FeedEntry>,
 }
 
 /// Publication info for one rendered feed.
@@ -1123,7 +1099,7 @@ pub struct ValueQuote {
 }
 
 /// The `craft` group: what one make of the item costs and earns.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CraftQuote {
     /// Reagent cost per make (copper).
     pub cost: i64,
@@ -1135,7 +1111,7 @@ pub struct CraftQuote {
 }
 
 /// The `deal` group: where a live listing ranks among its category's deals.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DealMark {
     /// 1-based rank by score.
     pub rank: u32,
@@ -1489,6 +1465,28 @@ pub fn utc_day(unix_ts: i64) -> i64 {
     unix_ts.div_euclid(86_400)
 }
 
+/// A fraction stored as the wire's integer: `round(fraction * 10000)`, half
+/// away from zero. Not a number, and anything at or below zero, read as zero;
+/// a value beyond a `u32` saturates at `u32::MAX`. The one definition behind
+/// every basis-point figure the feed carries — a span block's sale rate no
+/// less than a deal's score — so two of them can never round differently.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn basis_points(fraction: f64) -> u32 {
+    // The float-to-integer `as` cast saturates: not a number and anything at
+    // or below zero read as zero, anything beyond `u32` as `u32::MAX`.
+    (fraction * 10_000.0).round() as u32
+}
+
+/// Rounds `value` into a `u16`, saturating at both ends. Not a number, and
+/// anything at or below zero, read as zero.
+#[must_use]
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn saturate_u16(value: f64) -> u16 {
+    // Saturating for the same reason as `basis_points`.
+    value.round() as u16
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1556,5 +1554,44 @@ mod tests {
         );
         assert_eq!(SaleCounts::from_ledger(0, 0), None, "no eligible close is no evidence");
         assert_eq!(SaleCounts::from_ledger(2, -1), None, "a corrupt negative sum is no evidence");
+    }
+
+    #[test]
+    fn basis_points_rounds_half_away_from_zero_and_saturates() {
+        let cases = [
+            (0.25, 2_500),
+            (0.8889, 8_889),
+            (0.3617, 3_617),
+            (1.0, 10_000),
+            (0.000_050_001, 1),
+            (0.000_049_999, 0),
+            (0.3333, 3_333),
+            (2.5, 25_000),
+            (0.0, 0),
+            (-0.5, 0),
+            (f64::NAN, 0),
+            (f64::INFINITY, u32::MAX),
+            (f64::MAX, u32::MAX),
+        ];
+        for (fraction, expected) in cases {
+            assert_eq!(basis_points(fraction), expected, "bp({fraction})");
+        }
+    }
+
+    #[test]
+    fn saturate_u16_clamps_at_both_ends() {
+        let cases = [
+            (39.44, 39),
+            (0.4, 0),
+            (65_535.4, u16::MAX),
+            (70_000.0, u16::MAX),
+            (0.0, 0),
+            (-1.0, 0),
+            (f64::NAN, 0),
+            (f64::INFINITY, u16::MAX),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(saturate_u16(value), expected, "u16({value})");
+        }
     }
 }

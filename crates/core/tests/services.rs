@@ -2944,159 +2944,89 @@ fn bulk_block_paths_match_the_per_item_paths() {
     assert_eq!(d7.median, 210);
 }
 
+// --------------------------------------------------------- scan facts (feed v4)
+
+/// The fact view is the ranking's own evidence, by identity: the value, today's
+/// median against the days before, the seen-today sighting, the ledger counts,
+/// units sold, the month of lows and the vendor floor — and `None` for an
+/// identity the scan holds no row for.
 #[test]
-fn feed_export_builds_canonical_entries_through_the_bulk_paths() {
-    let today = 1_000_000; // utc day 11
-    let target = TargetId("us-4".into());
-    let item1 = item(1);
-    let variant_a = ItemRef::Pet { species: 2546, level: 1, quality: 3, breed: 11 };
-    let variant_b = ItemRef::Pet { species: 2546, level: 7, quality: 3, breed: 5 };
+fn scan_facts_expose_the_rankings_evidence_per_identity() {
+    let now = 1_000_000;
+    let (service, history, sales, _clock) = opportunity_fixture(now);
+    // Scripted with the days in no particular order, newest first: the view
+    // hands the month back oldest day first, as a sparkline reads it.
+    history.set_lows(1, utc_day(now), &[130_000, 110_000, 120_000]);
+    sales.set_units(&[(1, 140)]);
+    let facts = service.facts(&target().id, Category::Commodity).expect("facts");
 
-    let watchlist = Arc::new(FakeWatchlist::default());
-    for watched in [&item1, &variant_a, &variant_b] {
-        watchlist
-            .add(&NewWatchlistEntry { target: target.clone(), item: watched.clone(), note: None })
-            .expect("add watch");
-    }
-
-    let history = Arc::new(FakeHistory::default());
-    let mut fold1 = DayFold::new(item1.clone());
-    fold1.apply(&[listing(1, &item1, 100, 1), listing(2, &item1, 100, 2)]);
-    history
-        .save_fold(&target, &item1, utc_day(today), Category::Commodity, &fold1)
-        .expect("save fold");
-    history
-        .save_fold(
-            &target,
-            &variant_a,
-            utc_day(today),
-            Category::Pet,
-            &fold_with(&variant_a, 200, 1),
-        )
-        .expect("save fold");
-    history
-        .save_fold(
-            &target,
-            &variant_b,
-            utc_day(today),
-            Category::Pet,
-            &fold_with(&variant_b, 220, 3),
-        )
-        .expect("save fold");
-
-    let sales = Arc::new(FakeSales::default());
-    sales.rates.lock().unwrap().insert(item1.clone(), 0.5);
-    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
-        history.clone(),
-        Arc::new(FakeCache::default()),
-        sales,
-        Arc::new(FixedClock(today)),
-    ));
-    let feed = amtracker_core::services::feed_export::FeedExportService::new(
-        Arc::new(FakeSnapshots::new()),
-        history,
-        watchlist,
-        metrics,
-        Arc::new(FixedClock(today)),
-    )
-    .build_feed(
-        &target,
-        &amtracker_core::services::feed_export::ExportOptions {
-            spans: vec![Span::D1],
-            watchlist_only: true,
-        },
-    )
-    .expect("feed");
-
-    assert_eq!(feed.entries.len(), 2, "one item entry + one species-grain pet entry");
-    let pet_entry = feed
-        .entries
-        .iter()
-        .find(|entry| matches!(entry.item, ItemRef::Pet { species: 2546, .. }))
-        .expect("pet entry");
+    let one = facts.get(&item(1)).expect("item 1 has a scan row");
+    assert_eq!((one.value7, one.samples7), (110_000, 2_000), "the 7-day value and its evidence");
+    assert_eq!(one.sold_median14, None, "nothing priced has sold");
     assert_eq!(
-        pet_entry.item,
-        ItemRef::Pet { species: 2546, level: 0, quality: 0, breed: 0 },
-        "variants export under the canonical species grain"
+        (one.median_now, one.median_prev),
+        (110_000, 90_000.0),
+        "today against the day before"
     );
-    let pet_block = pet_entry.metrics.get(&Span::D1).expect("pet d1 block");
-    assert_eq!(pet_block.n, 2, "both variants pooled into one population");
-    assert_eq!(pet_block.median, 210);
+    assert_eq!(one.seen_today, Some((55_000, 1)));
+    assert_eq!(one.counts, Some(amtracker_core::domain::SaleCounts { sold: 1, expired: 3 }));
+    assert_eq!(one.sold_units, Some(140));
+    assert_eq!(one.lows, [120_000, 110_000, 130_000], "oldest day first");
+    assert_eq!(one.vendor_price, None, "the default catalog knows no price");
 
-    let item_entry = feed.entries.iter().find(|entry| entry.item == item1).expect("item entry");
-    let item_block = item_entry.metrics.get(&Span::D1).expect("item d1 block");
-    assert_eq!(item_block.n, 2);
-    assert_eq!(item_block.median, 100);
+    let two = facts.get(&item(2)).expect("item 2 has a scan row");
+    assert_eq!((two.counts, two.sold_units, two.lows), (None, None, &[][..]));
+    assert!(facts.get(&item(99)).is_none(), "no row, no facts");
+    assert_eq!(facts.computed_at(), now);
 }
 
+/// Ranks derived from a fact view are the ranking's own — the same rows, in
+/// the same order, as the cached-scan entry point answers — so a feed record's
+/// rank and the deals page can never disagree.
 #[test]
-fn feed_export_attributes_every_span_to_its_own_item_across_many_singles() {
-    // More single groups than spans, and two spans: the shape where a
-    // span-major matrix consumed as group-major cross-contaminates early
-    // entries and silently drops the tail.
-    let today = 1_000_000; // utc day 11
-    let target = TargetId("us-4".into());
-    let item1 = item(1);
-    let item2 = item(2);
-    let item3 = item(3);
-    let yesterday = utc_day(today) - 1;
+fn ranks_from_a_fact_view_match_the_ranking() {
+    let now = 1_000_000;
+    let (service, _history, _sales, _clock) = opportunity_fixture(now);
+    let facts = service.facts(&target().id, Category::Commodity).expect("facts");
 
-    let watchlist = Arc::new(FakeWatchlist::default());
-    for watched in [&item1, &item2, &item3] {
-        watchlist
-            .add(&NewWatchlistEntry { target: target.clone(), item: watched.clone(), note: None })
-            .expect("add watch");
-    }
+    let ranked = service
+        .opportunities(&target().id, Category::Commodity, 0.0, 10, OpportunitySort::Score)
+        .expect("ranked");
+    let from_view =
+        service.opportunities_in(&facts, Category::Commodity, 0.0, 10, OpportunitySort::Score);
 
-    let history = Arc::new(FakeHistory::default());
-    let save = |item: &ItemRef, day: i64, price: i64, count: i64| {
-        let listings: Vec<_> = (0..count).map(|i| listing(1_000 + i, item, price, 1)).collect();
-        let mut fold = DayFold::new(item.clone());
-        fold.apply(&listings);
-        history.save_fold(&target, item, day, Category::Commodity, &fold).expect("save fold");
-    };
-    save(&item1, utc_day(today), 100, 2);
-    save(&item1, yesterday, 100, 1); // d7: n=3, median 100
-    save(&item2, utc_day(today), 500, 1);
-    save(&item2, yesterday, 900, 1); // d7: n=2, median 700
-    save(&item3, utc_day(today), 900, 1); // d7: n=1, median 900
+    assert_eq!(from_view, ranked);
+    assert_eq!(from_view.len(), 2, "both fixture items are listed and rankable");
+    // The view's own floor and value are what the rank was computed from.
+    let first = from_view.first().expect("a ranked row");
+    let facts_of_first = facts.get(&first.item).expect("the ranked row has facts");
+    assert_eq!(facts_of_first.value7, first.value7);
+    assert_eq!(facts_of_first.sold_median14, first.sold_median14);
+    assert_eq!(facts_of_first.vendor_price, first.vendor_price);
+}
 
-    let sales = Arc::new(FakeSales::default());
-    let metrics = Arc::new(amtracker_core::services::metrics::MetricsService::new(
-        history.clone(),
-        Arc::new(FakeCache::default()),
-        sales,
-        Arc::new(FixedClock(today)),
-    ));
-    let feed = amtracker_core::services::feed_export::FeedExportService::new(
-        Arc::new(FakeSnapshots::new()),
-        history,
-        watchlist,
-        metrics,
-        Arc::new(FixedClock(today)),
-    )
-    .build_feed(
-        &target,
-        &amtracker_core::services::feed_export::ExportOptions {
-            spans: vec![Span::D1, Span::D7],
-            watchlist_only: true,
-        },
-    )
-    .expect("feed");
+/// A filter applied to the view behaves like the same filter on the ranking.
+#[test]
+fn ranks_from_a_fact_view_keep_the_ranking_filters() {
+    let now = 1_000_000;
+    let (service, _history, _sales, _clock) = opportunity_fixture(now);
+    let facts = service.facts(&target().id, Category::Commodity).expect("facts");
 
-    assert_eq!(feed.entries.len(), 3, "every single exports, none dropped");
-    let expected = [(1i64, 2i64, 100i64, 3i64, 100i64), (2, 1, 500, 2, 700), (3, 1, 900, 1, 900)];
-    for (id, d1_n, d1_median, d7_n, d7_median) in expected {
-        let entry = feed
-            .entries
-            .iter()
-            .find(|entry| entry.item == ItemRef::Item { item_id: id })
-            .unwrap_or_else(|| panic!("entry for item {id} missing"));
-        let d1 = entry.metrics.get(&Span::D1).unwrap_or_else(|| panic!("item {id} d1 missing"));
-        assert_eq!((d1.n, d1.median), (d1_n, d1_median), "item {id} d1 block");
-        let d7 = entry.metrics.get(&Span::D7).unwrap_or_else(|| panic!("item {id} d7 missing"));
-        assert_eq!((d7.n, d7.median), (d7_n, d7_median), "item {id} d7 block");
-    }
+    // Nothing churns a thousand listings a day under the churn anchor.
+    let none =
+        service.opportunities_in(&facts, Category::Commodity, 1_000.0, 10, OpportunitySort::Score);
+    assert_eq!(none.len(), 0, "the churn floor still applies");
+    // A limit of one keeps only the top-ranked row.
+    let top = service.opportunities_in(&facts, Category::Commodity, 0.0, 1, OpportunitySort::Score);
+    assert_eq!(top.len(), 1);
+    assert_eq!(
+        top.first().map(|row| &row.item),
+        service
+            .opportunities(&target().id, Category::Commodity, 0.0, 10, OpportunitySort::Score)
+            .expect("ranked")
+            .first()
+            .map(|row| &row.item)
+    );
 }
 
 // ------------------------------------------------------- snapshot browsing

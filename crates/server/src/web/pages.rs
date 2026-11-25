@@ -140,12 +140,12 @@ fn watch_button(open: bool, watched: bool, target: &TargetId, item: &ItemRef) ->
     if watched {
         format!(
             "<button class=\"btn btn-sm btn-danger\" data-watch-remove='{payload}'{auth} \
-             title=\"remove from watchlist (drives feed-slim.lua)\">unwatch</button>"
+             title=\"remove from watchlist\">unwatch</button>"
         )
     } else {
         format!(
             "<button class=\"btn btn-sm\" data-watch-add='{payload}'{auth} \
-             title=\"add to watchlist (drives feed-slim.lua)\">watch</button>"
+             title=\"add to watchlist\">watch</button>"
         )
     }
 }
@@ -316,11 +316,10 @@ pub(crate) async fn dashboard(State(state): State<Arc<AppState>>) -> Response {
             body,
             "<div class=\"card\"><h3>{slug}</h3><p class=\"feed-links\" style=\"margin:.2rem 0\">\
              <a href=\"/feed.lua?target={slug}\">feed.lua</a> · \
-             <a href=\"/feed-slim.lua?target={slug}\">feed-slim.lua</a> · \
              <a href=\"/api/feed.json?target={slug}\">feed.json</a></p>\
              <p class=\"muted\" style=\"margin:.2rem 0 0\">{} {}</p></div>",
-            tip("feed.lua", "The full tracker feed consumed by the AuctiMogger addon; download into AuctiMogger/AuctiMoggerTracker/ and /reload."),
-            tip("feed-slim.lua", "Watchlist-only feed — the same contract, restricted to the items you watch on this target.")
+            tip("feed.lua", "The market file the AuctiMogger Database addon loads: copy it over a slot of the addon (Market1.lua .. Market6.lua), then /reload."),
+            tip("feed.json", "The same market, decoded — for reading and for scripts.")
         );
     }
     body.push_str("</div>");
@@ -2844,9 +2843,9 @@ pub(crate) async fn overview_page(
 /// page opens in (see `watchlist_page`).
 const WATCHLIST_NOW_COLUMN: usize = 1;
 
-/// `GET /watchlist?target=&category=` — the curated list driving
-/// `feed-slim.lua`, joined to one market category's numbers. It opens dearest
-/// first by the current day's median; header clicks re-sort client-side.
+/// `GET /watchlist?target=&category=` — the curated list, joined to one
+/// market category's numbers. It opens dearest first by the current day's
+/// median; header clicks re-sort client-side.
 pub(crate) async fn watchlist_page(
     State(state): State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
@@ -2897,14 +2896,12 @@ pub(crate) async fn watchlist_page(
     let open = mutations_open(&state.config);
 
     let mut body = format!(
-        "<p class=\"muted\">{} <code>{}</code> — {} <code>feed-slim.lua</code> {}</p>",
+        "<p class=\"muted\">{} <code>{}</code></p>",
         tip(
             "watchlist",
             "Your curated list for this target, dearest first by today's median — click any column header to re-sort."
         ),
-        html_escape(target.as_str()),
-        tip("drives", "The slim feed is built on demand from exactly these entries."),
-        tip("feed-slim.lua", "Download it from the dashboard or /feed-slim.lua?target=…")
+        html_escape(target.as_str())
     );
     if report.is_empty() {
         let _ = write!(
@@ -3570,7 +3567,7 @@ pub(crate) async fn help_page() -> Response {
         ("score", "Weighted geometric mean of discount, reliability, churn and stability (weights from the config, normalized; only ratios matter for ranking). Any component at zero scores zero: a liquid but undiscounted market cannot outrank a real deal."),
         ("efficient crafts", "The /crafts ranking: every manual recipe with its reagents and output at their reference values, less the house cut, scaled by the output's 14-day sale rate. A reagent the book itself crafts is sourced at the cheaper of its market price and its craft cost, recursing through the book (a looping book is refused). Recipes that miss a price, lack sale evidence, sell too slowly or lose money are listed separately with the reason. The recipe file reloads when it changes on disk."),
         ("expected profit", "Per make: (output value × makes − house cut − reagent cost) × the output's sale rate — what one make is worth given the risk the output does not sell. The crafting ranking sorts on it."),
-        ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort). Drives feed-slim.lua — the addon consumes exactly those items."),
+        ("watchlist", "Your curated per-target list, opening dearest first by today's median (click a header to re-sort); the /priorities and /compare views are built from it."),
         ("snapshot viewer", "The /browse page: one stored snapshot's raw listings laid out like the in-game auction house (toolbar filters, sortable columns, page arrows). Without a pinned snapshot the newest one for the target/kind serves; pinning an id freezes that historical view. Names/levels/classes come from the catalog and read as — or raw ids until enrichment fills them."),
         ("alert rule", "A per-target watch condition (price-below, below-floor, sale-rate-above, days-since-last-sale-above) evaluated against the same cached blocks the item pages show — an alert can never contradict its page. Rules live in the store; evaluation runs after every ingest cycle. Each market category only observes while its own feed snapshot is younger than [alerts].max_data_age_secs (commodity rules gate on the commodities feed, item/pet rules on the auctions feed), so a dead feed can never manufacture an alert."),
         ("below-floor", "A per-target condition that fires while today's d1 median sits at or under a longer span's p05/p25 floor. In a flat market the median and the floor coincide, so it fires continuously there: read it as a flat-market detector, not as a price-drop signal — floor-below-value and new-listing-below are the drop signals."),

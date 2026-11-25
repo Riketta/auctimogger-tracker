@@ -18,10 +18,7 @@ use amtracker_core::{
         Span,
     },
     error::StoreError,
-    services::{
-        cycle::CycleOutcome,
-        feed_export::ExportOptions,
-    },
+    services::cycle::CycleOutcome,
 };
 use axum::{
     extract::{
@@ -117,91 +114,42 @@ fn internal_error(scope: &'static str, error: &impl std::fmt::Display) -> Respon
 
 // ------------------------------------------------------------------- feeds
 
-async fn feed_file(
-    State(state): State<Arc<AppState>>,
-    Query(params): Query<HashMap<String, String>>,
-    slim: bool,
+/// `GET /feed.lua?target=` — the published carrier: the v4 market file the
+/// `AuctiMoggerDatabase` addon loads (`addon/SPEC.md`, section 5), served
+/// verbatim from the copy the scheduler publishes after each successful
+/// cycle (throttled by `server.feed_publish_secs`). A request never rebuilds
+/// the market; 404 until the first publication.
+pub(crate) async fn feed_lua(
+    state: State<Arc<AppState>>,
+    params: Query<HashMap<String, String>>,
 ) -> Response {
     let target = match target_param(&params, &state.config) {
         Ok(target) => target,
         Err(response) => return *response,
     };
-    // Feed assembly/render touches SQLite and possibly lots of folds; keep it
-    // off the async workers.
-    let build = tokio::task::spawn_blocking({
+    // A multi-megabyte file read: keep it off the async workers.
+    let read = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || {
-            if slim {
-                // Built on demand from the watchlist, then served from the
-                // cache until the publish interval passes or the watchlist
-                // revision moves (any add/remove, from any path).
-                let options = ExportOptions {
-                    spans: state.config.metrics.spans.clone(),
-                    watchlist_only: true,
-                };
-                let bytes =
-                    state.response_cache.slim_feed(&target, state.watchlist.revision(), || {
-                        state.feed_export.build_feed(&target, &options).and_then(|feed| {
-                            state
-                                .renderer
-                                .render(&feed, FeedFormat::Lua)
-                                .map_err(|e| StoreError::Backend(e.to_string()))
-                        })
-                    })?;
-                Ok(Some(bytes.as_ref().clone()))
-            } else {
-                state.publisher.read(&target, FeedFormat::Lua)
-            }
-        }
+        move || state.publisher.read(&target, FeedFormat::Lua)
     });
-    let bytes = match build.await {
-        Ok(result) => result,
-        Err(error) => {
-            return super::render::store_error_page(StoreError::Backend(error.to_string())).await
-        }
-    };
-    match bytes {
-        Ok(Some(bytes)) => (
+    match read.await {
+        Ok(Ok(Some(bytes))) => (
             [
                 (header::CONTENT_TYPE, "text/x-lua; charset=utf-8"),
-                (
-                    header::CONTENT_DISPOSITION,
-                    if slim {
-                        "attachment; filename=\"feed-slim.lua\""
-                    } else {
-                        "attachment; filename=\"feed.lua\""
-                    },
-                ),
+                (header::CONTENT_DISPOSITION, "attachment; filename=\"feed.lua\""),
             ],
             bytes,
         )
             .into_response(),
-        Ok(None) => (
+        Ok(Ok(None)) => (
             StatusCode::NOT_FOUND,
             format!("no feed published yet for target '{}'", target.as_str()),
         )
             .into_response(),
-        Err(error) => super::render::store_error_page(error).await,
+        Ok(Err(error)) => super::render::store_error_page(error).await,
+        Err(error) => super::render::store_error_page(StoreError::Backend(error.to_string())).await,
     }
-}
-
-/// `GET /feed.lua?target=` — the cached full Lua feed.
-pub(crate) async fn feed_lua(
-    state: State<Arc<AppState>>,
-    params: Query<HashMap<String, String>>,
-) -> Response {
-    feed_file(state, params, false).await
-}
-
-/// `GET /feed-slim.lua?target=` — watchlist-only feed: built on demand,
-/// then cached for the feed publish interval; a watchlist change shows on
-/// the very next request.
-pub(crate) async fn feed_slim_lua(
-    state: State<Arc<AppState>>,
-    params: Query<HashMap<String, String>>,
-) -> Response {
-    feed_file(state, params, true).await
 }
 
 // -------------------------------------------------------------------- api
@@ -339,7 +287,7 @@ pub(crate) async fn api_index() -> Response {
         "description": "Local market-memory API over WoW auction data. Prices are integers in copper (10,000 copper = 1 gold); day values are UTC day numbers.",
         "openapi": "/api/openapi.json",
         "docs": "/api/docs",
-        "feeds": ["/feed.lua", "/feed-slim.lua", "/api/feed.json"],
+        "feeds": ["/feed.lua", "/api/feed.json"],
         "endpoints": endpoints,
     }))
     .into_response()
