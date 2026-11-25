@@ -69,6 +69,7 @@ local OPTIONAL = {
     "IsShiftKeyDown",
     "C_Timer",
     "Settings",
+    "MenuUtil",
 }
 
 local STUBS = { "CreateFrame", "GameTooltip", "UIParent", "time", "SlashCmdList", "SLASH_AMDB1", "SLASH_AMDB2" }
@@ -193,6 +194,9 @@ describe("the /amdb command", function()
             end,
             persist = function()
                 persisted = persisted + 1
+            end,
+            statusLine = function()
+                return "status line"
             end,
         })
     end
@@ -478,16 +482,22 @@ describe("the /amdb command", function()
             local withoutScreening = DIM
                 .. "without issecretvalue: values are used unscreened; a client without it exposes no secret values"
                 .. RESET
+            local withoutMenu = DIM
+                .. "without MenuUtil: the primary-market picker of the options panel moves to the next market on each click instead of opening a menu"
+                .. RESET
             local answer = run("status")
             assert.is_true(hasLine(answer, withoutPanel))
             assert.is_true(hasLine(answer, withoutScreening))
-            -- Seven optional surfaces are absent here; the eighth is print.
-            assert.equals(9, #answer)
+            assert.is_true(hasLine(answer, withoutMenu))
+            -- Eight optional surfaces are absent here; the ninth is print.
+            assert.equals(10, #answer)
             rawset(_G, "Settings", {})
             rawset(_G, "issecretvalue", function() end)
             answer = run("status")
             assert.is_false(hasLine(answer, withoutPanel))
             assert.is_false(hasLine(answer, withoutScreening))
+            -- The menu is still missing.
+            assert.is_true(hasLine(answer, withoutMenu))
         end)
 
         it("prints the reports recorded since the login line, once", function()

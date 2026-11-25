@@ -16,6 +16,7 @@ Core/format.lua
 Core/resolve.lua
 Core/tooltip_lines.lua
 Core/anchor.lua
+Core/panel_rows.lua
 
 # Market registration (must load before the slots)
 Adapters/market_files.lua

@@ -11,11 +11,12 @@ local ADDON, A = ...
 --                  this character chose is applied, and both tables are
 --                  written back in their clean shape;
 --   PLAYER_LOGIN   the first moment the player can read chat. The tooltip
---                  adapter and the /amdb command are built here, once: the
---                  attached frame is created and the hooks registered. Then
---                  the status line of SPEC 7.11 and every report the slot
---                  files recorded while they loaded are printed, and the
---                  update callbacks run, so subscribers see the markets;
+--                  adapter, the /amdb command and the options panel are built
+--                  here, once: the attached frame is created and the hooks
+--                  registered. Then the status line of SPEC 7.11 and every
+--                  report the slot files recorded while they loaded are
+--                  printed, and the update callbacks run, so subscribers see
+--                  the markets;
 --   PLAYER_LOGOUT  the settings are written back once more. Every change
 --                  already was, the moment it happened;
 --   MODIFIER_STATE_CHANGED  reaches the tooltip adapter, which rebuilds a
@@ -129,9 +130,23 @@ local function printReports()
     end
 end
 
---- Builds the tooltip adapter and the options once, and registers the hooks
---- and the slash command. Both touch the client's UI, so each is built under
---- pcall: what cannot start is reported in bad and left out.
+--- The options panel of SPEC 7.8, on the options the command built. A client
+--- without the Settings API goes without it, with a note; a panel that raises
+--- is reported in bad and left out. The command stays either way.
+---@param options AmdbOptions
+local function registerPanel(options)
+    local built, result = pcall(options.registerPanel, options)
+    if not built then
+        A.Say("the options panel could not start: " .. tostring(result), "bad")
+    elseif result == false then
+        A.Say(Options.TEXT.NO_PANEL, "info")
+    end
+end
+
+--- Builds the tooltip adapter and the options once, and registers the hooks,
+--- the slash command and the options panel. All of them touch the client's
+--- UI, so each is built under pcall: what cannot start is reported in bad and
+--- left out.
 local function buildAdapters()
     if A.tooltip == nil then
         local ok, tooltip = pcall(Tooltip.new, { store = A.store, settings = A.settings, say = A.SayNow })
@@ -153,6 +168,7 @@ local function buildAdapters()
             tooltip = A.tooltip,
             say = A.chat,
             persist = A.PersistSettings,
+            statusLine = statusLine,
         })
         if ok and type(options) == "table" then
             A.options = options
@@ -160,6 +176,7 @@ local function buildAdapters()
             if not registered then
                 A.Say("the /amdb command could not start: " .. tostring(err), "bad")
             end
+            registerPanel(options)
         else
             A.Say("the /amdb command could not start: " .. tostring(options), "bad")
         end

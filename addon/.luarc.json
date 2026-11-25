@@ -25,6 +25,7 @@
 		"ItemRefTooltip",
 		"lazy_setup",
 		"lazy_teardown",
+		"MenuUtil",
 		"match",
 		"mock",
 		"pending",

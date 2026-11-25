@@ -55,6 +55,7 @@ local GAME_FACING = {
 	"Enum",
 	"ItemRefTooltip",
 	"IsShiftKeyDown",
+	"MenuUtil",
 	"Settings",
 	"TooltipDataProcessor",
 	"issecretvalue",

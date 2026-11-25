@@ -13,6 +13,7 @@ local OPTIONAL_GLOBALS = {
     "IsShiftKeyDown",
     "C_Timer",
     "Settings",
+    "MenuUtil",
     "print",
 }
 local OPTIONAL_EVENTS = { "MODIFIER_STATE_CHANGED", "PLAYER_LOGOUT" }
@@ -181,6 +182,7 @@ describe("compat: fallbacks", function()
         assert.is_not_nil(fallbacks.TooltipDataProcessor:find("SPEC 7.5.1", 1, true))
         assert.is_not_nil(fallbacks.print:find("/amdb status", 1, true))
         assert.is_not_nil(fallbacks.Settings:find("slash command", 1, true))
+        assert.is_not_nil(fallbacks.MenuUtil:find("next market", 1, true))
         -- A required or authored surface has no fallback to document.
         assert.is_nil(fallbacks.CreateFrame)
         assert.is_nil(fallbacks.AuctiMoggerDatabase)

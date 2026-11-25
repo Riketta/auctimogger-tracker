@@ -35,6 +35,8 @@ local RESET = "|r"
 
 local NO_DATA = TITLE .. ": " .. BAD .. "no market data — copy the tracker's feed.lua over Market1.lua" .. RESET
 local PICK_ONE = "several markets loaded, pick one: /amdb market <id>"
+-- The note of SPEC 7.8, as the bootstrap records it (info prints muted).
+local NO_PANEL = "no options panel on this client — the /amdb command covers everything"
 
 --- Everything the TOC loads, slot files excepted.
 local FILES = {
@@ -46,6 +48,7 @@ local FILES = {
     "Core/resolve.lua",
     "Core/tooltip_lines.lua",
     "Core/anchor.lua",
+    "Core/panel_rows.lua",
     "Adapters/market_files.lua",
     "Adapters/compat.lua",
     "Adapters/extra_tip.lua",
@@ -71,18 +74,57 @@ local STUBS = {
     "GetAuctionBuyout",
     SETTINGS,
     CHARACTER,
+    "Settings",
+    "MenuUtil",
 }
 
---- A frame that records RegisterEvent and SetScript; any other method is a
---- no-op, so a tooltip frame accepts the setup calls the adapter makes.
+-- What registering the options panel creates at the login, after the tooltip:
+-- its frame, then one control per row of the model (Core/panel_rows.lua): the
+-- master switch's checkbox, the two preset buttons, seven line checkboxes and
+-- Shift detail's, and the primary-market picker. A font string is not a frame.
+local PANEL_CREATED = {
+    "Frame",
+    "CheckButton",
+    "Button",
+    "Button",
+    "CheckButton",
+    "CheckButton",
+    "CheckButton",
+    "CheckButton",
+    "CheckButton",
+    "CheckButton",
+    "CheckButton",
+    "CheckButton",
+    "Button",
+}
+local CREATED_AT_LOGIN = { "Frame", "GameTooltip", unpack(PANEL_CREATED) }
+
+--- A frame that records RegisterEvent, SetScript and the font strings it is
+--- asked for; any other method is a no-op, so a tooltip frame accepts the
+--- setup calls the adapter makes and a control the ones the panel makes.
 ---@return table frame
 local function newFrame(...)
-    local frame = { args = { ... }, events = {}, scripts = {} }
+    local frame = { args = { ... }, events = {}, scripts = {}, strings = {} }
     function frame:RegisterEvent(event)
         self.events[#self.events + 1] = event
     end
     function frame:SetScript(scriptType, handler)
         self.scripts[scriptType] = handler
+    end
+    function frame:CreateFontString()
+        local text = setmetatable({ shown = true }, {
+            __index = function()
+                return function() end
+            end,
+        })
+        function text:SetText(value)
+            self.text = value
+        end
+        function text:Hide()
+            self.shown = false
+        end
+        self.strings[#self.strings + 1] = text
+        return text
     end
     return setmetatable(frame, {
         __index = function()
@@ -133,8 +175,31 @@ end
 describe("bootstrap", function()
     local frame
     local tipFrame
+    local panelFrame
     local created
     local saved
+    local settingsCanvases
+    local settingsCategories
+
+    --- What CreateFrame hands out: the bootstrap's event frame is the first
+    --- plain frame, the tooltip adapter's frame the GameTooltip, and any later
+    --- plain frame the options panel's. The kind asked for is recorded; a
+    --- control of the panel belongs to no one of the three.
+    local function makeFrame(...)
+        local args = { ... }
+        created[#created + 1] = args[1]
+        local made = newFrame(unpack(args))
+        if args[1] == "GameTooltip" then
+            tipFrame = made
+        elseif args[1] == "Frame" then
+            if frame == nil then
+                frame = made
+            else
+                panelFrame = made
+            end
+        end
+        return made
+    end
 
     before_each(function()
         saved = {}
@@ -142,24 +207,35 @@ describe("bootstrap", function()
             saved[name] = rawget(_G, name)
         end
         created = {}
+        frame = nil
         tipFrame = nil
-        rawset(_G, "CreateFrame", function(...)
-            local args = { ... }
-            created[#created + 1] = args[1]
-            local made = newFrame(unpack(args))
-            if args[1] == "GameTooltip" then
-                tipFrame = made
-            else
-                frame = made
-            end
-            return made
-        end)
+        panelFrame = nil
+        settingsCanvases = {}
+        settingsCategories = {}
+        rawset(_G, "CreateFrame", makeFrame)
         rawset(_G, "UIParent", {})
         rawset(_G, "SlashCmdList", {})
         rawset(_G, "SLASH_AMDB1", nil)
         rawset(_G, "SLASH_AMDB2", nil)
         rawset(_G, SETTINGS, nil)
         rawset(_G, CHARACTER, nil)
+        -- The Settings API, as a current client has it: the options panel
+        -- registers with it and nothing is said of it.
+        rawset(_G, "Settings", {
+            RegisterCanvasLayoutCategory = function(owner, name)
+                local category = { name = name }
+                local layout = { anchors = {} }
+                function layout:AddAnchorPoint(point, x, y)
+                    self.anchors[#self.anchors + 1] = { point, x, y }
+                end
+                settingsCanvases[#settingsCanvases + 1] = { frame = owner, name = name, layout = layout }
+                return category, layout
+            end,
+            RegisterAddOnCategory = function(category)
+                settingsCategories[#settingsCategories + 1] = category
+            end,
+        })
+        rawset(_G, "MenuUtil", nil)
     end)
 
     after_each(function()
@@ -232,10 +308,10 @@ describe("bootstrap", function()
         assert.equals("function", type(rawget(_G, "SlashCmdList").AMDB))
         -- The frame the adapter created is the one CreateFrame handed out.
         assert.equals(tipFrame, A.tooltip.tip.tip)
-        assert.same({ "Frame", "GameTooltip" }, created)
+        assert.same(CREATED_AT_LOGIN, created)
         -- A second login builds nothing twice.
         fire("PLAYER_LOGIN")
-        assert.same({ "Frame", "GameTooltip" }, created)
+        assert.same(CREATED_AT_LOGIN, created)
     end)
 
     ----------------------------------------------------------- SavedVariables
@@ -517,12 +593,11 @@ describe("bootstrap", function()
     ------------------------------------------------------- a feature that fails
 
     it("leaves the tooltips out, reported in bad, when their frame cannot be created", function()
-        rawset(_G, "CreateFrame", function(kind)
+        rawset(_G, "CreateFrame", function(kind, ...)
             if kind == "GameTooltip" then
                 error("no tooltips on this client", 0)
             end
-            frame = newFrame(kind)
-            return frame
+            return makeFrame(kind, ...)
         end)
         local A, lines = boot()
         Loader.carrier(A, GOLDEN)
@@ -552,6 +627,76 @@ describe("bootstrap", function()
         assert.equals(status("1 market", TARGET, MUTED, "16m"), lines[1])
         -- The interpreter's message follows; the lead is ours.
         assert.equals(1, lines[2]:find(TITLE .. " " .. BAD .. "the /amdb command could not start: ", 1, true))
+    end)
+
+    ---------------------------------------------------------- the options panel
+
+    --- The text of the panel's last font string: the status line's row.
+    ---@return string|nil text
+    local function panelStatus()
+        assert.is_not_nil(panelFrame, "the options panel built no frame")
+        local strings = panelFrame.strings
+        return strings[#strings].text
+    end
+
+    it("registers the options panel with the Settings API at the login, once", function()
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        assert.same({}, settingsCanvases)
+        fire("PLAYER_LOGIN")
+        assert.equals(1, #settingsCanvases)
+        assert.equals("AuctiMogger Database", settingsCanvases[1].name)
+        assert.equals(panelFrame, settingsCanvases[1].frame)
+        assert.equals(A.options.panel.frame, panelFrame)
+        assert.same({ { "TOPLEFT", 16, -16 } }, settingsCanvases[1].layout.anchors)
+        assert.same({ { name = "AuctiMogger Database" } }, settingsCategories)
+        -- The panel's last row is the status line of SPEC 7.11, as the clock had
+        -- it; the login itself prints that line and says nothing of the panel.
+        assert.same({ status("1 market", TARGET, MUTED, "16m") }, lines)
+        assert.equals(status("1 market", TARGET, MUTED, "16m"), panelStatus())
+        -- A second login registers nothing twice.
+        fire("PLAYER_LOGIN")
+        assert.equals(1, #settingsCanvases)
+        assert.same(CREATED_AT_LOGIN, created)
+    end)
+
+    it("notes a client without the Settings API once, and goes on", function()
+        rawset(_G, "Settings", nil)
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        fire("PLAYER_LOGIN")
+        assert.same({
+            status("1 market", TARGET, MUTED, "16m"),
+            TITLE .. " " .. MUTED .. NO_PANEL .. RESET,
+        }, lines)
+        assert.is_nil(A.options.panel)
+        assert.same({ "Frame", "GameTooltip" }, created)
+        -- The command covers everything, as the note says.
+        A.options:run("deal off")
+        assert.is_false(A.settings.lines.deal)
+    end)
+
+    it("reports an options panel that cannot start, in bad, and keeps the command", function()
+        rawset(_G, "CreateFrame", function(kind, ...)
+            if kind == "CheckButton" then
+                error("no checkboxes on this client", 0)
+            end
+            return makeFrame(kind, ...)
+        end)
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        fire("PLAYER_LOGIN")
+        assert.same({
+            status("1 market", TARGET, MUTED, "16m"),
+            TITLE .. " " .. BAD .. "the options panel could not start: no checkboxes on this client" .. RESET,
+        }, lines)
+        assert.is_nil(A.options.panel)
+        -- Nothing half-built reached the client.
+        assert.same({}, settingsCanvases)
+        assert.same({}, settingsCategories)
+        -- The command is there all the same.
+        A.options:run("deal off")
+        assert.is_false(A.settings.lines.deal)
     end)
 
     ---------------------------------------------------------------- the events

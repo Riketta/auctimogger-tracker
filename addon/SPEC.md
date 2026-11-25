@@ -1,10 +1,10 @@
 # SPEC — AuctiMogger Database
 
-Status: **in progress**. Batches 1 to 4 are implemented: the domain types,
+Status: **in progress**. Batches 1 to 5 are implemented: the domain types,
 the record codec, the carrier and JSON-twin renderers, the golden fixtures,
 the tracker side that feeds them — the export service, publication and
-the v4 routes, feed v3 being gone — and the addon's core, its tooltip and
-the `/amdb` command. The options panel, the tracker's addon bundle and sync
+the v4 routes, feed v3 being gone — and the addon's core, its tooltip, the
+`/amdb` command and the options panel. The tracker's addon bundle and sync
 command, and the sniper's migration follow in the batches of §11. This file
 is the single source of truth for the AuctiMogger Database addon and for the
 tracker feed (v4) it consumes. When this file and the code disagree, the code
@@ -722,7 +722,8 @@ addon/
     AuctiMoggerDatabase.toc
     bootstrap.lua               composition root, loads last
     Core/                       pure Lua: pack, record, market, settings,
-                                format, resolve, tooltip_lines, anchor
+                                format, resolve, tooltip_lines, anchor,
+                                panel_rows
     Adapters/                   compat, market_files, extra_tip, tooltip,
                                 options, public_api
     Market1.lua … Market6.lua   slots (tracked placeholders)
@@ -747,6 +748,7 @@ Core/format.lua
 Core/resolve.lua
 Core/tooltip_lines.lua
 Core/anchor.lua
+Core/panel_rows.lua
 
 # Market registration (must load before the slots)
 Adapters/market_files.lua
@@ -816,6 +818,9 @@ Carried over from the sniper's house style:
   in `Core/` as the game global unless the file declares a local of that name
   first. The adapters' `Preferences` alias is for the files that could call
   the client's `Settings` API (§7.8).
+- A dependency handed to an object that keeps its methods on the same table
+  is never named like one of them: a dep named `status` once shadowed
+  `Options:status()` and silenced `/amdb status`.
 - A `---@class` block sits directly above the table it describes: the type
   checker binds it to the next definition, and a class separated from its
   table by constants or helpers has no fields.
@@ -832,6 +837,7 @@ Carried over from the sniper's house style:
 | `Core/resolve.lua` | `Resolve.item(value)`, `Resolve.species(value)` and `Resolve.resolve(value) -> kind, id` from a number, a hyperlink or an `item:` / `battlepet:` string. |
 | `Core/tooltip_lines.lua` | `TooltipLines.build(record, context) -> AmdbTipRow[]`, the pure row builder of §7.6. A row is `left`, `right` (nil: a single line) and, for a sparkline, `bars`. The context carries the ages, the other markets' records, the collapse and Shift flags and the settings; the builder reads no clock. |
 | `Core/anchor.lua` | `Anchor.side(ownerLeft, ownerRight, frameWidth, screenRight) -> "right" | "left"`, the pure side decision of §7.5.3; anything that is not four finite numbers answers the default side. `Anchor.point(side)` is the `SetPoint` arguments; `GAP` 8, `TOP_OFFSET` 10. |
+| `Core/panel_rows.lua` | `PanelRows.build(context) -> AmdbPanelRow[]`, the row model of the options panel (§7.8): the master switch, a button per preset, one checkbox per optional line and Shift detail under a title, the primary-market picker under another, and the status line, each with its label and its hover help. `PanelRows.height(rows)` is the height the frame needs. Pure: the settings, the markets and the status line arrive in the context. |
 
 #### 7.3.1 `AmdbRecord`
 
@@ -922,7 +928,7 @@ and a `fallbacks` table with one sentence per optional entry:
 |---|---|
 | Required globals | `CreateFrame`, `GameTooltip`, `UIParent`, `time`, `SlashCmdList` |
 | Required events | `ADDON_LOADED`, `PLAYER_LOGIN` |
-| Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `C_Timer`, `Settings`, `print` |
+| Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `C_Timer`, `Settings`, `MenuUtil`, `print` |
 | Optional events | `MODIFIER_STATE_CHANGED`, `PLAYER_LOGOUT` |
 | Authored | `SLASH_AMDB1`, `SLASH_AMDB2`, the namespace table `AuctiMoggerDatabase`, the attached frame `AuctiMoggerDatabaseTip` (a named frame: the client creates its global, and those of its font strings) |
 
@@ -956,9 +962,13 @@ in use (`processor`, `script` or `none`, kept in `path` for `/amdb status`).
 rebuild, `setEnabled` / `isEnabled` the master switch, `hide` / `isShown` the
 frame's state.
 
-**`Adapters/options.lua`** — the `/amdb` slash command and the settings panel
-(§7.7, §7.8); batch 4 ships the command. `Options.new({ store, settings,
-character, tooltip, say, persist })`, `register()`, `run(msg)`.
+**`Adapters/options.lua`** — the `/amdb` slash command (§7.7) and the options
+panel (§7.8). `Options.new({ store, settings, character, tooltip, say,
+persist, statusLine })`, `register()`, `run(msg)`, and for the panel
+`registerPanel()` and `refreshPanel()`. Every change of either goes through
+one `apply` method (`applyEnabled`, `applyLine`, `applyPreset`, `applyShift`,
+`applyMarket`) that changes the setting, writes it back and refreshes the
+panel; the command then answers in chat, and the panel says nothing.
 
 **`Adapters/public_api.lua`** — publishes the namespace table as the global `AuctiMoggerDatabase`, and `GetAuctionBuyout` as a global function of its own (§7.9).
 
@@ -970,12 +980,14 @@ SavedVariables lifecycle.
   in their clean shape, and this character's chosen primary market is
   applied. `A.PersistSettings()` writes both back; it runs after every change
   and again at `PLAYER_LOGOUT`.
-- `PLAYER_LOGIN` → the tooltip adapter and the options are built once, each
-  under `pcall`: what cannot start is reported in bad and left out, and the
-  login goes on. Then the status line of §7.11 (a pure function of the store
-  and `now`), the recorded reports, and `fireUpdate()` with each callback
-  error reported once in bad. A login that no `ADDON_LOADED` preceded (a
-  client whose event was refused) loads the settings itself.
+- `PLAYER_LOGIN` → the tooltip adapter, the options and the options panel
+  are built once, each under `pcall`: what cannot start is reported in bad
+  and left out, and the login goes on. A client without the `Settings` API
+  gets the one-time note of §7.8 instead. Then the status line of §7.11 (a
+  pure function of the store and `now`, handed to the panel as well), the
+  recorded reports, and `fireUpdate()` with each callback error reported
+  once in bad. A login that no `ADDON_LOADED` preceded (a client whose event
+  was refused) loads the settings itself.
 - `MODIFIER_STATE_CHANGED` → the tooltip adapter's `onModifier`.
 - The optional events are registered under `pcall`: a client that refuses one
   loses the feature it carries and keeps the login.
@@ -1142,6 +1154,9 @@ The bootstrap loads the two tables into `A.settings` and `A.character` and
 writes both back after every change and again at the logout: nothing a player
 chose waits for the logout to be saved.
 
+Every change the command makes goes through an `apply` method that the
+options panel shares (§7.8), so the two cannot disagree.
+
 `/amdb` (alias `/auctimoggerdb`):
 
 | Command | Effect |
@@ -1173,14 +1188,74 @@ prints the raw numbers, an absent field as `-`.
 
 ### 7.8 Options panel
 
-Interface → AddOns → AuctiMogger Database, built with
-`Settings.RegisterCanvasLayoutCategory` when `Settings` exists. Rows are
-data-driven and the panel height follows the row count: enable, preset
-buttons, one checkbox per optional line, Shift detail, the primary-market
-dropdown (loaded markets) and a status line. Without the `Settings` API the
-panel is skipped with a one-time note; the slash command covers everything.
-The adapter binds `Core/settings.lua` under another name (say `Preferences`):
-a local named `Settings` would shadow the client's global in the one file that
+Interface → AddOns → AuctiMogger Database. A canvas category of our own,
+registered at the login with `Settings.RegisterCanvasLayoutCategory(frame,
+"AuctiMogger Database")` and `Settings.RegisterAddOnCategory(category)`: the
+two calls are all this addon needs from that API, and they exist unchanged
+since the API appeared. Where the global is missing, or cannot register a
+canvas, the panel is skipped with one muted note at the login — `no options
+panel on this client — the /amdb command covers everything` — and the slash
+command covers everything. A panel that raises while it is built (a template
+this client lacks) is reported in bad and left out: nothing half-built reaches
+the client, and the command stays.
+
+**The frame.** `CreateFrame("Frame", nil, UIParent)`, 600 wide and as tall as
+its rows, hidden until the Settings UI parents it to its canvas. Only its
+top-left corner is anchored (`AddAnchorPoint("TOPLEFT", 16, -16)`), so the
+height is the frame's own. It is built once, and registered only once every
+control exists.
+
+**The rows** come from `Core/panel_rows.lua` (§7.3), in this order, and the
+adapter builds one region per row:
+
+| Row | Control |
+|---|---|
+| Enable tooltips | A checkbox: the master switch, read as the tooltip adapter reads it (on unless literally off). |
+| Preset | A button per preset of the settings module: `Basic`, `Standard`. |
+| Tooltip lines | A title, in the brand color. |
+| One checkbox per optional line | In the settings module's order and state; the label and the hover help of each are in the row model. |
+| Hold Shift for detail | A checkbox: off unless literally on. |
+| Market | A title, in the brand color. |
+| Primary market | A picker button naming the primary market; see below. |
+| The status line | The login line of §7.11, as the clock has it, wrapped within 560 pixels; unwrapped on a client that cannot wrap. |
+
+Every control is a frame this file creates, on a template the sniper runs on
+Forever as well: `UICheckButtonTemplate` for a checkbox (its label a font
+string to the right of the box, inside the box's hit rectangle, so the label
+takes the click too) and `UIPanelButtonTemplate` for a button. A checkbox's
+template toggles nothing by itself: the new state is read before the box is
+set. Each control that has help shows it on hover in the client's
+`GameTooltip`, at the cursor (`ANCHOR_CURSOR`): the label in the brand color,
+one line of body text. Help is decoration: a client without a usable tooltip
+gets none and raises nothing.
+
+**The primary-market picker.** Where the client has `MenuUtil`, a click opens
+its own menu with one radio entry per loaded market, read from the store at
+every opening; the chosen one goes through `applyMarket`, the command's own
+path. Without a usable menu (the global absent, or it raises on opening) a
+click moves to the next market in slot order, round to the first: the
+sniper's pattern. With no market loaded the picker reads `none loaded` and is
+disabled.
+
+**The refresh.** A shown frame refreshes itself on its own `OnUpdate`, at
+most once a second, and every `apply` refreshes it at once, so a change made
+through `/amdb` while the panel is open shows without a reload and the status
+line's age stays current. A refresh updates the controls in place; a row of
+another kind at an index takes the old controls down (a frame cannot be
+destroyed) and builds its own. The first error takes the panel out of service
+and is reported once in bad, so a broken panel never breaks a command.
+
+**Nothing runs on the open or close path.** The frame has no `OnShow`,
+`OnHide`, `OnRefresh`, `OnCommit` or `OnDefault`, although the Settings API
+documents `OnRefresh` for a canvas: Mastercraft ships its canvas the same way
+on Forever, where addon code on that path got Log Out and Exit blocked. A
+hidden frame is left alone, since a hidden frame's `OnUpdate` does not run.
+
+Taint: the frame and its controls are ours and unprotected; the Settings UI
+only shows, hides and reparents the frame.
+
+The adapter binds `Core/settings.lua` under another name (`Preferences`): a
+local named `Settings` would shadow the client's global in the one file that
 calls it.
 
 ### 7.9 Public API
@@ -1308,8 +1383,9 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - CI: a new `addon` job on `ubuntu-latest` with the same pins; the `docker`
   job then needs `linux` **and** `addon`.
 - `scripts/check_compat.lua` keeps `NON_EVENT_LITERALS`, the upper-case
-  constants that are not events (`ANCHOR_NONE`, `SLASH_AMDB1`, `SLASH_AMDB2`):
-  a new one is listed there with its reason, never in the event tiers.
+  constants that are not events (`ANCHOR_NONE`, `ANCHOR_CURSOR`, `SLASH_AMDB1`,
+  `SLASH_AMDB2`): a new one is listed there with its reason, never in the
+  event tiers.
 
 ## 10. Test plan
 
@@ -1339,6 +1415,10 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `market`: version gate, future rejection, stale flag, duplicate target,
   slot order, primary binding, default category, update callbacks.
 - `settings`: defaults, strict coercion both ways, presets.
+- `panel_rows`: the row order of §7.8; every optional line and every preset of
+  the settings module has its row, named and explained; the switch and Shift
+  read as the tooltip reads them; the market row and the status line; the
+  height.
 - `format`, `resolve`, `anchor`: table tests.
 - `tooltip_lines`: one test per line for shown and omitted, Shift detail,
   collapsed owner, each toggle; both samples of §7.6 line for line.
@@ -1349,12 +1429,16 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   report sink; the clock.
 - `compat`: the manifest tiers, a fallback per optional entry, `check()`.
 - `bootstrap`: the status line, the login flow and the SavedVariables lifecycle
-  through a stubbed frame.
+  through a stubbed frame, and the panel's three outcomes at the login.
 - `tooltip`: registration on both paths (never both), lifecycle (hidden when the
   owner is not shown, hidden on clear), Shift rebuild, secret values, busy
   guard, errors reported once.
 - `options`: every command of §7.7, the write-back after each change, and
   what `status` says without a feed.
+- `panel` (a spec of its own): the registration against a recording Settings
+  API, and the three ways it is left out; one control per row; what a click
+  does; the refresh in place and the tick; a replaced row; the picker's menu
+  and its click-cycle; the hover help; a refresh that fails.
 - `public_api`: fresh tables per call, `GetAuctionBuyout` chaining, absent
   addon data.
 
@@ -1369,9 +1453,13 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 4. `/amdb market <id>`: cross-market lines follow.
 5. Hover a bag item during combat: no blocked-action errors.
 6. Narrow the window so the frame flips to the left side.
-7. Sniper: `/am status` shows the database; tracked items value on
+7. Interface → AddOns → AuctiMogger Database: hover a control for its help;
+   toggle a line, a preset, the master switch, Shift detail and the market;
+   make the same changes through `/amdb` with the window closed and reopen
+   it; then close the window with Esc and confirm Log Out and Exit still work.
+8. Sniper: `/am status` shows the database; tracked items value on
    `tracker-d1`; a deal still arms; settings survive `/reload`.
-8. Retail client, if available: steps 1–3.
+9. Retail client, if available: steps 1–3 and 7.
 
 ## 11. Batches and steps
 
@@ -1522,6 +1610,30 @@ Done when every gate is green and the tooltip shows the sample of §7.6.
 `Settings` panel rows of §7.8, on the options adapter batch 4 created; spec
 for the row model.
 
+Done when every gate is green and the panel shows the rows of §7.8.
+
+**Status: done.** Every §9 gate is green through `addon/scripts/ci_local.sh`
+(847 tests). In-game validation (§10), step 7, is the owner's and was not run
+for this batch. It also settled details this spec had left open:
+
+- The panel is a canvas of our own controls, and the row model is a Core
+  module of its own, `Core/panel_rows.lua` (§7.3): the labels and the hover
+  help live next to the settings module's line keys and presets, and a spec
+  holds every line and every preset to its row.
+- The frame carries no script on the Settings window's open or close path. A
+  shown frame refreshes on its own `OnUpdate`, at most once a second, and
+  every `apply` refreshes it at once (§7.8).
+- The command and the panel share one `apply` method per change (§7.7).
+- The primary-market picker is the client's menu where `MenuUtil` exists and
+  a click-cycle otherwise; `MenuUtil` joined the optional globals with its
+  fallback sentence (§7.4).
+- The status line of §7.11 is the panel's last row: the bootstrap hands its
+  composer to the options as the dependency `statusLine`.
+- A dependency is never named like a method of the object that holds it
+  (§7.2).
+- `ANCHOR_CURSOR` is a curated non-event literal of the compat guard (§9).
+- Two specs are new, `panel_rows_spec.lua` and `panel_spec.lua` (§10).
+
 ### Batch 6 — tracker: addon bundle and sync
 
 1. `addon_bundle.rs` with the drift test.
@@ -1539,11 +1651,12 @@ for the row model.
 | Risk | Mitigation |
 |---|---|
 | No interface dump exists for these clients, so game APIs are unverified. | Nil-guard every surface; both tooltip hook paths; the compat manifest records each fallback; in-game checklist in §10. |
-| Retail path cannot be tested here. | Code paths are flavor-agnostic; retail is documented as untested until the owner runs step 8. |
+| Retail path cannot be tested here. | Code paths are flavor-agnostic; retail is documented as untested until the owner runs step 9. |
 | Packing bugs would corrupt every number. | Integers only, a printable-only alphabet, a Rust reference decoder, and the golden trio pinned from both languages. |
 | Data goes stale between syncs. | Age is always visible; stale markets are flagged; the sniper refuses stale spans. |
 | A market file copied into a git checkout over a tracked slot shows as modified. | Same as today's `feed.lua`; `git checkout` restores the placeholder. Documented in the README. |
 | The attached frame mis-anchors under UI scale. | Side decision is a pure function over effective-scale-corrected numbers; clamped to screen; checked in step 6 of §10. |
+| Addon code on the Settings window's open or close path can get Log Out and Exit blocked (Mastercraft's finding on Forever). | The canvas frame has no `OnShow`, `OnHide`, `OnRefresh`, `OnCommit` or `OnDefault`; it refreshes on its own `OnUpdate` (§7.8). Checked in step 7 of §10. |
 | Export reads a scan that lags the newest snapshot. | Live group is read from the snapshot directly; scheduler refreshes scans before publishing. |
 | Tooltip font lacks special glyphs on Forever. | Signs are `+` / `-` text; the sparkline is textures. |
 

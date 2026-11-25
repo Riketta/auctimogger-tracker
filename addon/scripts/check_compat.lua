@@ -326,6 +326,7 @@ local NAMESPACE_PATTERN = "%f[%w_](C_[%a][%w_]*)"
 -- reason; extend only when the scan flags a real constant.
 local NON_EVENT_LITERALS = {
     ANCHOR_NONE = "the tooltip's anchor type (addon/SPEC.md section 7.4)",
+    ANCHOR_CURSOR = "the GameTooltip owner anchor of the options panel's hover help (section 7.8)",
     SLASH_AMDB1 = "the slash command's global; set through rawset by name (section 7.7)",
     SLASH_AMDB2 = "the slash command's alias global; set through rawset by name (section 7.7)",
 }
