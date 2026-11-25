@@ -46,7 +46,7 @@ function Loader.carrier(namespace, path)
     return chunk(Loader.ADDON, namespace)
 end
 
---- A fresh namespace with the six Core modules loaded, in TOC order.
+--- A fresh namespace with the eight Core modules loaded, in TOC order.
 ---@return table namespace
 function Loader.core()
     return Loader.load(
@@ -56,7 +56,9 @@ function Loader.core()
         "Core/market.lua",
         "Core/settings.lua",
         "Core/format.lua",
-        "Core/resolve.lua"
+        "Core/resolve.lua",
+        "Core/tooltip_lines.lua",
+        "Core/anchor.lua"
     )
 end
 

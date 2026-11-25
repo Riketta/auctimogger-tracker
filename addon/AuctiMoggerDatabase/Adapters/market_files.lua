@@ -72,16 +72,37 @@ function A.FormatReport(text, level)
     return Format.PREFIX .. " " .. Format.colorize(color, text)
 end
 
+--- The report level `level` names; an unknown or an absent one is "info".
+---@param level AmdbReportLevel|nil
+---@return AmdbReportLevel kind
+local function levelOf(level)
+    return LEVEL_COLORS[level] and level or "info"
+end
+
 --- The one report sink. Always records; prints through `A.chat` at once only
 --- when `A.verbose` is set.
 ---@param text string
 ---@param level AmdbReportLevel|nil defaults to "info"
 function A.Say(text, level)
     local message = tostring(text)
-    local kind = LEVEL_COLORS[level] and level or "info"
+    local kind = levelOf(level)
     A.reports[#A.reports + 1] = { text = message, level = kind }
     if A.verbose then
         A.chat(A.FormatReport(message, kind))
+    end
+end
+
+--- Reports and prints now, whatever the mode: what `A.Say` records, plus the
+--- chat line at once unless `A.Say` already printed it (verbose mode). For
+--- something that goes wrong after login, when nothing drains the record
+--- again; it is in the record for `/amdb status` all the same.
+---@param text string
+---@param level AmdbReportLevel|nil defaults to "info"
+function A.SayNow(text, level)
+    local kind = levelOf(level)
+    A.Say(text, kind)
+    if not A.verbose then
+        A.chat(A.FormatReport(tostring(text), kind))
     end
 end
 

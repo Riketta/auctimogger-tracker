@@ -14,6 +14,8 @@ Core/market.lua
 Core/settings.lua
 Core/format.lua
 Core/resolve.lua
+Core/tooltip_lines.lua
+Core/anchor.lua
 
 # Market registration (must load before the slots)
 Adapters/market_files.lua
@@ -28,6 +30,9 @@ Market6.lua
 
 # Adapters
 Adapters/compat.lua
+Adapters/extra_tip.lua
+Adapters/tooltip.lua
+Adapters/options.lua
 Adapters/public_api.lua
 
 # Composition root (must be last)

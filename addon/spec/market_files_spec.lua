@@ -136,6 +136,7 @@ describe("market_files: loading", function()
         assert.equals("function", type(namespace.clock))
         assert.equals("function", type(namespace.chat))
         assert.equals("function", type(namespace.Say))
+        assert.equals("function", type(namespace.SayNow))
         assert.equals("function", type(namespace.FormatReport))
         assert.equals("function", type(namespace.TakeReports))
     end)
@@ -469,6 +470,23 @@ describe("market_files: reports", function()
         end
         A.Say("same", "warn")
         assert.equals(A.FormatReport("same", "warn"), printed)
+    end)
+
+    it("SayNow records, and prints at once, exactly once in either mode", function()
+        local A, lines = fresh()
+        local Format = A.Core.Format
+        A.SayNow("after login", "bad")
+        -- Recorded like any report, and printed although the mode is quiet.
+        assert.equals(1, #A.reports)
+        assert.same({ Format.PREFIX .. " " .. Format.COLORS.bad .. "after login|r" }, lines)
+        A.verbose = true
+        A.SayNow("still once", "warn")
+        assert.equals(2, #A.reports)
+        assert.equals(2, #lines)
+        -- An unknown level is "info", as for Say.
+        A.SayNow("plain", "nonsense")
+        assert.equals("info", A.reports[3].level)
+        assert.equals(Format.PREFIX .. " " .. Format.COLORS.muted .. "plain|r", lines[3])
     end)
 
     it("chats through print where it exists, and is silent where it does not", function()

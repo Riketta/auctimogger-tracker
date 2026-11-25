@@ -8,7 +8,8 @@
 --   * AuctiMoggerDatabase/Core and the generated Market*.lua slots get NO
 --     globals at all, not even _G: any game API reference there fails CI.
 --   * AuctiMoggerDatabase/Adapters gets exactly the manifest published by
---     Adapters/compat.lua (required + optional + authored) plus
+--     Adapters/compat.lua (required + optional + authored, the attached frame's
+--     global included) plus
 --     GetAuctionBuyout, the public global the addon defines. C_AuctionHouse
 --     is deliberately absent: it appears nowhere in this addon.
 --   * AuctiMoggerDatabase/bootstrap.lua (the composition root) gets the same
@@ -60,6 +61,7 @@ local GAME_FACING = {
 	"print",
 	-- authored
 	"AuctiMoggerDatabase",
+	"AuctiMoggerDatabaseTip",
 	"GetAuctionBuyout",
 	"SLASH_AMDB1",
 	"SLASH_AMDB2",

@@ -16,7 +16,8 @@ A.Compat = {}
 -- Tiers:
 --   required globals and events: the addon cannot work without them.
 --   optional globals and events: each one degrades one feature (see `fallbacks`).
---   authored: the globals this addon itself defines.
+--   authored: the globals this addon itself defines. The attached frame is
+--     named, so the client creates its global, and those of its font strings.
 
 ---@class AmdbCompatManifest
 ---@field requiredGlobals string[] without any of these the addon cannot work
@@ -61,7 +62,7 @@ Compat.optionalGlobals = {
 }
 Compat.optionalEvents = { "MODIFIER_STATE_CHANGED", "PLAYER_LOGOUT" }
 
-Compat.authored = { "SLASH_AMDB1", "SLASH_AMDB2", "AuctiMoggerDatabase" }
+Compat.authored = { "SLASH_AMDB1", "SLASH_AMDB2", "AuctiMoggerDatabase", "AuctiMoggerDatabaseTip" }
 
 Compat.fallbacks = {
     TooltipDataProcessor = "hook OnTooltipSetItem on the two tooltip frames instead (SPEC 7.5.1)",

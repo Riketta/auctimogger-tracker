@@ -261,6 +261,17 @@ tableTest("Format.ageTier", Format.ageTier, {
     { 90000, "stale" },
 })
 
+tableTest("Format.ageColor", Format.ageColor, {
+    { 0, "muted" },
+    { nil, "muted" },
+    { -100, "muted" },
+    { 2 * HOUR, "warn" },
+    { 12 * HOUR, "hot" },
+    { DAY - 1, "hot" },
+    { DAY, "bad" },
+    { 90000, "bad" },
+})
+
 tableTest("Format.rateTier", Format.rateTier, {
     { 0.5, "good" },
     { 1, "good" },
@@ -290,23 +301,23 @@ describe("Format on the sample lines of SPEC 7.6", function()
         assert.equals("1,234", Format.count(1234))
         assert.equals("618", Format.count(618))
         assert.equals("36%", Format.percent(34 / 94))
-        assert.equals("2.4", Format.rate(2.4))
+        assert.equals("31.6", Format.rate(31.6))
         assert.equals("39d", Format.supplyDays(39))
         assert.equals("2d", Format.days(2))
         assert.equals("350g", Format.money(3500000))
         assert.equals("80%", Format.percentBp(8000))
-        -- SPEC 7.6 spells 210g / +190g / +68g for the craft line; in copper that
-        -- is 2,100,000 / 1,900,000 / 684,000 (the JSON twin of SPEC 5.10 carries
-        -- ten times that for the same example).
-        assert.equals("210g", Format.money(2100000))
-        assert.equals("+190g", Format.moneySigned(1900000))
-        -- The sample writes "+68g"; the formatter keeps the silver.
-        assert.equals("+68g 40s", Format.moneySigned(684000))
+        -- The craft line, in the copper of the JSON twin of SPEC 5.10.
+        assert.equals("2100g", Format.money(21000000))
+        assert.equals("+1900g", Format.moneySigned(19000000))
+        assert.equals("+684g", Format.moneySigned(6840000))
         assert.equals("38%", Format.percentBp(3800))
         assert.equals("0.71", ("%.2f"):format(7100 / 10000))
         assert.equals("-3%", Format.signedPercentBp(-300))
         assert.equals("+10%", Format.signedPercentBp(1000))
         assert.equals("-5%", Format.signedPercentBp(-500))
+        -- The ages of the example's header and Snapshots line, 25 minutes after
+        -- its auctions stamp.
+        assert.equals("58m", Format.age(3500))
         assert.equals("25m", Format.age(25 * 60))
         assert.equals("1h 05m", Format.age(HOUR + 5 * 60))
         assert.equals("∞", Format.supplyDays(nil))

@@ -1,13 +1,19 @@
--- Specs for bootstrap.lua, the composition root: the frame it creates and the
--- lines PLAYER_LOGIN prints (SPEC 7.11).
+-- Specs for bootstrap.lua, the composition root: the frame it creates, the
+-- settings lifecycle (ADDON_LOADED, PLAYER_LOGOUT), the adapters it builds at
+-- PLAYER_LOGIN and the lines the login prints (SPEC 7.11).
 --
--- CreateFrame is stubbed to hand out a frame that records RegisterEvent and
--- SetScript. The stub goes into _G with rawset: a spec file's own globals are
--- private to it, and the addon is loaded with loadfile. The real namespace is
--- loaded in TOC order, slot files excepted, and PLAYER_LOGIN is delivered by
--- calling the recorded OnEvent script.
+-- CreateFrame is stubbed: an event frame that records RegisterEvent and
+-- SetScript, and a tooltip frame that accepts its setup calls. The stubs go
+-- into _G with rawset: a spec file's own globals are private to it, and the
+-- addon is loaded with loadfile. The real namespace is loaded in TOC order,
+-- slot files excepted, and events are delivered by calling the recorded
+-- OnEvent script.
 
 local Loader = require("spec.helpers.loader")
+
+local ADDON = "AuctiMoggerDatabase"
+local SETTINGS = "AuctiMoggerDatabaseSettings"
+local CHARACTER = "AuctiMoggerDatabaseCharacter"
 
 local NOW = 1795560000
 local HOUR = 3600
@@ -38,8 +44,13 @@ local FILES = {
     "Core/settings.lua",
     "Core/format.lua",
     "Core/resolve.lua",
+    "Core/tooltip_lines.lua",
+    "Core/anchor.lua",
     "Adapters/market_files.lua",
     "Adapters/compat.lua",
+    "Adapters/extra_tip.lua",
+    "Adapters/tooltip.lua",
+    "Adapters/options.lua",
     "Adapters/public_api.lua",
     "bootstrap.lua",
 }
@@ -50,8 +61,20 @@ local m = A.BeginMarket({ version = %d, trackerVersion = "0.1.0", target = %s, g
 A.EndMarket()
 ]]
 
---- A frame that records what the addon does to it.
----@param ... any what CreateFrame was given
+local STUBS = {
+    "CreateFrame",
+    "UIParent",
+    "SlashCmdList",
+    "SLASH_AMDB1",
+    "SLASH_AMDB2",
+    "AuctiMoggerDatabase",
+    "GetAuctionBuyout",
+    SETTINGS,
+    CHARACTER,
+}
+
+--- A frame that records RegisterEvent and SetScript; any other method is a
+--- no-op, so a tooltip frame accepts the setup calls the adapter makes.
 ---@return table frame
 local function newFrame(...)
     local frame = { args = { ... }, events = {}, scripts = {} }
@@ -61,7 +84,11 @@ local function newFrame(...)
     function frame:SetScript(scriptType, handler)
         self.scripts[scriptType] = handler
     end
-    return frame
+    return setmetatable(frame, {
+        __index = function()
+            return function() end
+        end,
+    })
 end
 
 --- The keys of `t`, sorted.
@@ -105,25 +132,40 @@ end
 
 describe("bootstrap", function()
     local frame
+    local tipFrame
     local created
-    local savedCreateFrame, savedNamespace, savedBuyout
+    local saved
 
     before_each(function()
-        savedCreateFrame = rawget(_G, "CreateFrame")
-        savedNamespace = rawget(_G, "AuctiMoggerDatabase")
-        savedBuyout = rawget(_G, "GetAuctionBuyout")
-        created = 0
+        saved = {}
+        for _, name in ipairs(STUBS) do
+            saved[name] = rawget(_G, name)
+        end
+        created = {}
+        tipFrame = nil
         rawset(_G, "CreateFrame", function(...)
-            created = created + 1
-            frame = newFrame(...)
-            return frame
+            local args = { ... }
+            created[#created + 1] = args[1]
+            local made = newFrame(unpack(args))
+            if args[1] == "GameTooltip" then
+                tipFrame = made
+            else
+                frame = made
+            end
+            return made
         end)
+        rawset(_G, "UIParent", {})
+        rawset(_G, "SlashCmdList", {})
+        rawset(_G, "SLASH_AMDB1", nil)
+        rawset(_G, "SLASH_AMDB2", nil)
+        rawset(_G, SETTINGS, nil)
+        rawset(_G, CHARACTER, nil)
     end)
 
     after_each(function()
-        rawset(_G, "CreateFrame", savedCreateFrame)
-        rawset(_G, "AuctiMoggerDatabase", savedNamespace)
-        rawset(_G, "GetAuctionBuyout", savedBuyout)
+        for _, name in ipairs(STUBS) do
+            rawset(_G, name, saved[name])
+        end
     end)
 
     --- The addon in TOC order, the chat recorded and the clock pinned to NOW.
@@ -143,10 +185,11 @@ describe("bootstrap", function()
 
     --- Delivers an event to the frame's OnEvent script.
     ---@param event string
-    local function fire(event)
+    ---@param arg1 any the event's first argument
+    local function fire(event, arg1)
         local handler = frame.scripts.OnEvent
         assert.is_not_nil(handler, "bootstrap installed no OnEvent script")
-        handler(frame, event)
+        handler(frame, event, arg1)
     end
 
     --- Registers another market: a header and no records, which is all the
@@ -161,6 +204,8 @@ describe("bootstrap", function()
         chunk(Loader.ADDON, A)
     end
 
+    ------------------------------------------------------------- the frame
+
     it("returns the namespace", function()
         local namespace = Loader.load(Loader.namespace(), unpack(FILES, 1, #FILES - 1))
         local chunk = assert(loadfile(Loader.ROOT .. "/bootstrap.lua"))
@@ -168,14 +213,120 @@ describe("bootstrap", function()
         assert.equals(namespace, module)
     end)
 
-    it("creates one frame, registers PLAYER_LOGIN and installs OnEvent", function()
+    it("creates its event frame at load and registers the lifecycle events", function()
         boot()
-        assert.equals(1, created)
-        assert.same({ "Frame" }, frame.args)
-        assert.same({ "PLAYER_LOGIN" }, frame.events)
+        assert.same({ "Frame" }, created)
+        assert.same({ "ADDON_LOADED", "PLAYER_LOGIN", "MODIFIER_STATE_CHANGED", "PLAYER_LOGOUT" }, frame.events)
         assert.same({ "OnEvent" }, keysOf(frame.scripts))
         assert.equals("function", type(frame.scripts.OnEvent))
     end)
+
+    it("builds the tooltip adapter and the /amdb command once, at the login", function()
+        local A = boot()
+        assert.is_nil(A.tooltip)
+        assert.is_nil(A.options)
+        fire("PLAYER_LOGIN")
+        assert.is_table(A.tooltip)
+        assert.equals("none", A.tooltip.path)
+        assert.is_table(A.options)
+        assert.equals("function", type(rawget(_G, "SlashCmdList").AMDB))
+        -- The frame the adapter created is the one CreateFrame handed out.
+        assert.equals(tipFrame, A.tooltip.tip.tip)
+        assert.same({ "Frame", "GameTooltip" }, created)
+        -- A second login builds nothing twice.
+        fire("PLAYER_LOGIN")
+        assert.same({ "Frame", "GameTooltip" }, created)
+    end)
+
+    ----------------------------------------------------------- SavedVariables
+
+    describe("SavedVariables", function()
+        it("loads the settings at ADDON_LOADED, keeping only the literals", function()
+            local A = boot()
+            rawset(_G, SETTINGS, { enabled = false, shiftDetail = "yes", lines = { deal = false, craft = "nope" } })
+            fire("ADDON_LOADED", ADDON)
+            assert.is_false(A.settings.enabled)
+            assert.is_true(A.settings.shiftDetail)
+            assert.is_false(A.settings.lines.deal)
+            assert.is_true(A.settings.lines.craft)
+            -- The cleaned table is what the client will save.
+            assert.equals(A.settings, rawget(_G, SETTINGS))
+        end)
+
+        it("answers the defaults for a first run", function()
+            local A = boot()
+            fire("ADDON_LOADED", ADDON)
+            assert.same(A.Core.Settings.defaults(), A.settings)
+            assert.same({ primaryMarket = nil }, A.character)
+        end)
+
+        it("ignores the ADDON_LOADED of another addon", function()
+            local A = boot()
+            rawset(_G, SETTINGS, { enabled = false })
+            fire("ADDON_LOADED", "SomeOtherAddon")
+            assert.is_nil(A.settings)
+            fire("ADDON_LOADED", ADDON)
+            assert.is_false(A.settings.enabled)
+        end)
+
+        it("restores the primary market this character chose", function()
+            local A, lines = boot()
+            Loader.carrier(A, GOLDEN)
+            secondMarket(A, OTHER, NOW - 600)
+            rawset(_G, CHARACTER, { primaryMarket = OTHER })
+            fire("ADDON_LOADED", ADDON)
+            assert.equals(OTHER, A.store:primaryTarget())
+            fire("PLAYER_LOGIN")
+            assert.same({ status("2 markets", OTHER, MUTED, "10m") }, lines)
+        end)
+
+        it("keeps a choice that names no loaded market, and the login line asks", function()
+            local A, lines = boot()
+            Loader.carrier(A, GOLDEN)
+            secondMarket(A, OTHER, NOW - 600)
+            rawset(_G, CHARACTER, { primaryMarket = "not-loaded" })
+            fire("ADDON_LOADED", ADDON)
+            fire("PLAYER_LOGIN")
+            assert.equals(status("2 markets", TARGET, MUTED, "16m") .. " · " .. PICK_ONE, lines[1])
+        end)
+
+        it("writes a change back the moment it happens, and again at the logout", function()
+            local A, lines = boot()
+            Loader.carrier(A, GOLDEN)
+            fire("ADDON_LOADED", ADDON)
+            fire("PLAYER_LOGIN")
+            clear(lines)
+            assert.equals(A.settings, rawget(_G, SETTINGS))
+            A.options:run("deal off")
+            assert.is_false(rawget(_G, SETTINGS).lines.deal)
+            -- The command's own answer, and nothing about the saving.
+            assert.same({ TITLE .. " deal line off" }, lines)
+            fire("PLAYER_LOGOUT")
+            assert.equals(A.settings, rawget(_G, SETTINGS))
+            assert.is_false(rawget(_G, SETTINGS).lines.deal)
+        end)
+
+        it("writes the primary market of this character back when it changes", function()
+            local A = boot()
+            Loader.carrier(A, GOLDEN)
+            secondMarket(A, OTHER, NOW - 600)
+            fire("ADDON_LOADED", ADDON)
+            fire("PLAYER_LOGIN")
+            A.options:run("market " .. OTHER)
+            assert.equals(OTHER, rawget(_G, CHARACTER).primaryMarket)
+        end)
+
+        it("finds settings at a login that no ADDON_LOADED preceded", function()
+            local A, lines = boot()
+            rawset(_G, SETTINGS, { enabled = false })
+            fire("PLAYER_LOGIN")
+            assert.is_false(A.settings.enabled)
+            assert.equals(A.settings, rawget(_G, SETTINGS))
+            assert.same({ NO_DATA }, lines)
+        end)
+    end)
+
+    -------------------------------------------------------------- the login
 
     it("prints nothing before the login", function()
         local A, lines = boot()
@@ -238,6 +389,8 @@ describe("bootstrap", function()
         local A, lines = boot()
         Loader.carrier(A, GOLDEN)
         secondMarket(A, OTHER, NOW - 600)
+        -- The settings are loaded before a choice is made, as in the client.
+        fire("ADDON_LOADED", ADDON)
         assert.is_true(A.store:setPrimary(OTHER))
         fire("PLAYER_LOGIN")
         assert.same({ status("2 markets", OTHER, MUTED, "10m") }, lines)
@@ -361,10 +514,78 @@ describe("bootstrap", function()
         A.verbose = false
     end)
 
+    ------------------------------------------------------- a feature that fails
+
+    it("leaves the tooltips out, reported in bad, when their frame cannot be created", function()
+        rawset(_G, "CreateFrame", function(kind)
+            if kind == "GameTooltip" then
+                error("no tooltips on this client", 0)
+            end
+            frame = newFrame(kind)
+            return frame
+        end)
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        local fired = 0
+        A.OnUpdate(function()
+            fired = fired + 1
+        end)
+        fire("PLAYER_LOGIN")
+        assert.is_nil(A.tooltip)
+        -- The command is there all the same, and knows no tooltip adapter.
+        assert.is_table(A.options)
+        assert.is_nil(A.options.tooltip)
+        assert.same({
+            status("1 market", TARGET, MUTED, "16m"),
+            TITLE .. " " .. BAD .. "tooltips could not start: no tooltips on this client" .. RESET,
+        }, lines)
+        assert.equals(1, fired)
+    end)
+
+    it("reports a /amdb command that cannot be registered, and goes on", function()
+        rawset(_G, "SlashCmdList", nil)
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        fire("PLAYER_LOGIN")
+        assert.is_table(A.options)
+        assert.equals(2, #lines)
+        assert.equals(status("1 market", TARGET, MUTED, "16m"), lines[1])
+        -- The interpreter's message follows; the lead is ours.
+        assert.equals(1, lines[2]:find(TITLE .. " " .. BAD .. "the /amdb command could not start: ", 1, true))
+    end)
+
+    ---------------------------------------------------------------- the events
+
+    it("routes MODIFIER_STATE_CHANGED to the tooltip adapter", function()
+        local A = boot()
+        fire("PLAYER_LOGIN")
+        local seen = {}
+        A.tooltip.onModifier = function(_, key)
+            seen[#seen + 1] = key
+        end
+        fire("MODIFIER_STATE_CHANGED", "LSHIFT")
+        fire("MODIFIER_STATE_CHANGED", "RSHIFT")
+        assert.same({ "LSHIFT", "RSHIFT" }, seen)
+    end)
+
+    it("survives a modifier handler that raised", function()
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        fire("PLAYER_LOGIN")
+        A.tooltip.onModifier = function()
+            error("shift broke", 0)
+        end
+        fire("MODIFIER_STATE_CHANGED", "LSHIFT")
+        assert.same({
+            status("1 market", TARGET, MUTED, "16m"),
+            TITLE .. " " .. BAD .. "shift broke" .. RESET,
+        }, lines)
+    end)
+
     it("ignores an event it did not register for", function()
         local A, lines = boot()
         Loader.carrier(A, GOLDEN)
-        fire("PLAYER_LOGOUT")
+        fire("PLAYER_ENTERING_WORLD")
         fire("ADDON_LOADED")
         assert.same({}, lines)
         assert.same({}, A.TakeReports())

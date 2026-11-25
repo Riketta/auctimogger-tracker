@@ -16,7 +16,7 @@ local OPTIONAL_GLOBALS = {
     "print",
 }
 local OPTIONAL_EVENTS = { "MODIFIER_STATE_CHANGED", "PLAYER_LOGOUT" }
-local AUTHORED = { "SLASH_AMDB1", "SLASH_AMDB2", "AuctiMoggerDatabase" }
+local AUTHORED = { "SLASH_AMDB1", "SLASH_AMDB2", "AuctiMoggerDatabase", "AuctiMoggerDatabaseTip" }
 local TIERS = { "requiredGlobals", "requiredEvents", "optionalGlobals", "optionalEvents", "authored" }
 
 -- Spelled in two parts, so that this file never holds the forbidden name either.

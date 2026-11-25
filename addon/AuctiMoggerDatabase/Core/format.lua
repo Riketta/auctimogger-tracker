@@ -3,11 +3,11 @@ A.Core = A.Core or {}
 
 -- Core/format.lua - display text (pure Lua).
 --
--- Money, percent, count, rate and age text, and the house colors as WoW
--- escape strings. Every formatter answers nil for an absent value, so callers
--- render a dash (or skip the line) instead of printing "nil"; junk that is
--- not a finite number answers nil as well, never an error. Nothing here reads
--- a game global.
+-- money, percent, count, rate and age text, the age / rate / trend color
+-- tiers, and the house colors as WoW escape strings. Every formatter answers
+-- nil for an absent value, so callers render a dash (or skip the line) instead
+-- of printing "nil"; junk that is not a finite number answers nil as well,
+-- never an error. Nothing here reads a game global.
 
 ---@alias AmdbColorName "brand"|"muted"|"dim"|"good"|"warn"|"hot"|"bad"
 ---@alias AmdbAgeTier "muted"|"warn"|"hot"|"stale"
@@ -16,6 +16,7 @@ A.Core = A.Core or {}
 
 ---@class AmdbFormatModule
 ---@field COLORS table<AmdbColorName, string> the house colors (SPEC 7.5.4)
+---@field ageColor fun(seconds: number|nil): AmdbColorName the house color of an age's tier
 ---@field RESET string ends a color run
 ---@field PREFIX string the addon title in the brand color
 local Format = {}
@@ -268,6 +269,25 @@ function Format.ageTier(seconds)
         return "hot"
     end
     return "stale"
+end
+
+-- The house color of each age tier (SPEC 7.5.4). The formatter's "stale" tier
+-- is the red the color table keeps under "bad".
+---@type table<AmdbAgeTier, AmdbColorName>
+local AGE_COLORS = {
+    muted = "muted",
+    warn = "warn",
+    hot = "hot",
+    stale = "bad",
+}
+
+--- The house color of an age badge (SPEC 7.5.4): the color of its tier, so
+--- data past 24 hours reads in bad. One table answers for the login line, the
+--- tooltip header and `/amdb status`, which cannot drift apart.
+---@param seconds number|nil
+---@return AmdbColorName color
+function Format.ageColor(seconds)
+    return AGE_COLORS[Format.ageTier(seconds)]
 end
 
 --- Color tier of a sale rate, the sniper's thresholds: 0.5 and above good,

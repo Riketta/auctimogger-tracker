@@ -1,13 +1,14 @@
 # SPEC — AuctiMogger Database
 
-Status: **in progress**. Batches 1 and 2 are implemented: the domain
-types, the record codec, the carrier and JSON-twin renderers, the golden fixtures,
-and the tracker side that feeds them — the export service, publication and
-the v4 routes; feed v3 is gone. The addon itself is not yet; the rest follows
-the batches in §11. This file is the single source of truth for the
-AuctiMogger Database addon and for the tracker feed (v4) it consumes. When
-this file and the code disagree, the code wins — fix the doc in the same
-change.
+Status: **in progress**. Batches 1 to 4 are implemented: the domain types,
+the record codec, the carrier and JSON-twin renderers, the golden fixtures,
+the tracker side that feeds them — the export service, publication and
+the v4 routes, feed v3 being gone — and the addon's core, its tooltip and
+the `/amdb` command. The options panel, the tracker's addon bundle and sync
+command, and the sniper's migration follow in the batches of §11. This file
+is the single source of truth for the AuctiMogger Database addon and for the
+tracker feed (v4) it consumes. When this file and the code disagree, the code
+wins — fix the doc in the same change.
 
 Scope: everything under `addon/` plus the tracker-side feed export, publication
 and sync command. The sniper addon (`Riketta/AuctiMogger`) has its own SPEC; §8
@@ -774,8 +775,8 @@ A slot placeholder is one line:
 
 The block above is the complete TOC. A line is added by the batch that creates
 its file, because `scripts/check_toc.lua` requires every listed file to exist:
-batch 3 ships it without the five tooltip and options lines, which batch 4
-adds with their files.
+batch 3 shipped it without the five tooltip and options lines, which batch 4
+added with their files.
 
 `addon/.styluaignore` exempts `AuctiMoggerDatabase/Market*.lua` from the
 formatter: a carrier's record lines are longer than 120 columns by design, and
@@ -810,6 +811,14 @@ Carried over from the sniper's house style:
   parameter, and nothing else reads `time`.
 - Comments and identifiers are plain ASCII. A user-facing string may carry the
   UTF-8 punctuation this spec shows (the em dash of §7.11).
+- A Core module that needs another binds it under that module's own name
+  (`local Settings = A.Core.Settings`): the compat guard reads a manifest name
+  in `Core/` as the game global unless the file declares a local of that name
+  first. The adapters' `Preferences` alias is for the files that could call
+  the client's `Settings` API (§7.8).
+- A `---@class` block sits directly above the table it describes: the type
+  checker binds it to the next definition, and a class separated from its
+  table by constants or helpers has no fields.
 
 ### 7.3 Core modules
 
@@ -819,10 +828,10 @@ Carried over from the sniper's house style:
 | `Core/record.lua` | `Record.decode(text) -> record, nil` or `nil, message`; it never throws. Produces `AmdbRecord` (§7.3.1) with the derived methods of §5.8 and refuses exactly what the Rust decoder refuses. |
 | `Core/market.lua` | `Market` (one loaded market) and `Store` (all markets): header validation, registration, lookups, primary binding, freshness tiers, change callbacks (§7.3.2). Pure: `now` is a parameter. |
 | `Core/settings.lua` | `Settings.defaults()`, `coerce(saved)`, `coerceCharacter(saved)`, the per-line and switch setters, `applyPreset(settings, name)`. |
-| `Core/format.lua` | `Format.money`, `moneySigned`, `percent`, `percentBp`, `signedPercentBp`, `count`, `rate`, `age`, `days`, `supplyDays`; `COLORS` (the §7.5.4 table as escape strings), `PREFIX`, `colorize(name, text)`; the tiers `ageTier(seconds)` (muted, warn, hot, stale at 2 h, 12 h, 24 h), `rateTier(fraction)` (good at 0.5 and up, warn at 0.2 and up, else bad) and `trendTier(bp)`. |
+| `Core/format.lua` | `Format.money`, `moneySigned`, `percent`, `percentBp`, `signedPercentBp`, `count`, `rate`, `age`, `days`, `supplyDays`; `COLORS` (the §7.5.4 table as escape strings), `PREFIX`, `colorize(name, text)`; the tiers `ageTier(seconds)` (muted, warn, hot, stale at 2 h, 12 h, 24 h), `rateTier(fraction)` (good at 0.5 and up, warn at 0.2 and up, else bad) and `trendTier(bp)`; `ageColor(seconds)` is the house color of an age's tier, with `stale` in `bad` — the one table the login line, the tooltip header and `/amdb status` read. |
 | `Core/resolve.lua` | `Resolve.item(value)`, `Resolve.species(value)` and `Resolve.resolve(value) -> kind, id` from a number, a hyperlink or an `item:` / `battlepet:` string. |
-| `Core/tooltip_lines.lua` | Pure line builder: record + context → lines. |
-| `Core/anchor.lua` | Pure side decision for the attached frame. |
+| `Core/tooltip_lines.lua` | `TooltipLines.build(record, context) -> AmdbTipRow[]`, the pure row builder of §7.6. A row is `left`, `right` (nil: a single line) and, for a sparkline, `bars`. The context carries the ages, the other markets' records, the collapse and Shift flags and the settings; the builder reads no clock. |
+| `Core/anchor.lua` | `Anchor.side(ownerLeft, ownerRight, frameWidth, screenRight) -> "right" | "left"`, the pure side decision of §7.5.3; anything that is not four finite numbers answers the default side. `Anchor.point(side)` is the `SetPoint` arguments; `GAP` 8, `TOP_OFFSET` 10. |
 
 #### 7.3.1 `AmdbRecord`
 
@@ -897,7 +906,9 @@ reads: the clock (`A.clock()`, the only reader of `time`), the chat sink
 level `info`, `warn` or `bad`: each is recorded in `A.reports` and printed at
 once only when `A.verbose` is set; otherwise the bootstrap prints them once at
 login through `A.TakeReports()`. `A.FormatReport(text, level)` is the one
-place a report becomes a chat line.
+place a report becomes a chat line. `A.SayNow(text, level)` is `A.Say` plus
+that chat line at once: for something that goes wrong after login, when
+nothing drains the record again and a quiet mode must not swallow it.
 
 **`Adapters/compat.lua`** — the manifest of every game surface the addon
 touches, in tiers, plus `check(env|nil) -> { ok, missing, absentOptional }`
@@ -913,36 +924,61 @@ and a `fallbacks` table with one sentence per optional entry:
 | Required events | `ADDON_LOADED`, `PLAYER_LOGIN` |
 | Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `C_Timer`, `Settings`, `print` |
 | Optional events | `MODIFIER_STATE_CHANGED`, `PLAYER_LOGOUT` |
-| Authored | `SLASH_AMDB1`, `SLASH_AMDB2`, the namespace table `AuctiMoggerDatabase` |
+| Authored | `SLASH_AMDB1`, `SLASH_AMDB2`, the namespace table `AuctiMoggerDatabase`, the attached frame `AuctiMoggerDatabaseTip` (a named frame: the client creates its global, and those of its font strings) |
 
 No `C_AuctionHouse` function appears anywhere, not even in a string.
 
-**`Adapters/extra_tip.lua`** — the attached frame.
+**`Adapters/extra_tip.lua`** — the attached frame, `A.ExtraTip.new()`.
 
 - One `GameTooltip` created with `CreateFrame("GameTooltip",
   "AuctiMoggerDatabaseTip", UIParent, "GameTooltipTemplate")`, stratum
   `TOOLTIP`, `SetClampedToScreen(true)`, owner `UIParent`, anchor `ANCHOR_NONE`.
-- `ExtraTip:show(owner, lines)`, `:hide()`, `:isShown()`.
-- Lines render through the native `AddLine` / `AddDoubleLine`. The sparkline is
-  a row of `Texture` regions parented to the frame and anchored to its bottom.
-- Positioning (§7.5.3) runs one frame after the fill, once the owner has its
-  final size.
+- `ExtraTip.new()`, `:show(owner, rows)`, `:hide()`, `:isShown()`. Every
+  show starts by hiding, then clears the lines: nothing of the previous
+  tooltip lingers.
+- Rows render through the native `AddLine` / `AddDoubleLine`. A sparkline row
+  is a caption line plus one `Texture` a day (at most 30, 3 px wide, 4 px
+  apart, 1 to 10 px tall by the day's byte), created on demand and anchored
+  to the row's own font string (`<frame>TextLeft<n>`), so the bars follow the
+  row wherever the client lays it out. A client that cannot draw them skips
+  them; nothing raises for decoration.
+- Every layout read is pcall'd and `issecretvalue`-screened. A number that
+  cannot be read is missing, and a missing number leaves the frame on its
+  default side.
+- Positioning (§7.5.3) happens inside `show`, which the tooltip adapter calls
+  one frame after the fill, once the owner has its final size.
 
 **`Adapters/tooltip.lua`** — hooks, lifecycle, Shift, re-entrancy guard
-(§7.5). `Tooltip.new({ store, settings, say })`; `setEnabled`, `isEnabled`.
+(§7.5). `Tooltip.new({ store, settings, say })` creates the attached frame
+and hooks nothing; `register()` installs the hooks once and answers the path
+in use (`processor`, `script` or `none`, kept in `path` for `/amdb status`).
+`onTooltip(owner, data)` is the hook entry, `onModifier(key)` the Shift
+rebuild, `setEnabled` / `isEnabled` the master switch, `hide` / `isShown` the
+frame's state.
 
 **`Adapters/options.lua`** — the `/amdb` slash command and the settings panel
-(§7.7, §7.8).
+(§7.7, §7.8); batch 4 ships the command. `Options.new({ store, settings,
+character, tooltip, say, persist })`, `register()`, `run(msg)`.
 
 **`Adapters/public_api.lua`** — publishes the namespace table as the global `AuctiMoggerDatabase`, and `GetAuctionBuyout` as a global function of its own (§7.9).
 
-**`bootstrap.lua`** — the composition root; builds the adapters in order and
-owns the SavedVariables lifecycle (`ADDON_LOADED` → load settings;
-`PLAYER_LOGIN` → create the frame, register hooks and the panel, print the
-status line, fire update callbacks). Batch 3 ships the `PLAYER_LOGIN` half:
-one frame, the status line of §7.11 (a pure function of the store and `now`),
-the recorded reports, then `fireUpdate()` with each callback error reported
-once in bad.
+**`bootstrap.lua`** — the composition root; owns one frame and the
+SavedVariables lifecycle.
+
+- `ADDON_LOADED` (its own addon) → `loadSettings`: the two saved tables are
+  coerced (§7.7) into the live `A.settings` and `A.character`, written back
+  in their clean shape, and this character's chosen primary market is
+  applied. `A.PersistSettings()` writes both back; it runs after every change
+  and again at `PLAYER_LOGOUT`.
+- `PLAYER_LOGIN` → the tooltip adapter and the options are built once, each
+  under `pcall`: what cannot start is reported in bad and left out, and the
+  login goes on. Then the status line of §7.11 (a pure function of the store
+  and `now`), the recorded reports, and `fireUpdate()` with each callback
+  error reported once in bad. A login that no `ADDON_LOADED` preceded (a
+  client whose event was refused) loads the settings itself.
+- `MODIFIER_STATE_CHANGED` → the tooltip adapter's `onModifier`.
+- The optional events are registered under `pcall`: a client that refuses one
+  loses the feature it carries and keeps the login.
 
 ### 7.5 Tooltip design
 
@@ -957,20 +993,30 @@ once in bad.
   post-call resolves the species from `data.id`. Nil-guarded, optional.
 - Identity: the processor payload's `id`, else a pcall'd `GetItem()` link parse
   with every read `issecretvalue`-screened.
+- Only the `GameTooltip` and `ItemRefTooltip` globals are attached to, both
+  read at call time. The record is looked up in the primary market, items
+  before commodities (§5.3); the other markets are read in that same pool.
+- The pet post-call is a second registration of the same entry point. Where
+  `BattlePet` is missing, only that registration is left out; a processor
+  that raises on the item type falls through to the script path.
 
 #### 7.5.2 Lifecycle
 
 1. Post-call → resolve identity → `Store:record()`. No record: hide the frame.
-2. Build lines with `Core/tooltip_lines.lua`; schedule display on the next
-   frame (`C_Timer.After(0, …)`).
+   The master switch off, a frame that is not an owner, an identity that
+   cannot be read: the frame is hidden all the same.
+2. Build rows with `Core/tooltip_lines.lua`; schedule display on the next
+   frame (`C_Timer.After(0, …)`; at once where the client has no timer).
 3. On display: if the owner is no longer shown, stay hidden. Otherwise position
-   and show.
+   and show. Only the latest request is ever displayed: each carries a
+   sequence number, and a display scheduled before it does nothing.
 4. Hide on the owner's `OnTooltipCleared` and `OnHide` (instance hooks
    installed once at login) and before every re-show.
 5. `MODIFIER_STATE_CHANGED` for Shift rebuilds a shown frame at the new detail
-   level. The owner is never refreshed, so no re-entrancy is possible.
+   level, on the next frame like any display. The owner is never refreshed, so
+   no re-entrancy is possible.
 6. Rendering is pcall-wrapped behind a busy guard; the first error is reported
-   once.
+   once, and a render that raised takes the frame down.
 
 Taint: the frame is ours and unprotected; every write is cosmetic. The owner is
 only read. Nothing is combat-gated.
@@ -985,6 +1031,12 @@ edge. The adapter converts with `GetEffectiveScale()`.
 - If that would cross the screen's right edge: mirror to the owner's left.
 - Vertically the frame's top aligns with the owner's top minus 10 px.
 
+`Anchor.point` turns the side into those `SetPoint` arguments:
+`TOPLEFT` / `TOPRIGHT` / `+8` / `-10` on the right, `TOPRIGHT` / `TOPLEFT` /
+`-8` / `-10` on the left. The screen's right edge is `UIParent`'s. A number
+that cannot be read leaves the frame on the default side; the frame is
+clamped to the screen either way.
+
 #### 7.5.4 Colors
 
 | Name | RGB | Used for |
@@ -998,59 +1050,77 @@ edge. The adapter converts with `GetEffectiveScale()`.
 | bad | `1.00, 0.25, 0.25` | Low sale rate, losses, stale |
 
 Age badge of the record's own snapshot (auctions or commodities): under 2 h
-muted, 2–12 h warn, 12–24 h hot, over 24 h `stale` in bad.
+muted, 2–12 h warn, 12–24 h hot, over 24 h `stale` in bad. In the tooltip
+header the badge is that snapshot's age — the commodities stamp for a
+commodity, the auctions stamp for everything else, pets included — and the
+market's own `generatedAt` age when the header lacks the stamp. Labels are
+muted, hints and the footer dim.
 
 ### 7.6 Tooltip lines
 
 Standard level, every optional line on:
 
 ```
- AuctiMogger Database                    forever-eu-pvp-alliance · 25m
- Min buyout                 380g 50s  ×214   ≤ vendor
+ AuctiMogger Database                    forever-eu-pvp-alliance · 58m
+ Min buyout                 380g 50s  ×214
  Market value               402g 10s  sold  -3%
- Sale rate (14d)            36%   (34 of 94 sold)
- Sold                       2.4/day · supply 39d
+ Sale rate (14d)            36%  (34 of 94 sold)
+ Sold                       31.6/day · supply 39d
  Last sale                  2d ago
  30-day low                 350g  · 80% of days higher
  30 days                    [ sparkline: 30 bars, lowest daily ask ]
  Crafting                   2100g → +1900g  (exp. +684g)
  Deal                       #12 · 38% under value · score 0.71
- forever-eu-pvp-horde       455g   +10%
- forever-eu-pvp-blackwater  391g   -5%
+ forever-eu-pvp-horde       442g 31s  +10%
+ forever-eu-pvp-blackwater  382g  -5%
 ```
+
+Both samples of this section are the record of §5.10 — completed where its
+JSON writes `...` with a fortnight of 443 units sold and two more markets —
+25 minutes after its auctions stamp and 58 after its commodities stamp. A
+spec pins each line for line.
 
 | Line | Shown when | Text |
 |---|---|---|
-| Header | always | Title; right: `target · age`. |
-| **Min buyout** | always | `money(floor)` + dim ` ×floorQty`; green `≤ vendor` when `atVendorFloor()`. Not listed but seen today: dim `none listed · seen today money(seenFloor) ×seenQty`. Otherwise dim `not listed`. |
-| **Market value** | always | `money(reference)` + dim source word (`sold` / `listed` / span name) + signed `trendBp` percent in good/bad when present. |
-| **Sale rate (14d)** | always | Percent in the rate color; dim `(soldCount of soldCount + expiredCount sold)`, or `180d` rate when the 14-day rate is absent. |
-| Sold | `sold` on, `soldPerDay()` known | `x.x/day · supply Nd`, `supply ∞` when unbounded. |
+| Header | always | Title in brand; right: `target · age`, the age in its tier color (§7.5.4). |
+| **Min buyout** | always | `money(floor)` + dim `  ×floorQty`; good `  ≤ vendor` when `atVendorFloor()`. Not listed but seen today: dim `none listed · seen today money(seenFloor) ×seenQty`. Otherwise dim `not listed`. |
+| **Market value** | always | `money(reference)` + dim source word (`sold` / `listed` / span name) + signed `trendBp` percent in good or bad (muted at zero) when present; dim `unknown` without a value. |
+| **Sale rate (14d)** | always | Percent in the rate color + dim `  (soldCount of soldCount + expiredCount sold)` when both counts exist. Without a 14-day rate the label reads `Sale rate (180d)` and the counts are left out: they describe the fortnight. Dim `no evidence` without any rate. |
+| Sold | `sold` on, `soldPerDay()` known | `x.x/day`, then ` · supply Nd` when `supplyDays` is known, or ` · supply ∞` when it is saturated or unbounded. |
 | Last sale | `lastSale` on, `daysSinceLastSale()` known | `today`, `1d ago`, `Nd ago`. |
-| 30-day low | `low` on, `low30` known | `money(low30)` + dim `· N% of days higher` from `lowRank30d`. |
-| Sparkline | `sparkline` on, `lows` present | Label `30 days`; bars from `lows`. |
-| Crafting | `craft` on | `money(cost) → ±money(profit)` + dim `(exp. ±money(expectedProfit))`; losses in bad. |
-| Deal | `deal` on | good `#rank · N% under value · score x.xx`. |
-| Other markets | `markets` on, more than one loaded | One line per other market that has the item: its target id; `money(reference)` and the difference against the primary reference. |
+| 30-day low | `low` on, `low30` known | `money(low30)` + dim `  · N% of days higher` from `lowRank30d`. |
+| Sparkline | `sparkline` on, `lows` present | Caption `30 days`; bars from `lows`. |
+| Crafting | `craft` on, `craft` present | `money(cost) → ±money(profit)` + dim `(exp. ±money(expectedProfit))`; losses in bad. |
+| Deal | `deal` on, `deal` present | good `#rank · N% under value · score x.xx`. |
+| Other markets | `markets` on | One line per other loaded market that has the item in the same pool: its target id as a muted label; `money(reference)` and, against the primary's reference, a signed percent. |
 
 Shift-held detail replaces the optional lines with:
 
 ```
  Sold median (14d)          402g 10s
- Value basis                7-day listing value · 214 listings
- Listed                     618 listings · 1,234 units
+ Value basis                7-day listing value  · 214 listings
+ Listed                     618 listings  · 1,234 units
  Vendor sell                12g 50s
- Supply                     39 days (94 listed ÷ 2.4/day)
+ Supply                     39 days  (1,234 listed ÷ 31.6/day)
  Sale rate (180d)           31%
  Closures since last sale   61
- Snapshots                  auctions 25m · commodities 1h 05m ago
+ Snapshots                  auctions 25m · commodities 58m ago
  d1   median 401g           p05 380g · p95 420g · 58 seen · 9 sold
  d7   median 431g           p05 380g · p95 512g · 214 seen · 210 sold
+ d14  median 431g           p05 385g · p95 512g · 300 seen · 443 sold
  194784 · commodity · feed v4
 ```
 
-Each line is omitted when its data is absent. A collapsed owner tooltip
-(`IsTooltipCollapsed()`) always renders the three basics only.
+Each line is omitted when its data is absent. `Supply` explains the tracker's
+division (§5.6, listed quantity ÷ the daily pace) with the two numbers it
+divided, and reads `at least 65535 days` for the saturated figure. `Sale rate
+(180d)` is left out when the basic line already shows that rate. `Snapshots`
+names each stamp the header carries: `auctions 25m ago` when it is the only
+one. The span rows follow wire order, with `· N sold` only where `qtySold` is
+known. The footer names the item id ungrouped (a player pastes it into a
+lookup), the category and the carrier's version. A collapsed owner tooltip
+(`IsTooltipCollapsed()`) always renders the three basics only, whatever is
+held or switched on.
 
 ### 7.7 Settings and slash command
 
@@ -1068,6 +1138,10 @@ chosen target id).
 Coercion is strict: only literal `true` / `false` count; anything else is the
 default. The three basics have no switch.
 
+The bootstrap loads the two tables into `A.settings` and `A.character` and
+writes both back after every change and again at the logout: nothing a player
+chose waits for the logout to be saved.
+
 `/amdb` (alias `/auctimoggerdb`):
 
 | Command | Effect |
@@ -1081,6 +1155,21 @@ default. The three basics have no switch.
 | `shift on` / `shift off` | Shift detail. |
 | `decode <item>` | Debug: print every decoded field for the item. |
 | `help` | The list above. |
+
+`/amdb` alone and `help` print the list; an unknown command says so, in warn,
+and prints it. Answers reach chat at once: data rows plain, a reply behind the
+addon title. A command that raises says so instead of showing a Lua error.
+
+`/amdb status` opens like the login line (`AuctiMogger Database: on · preset
+standard · shift detail on · tooltip hooks: processor`), prints one row per
+market (slot, target, records by table, age, `primary`, `stale`, dropped
+records), then every market a slot file could not register, the choice to make
+when the primary is ambiguous or names an unloaded market, each client surface
+the manifest lists and the addon lacks (a missing required one in bad, each
+absent optional one with its fallback sentence), and the reports recorded
+since the login line. The preset reads `basic`, `standard` or `custom`.
+`decode <item>` takes an id, a link or an `item:` / `battlepet:` string and
+prints the raw numbers, an absent field as `-`.
 
 ### 7.8 Options panel
 
@@ -1218,6 +1307,9 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   a machine without rocks. CI uses the real tools.
 - CI: a new `addon` job on `ubuntu-latest` with the same pins; the `docker`
   job then needs `linux` **and** `addon`.
+- `scripts/check_compat.lua` keeps `NON_EVENT_LITERALS`, the upper-case
+  constants that are not events (`ANCHOR_NONE`, `SLASH_AMDB1`, `SLASH_AMDB2`):
+  a new one is listed there with its reason, never in the event tiers.
 
 ## 10. Test plan
 
@@ -1249,14 +1341,20 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `settings`: defaults, strict coercion both ways, presets.
 - `format`, `resolve`, `anchor`: table tests.
 - `tooltip_lines`: one test per line for shown and omitted, Shift detail,
-  collapsed owner, each toggle.
+  collapsed owner, each toggle; both samples of §7.6 line for line.
+- `extra_tip`: creation, the rows, placement in pixels, secret and unreadable
+  layout, the sparkline.
 - `market_files`: the golden carrier loaded through a fake `...` and decoded by
   the real decoder; malformed header; unclosed builder; dropped records; the
   report sink; the clock.
 - `compat`: the manifest tiers, a fallback per optional entry, `check()`.
-- `bootstrap`: the status line and the login flow through a stubbed frame.
-- `tooltip`: registration on both paths, lifecycle (hidden when the owner is
-  not shown, hidden on clear), Shift rebuild, busy guard, errors reported once.
+- `bootstrap`: the status line, the login flow and the SavedVariables lifecycle
+  through a stubbed frame.
+- `tooltip`: registration on both paths (never both), lifecycle (hidden when the
+  owner is not shown, hidden on clear), Shift rebuild, secret values, busy
+  guard, errors reported once.
+- `options`: every command of §7.7, the write-back after each change, and
+  what `status` says without a feed.
 - `public_api`: fresh tables per call, `GetAuctionBuyout` chaining, absent
   addon data.
 
@@ -1393,11 +1491,36 @@ It also settled details this spec had left open:
 2. `Adapters/extra_tip.lua`, `Adapters/tooltip.lua`.
 3. `Adapters/options.lua` slash command; SavedVariables.
 4. The five TOC lines of §7.1, with their files.
-4. Specs. In-game validation (§10).
+5. Specs. In-game validation (§10): steps 2 to 6 are the owner's and were not
+   run for this batch.
+
+Done when every gate is green and the tooltip shows the sample of §7.6.
+
+**Status: done.** Every §9 gate is green through `addon/scripts/ci_local.sh`
+(795 tests). It also settled details this spec had left open:
+
+- The two samples of §7.6 are pinned line for line by specs built from the
+  §5.10 record; their numbers now agree with it and with each other (the
+  header and `Snapshots` ages, the `Sold` and `Supply` figures, the other
+  markets' prices).
+- A header badge and the `Snapshots` line read the record's own stamp
+  (§7.5.4).
+- The sale-rate label names the window it shows, and the fortnight's counts
+  stand only beside the 14-day rate (§7.6).
+- The sparkline hangs on its row's own font string, not on the frame's bottom:
+  its row is not always the last line (§7.4).
+- The id in the footer and in `decode` prints ungrouped (§7.6, §7.7).
+- `A.SayNow` (§7.4) and `Format.ageColor` (§7.3).
+- A Core module binds `Core/settings.lua` under its own name, and a class
+  annotation sits directly above its table (§7.2).
+- The `SLASH_` globals set by name are curated non-events for the compat guard
+  (§9).
+- A login that no `ADDON_LOADED` preceded loads the settings itself (§7.4).
 
 ### Batch 5 — addon options panel
 
-`Settings` panel rows of §7.8; spec for the row model.
+`Settings` panel rows of §7.8, on the options adapter batch 4 created; spec
+for the row model.
 
 ### Batch 6 — tracker: addon bundle and sync
 

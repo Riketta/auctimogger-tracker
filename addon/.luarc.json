@@ -9,6 +9,7 @@
 		"after_each",
 		"arg",
 		"AuctiMoggerDatabase",
+		"AuctiMoggerDatabaseTip",
 		"before_each",
 		"C_Timer",
 		"CreateFrame",
