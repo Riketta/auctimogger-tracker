@@ -1,11 +1,12 @@
 # SPEC — AuctiMogger Database
 
-Status: **in progress**. Batches 1 to 6 are implemented: the domain types,
+Status: **in progress**. Batches 1 to 7 are implemented: the domain types,
 the record codec, the carrier and JSON-twin renderers, the golden fixtures,
 the tracker side that feeds them — the export service, publication and
 the v4 routes, feed v3 being gone — the addon's core, its tooltip, the
-`/amdb` command and the options panel, and the tracker's addon bundle with
-the `addon-sync` command. The sniper's migration follows in the batches of
+`/amdb` command and the options panel, the tracker's addon bundle with
+the `addon-sync` command, and the sniper reading the database through its
+`MarketDatabasePort`. The sniper's tooltip removal (batch 8) follows in
 §11. This file is the single source of truth for the AuctiMogger Database
 addon and for the tracker feed (v4) it consumes. When this file and the code
 disagree, the code wins — fix the doc in the same change.
@@ -360,7 +361,7 @@ Applied by the addon when a carrier registers:
 | `version` missing or ≠ 4 | Market rejected; reported in chat and `/amdb status`. |
 | Required header field missing or malformed, or `target` outside the tracker's id grammar | Market rejected, reported. An optional field of the wrong type is dropped instead. |
 | `generatedAt` more than 5 minutes in the future | Market rejected (diverged generator), reported. |
-| `generatedAt` older than 24 hours | Market **kept and flagged stale**: tooltips render with a red age badge; `GetSpans` answers `nil` so the sniper gets no stale evidence. |
+| `generatedAt` older than 24 hours | Market **kept and flagged stale**: tooltips render with a red age badge; `GetSpans` answers `nil`, so a caller that values on spans gets no stale evidence. (The sniper reads `GetMarketInfo` and applies its own ceiling, §8.) |
 | Same `target` already registered from another slot | The later slot replaces the earlier one, keeps its own (later) slot number and moves to the end of the slot order; reported as a warning. |
 | A record fails to decode | That record is dropped and counted; the market stays. Reported once per market at login. |
 | Slot file is a placeholder or fails to compile | Nothing registers; a slot that fails to compile shows the client's own load error. |
@@ -1354,36 +1355,57 @@ level, and the update callbacks run after them.
 Repository `Riketta/AuctiMogger`. The sniper keeps its live tail, its deals
 ring and its seen marks. Everything that stored tracker data moves out.
 
-**Batch 7 — read the database**
+**Batch 7 — read the database** (done in `Riketta/AuctiMogger`)
 
 - TOC: `## OptionalDeps: AuctiMoggerDatabase`.
-- `ports/outbound.lua`: new read-only `MarketDatabasePort` with
+- `ports/outbound.lua`: the read-only `MarketDatabasePort` with
   `entry(keyString) -> { itemID, spans, generatedAt } | nil` and
-  `describe()`. `MarketDataPort` loses `beginSnapshot`, `commitSnapshot`,
-  `upsertMetrics`.
-- New `adapters/outbound/market_database.lua`: wraps the `AuctiMoggerDatabase`
-  global; caches one entry per key string and clears on `OnUpdate`, so the
-  per-lot hot path never decodes. Inert when the addon is absent.
+  `describe() -> { loaded, market, ageSeconds }`. `MarketDataPort` lost
+  `beginSnapshot`, `commitSnapshot` and `upsertMetrics`: the store's one
+  write path is the live tail.
+- `adapters/outbound/market_database.lua`: the only reader of the
+  `AuctiMoggerDatabase` global. One `GetMarketInfo` per key string, cached
+  (an unknown key is remembered too) and dropped on every `OnUpdate`. A pet
+  key reads its species (`opts.species`); any other key reads its item id,
+  so a variant pin reads the same record as the base key. Each call runs
+  under pcall: a lookup that raises costs that lookup and is reported once
+  per session. An addon present but not answering the four functions the
+  adapter calls is treated as absent and said so once at login; an addon
+  that loads late is bound by the first lookup.
 - `adapters/outbound/history_db.lua`: the `market` map and its three write
-  methods are removed; `trackerEvidence` reads the port. The valuation tiers
-  and the 24-hour ceiling are unchanged.
-- Delete `domain/rest_ingestor.lua`, `adapters/inbound/tracker_feed.lua`, the
-  `AuctiMoggerTracker/` folder and their specs.
-- `bootstrap.lua`: drop the ingestor, the feed adapter, `ingestAndLog`,
-  `IngestTrackerFeed` and the re-ingest on list change.
-- The sniper's own SavedVariables global `AuctiMoggerDB`: schema version 3;
-  on load drop the stale `market`, `snapshots` and `counters.restKeysIngested`.
-  Deals, resets, seen and observed marks are kept.
-- `status().market` becomes `status().database = { loaded, market, ageSeconds }`.
-- SPEC.md, AGENTS.md rule 2 (one write path: live observations), README.
+  methods are gone; `trackerEvidence` reads the port. The valuation tiers
+  and the 24-hour ceiling are unchanged, and they stay the reader's: the
+  adapter applies no staleness rule of its own, and an old entry still shows
+  its spans on the display paths while the valuation ignores it. A future
+  stamp is no evidence for the sniper, even inside the database's
+  five-minute tolerance. `invalidate()` drops the valuation memos; the
+  composition root wires it to the adapter's `onInvalidate`.
+- Deleted `domain/rest_ingestor.lua`, `adapters/inbound/tracker_feed.lua`,
+  the `AuctiMoggerTracker/` folder and their specs. CI packages the one
+  addon folder that remains and checks its TOC alone.
+- `bootstrap.lua`: the ingestor, the feed adapter, `ingestAndLog`,
+  `IngestTrackerFeed` and the re-ingest on list change are gone. So are the
+  `/am ingest` command, which had nothing left to call, and the console
+  adapter's never-wired `onSnipeListChanged` hook, which existed for the
+  re-ingest.
+- The sniper's own SavedVariables global `AuctiMoggerDB`: schema version 3.
+  A version 2 blob migrates in place — `market`, `snapshots` and
+  `counters.restKeysIngested` drop; the deals, resets, seen and observed
+  marks and the live tail are kept. Any other version is wiped, as before.
+- `status().market` became `status().database = { loaded, market, ageSeconds }`
+  (the core's optional `database` dependency); the live-tail counters it
+  carried moved to `status().live`. `/am status` and the Session tab name
+  the primary market and its age, or say the database is not loaded.
+- The sniper's SPEC.md, AGENTS.md (rule 2: one write path) and README are
+  updated.
 
 **Batch 8 — remove the sniper's tooltip**
 
 - Delete `ui/item_tooltip.lua` and its spec; drop the Session-tab "Item tips"
-  button, the `/am tooltip` and `/am ingest` commands and the
-  `AuctiMoggerUI.itemTooltip` key (pruned on load).
-- Remove their manifest and allowlist entries; CI packages only
-  `AuctiMogger`.
+  button, the `/am tooltip` command and the `AuctiMoggerUI.itemTooltip` key
+  (pruned on load).
+- Remove the tooltip's manifest and allowlist entries. (CI already packages
+  only `AuctiMogger`, and `/am ingest` left with batch 7.)
 
 ## 9. Quality gates
 
@@ -1494,6 +1516,25 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `public_api`: fresh tables per call, `GetAuctionBuyout` chaining, absent
   addon data.
 
+**Sniper (batch 7, in its own repository)**
+
+- `market_database`: inert without the addon; item, variant and pet keys;
+  one lookup per key string, unknown keys included; the cache drops on
+  `OnUpdate`; `describe()`; a raising API costs one lookup and is reported
+  once; a malformed answer; an addon that does not answer the API; a late
+  load; a key that names no item.
+- `history_db` (v3): every tracker-tier case through a fake
+  `MarketDatabasePort` — fresh, degraded, past 12 h, past 24 h, d7-only, the
+  slow-window sale rate, variant and pet keys, the rollup blend, a key never
+  observed — plus `invalidate()`, the v2 migration, the reset of any other
+  version and `stats`.
+- `core`, `gui`, `adapters`: `status().live` and `status().database`, the
+  Session-tab line both ways, `/am status`.
+- A cross-repository check run for batch 7 and not committed: the real addon
+  loaded from `fixtures/database_v4.lua`, read through the real sniper
+  adapter and history store — every record equal to the oracle, the
+  valuations and the evidence ceiling on real numbers.
+
 **In game** (owner, on Forever, `/console scriptErrors 1`)
 
 1. Install the addon folder; copy one carrier over `Market1.lua`; add two more
@@ -1509,8 +1550,10 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
    toggle a line, a preset, the master switch, Shift detail and the market;
    make the same changes through `/amdb` with the window closed and reopen
    it; then close the window with Esc and confirm Log Out and Exit still work.
-8. Sniper: `/am status` shows the database; tracked items value on
-   `tracker-d1`; a deal still arms; settings survive `/reload`.
+8. Sniper: `/am status` and the Session tab show the database's market and
+   age; tracked items value on `tracker-d1`; a deal still arms; settings and
+   the snipe list survive `/reload`; with the database addon disabled the
+   sniper still values on its live tail and says the database is not loaded.
 9. Retail client, if available: steps 1–3 and 7.
 
 ## 11. Batches and steps
@@ -1721,6 +1764,25 @@ spec had left open:
 
 ### Batch 7 — sniper reads the database (§8)
 
+**Status: done**, in `Riketta/AuctiMogger`: every gate of that repository is
+green through its own `scripts/ci_local.sh` (839 tests). In-game validation
+(§10, step 8) is the owner's and was not run. It also settled details this
+spec had left open:
+
+- The live-tail counters `status().market` carried stay in view as
+  `status().live`; only the database section is new (§8).
+- The adapter applies no staleness rule of its own: one `GetMarketInfo`
+  answers the item id, the spans and the market's stamp, where `GetSpans`
+  would have needed a second call for the stamp, and the evidence ceiling
+  stays where it was — in the history store's `trackerEvidence`.
+- A key the database does not know is cached like a known one, an addon that
+  loads after the sniper is bound by the first lookup, and every API call
+  is pcall'd with one report per session (§8).
+- `/am ingest` and the console adapter's ingest hook left with this batch,
+  not the next.
+- The store's schema v2 → v3 is its first in-place migration; every other
+  version is still wiped.
+
 ### Batch 8 — sniper tooltip removal and cleanup (§8)
 
 ## 12. Risks and mitigations
@@ -1730,7 +1792,7 @@ spec had left open:
 | No interface dump exists for these clients, so game APIs are unverified. | Nil-guard every surface; both tooltip hook paths; the compat manifest records each fallback; in-game checklist in §10. |
 | Retail path cannot be tested here. | Code paths are flavor-agnostic; retail is documented as untested until the owner runs step 9. |
 | Packing bugs would corrupt every number. | Integers only, a printable-only alphabet, a Rust reference decoder, and the golden trio pinned from both languages. |
-| Data goes stale between syncs. | Age is always visible; stale markets are flagged; the sniper refuses stale spans. |
+| Data goes stale between syncs. | Age is always visible; stale markets are flagged; the sniper's valuation refuses stale evidence (§8). |
 | A market file copied into a git checkout over a tracked slot shows as modified. | Same as today's `feed.lua`; `git checkout` restores the placeholder. Documented in the README. |
 | The attached frame mis-anchors under UI scale. | Side decision is a pure function over effective-scale-corrected numbers; clamped to screen; checked in step 6 of §10. |
 | Addon code on the Settings window's open or close path can get Log Out and Exit blocked (Mastercraft's finding on Forever). | The canvas frame has no `OnShow`, `OnHide`, `OnRefresh`, `OnCommit` or `OnDefault`; it refreshes on its own `OnUpdate` (§7.8). Checked in step 7 of §10. |
