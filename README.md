@@ -672,6 +672,12 @@ Pets use `"type":"pet"` with `speciesID`/`level`/`qualityID`/`breedID`.
 
 ### AuctiMogger Database
 
+The in-game addon that shows this market data on item tooltips. Its guide —
+installing, the `/amdb` commands, the options panel, what each tooltip line
+means and the API other addons can read — is
+[`addon/README.md`](addon/README.md); [`addon/SPEC.md`](addon/SPEC.md) is the
+technical contract.
+
 ```sh
 # On the machine with the game client, with any tracker binary of this version:
 auctimogger-tracker addon-sync --url http://localhost:8080 \
@@ -689,7 +695,7 @@ cp feed.lua <wow>/Interface/AddOns/AuctiMoggerDatabase/Market1.lua
 
 `<wow>` is the client root (the folder containing `Interface/`). The addon
 lives in [`addon/`](addon/SPEC.md) of this repository and is served by the
-tacker itself (`GET /api/addon/manifest` lists it, file by file), so the
+tracker itself (`GET /api/addon/manifest` lists it, file by file), so the
 addon always matches the feed format; a release also attaches
 `AuctiMoggerDatabase.zip` — the addon folder with empty market slots — for a
 manual install. It has six market slots (`Market1.lua` … `Market6.lua`), and
@@ -699,6 +705,11 @@ In-game, `/reload` loads the market file; `GET /feed.lua` and
 `/api/feed.json` answer 404 until the first successful cycle has published —
 wait for a green cycle. The files also live in the `amtracker-feeds` volume:
 `docker compose cp tracker:/work/feeds/wowforever-main/feed.lua .`
+
+In game: enable the addon, pick this character's primary market with
+`/amdb market <target>`, then hover any item — a panel beside the game's
+tooltip shows its market data, and **Shift** switches to the detail block.
+`/amdb help` lists the rest.
 
 ### Update, stop, reset
 
