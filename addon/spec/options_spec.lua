@@ -67,7 +67,6 @@ local OPTIONAL = {
     "ItemRefTooltip",
     "issecretvalue",
     "IsShiftKeyDown",
-    "C_Timer",
     "Settings",
     "MenuUtil",
 }
@@ -489,8 +488,9 @@ describe("the /amdb command", function()
             assert.is_true(hasLine(answer, withoutPanel))
             assert.is_true(hasLine(answer, withoutScreening))
             assert.is_true(hasLine(answer, withoutMenu))
-            -- Eight optional surfaces are absent here; the ninth is print.
-            assert.equals(10, #answer)
+            -- The login line, one market row, then one fallback line per
+            -- optional surface that is absent here.
+            assert.equals(2 + #OPTIONAL, #answer)
             rawset(_G, "Settings", {})
             rawset(_G, "issecretvalue", function() end)
             answer = run("status")

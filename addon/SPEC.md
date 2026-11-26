@@ -985,7 +985,7 @@ and a `fallbacks` table with one sentence per optional entry:
 |---|---|
 | Required globals | `CreateFrame`, `GameTooltip`, `UIParent`, `time`, `SlashCmdList` |
 | Required events | `ADDON_LOADED`, `PLAYER_LOGIN` |
-| Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `C_Timer`, `Settings`, `MenuUtil`, `print` |
+| Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `Settings`, `MenuUtil`, `print` |
 | Optional events | `MODIFIER_STATE_CHANGED`, `PLAYER_LOGOUT` |
 | Authored | `SLASH_AMDB1`, `SLASH_AMDB2`, the namespace table `AuctiMoggerDatabase`, the attached frame `AuctiMoggerDatabaseTip` (a named frame: the client creates its global, and those of its font strings) |
 
@@ -995,10 +995,16 @@ No `C_AuctionHouse` function appears anywhere, not even in a string.
 
 - One `GameTooltip` created with `CreateFrame("GameTooltip",
   "AuctiMoggerDatabaseTip", UIParent, "GameTooltipTemplate")`, stratum
-  `TOOLTIP`, `SetClampedToScreen(true)`, owner `UIParent`, anchor `ANCHOR_NONE`.
-- `ExtraTip.new()`, `:show(owner, rows)`, `:hide()`, `:isShown()`. Every
-  show starts by hiding, then clears the lines: nothing of the previous
-  tooltip lingers.
+  `TOOLTIP`, `SetClampedToScreen(true)`. It has no owner until it is shown.
+- `ExtraTip.new()`, `:show(owner, rows)`, `:place(owner)`, `:hide()`,
+  `:isShown()`. Every show starts by hiding, sets its owner and then clears
+  the lines: nothing of the previous tooltip lingers.
+- The owner is the tooltip the frame attaches to, and it is set on every
+  show (`SetOwner(owner, "ANCHOR_NONE")`, before the lines and the `Show`).
+  That is how the default UI shows a `GameTooltip`: its comparison tooltips,
+  which stand beside the item tooltip as this frame does, set it on every
+  comparison. LibExtraTip and TSM set theirs on every attach. Set once, at
+  creation, it left the frame down in game (§11, second follow-up).
 - Rows render through the native `AddLine` / `AddDoubleLine`. A sparkline row
   is a caption line plus one `Texture` a day (at most 30, 3 px wide, 4 px
   apart, 1 to 10 px tall by the day's byte), created on demand and anchored
@@ -1008,8 +1014,10 @@ No `C_AuctionHouse` function appears anywhere, not even in a string.
 - Every layout read is pcall'd and `issecretvalue`-screened. A number that
   cannot be read is missing, and a missing number leaves the frame on its
   default side.
-- Positioning (§7.5.3) happens inside `show`, which the tooltip adapter calls
-  one frame after the fill, once the owner has its final size.
+- Positioning (§7.5.3) happens inside `show` and again through `place`,
+  which the tooltip adapter calls when the owner is shown or resized: the
+  hook runs before the owner's own `Show`, so the first placement reads the
+  edges the owner had before it was laid out.
 
 **`Adapters/tooltip.lua`** — hooks, lifecycle, Shift, re-entrancy guard
 (§7.5). `Tooltip.new({ store, settings, say })` creates the attached frame
@@ -1074,19 +1082,29 @@ SavedVariables lifecycle.
 #### 7.5.2 Lifecycle
 
 1. Post-call → resolve identity → `Store:record()`. No record: hide the frame.
-   The master switch off, a frame that is not an owner, an identity that
-   cannot be read: the frame is hidden all the same.
-2. Build rows with `Core/tooltip_lines.lua`; schedule display on the next
-   frame (`C_Timer.After(0, …)`; at once where the client has no timer).
-3. On display: if the owner is no longer shown, stay hidden. Otherwise position
-   and show. Only the latest request is ever displayed: each carries a
-   sequence number, and a display scheduled before it does nothing.
+   The master switch off, an identity that cannot be read: the frame is
+   hidden all the same.
+2. Build rows with `Core/tooltip_lines.lua` and show the frame at once,
+   inside the hook. The owner's own shown state is not consulted: the client
+   calls the post-calls before its own `Show` of the owner
+   (`TooltipDataHandlerMixin:InternalProcessInfo`) and shows it as soon as
+   the hook returns. This is the order the default UI's comparison tooltips,
+   LibExtraTip and TSM are shown in.
+3. Item data processed on any other tooltip (a comparison tooltip, an
+   embedded one) is ignored: nothing is rendered and nothing is taken down.
 4. Hide on the owner's `OnTooltipCleared` and `OnHide` (instance hooks
-   installed once at login) and before every re-show.
-5. `MODIFIER_STATE_CHANGED` for Shift rebuilds a shown frame at the new detail
-   level, on the next frame like any display. The owner is never refreshed, so
-   no re-entrancy is possible.
-6. Rendering is pcall-wrapped behind a busy guard; the first error is reported
+   installed once at login) and before every re-show. The client re-processes
+   a shown tooltip every 0.2 s (`GameTooltip_OnUpdate`): each pass clears it
+   and calls the post-call again, so the frame goes down and up inside one
+   call, and no frame is rendered without it.
+5. Place again on the owner's `OnShow` and `OnSizeChanged`: the hook ran
+   before the owner was laid out (§7.5.3).
+6. `MODIFIER_STATE_CHANGED` for Shift rebuilds a shown frame at the new detail
+   level, at once. The owner's `Show` is never called, though LibExtraTip and
+   TSM call it for the final layout: the client's own code
+   (`GameTooltipDataMixin:SetWorldCursor`) warns that a tooltip shown by addon
+   code taints what it reads back from it.
+7. Rendering is pcall-wrapped behind a busy guard; the first error is reported
    once, and a render that raised takes the frame down.
 
 Taint: the frame is ours and unprotected; every write is cosmetic. The owner is
@@ -1107,6 +1125,10 @@ edge. The adapter converts with `GetEffectiveScale()`.
 `-8` / `-10` on the left. The screen's right edge is `UIParent`'s. A number
 that cannot be read leaves the frame on the default side; the frame is
 clamped to the screen either way.
+
+The side is decided when the frame is shown and again each time its owner is
+shown or resized: the hook runs before the owner's own `Show`, so the first
+decision reads the edges of the tooltip that was there before.
 
 #### 7.5.4 Colors
 
@@ -1535,8 +1557,8 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `format`, `resolve`, `anchor`: table tests.
 - `tooltip_lines`: one test per line for shown and omitted, Shift detail,
   collapsed owner, each toggle; both samples of §7.6 line for line.
-- `extra_tip`: creation, the rows, placement in pixels, secret and unreadable
-  layout, the sparkline.
+- `extra_tip`: creation, the owner set on every show, the rows, placement in
+  pixels and again on demand, secret and unreadable layout, the sparkline.
 - `market_files`: the golden carrier loaded through a fake `...` and decoded by
   the real decoder; malformed header; unclosed builder; dropped records; the
   report sink; the clock; a version 3 feed in a slot (reported in bad with its
@@ -1545,9 +1567,10 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `bootstrap`: the status line, the login flow and the SavedVariables lifecycle
   through a stubbed frame, and the panel's three outcomes at the login; a
   version 3 feed in a slot is printed once, in bad, after the status line.
-- `tooltip`: registration on both paths (never both), lifecycle (hidden when the
-  owner is not shown, hidden on clear), Shift rebuild, secret values, busy
-  guard, errors reported once.
+- `tooltip`: registration on both paths (never both), lifecycle (shown at
+  once, before the owner's own show; hidden on clear and on hide; item data of
+  another tooltip ignored; placed again on the owner's show and resize), Shift
+  rebuild, secret values, busy guard, errors reported once.
 - `options`: every command of §7.7, the write-back after each change, and
   what `status` says without a feed.
 - `panel` (a spec of its own): the registration against a recording Settings
@@ -1859,11 +1882,43 @@ had published, which was copied over a slot and read as an empty one.
   (§6.5).
 - The addon names a version 3 feed left in a slot (§7.4, §7.11).
 
+### Follow-up — the attached frame never appeared
+
+**Status: fixed in code; the in-game validation of §10, step 2, is the
+owner's and has not been run.** Found on the first real hover: the hook
+fired (the processor path), the render ran without an error and the frame
+was recorded as shown, yet `IsShown()` answered false right after `Show()`
+and nothing was visible, Shift or not. Three things in the lifecycle differed
+from how the default UI, OribosExchange's LibExtraTip and TSM show a tooltip
+of their own (Appendix C); all three are now theirs:
+
+- The owner was set once, at creation. Every reference sets it on every
+  show: `TooltipComparisonManager:Initialize` for the default UI's comparison
+  tooltips, `GameTooltip_ShowSimpleTooltip` and its siblings,
+  LibExtraTip's `Attach`, TSM's `ExtraTooltip:Attach`. The frame now sets its
+  owner on every show, before the lines (§7.4).
+- The display was scheduled for the next frame (`C_Timer.After(0)`). The
+  client calls the post-calls before it shows the owner
+  (`TooltipDataHandlerMixin:InternalProcessInfo`) and re-processes a shown
+  tooltip every 0.2 s (`GameTooltip_OnUpdate`), so a deferred frame is down
+  from each clear until the next frame comes. It is now shown inside the hook
+  and placed again when the owner is shown or resized (§7.5.2, §7.5.3).
+  `C_Timer` left the compat manifest with it.
+- Item data processed on another tooltip took the frame down. The client's
+  comparison tooltips go through the same processor; LibExtraTip and TSM
+  ignore a tooltip that is not theirs. So does the addon now (§7.5.2).
+
+Kept against the two libraries: the owner's `Show` is not called. Both call
+it to get the final layout first; the client's own code
+(`GameTooltipDataMixin:SetWorldCursor`) warns that a tooltip shown by addon
+code taints what it reads back from it. The frame is placed again through the
+owner's own hooks instead.
+
 ## 12. Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| No interface dump exists for these clients, so game APIs are unverified. | Nil-guard every surface; both tooltip hook paths; the compat manifest records each fallback; in-game checklist in §10. |
+| No interface dump of these clients exists, so game APIs are unverified. | The default UI's own code of build 1.60.1.70790 is at hand and matches every line number a frame dump of the Forever client names (Appendix C): a game idiom is checked against it first. Otherwise nil-guard every surface; both tooltip hook paths; the compat manifest records each fallback; in-game checklist in §10. |
 | Retail path cannot be tested here. | Code paths are flavor-agnostic; retail is documented as untested until the owner runs step 9. |
 | Packing bugs would corrupt every number. | Integers only, a printable-only alphabet, a Rust reference decoder, and the golden trio pinned from both languages. |
 | Data goes stale between syncs. | Age is always visible; stale markets are flagged; the sniper's valuation refuses stale evidence (§8). |
@@ -1875,6 +1930,7 @@ had published, which was copied over a slot and read as an empty one.
 | Export reads a scan that lags the newest snapshot. | Live group is read from the snapshot directly; scheduler refreshes scans before publishing. |
 | A redeploy keeps the feed volume, so an older tracker's carrier stays on disk until the first cycle. | The feed routes answer 404 for a file that is not of the current feed version (§6.5), and the addon reports a version 3 feed left in a slot (§7.11). |
 | Tooltip font lacks special glyphs on Forever. | Signs are `+` / `-` text; the sparkline is textures. |
+| A tooltip idiom of our own, where the default UI's is different, fails with no error in game: the attached frame stayed down through a whole session (§11). | The lifecycle follows the default UI's comparison tooltips, LibExtraTip and TSM (§7.5.2), and the first hover in game is run before a tooltip change is called done. |
 
 ## 13. Known limitations and later work
 
@@ -1901,6 +1957,12 @@ had published, which was copied over a slot and read as an empty one.
   disagrees with the owner's API-verified house ids (the README's example
   uses the verified ones).
 - Retail is compatible by construction but untested in game.
+- The panel goes to the right of the game's tooltip unless that would cross
+  the screen's edge. The client puts item comparison tooltips beside the same
+  tooltip by its own rule (`TooltipComparisonManager:AnchorShoppingTooltips`:
+  the side its owner is not on, when they fit there; else the side with more
+  room), so with comparisons on the two can overlap. Read from the two
+  anchoring rules; not yet seen in game.
 - `addon-sync` places every target the tracker reports: `--market` pins a
   market to a slot but cannot leave one out, and a slot no run claims is
   never reset to its placeholder (delete the file, or copy one from the
@@ -1961,3 +2023,17 @@ What moves out of the sniper repository (`Riketta/AuctiMogger` @ `83da07c`):
 - **Mastercraft** (Forever, interface 16001) — tooltip sections with switches.
 - **AuctiMogger** (sniper) — house Lua conventions, the compat manifest, the
   re-entrancy lesson behind the busy guard.
+- **Blizzard interface code 1.60.1.70790** (`BlizzardInterfaceCode`) — the
+  tooltip lifecycle the addon follows: `Blizzard_SharedXMLGame/Tooltip/
+  TooltipDataHandler.lua` (`InternalProcessInfo`: lines, post-calls, then
+  `Show`), `Blizzard_SharedXML/SharedTooltipTemplates.lua`
+  (`GameTooltip_ShowSimpleTooltip` and its siblings set the owner before
+  every show), `Blizzard_GameTooltip` (`GameTooltip_OnUpdate`, the 0.2 s
+  refresh) and `TooltipComparisonManager.lua` (a second tooltip set up
+  beside the item tooltip on every comparison). Every line number a frame
+  dump of the Forever client names matches it.
+- **LibExtraTip** (OribosExchange, `libs/LibExtraTip`) and TSM
+  (`LibTSMWoW/Source/UI/ExtraTooltip.lua`, `Service/TooltipWrapper.lua`) —
+  two attached-tooltip implementations: the owner set on every attach, shown
+  inside the post-call, released on `OnTooltipCleared`, a tooltip that is
+  not theirs ignored.

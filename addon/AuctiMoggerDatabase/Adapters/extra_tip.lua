@@ -6,7 +6,12 @@ local _, A = ...
 -- modified), filled through the native AddLine / AddDoubleLine and placed
 -- beside its owner (SPEC 7.5.3). It is created once and shown for one owner
 -- at a time: every show starts by hiding, so nothing of the previous tooltip
--- lingers.
+-- lingers, and sets the owner it is shown for. That owner is the tooltip the
+-- frame attaches to, and it is set on every show: the default UI's comparison
+-- tooltips, which stand beside the item tooltip as this frame does, do the
+-- same on each comparison, and so do LibExtraTip and TSM. A frame whose owner
+-- was set once, at creation, stayed down in game once it had been hidden:
+-- Show() ran, raised nothing, and IsShown() answered false.
 --
 -- Taint: the frame is ours and unprotected, and every write is cosmetic, so
 -- nothing is combat-gated. The owner is only read, and every layout read is
@@ -125,14 +130,14 @@ ExtraTip.__index = ExtraTip
 A.ExtraTip = ExtraTip
 
 --- Creates the frame (SPEC 7.4): a named GameTooltip on the tooltip stratum,
---- clamped to the screen, owned by UIParent with no anchor of its own.
+--- clamped to the screen. It has no owner until it is shown: the owner is the
+--- tooltip it attaches to, set by each show.
 ---@return AmdbExtraTip extra
 function ExtraTip.new()
     ---@type AmdbTipFrame
     local tip = CreateFrame("GameTooltip", FRAME_NAME, UIParent, "GameTooltipTemplate")
     tip:SetFrameStrata("TOOLTIP")
     tip:SetClampedToScreen(true)
-    tip:SetOwner(UIParent, "ANCHOR_NONE")
     return setmetatable({ tip = tip, bars = {}, shown = false }, ExtraTip)
 end
 
@@ -207,7 +212,9 @@ end
 
 --- Puts the frame beside its owner (SPEC 7.5.3): on the side Core/anchor.lua
 --- picks from the owner's edges, the frame's width and the screen's right
---- edge, all read in pixels.
+--- edge, all read in pixels. Called again while the frame is up, once its
+--- owner is shown or resized: the first placement reads the edges the owner
+--- had before the game laid it out.
 ---@param owner AmdbTipOwner the tooltip the frame attaches to
 function ExtraTip:place(owner)
     local tip = self.tip
@@ -225,11 +232,17 @@ end
 --- Fills the frame with `rows` and shows it beside `owner`. A row with a
 --- right-hand text is a double line; one without is a single line; one with
 --- bars also draws its sparkline. Whatever was up before comes down first.
+---
+--- The owner is set on every show, before the lines. Setting it once, at
+--- creation, is what left the frame down in game (the note at the top);
+--- this is the order the default UI, LibExtraTip and TSM show a tooltip in.
+--- No anchor of its own: the frame is placed by `place`.
 ---@param owner AmdbTipOwner the tooltip the frame attaches to
 ---@param rows AmdbTipRow[] the header and the basics at least
 function ExtraTip:show(owner, rows)
     self:hide()
     local tip = self.tip
+    tip:SetOwner(owner, "ANCHOR_NONE")
     tip:ClearLines()
     ---@type AmdbTipSpark[]
     local sparklines = {}

@@ -6,13 +6,20 @@ local ADDON, A = ...
 -- house rows) ends in one of two entry points: the TooltipDataProcessor
 -- post-call where the client has it, the OnTooltipSetItem script hook
 -- otherwise - never both, or the frame would render twice. Both resolve what
--- the tooltip is showing, read the record and schedule the attached frame
--- for the next frame, by which time the owner has its final size.
+-- the tooltip is showing, read the record and show the attached frame at
+-- once, inside the hook. That is where the default UI's comparison tooltips,
+-- LibExtraTip and TSM show theirs. The client calls the post-calls before it
+-- shows the owner, and its GameTooltip_OnUpdate re-processes a shown tooltip
+-- every 0.2 s, so a frame scheduled for a later frame would dip down at
+-- every refresh. Because the owner is not laid out yet when the hook runs,
+-- the frame is placed again when the owner is shown or resized.
 --
--- The owner is only ever read. Shift rebuilds our own frame at the other
--- detail level; the owner is never refreshed, so nothing of ours re-enters
--- the game's tooltip code. A render that raises is reported once, and a
--- render that is re-entered while it runs is dropped on the spot.
+-- The owner is only ever read. Its Show is not called, though LibExtraTip and
+-- TSM call it for the final layout: the client's own code warns that a
+-- tooltip shown by addon code taints what it reads back from it. Shift
+-- rebuilds our own frame at the other detail level, so nothing of ours
+-- re-enters the game's tooltip code. A render that raises is reported once,
+-- and a render that is re-entered while it runs is dropped on the spot.
 --
 -- Taint: the hooks are the client's own (a post-call, HookScript) and the
 -- frame is ours and unprotected. Nothing is combat-gated.
@@ -66,29 +73,11 @@ local ExtraTip = A.ExtraTip
 ---@field path AmdbHookPath the hook path in use; "none" until `register` ran
 ---@field busy boolean a render is running: a re-entrant display is dropped
 ---@field reported boolean true once the first error was reported
----@field sequence integer counts requests, so a display scheduled before the latest does nothing
----@field watched boolean true once the owners' hide hooks are installed
+---@field watched boolean true once the owners' hooks are installed
 ---@field shown AmdbTipPending|nil what the shown frame renders; nil while it is hidden
 local Tooltip = {}
 Tooltip.__index = Tooltip
 A.Tooltip = Tooltip
-
---- Runs `callback` on the next frame where the client has a timer, and at
---- once otherwise: without C_Timer the frame displays before the owner has
---- its final size, as the compat manifest says.
----@param callback fun()
-local function nextFrame(callback)
-    local timer = C_Timer
-    if type(timer) == "table" and type(timer.After) == "function" then
-        -- A plain function of the table, as the client's own code calls it.
-        if pcall(function()
-            timer.After(0, callback)
-        end) then
-            return
-        end
-    end
-    callback()
-end
 
 --- Whether a value is a plain number: screened first, because a secret value
 --- must not even be compared.
@@ -255,7 +244,6 @@ function Tooltip.new(deps)
     self.path = "none"
     self.busy = false
     self.reported = false
-    self.sequence = 0
     self.watched = false
     self.shown = nil
     return self
@@ -268,7 +256,7 @@ function Tooltip:isEnabled()
 end
 
 --- The master switch in the other direction: switching off takes a shown
---- frame down at once, and drops what was scheduled.
+--- frame down at once.
 ---@param on boolean
 function Tooltip:setEnabled(on)
     Preferences.setEnabled(self.settings, on)
@@ -283,11 +271,10 @@ function Tooltip:isShown()
     return self.shown ~= nil
 end
 
---- Takes the frame down and voids the display scheduled before this call.
+--- Takes the frame down. Safe to call when it is already down.
 function Tooltip:hide()
     self.tip:hide()
     self.shown = nil
-    self.sequence = self.sequence + 1
 end
 
 ---@param err any what a render raised
@@ -332,9 +319,8 @@ function Tooltip:context(subject, owner, shift)
     }
 end
 
---- Builds the rows for a target the primary market has, and schedules the
---- display for the next frame (SPEC 7.5.2). A newer request voids an older
---- schedule, so only the latest tooltip is ever shown.
+--- Builds the rows for a target the primary market has, and displays them at
+--- once (SPEC 7.5.2).
 ---@param owner any
 ---@param target AmdbTipTarget
 function Tooltip:prepare(owner, target)
@@ -345,23 +331,16 @@ function Tooltip:prepare(owner, target)
     end
     local shift = self:detailWanted(owner)
     local rows = TooltipLines.build(subject.record, self:context(subject, owner, shift))
-    self.sequence = self.sequence + 1
-    local sequence = self.sequence
-    local pending = { owner = owner, target = target, rows = rows, shift = shift }
-    nextFrame(function()
-        self:display(pending, sequence)
-    end)
+    self:display({ owner = owner, target = target, rows = rows, shift = shift })
 end
 
---- The display scheduled by `prepare`: nothing once it was superseded, and
---- nothing when the owner is no longer shown or the switch went off.
+--- Shows the frame for `pending` beside its owner. The owner's own shown
+--- state is not consulted: the hook runs before the game shows the owner. A
+--- render that is re-entered while another runs is dropped, and one that
+--- raised takes the frame down and is reported.
 ---@param pending AmdbTipPending
----@param sequence integer the request the display belongs to
-function Tooltip:display(pending, sequence)
-    if sequence ~= self.sequence or self.busy then
-        return
-    end
-    if not self:isEnabled() or not answersTrue(pending.owner, "IsShown") then
+function Tooltip:display(pending)
+    if self.busy then
         return
     end
     self.busy = true
@@ -376,13 +355,32 @@ function Tooltip:display(pending, sequence)
     end
 end
 
+--- Places the shown frame again, by its owner's edges as they are now
+--- (SPEC 7.5.3). Nothing while the frame is down. A placement that raised is
+--- reported and leaves the frame up.
+function Tooltip:replace()
+    local shown = self.shown
+    if shown == nil or self.busy then
+        return
+    end
+    local ok, err = pcall(self.tip.place, self.tip, shown.owner)
+    if not ok then
+        self:report(err)
+    end
+end
+
 --- The hook entry, for both paths: resolve what the owner shows, then show
---- the frame for it or take the frame down.
+--- the frame for it or take the frame down. Item data processed on another
+--- tooltip (a comparison tooltip, an embedded one) is not ours to decorate,
+--- and no reason to take the frame down: the owner's own clear and hide are.
 ---@param owner any the tooltip the post-call or the hook names
 ---@param data any the processor's payload; nil on the script path
 function Tooltip:onTooltip(owner, data)
+    if not isAttached(owner) then
+        return
+    end
     local ok, err = pcall(function()
-        if not self:isEnabled() or not isAttached(owner) then
+        if not self:isEnabled() then
             self:hide()
             return
         end
@@ -418,13 +416,20 @@ function Tooltip:onModifier(key)
     end
 end
 
---- Installs the hide hooks of one owner tooltip: the frame comes down with
---- its owner, whether the game clears it or hides it.
+--- Installs the hooks of one owner tooltip. The frame comes down with its
+--- owner, whether the game clears it or hides it, and is placed again when
+--- the owner is shown or resized: the hook ran before the owner's own Show,
+--- by edges that may not have been the owner's last.
 ---@param frame any a GameTooltip or an ItemRefTooltip
 function Tooltip:watchOwner(frame)
     for _, script in ipairs({ "OnTooltipCleared", "OnHide" }) do
         pcall(frame.HookScript, frame, script, function()
             self:hide()
+        end)
+    end
+    for _, script in ipairs({ "OnShow", "OnSizeChanged" }) do
+        pcall(frame.HookScript, frame, script, function()
+            self:replace()
         end)
     end
 end
@@ -476,7 +481,7 @@ function Tooltip:registerScripts()
 end
 
 --- Installs the hooks, once: the processor path where the client has it, the
---- script path otherwise, and the owner's hide hooks on both. Idempotent.
+--- script path otherwise, and the owner's hooks on both. Idempotent.
 ---@return AmdbHookPath path
 function Tooltip:register()
     if self.path == "none" and not self:registerProcessor() then

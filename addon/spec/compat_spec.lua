@@ -11,7 +11,6 @@ local OPTIONAL_GLOBALS = {
     "ItemRefTooltip",
     "issecretvalue",
     "IsShiftKeyDown",
-    "C_Timer",
     "Settings",
     "MenuUtil",
     "print",

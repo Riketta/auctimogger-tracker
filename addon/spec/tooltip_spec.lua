@@ -4,9 +4,10 @@
 --
 -- The real store, decoder, row builder and attached frame run together: the
 -- golden carrier is loaded, the owners are frames that record their hooks,
--- CreateFrame hands out the attached frame, and C_Timer queues its callbacks
--- so a test decides when the next frame comes. The stubs go into _G with
--- rawset: a spec file's own globals are private to it.
+-- and CreateFrame hands out a frame that records what is done to it. An
+-- owner's hooks stand in for the game: OnTooltipCleared and OnHide for its
+-- clearing, OnShow and OnSizeChanged for its layout. The stubs go into _G
+-- with rawset: a spec file's own globals are private to it.
 
 local Loader = require("spec.helpers.loader")
 local Encode = require("spec.helpers.encode")
@@ -80,12 +81,22 @@ end
 --- does not list is a no-op: the frame's creation calls are not its subject.
 ---@return table frame
 local function newFrame()
-    local frame = { lines = {}, shown = false, shownCount = 0 }
+    local frame = { lines = {}, points = {}, shown = false, shownCount = 0 }
     function frame:NumLines()
         return #self.lines
     end
+    function frame:SetOwner(owner, anchor)
+        self.owner = owner
+        self.anchor = anchor
+    end
     function frame:ClearLines()
         self.lines = {}
+    end
+    function frame:ClearAllPoints()
+        self.points = {}
+    end
+    function frame:SetPoint(...)
+        self.points[#self.points + 1] = { ... }
     end
     function frame:AddLine(text)
         self.lines[#self.lines + 1] = { text }
@@ -175,10 +186,13 @@ local STUBS = {
     "ItemRefTooltip",
     "TooltipDataProcessor",
     "Enum",
-    "C_Timer",
     "IsShiftKeyDown",
     "issecretvalue",
 }
+
+--- The scripts the adapter installs on an owner: two that take the frame
+--- down, two that place it again.
+local OWNER_HOOKS = { "OnTooltipCleared", "OnHide", "OnShow", "OnSizeChanged" }
 
 describe("the tooltip adapter", function()
     local A
@@ -186,30 +200,35 @@ describe("the tooltip adapter", function()
     local frame
     local gameTooltip
     local itemRef
-    local timers
     local said
     local shift
     local createdKind
     local saved
 
-    --- Lets the next frame come: every queued callback runs.
-    local function nextFrame()
-        local pending = timers
-        timers = {}
-        for index = 1, #pending do
-            pending[index]()
+    --- The side the frame was last placed on, as its own anchor point names it.
+    ---@return string|nil point
+    local function side()
+        local last = frame.points[#frame.points]
+        if last == nil then
+            return nil
         end
+        return last[1]
     end
 
-    --- Hovers an item on an owner: the owner is shown, the hook fires, a
-    --- frame passes.
+    --- Hovers an item on an owner the way the game does (SPEC 7.5.2): the hook
+    --- fires while the owner is still hidden, then the game shows it.
     ---@param id integer|nil the item id; 25 by default
     ---@param owner table|nil GameTooltip by default
     local function hover(id, owner)
         local target = owner or gameTooltip
-        target.shown = true
+        target.shown = false
         tooltip:onTooltip(target, { id = id or 25, type = "item" })
-        nextFrame()
+        target.shown = true
+        -- Only a registered adapter installed the owner's hooks.
+        local shown = target.hooks.OnShow
+        if shown ~= nil then
+            shown(target)
+        end
     end
 
     --- A TooltipDataProcessor that records its post-calls, and the Enum of
@@ -244,7 +263,6 @@ describe("the tooltip adapter", function()
         for _, name in ipairs(STUBS) do
             saved[name] = rawget(_G, name)
         end
-        timers = {}
         said = {}
         shift = false
         frame = newFrame()
@@ -253,10 +271,13 @@ describe("the tooltip adapter", function()
             createdKind = kind
             return frame
         end)
-        rawset(_G, "UIParent", {})
-        rawset(_G, "C_Timer", {
-            After = function(_, callback)
-                timers[#timers + 1] = callback
+        -- A 1920 px screen at scale 1: its right edge is what the side reads.
+        rawset(_G, "UIParent", {
+            GetRight = function()
+                return 1920
+            end,
+            GetEffectiveScale = function()
+                return 1
             end,
         })
         rawset(_G, "IsShiftKeyDown", function()
@@ -294,7 +315,6 @@ describe("the tooltip adapter", function()
         assert.equals("none", tooltip.path)
         assert.same({}, gameTooltip.hooks)
         assert.same({}, itemRef.hooks)
-        assert.same({}, timers)
         assert.is_true(tooltip:isEnabled())
     end)
 
@@ -359,22 +379,22 @@ describe("the tooltip adapter", function()
             assert.equals("none", tooltip:register())
         end)
 
-        it("installs the owner's hide hooks on both paths", function()
+        it("installs the owner's hide hooks, and its layout hooks, on both paths", function()
             processor(true)
             assert.equals("processor", tooltip:register())
-            assert.equals("function", type(gameTooltip.hooks.OnTooltipCleared))
-            assert.equals("function", type(gameTooltip.hooks.OnHide))
-            assert.equals("function", type(itemRef.hooks.OnTooltipCleared))
-            assert.equals("function", type(itemRef.hooks.OnHide))
+            for _, script in ipairs(OWNER_HOOKS) do
+                assert.equals("function", type(gameTooltip.hooks[script]))
+                assert.equals("function", type(itemRef.hooks[script]))
+            end
             assert.is_nil(gameTooltip.hooks.OnTooltipSetItem)
         end)
 
-        it("installs the owner's hide hooks on the script path too", function()
+        it("installs the same hooks on the script path", function()
             assert.equals("script", tooltip:register())
-            assert.equals("function", type(gameTooltip.hooks.OnTooltipCleared))
-            assert.equals("function", type(gameTooltip.hooks.OnHide))
-            assert.equals("function", type(itemRef.hooks.OnTooltipCleared))
-            assert.equals("function", type(itemRef.hooks.OnHide))
+            for _, script in ipairs(OWNER_HOOKS) do
+                assert.equals("function", type(gameTooltip.hooks[script]))
+                assert.equals("function", type(itemRef.hooks[script]))
+            end
         end)
 
         it("is idempotent: a second register adds no hook", function()
@@ -393,9 +413,8 @@ describe("the tooltip adapter", function()
 
         it("reads the link from GetItem on the script path, and shows the frame", function()
             assert.equals("script", tooltip:register())
-            gameTooltip.shown = true
+            gameTooltip.shown = false
             gameTooltip.hooks.OnTooltipSetItem(gameTooltip)
-            nextFrame()
             assert.is_true(frame.shown)
             assert.equals(FLOOR_25, rightOf(frame, "Min buyout"))
         end)
@@ -405,7 +424,6 @@ describe("the tooltip adapter", function()
             gameTooltip.link = nil
             gameTooltip.shown = true
             gameTooltip.hooks.OnTooltipSetItem(gameTooltip)
-            nextFrame()
             assert.is_false(frame.shown)
         end)
     end)
@@ -423,12 +441,17 @@ describe("the tooltip adapter", function()
             petCallback = calls[2].callback
         end)
 
-        it("shows the frame on the next frame, not at once", function()
-            gameTooltip.shown = true
+        it("shows the frame at once, inside the hook, before the game shows the owner", function()
+            local ownerShownWhenRendered
+            frame.Show = function(self)
+                self.shown = true
+                self.shownCount = self.shownCount + 1
+                ownerShownWhenRendered = gameTooltip.shown
+            end
+            gameTooltip.shown = false
             callback(gameTooltip, { id = 25, type = "item" })
-            assert.is_false(frame.shown)
-            assert.equals(1, #timers)
-            nextFrame()
+            -- The client calls the post-calls before its own Show of the owner.
+            assert.is_false(ownerShownWhenRendered)
             assert.is_true(frame.shown)
             assert.is_true(tooltip:isShown())
         end)
@@ -446,13 +469,12 @@ describe("the tooltip adapter", function()
             assert.equals("999999g 99s 99c" .. DIM .. "  ×1" .. RESET, rightOf(frame, "Min buyout"))
         end)
 
-        it("stays hidden when the owner is no longer shown by the next frame", function()
-            gameTooltip.shown = true
-            callback(gameTooltip, { id = 25, type = "item" })
-            gameTooltip.shown = false
-            nextFrame()
-            assert.is_false(frame.shown)
-            assert.is_false(tooltip:isShown())
+        it("sets the frame's owner on every show: the tooltip that was hooked", function()
+            hover()
+            assert.equals(gameTooltip, frame.owner)
+            assert.equals("ANCHOR_NONE", frame.anchor)
+            hover(25, itemRef)
+            assert.equals(itemRef, frame.owner)
         end)
 
         it("takes the frame down when the owner is cleared, and when it is hidden", function()
@@ -471,6 +493,16 @@ describe("the tooltip adapter", function()
             assert.is_false(frame.shown)
         end)
 
+        it("is up again at once after a refresh: the owner is cleared and re-processed in one call", function()
+            -- GameTooltip_OnUpdate re-processes a hovered tooltip every 0.2 s:
+            -- ClearLines fires OnTooltipCleared, the post-call follows.
+            hover()
+            gameTooltip.hooks.OnTooltipCleared(gameTooltip)
+            callback(gameTooltip, { id = 25, type = "item" })
+            assert.is_true(frame.shown)
+            assert.equals(FLOOR_25, rightOf(frame, "Min buyout"))
+        end)
+
         it("takes the frame down for a tooltip that shows something without a record", function()
             hover()
             hover(123456)
@@ -481,16 +513,63 @@ describe("the tooltip adapter", function()
         it("takes the frame down for an owner that no longer names an item", function()
             hover()
             gameTooltip.link = nil
-            gameTooltip.shown = true
             tooltip:onTooltip(gameTooltip, nil)
-            nextFrame()
             assert.is_false(frame.shown)
         end)
 
-        it("leaves comparison tooltips and every other frame alone", function()
-            hover(25, newOwner(LINK))
+        it("ignores item data processed on another tooltip: the frame is neither raised nor lowered", function()
+            -- The client's comparison tooltips go through the same processor.
+            local comparison = newOwner(LINK)
+            tooltip:onTooltip(comparison, { id = 25, type = "item" })
             assert.is_false(frame.shown)
-            assert.equals(0, #timers)
+            assert.equals(0, frame.shownCount)
+            hover()
+            tooltip:onTooltip(comparison, { id = 25, type = "item" })
+            assert.is_true(frame.shown)
+            assert.is_true(tooltip:isShown())
+            assert.equals(1, frame.shownCount)
+        end)
+
+        it("places the frame again when its owner is shown, and when it is resized", function()
+            local edge = 600
+            gameTooltip.GetRight = function()
+                return edge
+            end
+            -- The hook runs before the owner is laid out: the frame is placed
+            -- by the edges of the tooltip before it, where it fits on the right.
+            gameTooltip.shown = false
+            callback(gameTooltip, { id = 25, type = "item" })
+            assert.equals("TOPLEFT", side())
+            -- The game shows the owner at its real edges: the frame mirrors.
+            edge = 1900
+            gameTooltip.shown = true
+            gameTooltip.hooks.OnShow(gameTooltip)
+            assert.equals("TOPRIGHT", side())
+            assert.equals(1, #frame.points)
+            -- A narrower owner: back to the right, on the same frame.
+            edge = 600
+            gameTooltip.hooks.OnSizeChanged(gameTooltip)
+            assert.equals("TOPLEFT", side())
+            assert.equals(1, frame.shownCount)
+        end)
+
+        it("places nothing again while the frame is down", function()
+            gameTooltip.hooks.OnShow(gameTooltip)
+            gameTooltip.hooks.OnSizeChanged(gameTooltip)
+            assert.same({}, frame.points)
+            assert.is_false(frame.shown)
+        end)
+
+        it("reports a placement that raised once, and leaves the frame up", function()
+            hover()
+            frame.ClearAllPoints = function()
+                error("no layout", 0)
+            end
+            gameTooltip.hooks.OnSizeChanged(gameTooltip)
+            gameTooltip.hooks.OnShow(gameTooltip)
+            assert.is_true(frame.shown)
+            assert.is_true(tooltip:isShown())
+            assert.same({ { "tooltip error (reported once): no layout", "bad" } }, said)
         end)
 
         it("reads the item record before the commodity one for an id in both tables", function()
@@ -500,9 +579,8 @@ describe("the tooltip adapter", function()
         end)
 
         it("resolves a battle pet from the pet post-call", function()
-            gameTooltip.shown = true
+            gameTooltip.shown = false
             petCallback(gameTooltip, { id = 2546, type = "battlepet" })
-            nextFrame()
             assert.is_true(frame.shown)
             assert.equals("250g" .. DIM .. "  ×1" .. RESET, rightOf(frame, "Min buyout"))
         end)
@@ -512,7 +590,7 @@ describe("the tooltip adapter", function()
             assert.is_false(tooltip:isEnabled())
             hover()
             assert.is_false(frame.shown)
-            assert.equals(0, #timers)
+            assert.equals(0, frame.shownCount)
         end)
 
         it("takes a shown frame down when the switch goes off", function()
@@ -521,14 +599,6 @@ describe("the tooltip adapter", function()
             tooltip:setEnabled(false)
             assert.is_false(frame.shown)
             assert.is_false(tooltip:isShown())
-        end)
-
-        it("voids a scheduled display when the switch goes off before the next frame", function()
-            gameTooltip.shown = true
-            callback(gameTooltip, { id = 25, type = "item" })
-            tooltip:setEnabled(false)
-            nextFrame()
-            assert.is_false(frame.shown)
         end)
 
         it("adds one line per other market that has the item, against the primary", function()
@@ -543,13 +613,6 @@ describe("the tooltip adapter", function()
             addMarket(A, OTHER, 117, 5000)
             hover()
             assert.is_nil(otherLine(frame, OTHER))
-        end)
-
-        it("displays at once where the client has no timer", function()
-            rawset(_G, "C_Timer", nil)
-            gameTooltip.shown = true
-            callback(gameTooltip, { id = 25, type = "item" })
-            assert.is_true(frame.shown)
         end)
     end)
 
@@ -566,9 +629,8 @@ describe("the tooltip adapter", function()
 
         it("does not use a secret payload id: the owner's link stands in", function()
             keepSecret(SECRET)
-            gameTooltip.shown = true
+            gameTooltip.shown = false
             callback(gameTooltip, { id = SECRET, type = "item" })
-            nextFrame()
             -- The link names item 25.
             assert.equals(FLOOR_25, rightOf(frame, "Min buyout"))
         end)
@@ -577,21 +639,18 @@ describe("the tooltip adapter", function()
             keepSecret(SECRET)
             hover()
             gameTooltip.link = SECRET
-            gameTooltip.shown = true
             tooltip:onTooltip(gameTooltip, nil)
-            nextFrame()
             assert.is_false(frame.shown)
         end)
 
-        it("stays hidden when IsShown answers a secret", function()
+        it("does not read the owner's IsShown, so a secret answer cannot hide the frame", function()
             keepSecret("yes")
             gameTooltip.IsShown = function()
                 return "yes"
             end
-            gameTooltip.shown = true
+            gameTooltip.shown = false
             callback(gameTooltip, { id = 25, type = "item" })
-            nextFrame()
-            assert.is_false(frame.shown)
+            assert.is_true(frame.shown)
         end)
     end)
 
@@ -616,14 +675,11 @@ describe("the tooltip adapter", function()
             assert.equals(1, frame.shownCount)
             shift = true
             tooltip:onModifier("LSHIFT")
-            -- On the next frame, like any display.
-            assert.equals(1, frame.shownCount)
-            nextFrame()
+            -- At once, on our own frame.
             assert.equals(2, frame.shownCount)
             assert.equals(FOOTER_25, frame.lines[#frame.lines][1])
             shift = false
             tooltip:onModifier("RSHIFT")
-            nextFrame()
             assert.equals(3, frame.shownCount)
             assert.not_equals(FOOTER_25, frame.lines[#frame.lines][1])
             -- The owner was never asked to refresh: it has no way to be, and
@@ -634,7 +690,6 @@ describe("the tooltip adapter", function()
         it("does nothing while the detail level would not change", function()
             hover()
             tooltip:onModifier("LSHIFT")
-            assert.equals(0, #timers)
             assert.equals(1, frame.shownCount)
         end)
 
@@ -643,11 +698,11 @@ describe("the tooltip adapter", function()
             gameTooltip.hooks.OnHide(gameTooltip)
             shift = true
             tooltip:onModifier("LSHIFT")
-            assert.equals(0, #timers)
+            assert.equals(1, frame.shownCount)
             hover()
             shift = true
             tooltip:onModifier("LCTRL")
-            assert.equals(0, #timers)
+            assert.equals(2, frame.shownCount)
         end)
 
         it("does nothing when the settings turn the detail level off", function()
@@ -655,7 +710,7 @@ describe("the tooltip adapter", function()
             hover()
             shift = true
             tooltip:onModifier("LSHIFT")
-            assert.equals(0, #timers)
+            assert.equals(1, frame.shownCount)
         end)
 
         it("keeps a collapsed owner at the basics, Shift or not", function()
@@ -680,6 +735,7 @@ describe("the tooltip adapter", function()
             -- The frame is already up when the render fails.
             frame.Show = function(self)
                 self.shown = true
+                self.shownCount = self.shownCount + 1
                 error("the frame broke", 0)
             end
             hover()
@@ -691,13 +747,8 @@ describe("the tooltip adapter", function()
         end)
 
         it("drops a display that is re-entered while a render runs", function()
-            -- Synchronous timers: the re-entrant request would display at
-            -- once, inside the render, and recurse without the guard.
-            rawset(_G, "C_Timer", {
-                After = function(_, queued)
-                    queued()
-                end,
-            })
+            -- The frame's own Show asks for another item while it renders:
+            -- the re-entrant display would recurse without the guard.
             frame.Show = function(self)
                 self.shownCount = self.shownCount + 1
                 tooltip:onTooltip(gameTooltip, { id = 117, type = "item" })

@@ -51,7 +51,6 @@ local GAME_FACING = {
 	"UIParent",
 	"time",
 	-- optional
-	"C_Timer",
 	"Enum",
 	"ItemRefTooltip",
 	"IsShiftKeyDown",

@@ -61,6 +61,7 @@ local function newTipFrame()
     function frame:SetOwner(owner, anchor)
         self.owner = owner
         self.anchor = anchor
+        self.calls[#self.calls + 1] = "SetOwner"
     end
     function frame:ClearLines()
         self.lines = {}
@@ -201,15 +202,15 @@ describe("ExtraTip", function()
         assert.equals(namespace.ExtraTip, module)
     end)
 
-    it("creates one named GameTooltip from the template, owned by UIParent with no anchor", function()
+    it("creates one named GameTooltip from the template, with no owner until it is shown", function()
         local extra = ExtraTip.new()
         assert.equals(1, #created)
         assert.same({ "GameTooltip", NAME, screen, "GameTooltipTemplate" }, created[1])
         assert.equals(extra.tip, frame)
         assert.equals("TOOLTIP", frame.strata)
         assert.is_true(frame.clamped)
-        assert.equals(screen, frame.owner)
-        assert.equals("ANCHOR_NONE", frame.anchor)
+        assert.is_nil(frame.owner)
+        assert.is_nil(frame.anchor)
     end)
 
     it("starts hidden", function()
@@ -233,6 +234,17 @@ describe("ExtraTip", function()
         extra:show(owner, rows())
         assert.is_true(frame.shown)
         assert.is_true(extra:isShown())
+    end)
+
+    it("sets its owner on every show: the tooltip it attaches to, with no anchor of its own", function()
+        local extra = ExtraTip.new()
+        extra:show(owner, rows())
+        assert.equals(owner, frame.owner)
+        assert.equals("ANCHOR_NONE", frame.anchor)
+        local other = newRegion(400, 600, 1)
+        extra:show(other, rows())
+        assert.equals(other, frame.owner)
+        assert.equals(2, countCalls(frame, "SetOwner"))
     end)
 
     it("clears the previous lines before every fill", function()
@@ -317,12 +329,25 @@ describe("ExtraTip", function()
         assert.equals(3, countCalls(frame, "Hide"))
     end)
 
-    it("hides before every re-show, so nothing of the previous tooltip lingers", function()
+    it("sets the owner before the lines and the show, and hides before every re-show", function()
         local extra = ExtraTip.new()
         extra:show(owner, rows())
-        assert.same({ "Hide", "ClearLines", "Show" }, frame.calls)
+        assert.same({ "Hide", "SetOwner", "ClearLines", "Show" }, frame.calls)
         extra:show(owner, rows())
-        assert.same({ "Hide", "ClearLines", "Show", "Hide", "ClearLines", "Show" }, frame.calls)
+        assert.same({ "Hide", "SetOwner", "ClearLines", "Show", "Hide", "SetOwner", "ClearLines", "Show" }, frame.calls)
+    end)
+
+    it("places a shown frame again from the owner's edges as they are now", function()
+        local extra = ExtraTip.new()
+        extra:show(owner, rows())
+        assert.same({ { "TOPLEFT", owner, "TOPRIGHT", 8, -10 } }, frame.points)
+        -- The owner is wider than it looked: the frame mirrors, and is not
+        -- shown a second time.
+        extra:place(newRegion(400, 1713, 1))
+        assert.equals(1, #frame.points)
+        assert.equals("TOPRIGHT", frame.points[1][1])
+        assert.equals(1, countCalls(frame, "Show"))
+        assert.is_true(extra:isShown())
     end)
 end)
 
