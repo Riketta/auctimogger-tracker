@@ -1884,13 +1884,19 @@ had published, which was copied over a slot and read as an empty one.
 
 ### Follow-up — the attached frame never appeared
 
-**Status: fixed in code; the in-game validation of §10, step 2, is the
-owner's and has not been run.** Found on the first real hover: the hook
-fired (the processor path), the render ran without an error and the frame
-was recorded as shown, yet `IsShown()` answered false right after `Show()`
-and nothing was visible, Shift or not. Three things in the lifecycle differed
-from how the default UI, OribosExchange's LibExtraTip and TSM show a tooltip
-of their own (Appendix C); all three are now theirs:
+**Status: done.** Every §9 gate is green through `addon/scripts/ci_local.sh`
+(857 tests). The owner then saw the frame in game on Forever, after copying
+the addon over an install that still held the old code: shown, visible,
+owned by `GameTooltip`, nine rows, 472 by 147 pixels, no error reported.
+The rest of §10 steps 2 to 6 (Shift, a chat link, an auction-house row, the
+flip at the screen edge, combat) is the owner's and was not reported.
+
+Found on the first real hover: the hook fired (the processor path), the
+render ran without an error and the frame was recorded as shown, yet
+`IsShown()` answered false right after `Show()` and nothing was visible,
+Shift or not. Three things in the lifecycle differed from how the default UI,
+OribosExchange's LibExtraTip and TSM show a tooltip of their own (Appendix C);
+all three are now theirs:
 
 - The owner was set once, at creation. Every reference sets it on every
   show: `TooltipComparisonManager:Initialize` for the default UI's comparison
