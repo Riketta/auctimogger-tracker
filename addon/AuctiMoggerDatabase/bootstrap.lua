@@ -25,6 +25,9 @@ local ADDON, A = ...
 -- A feature that cannot start is reported in bad and left out; the login
 -- line and the update callbacks run all the same.
 --
+-- A version 3 feed left in a market slot registers nothing and records
+-- nothing; it is reported here, at load, once every slot has run (SPEC 7.11).
+--
 -- The status line is a pure function of the store and `now`: a spec reads it
 -- through a stubbed frame, without a client.
 
@@ -37,6 +40,11 @@ assert(
     type(A.Options) == "table" and type(A.Options.new) == "function",
     ADDON .. ": A.Options must be set before bootstrap.lua loads"
 )
+
+-- The TOC loads this file after every slot. A version 3 feed left in one
+-- called no loader, so nothing recorded it: said here, the login prints it
+-- with the reports the slot files did record.
+A.ReportLegacyFeed()
 
 ---@type AmdbFormatModule
 local Format = A.Core.Format

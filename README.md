@@ -703,7 +703,10 @@ a carrier is installed by copying it over a slot.
 
 In-game, `/reload` loads the market file; `GET /feed.lua` and
 `/api/feed.json` answer 404 until the first successful cycle has published —
-wait for a green cycle. The files also live in the `amtracker-feeds` volume:
+wait for a green cycle. After an update they also answer 404 while the file in
+the volume is still the previous tracker's, until its first cycle republishes
+it (`POST /api/fetch?target=` runs one now). The files also live in the
+`amtracker-feeds` volume:
 `docker compose cp tracker:/work/feeds/wowforever-main/feed.lua .`
 
 In game: enable the addon, pick this character's primary market with

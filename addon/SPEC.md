@@ -366,6 +366,7 @@ Applied by the addon when a carrier registers:
 | Same `target` already registered from another slot | The later slot replaces the earlier one, keeps its own (later) slot number and moves to the end of the slot order; reported as a warning. |
 | A record fails to decode | That record is dropped and counted; the market stays. Reported once per market at login. |
 | Slot file is a placeholder or fails to compile | Nothing registers; a slot that fails to compile shows the client's own load error. |
+| Slot file is a version 3 carrier (a plain `AuctiMoggerTrackerFeed` table, left by an older tracker) | Nothing registers, and nothing is recorded while it loads: it calls no loader. `bootstrap.lua` reports it once at its own load, in bad — update the tracker and download the market again (§7.4, §7.11). |
 
 Every commit takes the next slot number in load order, a rejected one included,
 so the numbers match `Market1.lua` … `Market6.lua`. A rejected market is
@@ -649,6 +650,14 @@ counter that keyed the slim feed's cache (`WatchlistService::revision`).
 it and at `addon-sync`, and the OpenAPI document, the `/api` directory and
 the drift test cover every route: the file route is axum's wildcard
 `{*path}` on the router and `{path}` in the document.
+
+Both feed routes serve a file only when it is of the feed version this tracker
+publishes. The carrier's header is read with the parser `addon-sync` checks a
+download with, and has to name version 4 and the target asked for; the twin
+has to declare version 4. Anything else on disk answers 404 with the reason,
+as no publication does. A redeploy keeps the feed volume, so without this rule
+the carrier an older tracker published would be served until its first
+successful cycle republished it — and the current addon cannot load it.
 
 ### 6.6 CLI
 
@@ -958,6 +967,12 @@ place a report becomes a chat line. `A.SayNow(text, level)` is `A.Say` plus
 that chat line at once: for something that goes wrong after login, when
 nothing drains the record again and a quiet mode must not swallow it.
 
+`A.ReportLegacyFeed()` serves the one carrier no loader ever sees: a version 3
+feed, which is a plain table assigned to a global (`AuctiMoggerTrackerFeed`).
+`bootstrap.lua` calls it once at its own load, after every slot has run; a
+loaded version 3 feed is reported in bad, naming its version, and the global
+is left alone (§5.9, §7.11).
+
 **`Adapters/compat.lua`** — the manifest of every game surface the addon
 touches, in tiers, plus `check(env|nil) -> { ok, missing, absentOptional }`
 for `/amdb status` (it reads the global table through `rawget` and never
@@ -1017,6 +1032,8 @@ panel; the command then answers in chat, and the panel says nothing.
 **`bootstrap.lua`** — the composition root; owns one frame and the
 SavedVariables lifecycle.
 
+- At load, last of the TOC, after every slot has run: `A.ReportLegacyFeed()`
+  says a version 3 feed left in a slot (§7.11).
 - `ADDON_LOADED` (its own addon) → `loadSettings`: the two saved tables are
   coerced (§7.7) into the live `A.settings` and `A.character`, written back
   in their clean shape, and this character's chosen primary market is
@@ -1351,6 +1368,11 @@ other than the primary, whose age the line already shows. The reports recorded
 while the slot files loaded follow on their own lines, each in the color of its
 level, and the update callbacks run after them.
 
+A version 3 feed left in a market slot is among those reports, in bad: `a
+version 3 tracker feed is in a market slot and was not read — update the
+tracker and download the market again (that slot file opens with
+AuctiMoggerTrackerFeed)`. Said once, at load; no slot can be named.
+
 ## 8. Sniper migration
 
 Repository `Riketta/AuctiMogger`. The sniper keeps its live tail, its deals
@@ -1481,6 +1503,9 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `DatabaseExportService`: group attachment rules, pet pooling, rank and
   craft selection, entries without spans omitted, deterministic order.
 - Scheduler: scans refresh before the feed publishes.
+- Feed routes: a version 3 carrier and twin left on disk are not served (404
+  with the reason), nor a carrier of another version or market, nor a truncated
+  one; the next cycle's files are served again.
 - Addon bundle: the embedded table matches the folder in both directions,
   byte for byte; every file the TOC loads is embedded; the TOC's version is
   the addon's `VERSION`; the manifest carries each file's hash and size, and
@@ -1514,10 +1539,12 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   layout, the sparkline.
 - `market_files`: the golden carrier loaded through a fake `...` and decoded by
   the real decoder; malformed header; unclosed builder; dropped records; the
-  report sink; the clock.
+  report sink; the clock; a version 3 feed in a slot (reported in bad with its
+  version, the global left alone, nothing without one).
 - `compat`: the manifest tiers, a fallback per optional entry, `check()`.
 - `bootstrap`: the status line, the login flow and the SavedVariables lifecycle
-  through a stubbed frame, and the panel's three outcomes at the login.
+  through a stubbed frame, and the panel's three outcomes at the login; a
+  version 3 feed in a slot is printed once, in bad, after the status line.
 - `tooltip`: registration on both paths (never both), lifecycle (hidden when the
   owner is not shown, hidden on clear), Shift rebuild, secret values, busy
   guard, errors reported once.
@@ -1822,6 +1849,16 @@ had left open:
 - The button was the last link of the Session tab's toggle chain, so the
   chain closes up without a change to its anchoring.
 
+### Follow-up — a stale carrier after an upgrade
+
+**Status: done.** Found on the first real install: the tracker was redeployed
+and its `/feed.lua` still answered the version 3 carrier the previous tracker
+had published, which was copied over a slot and read as an empty one.
+
+- The feed routes refuse a file that is not of the current feed version
+  (§6.5).
+- The addon names a version 3 feed left in a slot (§7.4, §7.11).
+
 ## 12. Risks and mitigations
 
 | Risk | Mitigation |
@@ -1836,6 +1873,7 @@ had left open:
 | A new addon file is never added to the embedded table. | The drift test walks the folder and fails in both directions until it is, and `include_str!` rebuilds the server whenever an embedded file changes (§6.7). |
 | A bad download replaces a working addon file or market. | The tracker verifies each addon download against its manifest hash, and the service verifies each carrier before it replaces a slot; a failure leaves the file as it was (§6.7). |
 | Export reads a scan that lags the newest snapshot. | Live group is read from the snapshot directly; scheduler refreshes scans before publishing. |
+| A redeploy keeps the feed volume, so an older tracker's carrier stays on disk until the first cycle. | The feed routes answer 404 for a file that is not of the current feed version (§6.5), and the addon reports a version 3 feed left in a slot (§7.11). |
 | Tooltip font lacks special glyphs on Forever. | Signs are `+` / `-` text; the sparkline is textures. |
 
 ## 13. Known limitations and later work

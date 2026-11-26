@@ -37,6 +37,9 @@ local NO_DATA = TITLE .. ": " .. BAD .. "no market data — copy the tracker's f
 local PICK_ONE = "several markets loaded, pick one: /amdb market <id>"
 -- The note of SPEC 7.8, as the bootstrap records it (info prints muted).
 local NO_PANEL = "no options panel on this client — the /amdb command covers everything"
+-- What a version 3 carrier left in a slot is told by (SPEC 7.11).
+local LEGACY_FEED = "a version 3 tracker feed is in a market slot and was not read — update the tracker"
+    .. " and download the market again (that slot file opens with AuctiMoggerTrackerFeed)"
 
 --- Everything the TOC loads, slot files excepted.
 local FILES = {
@@ -76,6 +79,7 @@ local STUBS = {
     CHARACTER,
     "Settings",
     "MenuUtil",
+    "AuctiMoggerTrackerFeed",
 }
 
 -- What registering the options panel creates at the login, after the tooltip:
@@ -236,6 +240,7 @@ describe("bootstrap", function()
             end,
         })
         rawset(_G, "MenuUtil", nil)
+        rawset(_G, "AuctiMoggerTrackerFeed", nil)
     end)
 
     after_each(function()
@@ -535,6 +540,33 @@ describe("bootstrap", function()
         }, lines)
         -- Printed once: the report is gone.
         assert.same({}, A.TakeReports())
+    end)
+
+    it("reports a version 3 feed left in a slot, in bad, once", function()
+        -- The v3 carrier is a plain table: it calls no loader, so nothing was
+        -- recorded while it loaded and no slot can be named. bootstrap.lua reads
+        -- its global at load, after every slot has run.
+        rawset(_G, "AuctiMoggerTrackerFeed", { version = 3, generatedAt = NOW - 600 })
+        local A, lines = boot()
+        Loader.carrier(A, GOLDEN)
+        fire("PLAYER_LOGIN")
+        assert.same({
+            status("1 market", TARGET, MUTED, "16m"),
+            TITLE .. " " .. BAD .. LEGACY_FEED .. RESET,
+        }, lines)
+        assert.same({}, A.TakeReports())
+        -- Not ours to clear: the global is still there, and it is not said twice.
+        assert.equals("table", type(rawget(_G, "AuctiMoggerTrackerFeed")))
+        clear(lines)
+        fire("PLAYER_LOGIN")
+        assert.same({ status("1 market", TARGET, MUTED, "16m") }, lines)
+    end)
+
+    it("says it after the no-data line when the old feed is all there is", function()
+        rawset(_G, "AuctiMoggerTrackerFeed", { version = 3 })
+        local _, lines = boot()
+        fire("PLAYER_LOGIN")
+        assert.same({ NO_DATA, TITLE .. " " .. BAD .. LEGACY_FEED .. RESET }, lines)
     end)
 
     it("fires the update callbacks at login", function()

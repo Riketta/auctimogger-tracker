@@ -13,13 +13,21 @@ use std::{
 use amtracker_core::{
     domain::{
         Category,
+        DatabaseSnapshot,
         FeedFormat,
         ItemDayRow,
         PayloadKind,
         Span,
+        TargetId,
     },
-    error::StoreError,
-    services::cycle::CycleOutcome,
+    error::{
+        StoreError,
+        SyncError,
+    },
+    services::{
+        addon_sync::read_carrier_header,
+        cycle::CycleOutcome,
+    },
 };
 use axum::{
     extract::{
@@ -115,11 +123,119 @@ fn internal_error(scope: &'static str, error: &impl std::fmt::Display) -> Respon
 
 // ------------------------------------------------------------------- feeds
 
+/// How the v3 carrier opened: a plain table assigned to a global, from before
+/// the addon had a market loader of its own. A file that starts this way was
+/// published by a tracker older than feed v4.
+const LEGACY_CARRIER_PREFIX: &[u8] = b"AuctiMoggerTrackerFeed";
+
+/// The feed version a JSON twin declares, read from the head of the document:
+/// `version` is the first key the twin writes. `None` when the head declares
+/// none.
+fn twin_version(bytes: &[u8]) -> Option<i64> {
+    const HEAD: usize = 256;
+    let text = std::str::from_utf8(bytes).ok()?;
+    let head = text.get(..bytes.len().min(HEAD))?;
+    let after_key = head.trim_start().strip_prefix('{')?.trim_start();
+    let after_key = after_key.strip_prefix("\"version\"")?.trim_start();
+    let digits = after_key.strip_prefix(':')?.trim_start();
+    let end = digits.find(|c: char| !c.is_ascii_digit()).unwrap_or(digits.len());
+    digits.get(..end)?.parse().ok()
+}
+
+/// Why a published feed file is not served, or `None` when it is. The Lua
+/// carrier has to be a market file of the feed version this tracker publishes,
+/// for the target asked for — the file the addon loads; its header is read with
+/// the parser `addon-sync` checks a download with. The JSON twin has to declare
+/// that version.
+///
+/// A redeploy keeps the feed volume, so without this check a file an older
+/// tracker published would be served until the next cycle republishes it, and
+/// the current addon cannot load it.
+fn refused_feed(bytes: &[u8], target: &str, format: FeedFormat) -> Option<String> {
+    let current = i64::from(DatabaseSnapshot::FEED_VERSION);
+    match format {
+        FeedFormat::Lua => {
+            if bytes.starts_with(LEGACY_CARRIER_PREFIX) {
+                return Some("it is a version 3 feed, published by an older tracker".to_owned());
+            }
+            match read_carrier_header(bytes) {
+                Ok(header) if header.version == current && header.target == target => None,
+                Ok(header) => Some(format!(
+                    "it is feed version {} for market '{}' and not version {current} for '{target}'",
+                    header.version, header.target
+                )),
+                Err(error) => Some(match error {
+                    SyncError::Verify(message) => message,
+                    other => other.to_string(),
+                }),
+            }
+        }
+        FeedFormat::Json => match twin_version(bytes) {
+            Some(version) if version == current => None,
+            Some(version) => {
+                Some(format!("it is the JSON twin of feed version {version} and not of {current}"))
+            }
+            None => Some("it declares no feed version".to_owned()),
+        },
+    }
+}
+
+/// What a feed route has for one target: the published file, or the 404 that
+/// says why nothing is served.
+enum FeedFile {
+    /// The file, in the feed version this tracker serves.
+    Served(Vec<u8>),
+    /// Nothing is served for the target, and the response says why.
+    NotFound(Response),
+}
+
+/// Reads the file the scheduler published for the target, and checks that it
+/// is one this tracker serves ([`refused_feed`]). Nothing published and a
+/// refused file both read as a 404 to a client; the body says which.
+fn read_published_feed(
+    state: &AppState,
+    target: &TargetId,
+    format: FeedFormat,
+) -> Result<FeedFile, StoreError> {
+    let Some(bytes) = state.publisher.read(target, format)? else {
+        return Ok(FeedFile::NotFound(
+            (
+                StatusCode::NOT_FOUND,
+                format!("no feed published yet for target '{}'", target.as_str()),
+            )
+                .into_response(),
+        ));
+    };
+    match refused_feed(&bytes, target.as_str(), format) {
+        None => Ok(FeedFile::Served(bytes)),
+        Some(reason) => {
+            tracing::warn!(
+                target = %target.as_str(),
+                format = ?format,
+                reason = %reason,
+                "published feed refused: it is not of the current feed version"
+            );
+            Ok(FeedFile::NotFound(
+                (
+                    StatusCode::NOT_FOUND,
+                    format!(
+                        "the feed published for target '{}' is not served: {reason}. A successful \
+                         fetch cycle publishes it again in the current format.",
+                        target.as_str()
+                    ),
+                )
+                    .into_response(),
+            ))
+        }
+    }
+}
+
 /// `GET /feed.lua?target=` — the published carrier: the v4 market file the
 /// `AuctiMoggerDatabase` addon loads (`addon/SPEC.md`, section 5), served
 /// verbatim from the copy the scheduler publishes after each successful
 /// cycle (throttled by `server.feed_publish_secs`). A request never rebuilds
-/// the market; 404 until the first publication.
+/// the market; 404 until the first publication, and for a file on disk that
+/// is not of this feed version (one an older tracker left behind).
 pub(crate) async fn feed_lua(
     state: State<Arc<AppState>>,
     params: Query<HashMap<String, String>>,
@@ -132,10 +248,10 @@ pub(crate) async fn feed_lua(
     let read = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.publisher.read(&target, FeedFormat::Lua)
+        move || read_published_feed(&state, &target, FeedFormat::Lua)
     });
     match read.await {
-        Ok(Ok(Some(bytes))) => (
+        Ok(Ok(FeedFile::Served(bytes))) => (
             [
                 (header::CONTENT_TYPE, "text/x-lua; charset=utf-8"),
                 (header::CONTENT_DISPOSITION, "attachment; filename=\"feed.lua\""),
@@ -143,11 +259,7 @@ pub(crate) async fn feed_lua(
             bytes,
         )
             .into_response(),
-        Ok(Ok(None)) => (
-            StatusCode::NOT_FOUND,
-            format!("no feed published yet for target '{}'", target.as_str()),
-        )
-            .into_response(),
+        Ok(Ok(FeedFile::NotFound(response))) => response,
         Ok(Err(error)) => super::render::store_error_page(error).await,
         Err(error) => super::render::store_error_page(StoreError::Backend(error.to_string())).await,
     }
@@ -1074,9 +1186,10 @@ fn blocks_response(
 /// `GET /api/feed.json?target=` — the published full feed: the very
 /// `feed.json` the scheduler writes after each successful cycle (throttled by
 /// `server.feed_publish_secs`), the JSON twin of `/feed.lua`. Served as-is —
-/// a request never rebuilds the whole market.
+/// a request never rebuilds the whole market. 404 until the first publication,
+/// and for a file on disk that is not of this feed version.
 pub(crate) async fn api_feed_json(
-    State(state): State<Arc<AppState>>,
+    state: State<Arc<AppState>>,
     Query(params): Query<HashMap<String, String>>,
 ) -> Response {
     let target = match target_param(&params, &state.config) {
@@ -1087,17 +1200,13 @@ pub(crate) async fn api_feed_json(
     let read = tokio::task::spawn_blocking({
         let state = Arc::clone(&state);
         let target = target.clone();
-        move || state.publisher.read(&target, FeedFormat::Json)
+        move || read_published_feed(&state, &target, FeedFormat::Json)
     });
     match read.await {
-        Ok(Ok(Some(bytes))) => {
+        Ok(Ok(FeedFile::Served(bytes))) => {
             ([(header::CONTENT_TYPE, "application/json")], bytes).into_response()
         }
-        Ok(Ok(None)) => (
-            StatusCode::NOT_FOUND,
-            format!("no feed published yet for target '{}'", target.as_str()),
-        )
-            .into_response(),
+        Ok(Ok(FeedFile::NotFound(response))) => response,
         Ok(Err(error)) => internal_error("feed-json", &error),
         Err(error) => internal_error("feed-json-join", &error),
     }
@@ -2133,5 +2242,91 @@ fn cycle_outcome_label(outcome: &CycleOutcome) -> &'static str {
         CycleOutcome::Fetched => "fresh",
         CycleOutcome::NotModified => "not-modified",
         CycleOutcome::Empty => "empty",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Test assertions may unwrap/expect/panic: fixture-driven, deterministic
+    // inputs (the SecOutfall precedent).
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
+    use amtracker_core::domain::{
+        DatabaseSnapshot,
+        FeedFormat,
+    };
+
+    use super::{
+        refused_feed,
+        twin_version,
+    };
+
+    const TARGET: &str = "t1";
+
+    /// A carrier as the codec writes one, down to its header and closing call:
+    /// every line `read_carrier_header` reads.
+    fn carrier(version: u32, target: &str) -> Vec<u8> {
+        [
+            "-- AuctiMogger Database market file - GENERATED by auctimogger-tracker 0.1.0-test. Do not hand-edit.",
+            "local _, A = ...",
+            "local m = A.BeginMarket({",
+            &format!("    version = {version},"),
+            "    trackerVersion = \"0.1.0-test\",",
+            &format!("    target = \"{target}\","),
+            "    generatedAt = 1760000000,",
+            "})",
+            "A.EndMarket()",
+        ]
+        .join("\n")
+        .into_bytes()
+    }
+
+    #[test]
+    fn a_carrier_of_the_current_version_for_the_target_is_served() {
+        let bytes = carrier(DatabaseSnapshot::FEED_VERSION, TARGET);
+        assert_eq!(refused_feed(&bytes, TARGET, FeedFormat::Lua), None);
+    }
+
+    #[test]
+    fn a_v3_carrier_is_refused_by_name() {
+        let bytes = b"AuctiMoggerTrackerFeed = {\n  version = 3,\n}\n";
+        let reason = refused_feed(bytes, TARGET, FeedFormat::Lua).expect("refused");
+        assert!(reason.contains("version 3 feed, published by an older tracker"), "{reason}");
+    }
+
+    #[test]
+    fn a_carrier_of_another_version_or_market_is_refused() {
+        let other_version = carrier(5, TARGET);
+        let reason = refused_feed(&other_version, TARGET, FeedFormat::Lua).expect("refused");
+        assert!(reason.contains("feed version 5"), "{reason}");
+
+        let other_market = carrier(DatabaseSnapshot::FEED_VERSION, "elsewhere");
+        let reason = refused_feed(&other_market, TARGET, FeedFormat::Lua).expect("refused");
+        assert!(reason.contains("for market 'elsewhere'"), "{reason}");
+    }
+
+    #[test]
+    fn a_truncated_carrier_is_refused() {
+        let mut bytes = carrier(DatabaseSnapshot::FEED_VERSION, TARGET);
+        bytes.truncate(bytes.len() - 14);
+        assert!(refused_feed(&bytes, TARGET, FeedFormat::Lua).is_some());
+    }
+
+    #[test]
+    fn the_json_twin_is_judged_by_the_version_in_its_head() {
+        let current = i64::from(DatabaseSnapshot::FEED_VERSION);
+        let pretty = format!("{{\n  \"version\": {current},\n  \"target\": \"t1\"\n}}");
+        assert_eq!(twin_version(pretty.as_bytes()), Some(current));
+        assert_eq!(twin_version(b"{\"version\":3,\"items\":[]}"), Some(3));
+        assert_eq!(twin_version(b"{ \"trackerVersion\": \"0.1.0\" }"), None);
+        assert_eq!(twin_version(b""), None);
+        assert_eq!(twin_version(&[0xff, 0xfe]), None);
+
+        let old = b"{\n  \"version\": 3,\n}".to_vec();
+        let reason = refused_feed(&old, TARGET, FeedFormat::Json).expect("refused");
+        assert!(reason.contains("JSON twin of feed version 3"), "{reason}");
+
+        let fresh = pretty.into_bytes();
+        assert_eq!(refused_feed(&fresh, TARGET, FeedFormat::Json), None);
     }
 }

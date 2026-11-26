@@ -2032,6 +2032,77 @@ async fn feed_downloads_serve_the_published_copies() {
     std::fs::remove_dir_all(&root).ok();
 }
 
+/// A redeploy keeps the feed volume, so the carrier and the twin an older
+/// tracker published stay on disk until the next cycle. They are not served —
+/// the current addon cannot load them — and the 404 says what is there.
+#[tokio::test]
+async fn feed_downloads_refuse_a_file_of_another_feed_version() {
+    let (state, root) = test_state(None);
+    let target = TargetId(TARGET.into());
+    state
+        .publisher
+        .publish(
+            &target,
+            FeedFormat::Lua,
+            b"AuctiMoggerTrackerFeed = {\n  version = 3,\n  generatedAt = 1795648943,\n}\n",
+        )
+        .expect("publish the v3 carrier");
+    state
+        .publisher
+        .publish(&target, FeedFormat::Json, b"{\"version\":3,\"generatedAt\":1795648943}")
+        .expect("publish the v3 twin");
+    let router = build_router_arc(Arc::clone(&state));
+
+    let (status, body) = get(router.clone(), "/feed.lua?target=t1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a v3 carrier is not served");
+    assert!(
+        body.contains("the feed published for target 't1' is not served: it is a version 3 feed"),
+        "{body}"
+    );
+    let (status, body) = get(router.clone(), "/api/feed.json?target=t1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "a v3 twin is not served");
+    assert!(body.contains("JSON twin of feed version 3"), "{body}");
+
+    // A carrier of this version, but for another market, is not this target's feed.
+    let snapshot = DatabaseSnapshot {
+        target: TargetId(TARGET.into()),
+        market: MarketMeta {
+            region: None,
+            ruleset_id: None,
+            house_id: None,
+            connected_realm_id: None,
+            flavor: Flavor::default(),
+        },
+        tracker_version: "0.1.0-test".into(),
+        generated_at: 1_760_000_000,
+        auctions_at: None,
+        commodities_at: None,
+        entries: Vec::new(),
+    };
+    let lua = FeedCodec.render(&snapshot, FeedFormat::Lua).expect("render");
+    let elsewhere = String::from_utf8(lua)
+        .expect("utf8")
+        .replace(&format!("    target = \"{TARGET}\",\n"), "    target = \"elsewhere\",\n");
+    assert!(!elsewhere.contains(&format!("\"{TARGET}\"")), "the header was rewritten");
+    state.publisher.publish(&target, FeedFormat::Lua, elsewhere.as_bytes()).expect("publish");
+    let (status, body) = get(router.clone(), "/feed.lua?target=t1").await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert!(body.contains("for market 'elsewhere'"), "{body}");
+
+    // The next cycle's files are served again.
+    let lua = FeedCodec.render(&snapshot, FeedFormat::Lua).expect("render");
+    let json = FeedCodec.render(&snapshot, FeedFormat::Json).expect("render");
+    state.publisher.publish(&target, FeedFormat::Lua, &lua).expect("publish");
+    state.publisher.publish(&target, FeedFormat::Json, &json).expect("publish");
+    let (status, body) = get(router.clone(), "/feed.lua?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_bytes(), lua.as_slice());
+    let (status, body) = get(router, "/api/feed.json?target=t1").await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(body.as_bytes(), json.as_slice());
+    std::fs::remove_dir_all(&root).ok();
+}
+
 /// The watchlist-only feed is gone with the v3 contract: the route answers
 /// 404, and a watchlist change no longer feeds anything.
 #[tokio::test]

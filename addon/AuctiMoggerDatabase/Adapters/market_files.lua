@@ -180,4 +180,33 @@ function A.EndMarket()
     return market
 end
 
+--- The global the version 3 carrier assigned. Before the addon had a market
+--- loader a tracker feed was a plain table, and a slot file that still is one
+--- calls neither `A.BeginMarket` nor `A.EndMarket`: it registers nothing,
+--- records nothing and reads as an empty slot. Its global is the only tell.
+local LEGACY_FEED_VARIABLE = "AuctiMoggerTrackerFeed"
+
+--- Reports a version 3 feed left in a market slot, in bad. bootstrap.lua
+--- calls it once, at its own load: the TOC loads it after every slot. The
+--- addon cannot tell which slot holds the file, so the report says how to
+--- recognise it. Nothing is cleared: the global is not ours.
+---@return boolean found true when an old tracker feed is loaded
+function A.ReportLegacyFeed()
+    local legacy = rawget(_G, LEGACY_FEED_VARIABLE)
+    if type(legacy) ~= "table" then
+        return false
+    end
+    local version = rawget(legacy, "version")
+    local what = type(version) == "number" and ("a version " .. tostring(version) .. " tracker feed")
+        or "an old tracker feed"
+    A.Say(
+        what
+            .. " is in a market slot and was not read — update the tracker and download the market again (that slot file opens with "
+            .. LEGACY_FEED_VARIABLE
+            .. ")",
+        "bad"
+    )
+    return true
+end
+
 return A

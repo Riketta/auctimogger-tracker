@@ -104,6 +104,10 @@ for every market:
 A stale market still shows its tooltips, flagged. `GetSpans` answers nothing
 for it, so an addon that values on spans gets no stale evidence.
 
+Right after the tracker was updated, its feed routes answer 404 until its first
+cycle has published the new format. That is deliberate: a file the previous
+version published cannot be read by this addon.
+
 ## The tooltip
 
 Hover an item — in your bags, bank, mail, a chat link or an auction house row.
@@ -201,6 +205,7 @@ the command covers everything.
 | Chat says | What it means | What to do |
 |---|---|---|
 | `no market data — copy the tracker's feed.lua over Market1.lua` | No slot file holds a market. | Install a market file. |
+| `a version 3 tracker feed is in a market slot and was not read — …` | A slot file holds the old feed format, usually one downloaded before an updated tracker had published again. | Update the tracker, wait for its first cycle, then download the market again over that slot — the file that opens with `AuctiMoggerTrackerFeed`. |
 | `several markets loaded, pick one: /amdb market <id>` | More than one market is loaded and this character has no primary market. | `/amdb market <target>`. |
 | `<market> is 2d old — resync` | A market other than the primary is over 24 hours old. | Download it again and `/reload`. |
 | `rejected: …` | A slot file is not a feed this version reads: another version, a malformed header, a clock more than five minutes ahead, or a truncated download. | Update the tracker, then download again. |

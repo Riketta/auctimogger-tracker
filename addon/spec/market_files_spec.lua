@@ -139,6 +139,7 @@ describe("market_files: loading", function()
         assert.equals("function", type(namespace.SayNow))
         assert.equals("function", type(namespace.FormatReport))
         assert.equals("function", type(namespace.TakeReports))
+        assert.equals("function", type(namespace.ReportLegacyFeed))
     end)
 
     it("starts silent, with no report", function()
@@ -384,6 +385,65 @@ A.EndMarket()]]
         assert.equals("bad", A.reports[1].level)
         assert.is_true(mentions(reportText(A), "could not be registered"))
         assert.same({}, lines)
+    end)
+end)
+
+describe("market_files: a version 3 feed left in a slot", function()
+    --- Runs `A.ReportLegacyFeed` with the old carrier's global set to `value`.
+    --- The global is put back as it was, whatever the call does.
+    ---@param A table namespace
+    ---@param value any
+    ---@return boolean found
+    local function reportWith(A, value)
+        local previous = rawget(_G, "AuctiMoggerTrackerFeed")
+        rawset(_G, "AuctiMoggerTrackerFeed", value)
+        local ok, found = pcall(A.ReportLegacyFeed)
+        rawset(_G, "AuctiMoggerTrackerFeed", previous)
+        assert.is_true(ok, found)
+        return found
+    end
+
+    it("reports nothing while no old feed is loaded", function()
+        local A, lines = fresh()
+        assert.is_false(A.ReportLegacyFeed())
+        assert.same({}, A.reports)
+        assert.same({}, lines)
+    end)
+
+    it("ignores a global that holds no table", function()
+        local A = fresh()
+        assert.is_false(reportWith(A, nil))
+        assert.is_false(reportWith(A, "AuctiMoggerTrackerFeed"))
+        assert.is_false(reportWith(A, false))
+        assert.same({}, A.reports)
+    end)
+
+    it("reports the old feed in bad, with its version, and leaves the global alone", function()
+        local A, lines = fresh()
+        local old = { version = 3, generatedAt = 1795648943 }
+        local previous = rawget(_G, "AuctiMoggerTrackerFeed")
+        rawset(_G, "AuctiMoggerTrackerFeed", old)
+        local ok, found = pcall(A.ReportLegacyFeed)
+        local kept = rawget(_G, "AuctiMoggerTrackerFeed")
+        rawset(_G, "AuctiMoggerTrackerFeed", previous)
+        assert.is_true(ok, found)
+        assert.is_true(found)
+        assert.equals(old, kept, "the global is not ours to clear")
+        assert.equals("bad", A.reports[1].level)
+        local text = reportText(A)
+        assert.is_true(mentions(text, "a version 3 tracker feed is in a market slot and was not read"))
+        assert.is_true(mentions(text, "update the tracker and download the market again"))
+        assert.is_true(mentions(text, "AuctiMoggerTrackerFeed"))
+        -- Recorded, not printed: the login says it.
+        assert.same({}, lines)
+    end)
+
+    it("names no version the old feed does not carry", function()
+        local A = fresh()
+        assert.is_true(reportWith(A, { version = "three" }))
+        local text = reportText(A)
+        assert.is_true(mentions(text, "an old tracker feed is in a market slot and was not read"))
+        assert.is_false(mentions(text, "a version"))
     end)
 end)
 

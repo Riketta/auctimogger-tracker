@@ -413,7 +413,7 @@ fn spec_paths_items_and_feeds() -> Value {
                 "responses": {
                     "200": { "description": "OK", "content": { "application/json": { "schema": { "type": "object" } } } },
                     "400": { "description": "Unknown target." },
-                    "404": { "description": "No feed published yet for the target." },
+                    "404": { "description": "No feed published yet for the target, or the file on disk is not of the current feed version (one an older tracker left behind): a successful cycle publishes it again." },
                     "500": { "description": "Store or internal failure." }
                 }
             }),
@@ -427,7 +427,7 @@ fn spec_paths_items_and_feeds() -> Value {
                 "responses": {
                     "200": { "description": "OK", "content": { "text/x-lua": { "schema": { "type": "string" } } } },
                     "400": { "description": "Unknown target." },
-                    "404": { "description": "No feed published yet for the target." }
+                    "404": { "description": "No feed published yet for the target, or the file on disk is not of the current feed version (one an older tracker left behind): a successful cycle publishes it again." }
                 }
             }),
         },
