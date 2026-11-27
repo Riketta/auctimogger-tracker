@@ -5060,7 +5060,7 @@ mod tests {
     fn foreign_keys_are_enforced_on_opened_connections() {
         let dir =
             std::env::temp_dir().join(format!("amtracker-fk-{}-{}", std::process::id(), line!()));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::testdir::fresh(&dir).expect("temp dir");
         let store = SqliteStore::open(
             &dir.join("fk.db"),
             &dir.join("raw"),
@@ -5082,9 +5082,9 @@ mod tests {
     }
 
     fn test_store_auto(name: &str, auto_vacuum: AutoVacuum) -> (std::path::PathBuf, SqliteStore) {
-        // A per-process counter on top of the pid: an aborted run leaves its
-        // directory behind, and Windows recycles pids eagerly enough for a
-        // later run to reopen that stale database.
+        // A per-process counter on top of the pid keeps the names apart within
+        // a run; `testdir::fresh` keeps a recycled pid from reopening a previous
+        // run's leftover directory as a stale store.
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
             "amtracker-{name}-{}-{}-{}",
@@ -5092,7 +5092,7 @@ mod tests {
             line!(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        std::fs::create_dir_all(&dir).expect("temp dir");
+        let dir = crate::testdir::fresh(&dir).expect("temp dir");
         let store = SqliteStore::open(
             &dir.join("test.db"),
             &dir.join("raw"),

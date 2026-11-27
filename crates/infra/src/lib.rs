@@ -16,4 +16,5 @@ pub mod feed;
 pub mod pack;
 pub mod record;
 pub mod store;
+pub mod testdir;
 pub mod wowhead_item_info;

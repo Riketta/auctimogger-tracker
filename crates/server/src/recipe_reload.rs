@@ -122,7 +122,7 @@ mod tests {
             std::process::id(),
             SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
-        std::fs::create_dir_all(&temp).unwrap();
+        let temp = amtracker_infra::testdir::fresh(&temp).unwrap();
         let clock: Arc<dyn amtracker_core::ports::ClockPort> =
             Arc::new(amtracker_infra::clock::SystemClock);
         let store = Arc::new(
@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn a_changed_recipe_file_reloads_and_an_unchanged_one_does_not() {
         let dir = std::env::temp_dir().join(format!("amtracker-reload-ok-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = amtracker_infra::testdir::fresh(&dir).unwrap();
         let path = dir.join("recipes.toml");
         write(&path, "[[recipe]]\nitem = 1\nreagents = { 2 = 1 }\n");
         let crafts = service();
@@ -234,7 +234,7 @@ mod tests {
     #[test]
     fn a_broken_recipe_file_keeps_the_previous_book_and_names_the_fault() {
         let dir = std::env::temp_dir().join(format!("amtracker-reload-bad-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = amtracker_infra::testdir::fresh(&dir).unwrap();
         let path = dir.join("recipes.toml");
         write(&path, "[[recipe]]\nitem = 1\nreagents = { 2 = 1 }\n");
         let crafts = service();
@@ -267,7 +267,7 @@ mod tests {
     fn a_missing_recipe_file_is_a_failure_not_an_empty_book() {
         let dir =
             std::env::temp_dir().join(format!("amtracker-reload-missing-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = amtracker_infra::testdir::fresh(&dir).unwrap();
         let path = dir.join("recipes.toml");
         write(&path, "[[recipe]]\nitem = 1\nreagents = { 2 = 1 }\n");
         let crafts = service();

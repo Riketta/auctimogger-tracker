@@ -393,7 +393,7 @@ fn load_config_reads_and_validates_the_recipe_file() {
         std::process::id(),
         line!()
     ));
-    std::fs::create_dir_all(&dir).expect("temp dir");
+    let dir = amtracker_infra::testdir::fresh(&dir).expect("temp dir");
     let recipes_path = dir.join("recipes.toml");
     std::fs::write(&recipes_path, "[[recipe]]\nitem = 1\nreagents = { 2 = 1, 3 = 2 }\n")
         .expect("write recipes");

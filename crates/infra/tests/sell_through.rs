@@ -58,8 +58,7 @@ fn temp_dir(tag: &str) -> PathBuf {
         std::process::id(),
         SEQ.fetch_add(1, Ordering::SeqCst)
     ));
-    std::fs::create_dir_all(&dir).expect("create temp dir");
-    dir
+    amtracker_infra::testdir::fresh(&dir).expect("create temp dir")
 }
 
 fn snapshot(target: &TargetId, _id: i64, fetched_at: i64, count: usize) -> NewSnapshot {
