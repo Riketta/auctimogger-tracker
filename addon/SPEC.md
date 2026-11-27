@@ -217,7 +217,7 @@ Lua decoder refuses exactly the same things:
 | A varint is longer than 10 bytes, or not minimal (a trailing zero group, as in `80 00`). |
 | An integer is `2^53` or more in magnitude. |
 | The padding is more than 4 bits or not all zero. |
-| A flag word sets a bit with no meaning, or `qtySum` is set without `listed`. |
+| A flag word sets a bit with no meaning, or `qtySum` or `p05` is set without `listed`. |
 | An `evidence` or `position` group is announced in `flags` with a flag word of zero: the encoder leaves such a group out. |
 | `supplyDays`, `lowRank30d` or `daysSinceListed` is above 65535; `rank`, `scoreBp` or `discountBp` is above `2^32 − 1`; the `lows` count is above 30. |
 | No span is present, or bytes follow the last field. |
@@ -240,7 +240,8 @@ per present span, in order d1, d7, d14, d30:
 
 live:
   lflags  varint   0x01 listed  0x02 qtySum  0x04 seenToday  0x08 daysSinceListed
-  [floor] [floorQty] [listed]      [qtySum]      [seenFloor] [seenQty] [daysSinceListed]
+                   0x10 p05
+  [floor] [floorQty] [listed]      [qtySum] [p05]      [seenFloor] [seenQty] [daysSinceListed]
 
 value:
   vflags  varint   0x01 soldMedian14  0x02 trendBp
@@ -270,8 +271,9 @@ or depend on another:
 
 - `listed` writes `floor`, `floorQty` and `listed` together. An item seen today
   and already gone has a `live` group without it, and then has no floor.
-- `qtySum` describes that listing summary, so it is only written inside a
-  `listed` group.
+- `qtySum` and `p05` describe that listing summary, so they are only written
+  inside a `listed` group, `qtySum` first. An orphan of either is refused, the
+  `qtySum` bit named first.
 - `seenToday` writes `seenFloor` and `seenQty` together.
 - `daysSinceListed` stands on its own. An item last listed days ago, and
   neither listed nor seen today, has a `live` group that holds nothing but it.
@@ -288,6 +290,7 @@ the tracker has no evidence — never zero.
 | live | `floorQty` | newest snapshot | Quantity listed at exactly that price. |
 | live | `listed` | newest snapshot | Listings of the item in the snapshot. |
 | live | `qtySum` | newest snapshot | Total quantity listed. |
+| live | `p05` | newest snapshot (`snapshot_item_floor`) | 5th percentile of the unit prices listed in the snapshot, one sample per listing, nearest rank — the span blocks' own estimator, so the live figure and a span over the same listings agree. With ≤ 20 listings it is the floor. |
 | live | `seenFloor`, `seenQty` | prepared scan | Today's cheapest listing that is no longer listed (bought or cancelled). |
 | live | `daysSinceListed` | prepared scan (hour fold) | Whole UTC days since the item was last seen listed: 0 when the newest snapshot lists it or the fold lists it today, else `today −` the newest day the fold lists it on, inside the 30-day low window. `u16`. |
 | value | `value7` | prepared scan | Quantity-weighted 7-day median listing price. Present only when > 0. |
@@ -338,6 +341,9 @@ Absent and zero are different for every optional field:
 - `daysSinceListed` absent — no hour-fold row for the identity inside the low
   window (a fresh fold, or nothing listed for 30 days). `0` — listed now, or
   seen today.
+- `p05` absent — the item is not listed, or the tracker's snapshot summary
+  predates the column (every floor row right after that upgrade, until the
+  snapshot's rows are rebuilt on first read).
 - `soldCount` absent — no credit-eligible evidence. `soldCount = 0` — evidence
   exists and nothing sold.
 - `supplyDays` absent — no sold evidence, or nothing sold: such stock never
@@ -401,7 +407,7 @@ old" is more useful than an empty one, and the age is always visible.
       "itemID": 194784,
       "category": "commodity",
       "spans": { "d1": { "n": 58, "min": 575, "...": "..." } },
-      "live": { "floor": 3805000, "floorQty": 214, "listed": 618, "qtySum": 1234, "daysSinceListed": 0 },
+      "live": { "floor": 3805000, "floorQty": 214, "listed": 618, "qtySum": 1234, "p05": 3820000, "daysSinceListed": 0 },
       "value7": 4123500,
       "soldMedian14": 4021000,
       "samples7": 214,
@@ -422,9 +428,10 @@ are `null`; absent scalars are omitted.
 The twin is rendered from the decoded records, so it shows exactly what a
 decoder reads: a rate the ranking computes as `34 / 94` appears as `0.3617`. A
 record seen today and gone has `"live": { "seenFloor": …, "seenQty": … }` and
-no floor; one last listed days ago has `"live": { "daysSinceListed": 3 }`.
-Keys come in the order shown above (top level, market, entry, span
-block `n` … `qtySold`, live, craft, deal), and span blocks as `d1`, `d7`,
+no floor; one last listed days ago has `"live": { "daysSinceListed": 3 }`;
+one listed from a summary that predates `p05` has `floor`, `floorQty` and
+`listed` and no `p05`. Keys come in the order shown above (top level, market,
+entry, span block `n` … `qtySold`, live, craft, deal), and span blocks as `d1`, `d7`,
 `d14`, `d30`. The file is pretty-printed with two-space indentation and no
 trailing newline.
 
@@ -448,11 +455,11 @@ The nine records:
 | `items[117]` | A listing that never sells: prices near 10 000 000 000 copper (five-byte varints), a present zero sale rate and zero sold, `supplyDays` 65535, a trend of 0, the top deal. |
 | `items[2589]` | Seen today and gone: a `live` group with `seenFloor`/`seenQty` and no floor, dated today; a sold-source value. |
 | `items[194784]` | One side of the dual-category id: a d7 span and never a credited sale, and a `live` group that holds nothing but `daysSinceListed` 3 — listed three days ago and not since, so no d1 block. |
-| `commodities[191460]` | A losing craft, a listing without `qtySum`, a one-day sparkline, a rising trend. |
+| `commodities[191460]` | A losing craft, a listing without `qtySum` but with a `p05` (the two flags are independent), a one-day sparkline, a rising trend. |
 | `commodities[191461]` | Bulk: quantities past a billion, a full 30-day sparkline, `lowRank30d` 10000, a falling trend. |
 | `commodities[194784]` | The other side of the dual id, and the record with every group: the example of §5.10. |
 | `pets[293]` | A pooled species: one span, no ledger field. |
-| `pets[2546]` | A single-variant species with full groups. |
+| `pets[2546]` | A single-variant species with full groups; its listing carries no `p05`, a snapshot summary from before the column. |
 
 - A Rust test re-renders all three and asserts they are byte-identical to the
   committed files. `AMTRACKER_UPDATE_GOLDEN=1 cargo test -p amtracker-infra
@@ -525,6 +532,7 @@ pub struct LiveListing {
     pub floor_qty: i64,
     pub listed: i64,
     pub qty_sum: Option<i64>,
+    pub p05: Option<i64>,                      // the snapshot summary's own
 }
 pub struct SeenListing {
     pub floor: i64,                           // seenFloor on the wire
@@ -614,7 +622,16 @@ Algorithm:
    fold lists the identity on (`ItemFacts::last_listed_day`, today included),
    which rides the ranking's hourly low context (`LowContext::last_day`, off
    the same `daily_lows` read — no query of its own); else absent. A day past
-   `today` reads as 0.
+   `today` reads as 0. `p05` is the snapshot summary's own: the store computes
+   it as it records a snapshot — one sample per listing, by
+   `metrics::nearest_rank`, the estimator behind the span blocks — and keeps it
+   in `snapshot_item_floor.p05`. That column is a shape-guarded additive ALTER
+   after the migration ladder (no schema version bump: a fresh file gets it
+   from the schema batch, a file already at the current version after the
+   ladder), with a partial index over the rows still carrying NULL so the
+   read-side probe stays a seek; a snapshot whose floor rows predate the column
+   is rebuilt from its retained listings on first read, once. The export adds
+   nothing: `p05` travels as stored.
 5. `low30` and `lowRank30d` computed with the ranking's own `low_rank`; the
    sparkline scales each low as `round(low × 128 ÷ reference)`, so the
    reference sits at mid-scale and anything above twice it reads as 255.
@@ -911,7 +928,7 @@ Carried over from the sniper's house style:
 ```lua
 ---@class AmdbRecord
 ---@field spans table<string, table>     -- d1/d7/d14/d30 -> the v3 span block
----@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, seenFloor, seenQty, daysSinceListed
+---@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, p05, seenFloor, seenQty, daysSinceListed
 ---@field value7 integer|nil
 ---@field soldMedian14 integer|nil
 ---@field samples7 integer|nil
@@ -1180,6 +1197,7 @@ Standard level, every optional line on:
 ```
  AuctiMogger Database                    forever-eu-pvp-alliance · 58m
  Min buyout                 380g 50s  ×214
+ Live p05                   382g
  Market value               402g 10s  sold  -3%
  Sale rate (14d)            36%  (34 of 94 sold)
  Sold                       31.6/day · supply 39d
@@ -1202,6 +1220,7 @@ spec pins each line for line.
 |---|---|---|
 | Header | always | Title in brand; right: `target · age`, the age in its tier color (§7.5.4). |
 | **Min buyout** | always | `money(floor)` + dim `  ×floorQty`; good `  ≤ vendor` when `atVendorFloor()`. Not listed but seen today: dim `none listed · seen today money(seenFloor) ×seenQty`. Otherwise dim `not listed`. |
+| Live p05 | `p05` on, `live.p05` present | `money(p05)`. It stands right under `Min buyout`, beside the floor it is drawn from: the sniping level of the newest snapshot (§5.6). Left out for a listing from a summary that predates it, and not repeated in the Shift detail, which shows each span's own p05. |
 | **Market value** | always | `money(reference)` + dim source word (`sold` / `listed` / span name) + signed `trendBp` percent in good or bad (muted at zero) when present; dim `unknown` without a value. |
 | **Sale rate (14d)** | always | Percent in the rate color + dim `  (soldCount of soldCount + expiredCount sold)` when both counts exist. Without a 14-day rate the label reads `Sale rate (180d)` and the counts are left out: they describe the fortnight. Dim `no evidence` without any rate. |
 | Sold | `sold` on, `soldPerDay()` known | `x.x/day`, then ` · supply Nd` when `supplyDays` is known, or ` · supply ∞` when it is saturated or unbounded. |
@@ -1248,7 +1267,7 @@ Saved in `AuctiMoggerDatabaseSettings` (account):
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Master switch. |
-| `lines` | absent | Optional line overrides; absent key = on. Keys: `sold`, `lastSale`, `listed`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
+| `lines` | absent | Optional line overrides; absent key = on. Keys: `p05`, `sold`, `lastSale`, `listed`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
 | `shiftDetail` | `true` | Shift shows the detail level. |
 | `coins` | `false` | Prices as the client's own coin icons (`GetMoneyString`) instead of text, in tooltips and in chat. Needs the API (§7.4); on a client without it the setting stays off and `/amdb coins on` says why. |
 
@@ -1395,7 +1414,7 @@ commodities for a commodity), nil when the header lacks that stamp.
 
 `AmdbMarketInfo` is flat, camelCase and fresh per call: `itemID`, `category`,
 `market`, `generatedAt`, `ageSeconds`, `snapshotAgeSeconds`, `stale`,
-`floorNow`, `floorQty`, `listedNow`, `seenFloor`, `daysSinceListed`, `value`, `valueSource`,
+`floorNow`, `floorQty`, `listedNow`, `p05Now`, `seenFloor`, `daysSinceListed`, `value`, `valueSource`,
 `trend`, `soldMedian14`, `saleRate`, `saleRate180d`, `soldCount`,
 `expiredCount`, `soldPerDay`, `supplyDays`, `daysSinceLastSale`,
 `closuresSinceLastSale`, `low30`, `lowRank30d`, `vendorPrice`, `craft`, `deal`,
@@ -1544,7 +1563,7 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `pack.rs`: varint and zigzag round-trips at 0, 127, 128, 2^32 and the
   maximum; the documented byte layout; text vectors pinned against the Lua
   prototype; alphabet membership; padding; non-minimal and over-long varints.
-- `record.rs`: encode → decode round-trip over 2^18 flag combinations and over
+- `record.rs`: encode → decode round-trip over 2^19 flag combinations and over
   every span set with every span flag; both signs, both saturations, a present
   zero; the wire layout written field by field. Malformed inputs are errors,
   never panics: every proper prefix of a record, every one-symbol mutation of
@@ -1554,7 +1573,13 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - Golden fixtures byte-stable (§5.11).
 - `DatabaseExportService`: group attachment rules, pet pooling, rank and
   craft selection, entries without spans omitted, deterministic order; the
-  date of the last listing off the snapshot, then the fold, then absent.
+  date of the last listing off the snapshot, then the fold, then absent; the
+  live `p05` off the stored summary, and none for a summary without one.
+- Store: `p05` at ingest by nearest rank (21 listings → the second cheapest,
+  20 → the floor), with and without a quantity sum; a pre-column row heals on
+  the first `floors()` and `floor()` read with every other field unchanged,
+  once; a fresh database has the column and its index; an old-shape v11 file
+  gains the column and heals.
 - Opportunity scan: a today-row dates the last listing without entering the
   lows, and `low_rank` still ignores today.
 - Scheduler: scans refresh before the feed publishes.
@@ -1578,7 +1603,8 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 **Lua**
 
 - `pack`, `record`: every field, every absence, malformed and truncated
-  records, wrong padding.
+  records, wrong padding; a listing without a `p05`; both orphan flags
+  refused in the Rust decoder's order.
 - Golden trio (§5.11).
 - `market`: version gate, future rejection, stale flag, duplicate target,
   slot order, primary binding, default category, update callbacks.
@@ -1591,7 +1617,8 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   renderer — what it is handed, the sign, zero, junk, a renderer that raises
   or answers no string, and clearing it.
 - `tooltip_lines`: one test per line for shown and omitted, Shift detail,
-  collapsed owner, each toggle; both samples of §7.6 line for line.
+  collapsed owner, each toggle; both samples of §7.6 line for line; `Live p05`
+  under the floor, absent for an older summary, not in the Shift detail.
 - `extra_tip`: creation, the owner set on every show, the rows, placement in
   pixels and again on demand, secret and unreadable layout, the sparkline.
 - `market_files`: the golden carrier loaded through a fake `...` and decoded by
@@ -1615,7 +1642,8 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   and its click-cycle; the hover help; a refresh that fails; the coin
   checkbox, which comes back off on a client without the API.
 - `public_api`: fresh tables per call, `GetAuctionBuyout` chaining, absent
-  addon data, the documented field set of `GetMarketInfo`.
+  addon data, the documented field set of `GetMarketInfo` (31 fields),
+  `p05Now` present and absent.
 
 **Sniper (batch 7, in its own repository)**
 
@@ -1650,7 +1678,8 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 2. Hover: a bag item, a chat link, an auction-house browse row, a commodity
    row, an item without data, a pet cage, a battle-pet link.
 3. Press and release Shift while hovering. Run `/amdb basic`, `/amdb standard`
-   and each line toggle. `/amdb off`, `/amdb on`. Hover an item that is not
+   and each line toggle. `/amdb off`, `/amdb on`. Hover a listed item:
+   `Live p05` sits right under `Min buyout`. Hover an item that is not
    listed: `Min buyout` says `not listed` and `Last listed` says how long ago.
    `/amdb coins on`: prices read as coin icons in the tooltip and in
    `/amdb decode`; `/amdb coins off`.
@@ -1994,6 +2023,28 @@ difference stays.
 - What OribosExchange has and this addon leaves out, by the owner's choice: a
   region-wide median and a "sold by vendors" flag (§13).
 - Every §9 gate is green: `addon/scripts/ci_local.sh` (884 tests) and the
+  tracker's fmt, clippy and tests.
+
+### Follow-up — Live p05
+
+**Status: implemented; not yet seen in game.** The owner asked for the latest
+p05 — the 5th percentile of what is listed right now — in the default panel.
+Until now a percentile showed only in the Shift detail, per span, and nothing
+live beyond the floor.
+
+- The store computes `p05` as it records a snapshot, with the metrics engine's
+  own estimator (one sample per listing, nearest rank), and keeps it in
+  `snapshot_item_floor.p05` (§6.3): a shape-guarded additive ALTER after the
+  migration ladder, a partial index over the rows not yet healed, and a
+  one-time rebuild of a snapshot's floor rows on first read when they predate
+  the column. No schema version bump.
+- The record's `live` group carries it as bit `0x10` of `live.lflags`, written
+  after `qtySum` (§5.5); an orphan is refused like `qtySum`'s. The tooltip
+  shows it as `Live p05`, right under `Min buyout`, with the key `p05` (§7.6,
+  §7.7); `GetMarketInfo` answers `p05Now`.
+- The golden fixture covers every shape: `p05` with and without `qtySum`, a
+  listing without `p05`, and nothing listed.
+- Every §9 gate is green: `addon/scripts/ci_local.sh` (893 tests) and the
   tracker's fmt, clippy and tests.
 
 ## 12. Risks and mitigations

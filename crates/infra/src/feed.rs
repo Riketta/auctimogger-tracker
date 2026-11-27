@@ -434,6 +434,8 @@ mod twin {
         #[serde(skip_serializing_if = "Option::is_none")]
         pub qty_sum: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        pub p05: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         pub seen_floor: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub seen_qty: Option<i64>,
@@ -449,6 +451,7 @@ mod twin {
                 floor_qty: listed.map(|listing| listing.floor_qty),
                 listed: listed.map(|listing| listing.listed),
                 qty_sum: listed.and_then(|listing| listing.qty_sum),
+                p05: listed.and_then(|listing| listing.p05),
                 seen_floor: live.seen.as_ref().map(|seen| seen.floor),
                 seen_qty: live.seen.as_ref().map(|seen| seen.qty),
                 days_since_listed: live.days_since_listed,
@@ -753,6 +756,7 @@ mod database_tests {
                         floor_qty: 214,
                         listed: 618,
                         qty_sum: Some(1234),
+                        p05: Some(3_820_000),
                     }),
                     seen: Some(SeenListing { floor: 3_750_000, qty: 5 }),
                     days_since_listed: Some(0),
@@ -1136,7 +1140,7 @@ mod database_tests {
         let entry = &value["items"][0];
         assert_eq!(
             entry["live"],
-            serde_json::json!({ "floor": 3_805_000, "floorQty": 214, "listed": 618, "qtySum": 1234, "seenFloor": 3_750_000, "seenQty": 5, "daysSinceListed": 0 })
+            serde_json::json!({ "floor": 3_805_000, "floorQty": 214, "listed": 618, "qtySum": 1234, "p05": 3_820_000, "seenFloor": 3_750_000, "seenQty": 5, "daysSinceListed": 0 })
         );
         assert_eq!(entry["value7"], 4_123_500);
         assert_eq!(entry["soldMedian14"], 4_021_000);
@@ -1165,10 +1169,16 @@ mod database_tests {
 
     #[test]
     fn twin_keeps_absent_scalars_absent_inside_a_present_group() {
-        // Listed, but neither a quantity sum nor anything seen gone.
+        // Listed, but neither a quantity sum nor a p05 nor anything seen gone.
         let mut entry = item(25, Category::Item);
         entry.record.live = Some(LiveQuote {
-            listed: Some(LiveListing { floor: 15000, floor_qty: 1, listed: 58, qty_sum: None }),
+            listed: Some(LiveListing {
+                floor: 15000,
+                floor_qty: 1,
+                listed: 58,
+                qty_sum: None,
+                p05: None,
+            }),
             seen: None,
             days_since_listed: None,
         });
@@ -1212,7 +1222,13 @@ mod database_tests {
         // Listed, but the fold never dated it: no key at all.
         let mut undated = item(2589, Category::Item);
         undated.record.live = Some(LiveQuote {
-            listed: Some(LiveListing { floor: 15000, floor_qty: 1, listed: 58, qty_sum: None }),
+            listed: Some(LiveListing {
+                floor: 15000,
+                floor_qty: 1,
+                listed: 58,
+                qty_sum: None,
+                p05: None,
+            }),
             seen: None,
             days_since_listed: None,
         });
@@ -1230,6 +1246,78 @@ mod database_tests {
         );
         assert_eq!(text.matches("daysSinceListed").count(), 2, "{text}");
         assert!(!text.contains("\"daysSinceListed\": null"), "{text}");
+    }
+
+    /// `p05` is written right after `qtySum` when it is known — also when the
+    /// listing carries no quantity sum — and omitted when it is not: never a
+    /// null, never a zero the tracker did not mean.
+    #[test]
+    fn twin_writes_p05_after_qty_sum_when_known_and_omits_it_otherwise() {
+        // After the quantity sum, before the sighting that is gone.
+        let mut summed = item(194_784, Category::Commodity);
+        summed.record.live = Some(LiveQuote {
+            listed: Some(LiveListing {
+                floor: 3_805_000,
+                floor_qty: 214,
+                listed: 618,
+                qty_sum: Some(1234),
+                p05: Some(3_820_000),
+            }),
+            seen: Some(SeenListing { floor: 3_750_000, qty: 5 }),
+            days_since_listed: Some(0),
+        });
+        // No quantity sum at all: the p05 follows the listing count directly.
+        let mut dry = item(191_460, Category::Commodity);
+        dry.record.live = Some(LiveQuote {
+            listed: Some(LiveListing {
+                floor: 90_000,
+                floor_qty: 100,
+                listed: 3,
+                qty_sum: None,
+                p05: Some(92_000),
+            }),
+            seen: None,
+            days_since_listed: Some(0),
+        });
+        // A pre-column row: no key at all, the rest of the summary intact.
+        let mut legacy = item(25, Category::Item);
+        legacy.record.live = Some(LiveQuote {
+            listed: Some(LiveListing {
+                floor: 15000,
+                floor_qty: 1,
+                listed: 58,
+                qty_sum: Some(58),
+                p05: None,
+            }),
+            seen: None,
+            days_since_listed: Some(0),
+        });
+        let text = twin_text(&snapshot(vec![legacy, dry, summed]));
+        assert!(
+            text.contains(
+                "\"live\": {\n        \"floor\": 3805000,\n        \"floorQty\": 214,\n        \"listed\": 618,\n        \"qtySum\": 1234,\n        \"p05\": 3820000,\n        \"seenFloor\": 3750000,\n        \"seenQty\": 5,\n        \"daysSinceListed\": 0\n      }"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\"live\": {\n        \"floor\": 90000,\n        \"floorQty\": 100,\n        \"listed\": 3,\n        \"p05\": 92000,\n        \"daysSinceListed\": 0\n      }"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "\"live\": {\n        \"floor\": 15000,\n        \"floorQty\": 1,\n        \"listed\": 58,\n        \"qtySum\": 58,\n        \"daysSinceListed\": 0\n      }"
+            ),
+            "{text}"
+        );
+        // `p05` also names a span field, so the live groups are checked alone.
+        let value: serde_json::Value = serde_json::from_str(&text).expect("valid json");
+        let items = value["items"].as_array().expect("items");
+        assert_eq!(items[0]["live"].get("p05"), None, "an absent p05 is no key at all");
+        assert_eq!(items[1]["live"]["p05"], 92_000);
+        assert_eq!(items[2]["live"]["p05"], 3_820_000);
+        assert!(!text.contains("\"p05\": null"), "{text}");
     }
 
     #[test]
@@ -1321,6 +1409,7 @@ mod database_tests {
                     "floorQty",
                     "listed",
                     "qtySum",
+                    "p05",
                     "seenFloor",
                     "seenQty",
                     "daysSinceListed"

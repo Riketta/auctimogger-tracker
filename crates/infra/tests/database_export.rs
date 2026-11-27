@@ -521,7 +521,9 @@ fn a_listed_item_carries_its_live_value_evidence_position_and_rank() {
                 floor: 60_000,
                 floor_qty: 10,
                 listed: 10,
-                qty_sum: Some(15)
+                qty_sum: Some(15),
+                // Half the listings sit at the floor: the 5th percentile is the floor.
+                p05: Some(60_000),
             }),
             // Today's fold floor of 110 000 sits above the live floor: the
             // cheap stacks are still up, nothing is "gone".
@@ -569,7 +571,13 @@ fn a_listed_item_carries_its_live_value_evidence_position_and_rank() {
     assert_eq!(
         two.record.live,
         Some(LiveQuote {
-            listed: Some(LiveListing { floor: 180_000, floor_qty: 5, listed: 5, qty_sum: Some(5) }),
+            listed: Some(LiveListing {
+                floor: 180_000,
+                floor_qty: 5,
+                listed: 5,
+                qty_sum: Some(5),
+                p05: Some(180_000),
+            }),
             seen: None,
             days_since_listed: Some(0),
         })
@@ -618,7 +626,13 @@ fn seen_today_gone_dual_category_and_thin_evidence_records() {
     assert_eq!(
         level.record.live,
         Some(LiveQuote {
-            listed: Some(LiveListing { floor: 40_000, floor_qty: 8, listed: 2, qty_sum: Some(8) }),
+            listed: Some(LiveListing {
+                floor: 40_000,
+                floor_qty: 8,
+                listed: 2,
+                qty_sum: Some(8),
+                p05: Some(40_000),
+            }),
             seen: None,
             days_since_listed: Some(0),
         })
@@ -721,7 +735,13 @@ fn days_since_listed_comes_off_the_newest_snapshot_then_the_hour_fold() {
     assert_eq!(
         listed.record.live,
         Some(LiveQuote {
-            listed: Some(LiveListing { floor: 50_000, floor_qty: 1, listed: 1, qty_sum: Some(1) }),
+            listed: Some(LiveListing {
+                floor: 50_000,
+                floor_qty: 1,
+                listed: 1,
+                qty_sum: Some(1),
+                p05: Some(50_000),
+            }),
             seen: None,
             days_since_listed: Some(0),
         }),
@@ -753,6 +773,82 @@ fn days_since_listed_comes_off_the_newest_snapshot_then_the_hour_fold() {
     assert_eq!(live_of(1), serde_json::json!({ "daysSinceListed": 3 }));
     assert_eq!(live_of(2)["daysSinceListed"], 0);
     assert!(live_of(3).get("daysSinceListed").is_none(), "{}", live_of(3));
+
+    std::fs::remove_dir_all(&market.dir).ok();
+}
+
+/// The live `p05` is the newest snapshot's own 5th percentile, nearest rank
+/// over its listings: it reaches the record's live group and the JSON twin
+/// exactly as stored — above the floor when the listings spread, at the floor
+/// when they do not — while an item seen today and gone carries no listing
+/// summary and so no `p05` at all.
+#[test]
+fn live_p05_comes_off_the_newest_snapshot_into_the_record_and_the_twin() {
+    let market = Market::open(
+        "live-p05",
+        TargetKind::BlizzardConnectedRealm { region: "us".into(), connected_realm_id: 4 },
+        "retail",
+    );
+    let today = market.today();
+    // Each item folded today, so each has a d1 block to carry its groups. Item
+    // 3 is folded but not listed in the newest snapshot: seen today, gone.
+    market.fold(&item(1), today, Category::Commodity, 1010, 21);
+    market.fold(&item(2), today, Category::Commodity, 2500, 20);
+    market.fold(&item(3), today, Category::Commodity, 500, 3);
+    // The newest snapshot lists item 1 by twenty-one single-unit listings at
+    // 1000, 1001, …: nearest rank puts the 5th percentile at the second
+    // cheapest, one above the floor. Item 2 is twenty stacks at one price: its
+    // p05 is that price, the floor itself.
+    let spread: Vec<NormalizedListing> =
+        (0..21).map(|n| listing(1000 + n, &item(1), 1000 + n, 1)).collect();
+    let flat: Vec<NormalizedListing> =
+        (0..20).map(|n| listing(2000 + n, &item(2), 2500, 5)).collect();
+    market.snapshot(PayloadKind::Commodities, NOW, Some(NOW - 60), &[spread, flat].concat());
+
+    let (snapshot, _opportunities) = build(&market, Vec::new());
+    let listed = |id: i64| {
+        entry(&snapshot, &item(id), Category::Commodity)
+            .record
+            .live
+            .as_ref()
+            .and_then(|live| live.listed.as_ref())
+            .map(|listing| (listing.floor, listing.listed, listing.qty_sum, listing.p05))
+    };
+    assert_eq!(listed(1), Some((1000, 21, Some(21), Some(1001))));
+    assert_eq!(listed(2), Some((2500, 20, Some(100), Some(2500))));
+
+    // Seen today and gone: no listing, so no p05.
+    assert_eq!(
+        entry(&snapshot, &item(3), Category::Commodity).record.live,
+        Some(LiveQuote {
+            listed: None,
+            seen: Some(SeenListing { floor: 500, qty: 3 }),
+            days_since_listed: None,
+        })
+    );
+
+    // The twin says the same, key for key.
+    let json = FeedCodec.render(&snapshot, FeedFormat::Json).expect("twin");
+    let twin: serde_json::Value = serde_json::from_slice(&json).expect("valid json");
+    let live_of = |id: i64| {
+        twin["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|entry| entry["itemID"].as_i64() == Some(id) && entry["category"] == "commodity")
+            .unwrap_or_else(|| panic!("no commodity record for item {id}"))["live"]
+            .clone()
+    };
+    assert_eq!(
+        live_of(1),
+        serde_json::json!({ "floor": 1000, "floorQty": 1, "listed": 21, "qtySum": 21, "p05": 1001, "daysSinceListed": 0 })
+    );
+    assert_eq!(live_of(2)["p05"], 2500);
+    assert_eq!(
+        live_of(3),
+        serde_json::json!({ "seenFloor": 500, "seenQty": 3 }),
+        "gone: no floor, no p05"
+    );
 
     std::fs::remove_dir_all(&market.dir).ok();
 }
@@ -828,6 +924,7 @@ fn the_export_renders_losslessly_into_the_carrier_and_its_twin() {
         .expect("item 1's commodity record");
     assert_eq!(one["live"]["floor"], 60_000);
     assert_eq!(one["live"]["qtySum"], 15);
+    assert_eq!(one["live"]["p05"], 60_000);
     assert_eq!(one["live"]["daysSinceListed"], 0, "the newest snapshot lists it");
     assert_eq!(one["value7"], 100_000);
     assert_eq!(one["soldMedian14"], 80_000);
@@ -904,7 +1001,13 @@ fn pet_species_export_per_species_with_groups_only_when_single_variant() {
     assert_eq!(
         single.record.live,
         Some(LiveQuote {
-            listed: Some(LiveListing { floor: 250, floor_qty: 2, listed: 2, qty_sum: Some(2) }),
+            listed: Some(LiveListing {
+                floor: 250,
+                floor_qty: 2,
+                listed: 2,
+                qty_sum: Some(2),
+                p05: Some(250),
+            }),
             seen: None,
             days_since_listed: Some(0),
         })

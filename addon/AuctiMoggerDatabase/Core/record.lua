@@ -46,7 +46,8 @@ local LFLAG_LISTED = 0x01
 local LFLAG_QTY_SUM = 0x02
 local LFLAG_SEEN = 0x04
 local LFLAG_DAYS_LISTED = 0x08
-local LFLAG_MASK = 0x0F
+local LFLAG_P05 = 0x10
+local LFLAG_MASK = 0x1F
 
 local VFLAG_SOLD_MEDIAN14 = 0x01
 local VFLAG_TREND = 0x02
@@ -104,6 +105,7 @@ local REFERENCE_SPANS = { "d7", "d14", "d30", "d1" }
 ---@field floorQty integer|nil units listed at exactly the floor
 ---@field listed integer|nil listings in the snapshot
 ---@field qtySum integer|nil units listed in total
+---@field p05 integer|nil copper: 5th percentile of the unit prices in the newest snapshot, nearest rank
 ---@field seenFloor integer|nil copper: today's cheapest listing that is gone
 ---@field seenQty integer|nil units of that listing
 ---@field daysSinceListed integer|nil whole days since the item was last seen listed; 0 = today
@@ -120,7 +122,7 @@ local REFERENCE_SPANS = { "d7", "d14", "d30", "d1" }
 
 ---@class AmdbRecord
 ---@field spans table<string, AmdbSpanBlock> d1/d7/d14/d30 -> the v3 span block
----@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, seenFloor, seenQty, daysSinceListed
+---@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, p05, seenFloor, seenQty, daysSinceListed
 ---@field value7 integer|nil
 ---@field soldMedian14 integer|nil
 ---@field samples7 integer|nil
@@ -194,9 +196,13 @@ end
 ---@return AmdbLive live
 local function readLive(reader)
     local lflags = reader:flag("live.lflags", LFLAG_MASK)
-    -- `qtySum` describes the listing summary: without `listed` it reads nothing.
+    -- `qtySum` and `p05` describe the listing summary: without `listed` they
+    -- read nothing.
     if hasBit(lflags, LFLAG_QTY_SUM) and not hasBit(lflags, LFLAG_LISTED) then
         error(Pack.unknownFlagMessage("live.lflags", LFLAG_QTY_SUM), 0)
+    end
+    if hasBit(lflags, LFLAG_P05) and not hasBit(lflags, LFLAG_LISTED) then
+        error(Pack.unknownFlagMessage("live.lflags", LFLAG_P05), 0)
     end
     local live = {}
     if hasBit(lflags, LFLAG_LISTED) then
@@ -207,10 +213,15 @@ local function readLive(reader)
         if hasBit(lflags, LFLAG_QTY_SUM) then
             qtySum = reader:varint("live.qtySum")
         end
+        local p05
+        if hasBit(lflags, LFLAG_P05) then
+            p05 = reader:varint("live.p05")
+        end
         live.floor = floor
         live.floorQty = floorQty
         live.listed = listed
         live.qtySum = qtySum
+        live.p05 = p05
     end
     if hasBit(lflags, LFLAG_SEEN) then
         live.seenFloor = reader:varint("live.seenFloor")

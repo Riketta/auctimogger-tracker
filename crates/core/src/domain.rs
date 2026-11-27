@@ -558,6 +558,11 @@ pub struct SnapshotFloor {
     pub listing_count: u64,
     /// Total quantity of the item listed in the snapshot.
     pub qty_sum: i64,
+    /// 5th percentile of the snapshot's listing unit prices, nearest rank
+    /// (`metrics::nearest_rank` over one sample per listing), so the live figure
+    /// and the span blocks agree. `None` for a row written before the column
+    /// existed.
+    pub p05: Option<i64>,
 }
 
 /// One listing of an item in one stored snapshot, joined to its sighting
@@ -1077,6 +1082,8 @@ pub struct LiveListing {
     pub listed: i64,
     /// Total quantity listed.
     pub qty_sum: Option<i64>,
+    /// `p05` on the wire.
+    pub p05: Option<i64>,
 }
 
 /// A listing seen earlier today that the newest snapshot no longer lists.

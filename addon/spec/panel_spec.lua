@@ -41,6 +41,7 @@ local LABELS = {
     "Enable tooltips",
     "Preset",
     "Tooltip lines",
+    "Live p05",
     "Sold per day and supply",
     "Last sale",
     "Last listed",
@@ -447,7 +448,7 @@ describe("the options panel", function()
             -- Ours until the Settings UI parents it: it must not stand on the screen.
             assert.is_false(frame.shown)
             assert.same({ 600, 0 }, frame.size)
-            assert.equals(490, frame.height)
+            assert.equals(516, frame.height)
             assert.equals("Frame", frame.kind)
             assert.is_nil(frame.template)
             assert.equals(rawget(_G, "UIParent"), frame.parent)
@@ -531,6 +532,7 @@ describe("the options panel", function()
                 "CheckButton",
                 "CheckButton",
                 "CheckButton",
+                "CheckButton",
                 "Button",
             }, pluck(created, "kind"))
             assert.equals("UICheckButtonTemplate", createdOf("CheckButton")[1].template)
@@ -555,7 +557,7 @@ describe("the options panel", function()
         it("gives the titles the brand color of SPEC 7.5.4, and the labels the client's own", function()
             register()
             assert.same({ 1, 125 / 255, 10 / 255 }, strings[3].textColor)
-            assert.same({ 1, 125 / 255, 10 / 255 }, strings[14].textColor)
+            assert.same({ 1, 125 / 255, 10 / 255 }, strings[15].textColor)
             assert.is_nil(strings[1].textColor)
             assert.equals("GameFontHighlight", strings[1].font)
             assert.equals("GameFontNormal", statusText().font)
@@ -601,7 +603,7 @@ describe("the options panel", function()
             register()
             assert.equals(TARGET, pickerOf().text)
             assert.is_true(pickerOf().enabled)
-            assert.equals("Primary market", strings[15].text)
+            assert.equals("Primary market", strings[16].text)
         end)
 
         it("reads the settings it is registered under", function()
@@ -612,6 +614,7 @@ describe("the options panel", function()
             assert.is_false(checkboxOf("Enable tooltips").checked)
             assert.is_false(checkboxOf("Deal").checked)
             assert.is_true(checkboxOf("Crafting").checked)
+            assert.is_true(checkboxOf("Live p05").checked)
             assert.is_false(checkboxOf("Hold Shift for detail").checked)
             -- Text is the default form of a price.
             assert.is_false(checkboxOf("Coin icons for prices").checked)
@@ -778,13 +781,13 @@ describe("the options panel", function()
             assert.is_false(old.shown)
             assert.is_false(oldLabel.shown)
             -- The frame follows the rows: 26 pixels for 60.
-            assert.equals(490 - 26 + 60, options.panel.frame.height)
+            assert.equals(516 - 26 + 60, options.panel.frame.height)
             local standIn = statusText()
             A.Core.PanelRows.build = realBuild
             assert.is_true(options:refreshPanel())
             assert.is_true(checkboxOf("Enable tooltips").shown)
             assert.is_false(standIn.shown)
-            assert.equals(490, options.panel.frame.height)
+            assert.equals(516, options.panel.frame.height)
         end)
 
         it("takes the rows down that a shorter model no longer has", function()
@@ -800,7 +803,7 @@ describe("the options panel", function()
             assert.is_true(options:refreshPanel())
             assert.is_false(status.shown)
             assert.is_nil(options.panel.regions[#rows + 1])
-            assert.equals(490 - 60, options.panel.frame.height)
+            assert.equals(516 - 60, options.panel.frame.height)
             A.Core.PanelRows.build = realBuild
         end)
     end)

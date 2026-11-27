@@ -116,6 +116,7 @@ With the standard preset and every optional line on, the panel reads:
 ```
  AuctiMogger Database                    forever-eu-pvp-alliance · 58m
  Min buyout                 380g 50s  ×214
+ Live p05                   382g
  Market value               402g 10s  sold  -3%
  Sale rate (14d)            36%  (34 of 94 sold)
  Sold                       31.6/day · supply 39d
@@ -137,6 +138,7 @@ client reports as collapsed shows the three bold lines only.
 |---|---|
 | Header | The market the record comes from, and its age. |
 | **Min buyout** | The cheapest unit price listed now, and how many units sit at exactly that price. Not listed but seen today: `none listed · seen today …`. Otherwise `not listed`. |
+| Live p05 | The price under which the cheapest 5% of the listings in the newest snapshot sit — the sniping level, read off the same dump as the min buyout. With twenty listings or fewer it equals the min buyout. |
 | **Market value** | What the tracker values the item at, and where that comes from: the 14-day sold median (`sold`) once at least three priced units sold, else the 7-day listing median (`listed`), else the median of a longer window (named). The signed percent is today's listing median against the previous six days. |
 | **Sale rate (14d)** | The share of the fortnight's listings that sold, with the counts behind it. Without a 14-day rate the line reads `Sale rate (180d)`. |
 | Sold | Units sold per day, and how long the listed supply lasts at that pace (`supply ∞` when the figure is unbounded). |
@@ -188,7 +190,7 @@ command says so and prices stay as text.
 | `market <target>` | Choose this character's primary market. |
 | `lines` | List the optional lines and their state. |
 | `basic` / `standard` | Presets: the optional lines all off / all on. |
-| `<line> on` / `<line> off` | One optional line: `sold`, `lastSale`, `listed`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
+| `<line> on` / `<line> off` | One optional line: `p05`, `sold`, `lastSale`, `listed`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
 | `shift on` / `shift off` | Whether Shift shows the detail block. |
 | `coins on` / `coins off` | Prices as coin icons instead of text. |
 | `decode <item>` | Debug: every decoded field of the item, from an id, a link or an `item:` string. An absent field prints `-`. |
@@ -246,7 +248,7 @@ is nil when the addon is absent or disabled.
 `opts.market` are optional and select another pool or another market.
 
 `GetMarketInfo` returns a fresh, flat table — `floorNow`, `floorQty`,
-`listedNow`, `daysSinceListed`, `value`, `valueSource`, `trend`, `saleRate`,
+`listedNow`, `p05Now`, `daysSinceListed`, `value`, `valueSource`, `trend`, `saleRate`,
 `saleRate180d`, `low30`, `craft`, `deal`, `stale`, `ageSeconds` and the rest —
 with `nil` for every field the tracker has no evidence for. Keep what you
 need: the next call builds a new one.

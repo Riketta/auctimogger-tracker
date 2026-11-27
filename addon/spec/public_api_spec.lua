@@ -45,6 +45,7 @@ local FIELDS = {
     "floorNow",
     "floorQty",
     "listedNow",
+    "p05Now",
     "seenFloor",
     "daysSinceListed",
     "value",
@@ -231,8 +232,8 @@ describe("public_api", function()
     describe("GetMarketInfo", function()
         it("holds exactly the documented fields: none extra, and none missing where the record has it", function()
             local A = loaded()
-            -- 7.9 spells 30 fields.
-            assert.equals(30, #FIELDS)
+            -- 7.9 spells 31 fields.
+            assert.equals(31, #FIELDS)
             -- The record that carries every group has all of them present.
             sameList(FIELDS, keysOf(A.GetMarketInfo(194784, { category = "commodity" })))
             -- Elsewhere an absent value is an absent key, never a zero or a false.
@@ -268,6 +269,16 @@ describe("public_api", function()
             assert.is_nil(A.GetMarketInfo(194784).trend)
         end)
 
+        it("describes a listing from a snapshot summary older than the p05 column", function()
+            local info = loaded().GetMarketInfo(PET_LINK)
+            assert.is_not_nil(info)
+            -- Everything of the listing but the percentile, which that summary
+            -- never held: an absent field, never a zero.
+            assert.equals(2500000, info.floorNow)
+            assert.equals(2, info.listedNow)
+            assert.is_nil(info.p05Now)
+        end)
+
         it("describes a steady seller field for field", function()
             local A = loaded()
             local info = A.GetMarketInfo(25)
@@ -282,6 +293,8 @@ describe("public_api", function()
             assert.equals(15000, info.floorNow)
             assert.equals(1, info.floorQty)
             assert.equals(58, info.listedNow)
+            -- The 5th percentile of the snapshot's listing prices.
+            assert.equals(15900, info.p05Now)
             assert.is_nil(info.seenFloor)
             -- Listed now: last listed today.
             assert.equals(0, info.daysSinceListed)

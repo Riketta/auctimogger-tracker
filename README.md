@@ -473,8 +473,9 @@ A record holds the four span blocks (`d1`/`d7`/`d14`/`d30`: `n, min, p05,
 p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`, `saleRate`,
 `saleRate180d`, `daysSinceLastSale`, `closuresSinceLastSale`, `qtySold`) and
 the groups behind them: the `live` listing (floor, quantity at the floor,
-listings, total quantity, today's sighting that is already gone, and the
-days since the item was last seen listed), the `value` (7-day listing value, 14-day sold median, today's trend in basis
+listings, total quantity, the 5th percentile of the listing prices, today's
+sighting that is already gone, and the days since the item was last seen
+listed), the `value` (7-day listing value, 14-day sold median, today's trend in basis
 points), the sold/expired `evidence` with days of supply, the 30-day
 `position` (lowest ask, share of days above the live floor, a one-byte-per-day
 sparkline), the vendor price, the best craft and the deal rank. Every

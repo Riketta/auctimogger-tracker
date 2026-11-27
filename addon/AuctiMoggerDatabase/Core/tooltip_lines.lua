@@ -192,6 +192,22 @@ local function rateRow(record)
     return { left = long and "Sale rate (180d)" or "Sale rate (14d)", right = text }
 end
 
+--- Live p05: the 5th percentile of the unit prices in the newest snapshot,
+--- one sample per listing, by the tracker's own estimator for the span
+--- blocks, so the live figure and a span over the same listings agree. It is
+--- the sniping level. Absent for a snapshot summary from before the tracker
+--- kept it (SPEC 5.7).
+---@param record AmdbRecord
+---@return AmdbTipRow|nil row
+local function liveP05Row(record)
+    local live = record.live
+    local p05 = live ~= nil and live.p05 or nil
+    if p05 == nil then
+        return nil
+    end
+    return { left = "Live p05", right = Format.money(p05) }
+end
+
 --- The header and the three basics: what every level shows.
 ---@param record AmdbRecord
 ---@param context AmdbTipContext
@@ -339,8 +355,10 @@ end
 ---@param context AmdbTipContext
 ---@return AmdbTipRow[] rows
 local function standardRows(record, context)
-    local rows = basics(record, context)
     local settings = context.settings
+    -- The header and the floor open the level; the live p05, when it shows,
+    -- stands right beside the floor it is drawn from.
+    local rows = { headerRow(context), buyoutRow(record) }
     ---@param key string the optional line's key
     ---@param build fun(record: AmdbRecord): AmdbTipRow|nil
     local function optional(key, build)
@@ -351,6 +369,9 @@ local function standardRows(record, context)
             end
         end
     end
+    optional("p05", liveP05Row)
+    rows[#rows + 1] = valueRow(record)
+    rows[#rows + 1] = rateRow(record)
     optional("sold", soldRow)
     optional("lastSale", lastSaleRow)
     optional("listed", listedRow)

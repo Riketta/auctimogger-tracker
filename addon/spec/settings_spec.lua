@@ -63,7 +63,10 @@ end
 describe("Settings module", function()
     it("lists the optional lines and the presets", function()
         local module = fresh()
-        assert.same({ "sold", "lastSale", "listed", "low", "sparkline", "craft", "deal", "markets" }, module.LINE_KEYS)
+        assert.same(
+            { "p05", "sold", "lastSale", "listed", "low", "sparkline", "craft", "deal", "markets" },
+            module.LINE_KEYS
+        )
         assert.same({ "basic", "standard" }, module.PRESETS)
     end)
 
@@ -80,7 +83,7 @@ describe("Settings.defaults", function()
         local settings = Settings.defaults()
         assert.is_true(settings.enabled)
         assert.is_true(settings.shiftDetail)
-        assert.same({ true, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, true, true, true, true, true, true, true, true }, lineStates(settings.lines))
         local count = 0
         local known = {}
         for _, key in ipairs(Settings.LINE_KEYS) do
@@ -161,7 +164,7 @@ describe("Settings.coerce", function()
     it("falls back to the default for a line key that is missing", function()
         local settings = Settings.coerce({ lines = { sold = false } })
         assert.is_false(settings.lines.sold)
-        assert.same({ false, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, false, true, true, true, true, true, true, true }, lineStates(settings.lines))
     end)
 
     it("ignores line keys that name no line", function()
@@ -179,7 +182,7 @@ describe("Settings.coerce", function()
     it("answers the defaults when lines is not a table", function()
         local settings = Settings.coerce({ lines = "sold", enabled = false })
         assert.is_false(settings.enabled)
-        assert.same({ true, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, true, true, true, true, true, true, true, true }, lineStates(settings.lines))
     end)
 
     it("never mutates its input", function()
@@ -208,7 +211,7 @@ describe("Settings.coerce", function()
             }),
         }
         local settings = Settings.coerce(saved)
-        assert.same({ true, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, true, true, true, true, true, true, true, true }, lineStates(settings.lines))
     end)
 end)
 
@@ -330,7 +333,7 @@ describe("Settings.setShiftDetail and setEnabled", function()
         local settings = Settings.defaults()
         Settings.setEnabled(settings, false)
         Settings.setShiftDetail(settings, false)
-        assert.same({ true, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, true, true, true, true, true, true, true, true }, lineStates(settings.lines))
     end)
 end)
 
@@ -350,7 +353,7 @@ describe("Settings.setCoins", function()
     it("leaves the lines and the other switches alone, as they leave it", function()
         local settings = Settings.defaults()
         Settings.setCoins(settings, true)
-        assert.same({ true, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, true, true, true, true, true, true, true, true }, lineStates(settings.lines))
         assert.is_true(settings.enabled)
         assert.is_true(settings.shiftDetail)
         Settings.setEnabled(settings, false)
@@ -370,7 +373,7 @@ describe("Settings.applyPreset", function()
         local settings = Settings.defaults()
         settings.enabled = false
         assert.is_true(Settings.applyPreset(settings, "basic"))
-        assert.same({ false, false, false, false, false, false, false, false }, lineStates(settings.lines))
+        assert.same({ false, false, false, false, false, false, false, false, false }, lineStates(settings.lines))
         -- The preset touches lines only.
         assert.is_false(settings.enabled)
         assert.is_true(settings.shiftDetail)
@@ -380,7 +383,7 @@ describe("Settings.applyPreset", function()
         local settings = Settings.defaults()
         Settings.applyPreset(settings, "basic")
         assert.is_true(Settings.applyPreset(settings, "standard"))
-        assert.same({ true, true, true, true, true, true, true, true }, lineStates(settings.lines))
+        assert.same({ true, true, true, true, true, true, true, true, true }, lineStates(settings.lines))
     end)
 
     it("answers false for an unknown preset and changes nothing", function()

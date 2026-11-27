@@ -575,10 +575,11 @@ describe("the /amdb command", function()
         it("lists every optional line with its state", function()
             local answer = run("lines")
             assert.equals(TITLE .. " optional tooltip lines (standard)", answer[1])
-            assert.equals("  sold" .. GOOD .. "  on" .. RESET, answer[2])
-            assert.equals("  listed" .. GOOD .. "  on" .. RESET, answer[4])
-            assert.equals("  markets" .. GOOD .. "  on" .. RESET, answer[9])
-            assert.equals(10, #answer)
+            assert.equals("  sold" .. GOOD .. "  on" .. RESET, answer[3])
+            assert.equals("  p05" .. GOOD .. "  on" .. RESET, answer[2])
+            assert.equals("  listed" .. GOOD .. "  on" .. RESET, answer[5])
+            assert.equals("  markets" .. GOOD .. "  on" .. RESET, answer[10])
+            assert.equals(11, #answer)
         end)
 
         it("switches one line, and writes it back at once", function()
@@ -594,7 +595,7 @@ describe("the /amdb command", function()
             run("sparkline off")
             local answer = run("lines")
             assert.equals(TITLE .. " optional tooltip lines (custom)", answer[1])
-            assert.equals("  sparkline" .. BAD .. "  off" .. RESET, answer[6])
+            assert.equals("  sparkline" .. BAD .. "  off" .. RESET, answer[7])
         end)
 
         it("answers every key of the settings module", function()
@@ -788,6 +789,7 @@ describe("the /amdb command", function()
                 "floorQty 1",
                 "listed 58",
                 "qtySum 58",
+                "p05 15900",
                 "seenFloor -",
                 "seenQty -",
                 "daysSinceListed 0",
@@ -833,7 +835,7 @@ describe("the /amdb command", function()
             -- live group holds the date of its last listing and nothing else.
             assert.same({ "194784", "item" }, { decoded("194784") })
             assert.equals(
-                "live floor - · floorQty - · listed - · qtySum - · seenFloor - · seenQty - · daysSinceListed 3",
+                "live floor - · floorQty - · listed - · qtySum - · p05 - · seenFloor - · seenQty - · daysSinceListed 3",
                 lines[3]
             )
         end)
@@ -841,7 +843,7 @@ describe("the /amdb command", function()
         it("reads a battle pet by species", function()
             assert.same({ "2546", "pet" }, { decoded("battlepet:2546") })
             assert.equals(
-                "live floor 2500000 · floorQty 1 · listed 2 · qtySum 2 · seenFloor - · seenQty - · daysSinceListed 0",
+                "live floor 2500000 · floorQty 1 · listed 2 · qtySum 2 · p05 - · seenFloor - · seenQty - · daysSinceListed 0",
                 lines[4]
             )
         end)

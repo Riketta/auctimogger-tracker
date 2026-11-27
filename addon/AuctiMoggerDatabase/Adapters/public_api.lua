@@ -47,6 +47,7 @@ local previousBuyout = rawget(_G, "GetAuctionBuyout")
 ---@field floorNow integer|nil copper: the cheapest unit price listed now
 ---@field floorQty integer|nil units listed at exactly the floor
 ---@field listedNow integer|nil listings in the snapshot
+---@field p05Now integer|nil copper: the 5th percentile of the unit prices in the newest snapshot, nearest rank
 ---@field seenFloor integer|nil copper: today's cheapest listing that is gone
 ---@field daysSinceListed integer|nil whole days since the item was last seen listed; 0 = today
 ---@field value number|nil copper: the record's reference value
@@ -213,6 +214,7 @@ local function toInfo(located, now)
         floorNow = live ~= nil and live.floor or nil,
         floorQty = live ~= nil and live.floorQty or nil,
         listedNow = live ~= nil and live.listed or nil,
+        p05Now = live ~= nil and live.p05 or nil,
         seenFloor = live ~= nil and live.seenFloor or nil,
         daysSinceListed = live ~= nil and live.daysSinceListed or nil,
         value = record:reference(),

@@ -648,6 +648,7 @@ function Options:decode(argument)
         { name = "floorQty", value = live ~= nil and live.floorQty or nil },
         { name = "listed", value = live ~= nil and live.listed or nil },
         { name = "qtySum", value = live ~= nil and live.qtySum or nil },
+        { name = "p05", value = live ~= nil and live.p05 or nil },
         { name = "seenFloor", value = live ~= nil and live.seenFloor or nil },
         { name = "seenQty", value = live ~= nil and live.seenQty or nil },
         { name = "daysSinceListed", value = live ~= nil and live.daysSinceListed or nil },

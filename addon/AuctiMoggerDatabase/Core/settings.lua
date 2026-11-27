@@ -15,12 +15,13 @@ A.Core = A.Core or {}
 local Settings = {}
 A.Core.Settings = Settings
 
-Settings.LINE_KEYS = { "sold", "lastSale", "listed", "low", "sparkline", "craft", "deal", "markets" }
+Settings.LINE_KEYS = { "p05", "sold", "lastSale", "listed", "low", "sparkline", "craft", "deal", "markets" }
 Settings.PRESETS = { "basic", "standard" }
 
 --- On/off state of every optional tooltip line (SPEC 7.7). A key that is
 --- absent in saved data means on; after coercion every key is a boolean.
 ---@class AmdbLineSettings
+---@field p05 boolean
 ---@field sold boolean
 ---@field lastSale boolean
 ---@field listed boolean
@@ -77,6 +78,7 @@ function Settings.defaults()
         shiftDetail = true,
         coins = false,
         lines = {
+            p05 = true,
             sold = true,
             lastSale = true,
             listed = true,

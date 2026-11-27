@@ -175,10 +175,12 @@ impl FakeSnapshots {
     }
 
     /// Listing summary of one recorded snapshot, derived from its listings —
-    /// the reference semantics the store's `snapshot_item_floor` rows publish.
+    /// the reference semantics the store's `snapshot_item_floor` rows publish,
+    /// `p05` included (nearest rank, one sample per listing).
     fn summary(&self, snapshot_id: i64) -> HashMap<ItemRef, amtracker_core::domain::SnapshotFloor> {
         let inner = self.inner.lock().unwrap();
         let mut out: HashMap<ItemRef, amtracker_core::domain::SnapshotFloor> = HashMap::new();
+        let mut prices: HashMap<ItemRef, Vec<i64>> = HashMap::new();
         for listing in inner.listings.get(&snapshot_id).into_iter().flatten() {
             let floor = out.entry(listing.item_ref.clone()).or_insert(
                 amtracker_core::domain::SnapshotFloor {
@@ -186,6 +188,7 @@ impl FakeSnapshots {
                     floor_qty: 0,
                     listing_count: 0,
                     qty_sum: 0,
+                    p05: None,
                 },
             );
             if listing.unit_price < floor.floor_price {
@@ -197,6 +200,18 @@ impl FakeSnapshots {
             }
             floor.listing_count += 1;
             floor.qty_sum += listing.quantity;
+            prices.entry(listing.item_ref.clone()).or_default().push(listing.unit_price);
+        }
+        for (item, floor) in &mut out {
+            let Some(samples) = prices.get_mut(item) else {
+                continue;
+            };
+            samples.sort_unstable();
+            let rank = amtracker_core::metrics::nearest_rank(
+                i64::try_from(samples.len()).unwrap_or(1),
+                0.05,
+            );
+            floor.p05 = samples.get(rank - 1).copied();
         }
         out
     }

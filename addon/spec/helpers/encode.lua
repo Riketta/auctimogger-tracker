@@ -23,7 +23,7 @@ local SPAN_NAMES = { "d1", "d7", "d14", "d30" }
 local SFLAG_SALE_RATE, SFLAG_SALE_RATE_180D, SFLAG_DAYS_SINCE_LAST_SALE, SFLAG_CLOSURES, SFLAG_QTY_SOLD =
     0x01, 0x02, 0x04, 0x08, 0x10
 
-local LFLAG_LISTED, LFLAG_QTY_SUM, LFLAG_SEEN, LFLAG_DAYS_LISTED = 0x01, 0x02, 0x04, 0x08
+local LFLAG_LISTED, LFLAG_QTY_SUM, LFLAG_SEEN, LFLAG_DAYS_LISTED, LFLAG_P05 = 0x01, 0x02, 0x04, 0x08, 0x10
 local VFLAG_SOLD_MEDIAN14, VFLAG_TREND = 0x01, 0x02
 local EFLAG_SOLD_COUNT, EFLAG_EXPIRED_COUNT, EFLAG_SUPPLY_DAYS = 0x01, 0x02, 0x04
 local PFLAG_LOW30, PFLAG_LOW_RANK, PFLAG_LOWS = 0x01, 0x02, 0x04
@@ -250,8 +250,8 @@ end
 
 --- The `live` group: the listing summary, then what was seen and is gone,
 --- then how long ago the item was last listed. `listed` carries `floor`,
---- `floorQty` and `listed` together; `qtySum` only rides with it; `seenFloor`
---- carries `seenQty`.
+--- `floorQty` and `listed` together; `qtySum` and `p05` only ride with it;
+--- `seenFloor` carries `seenQty`.
 local function putLive(out, live)
     local lflags = 0
     if live.listed ~= nil then
@@ -259,6 +259,9 @@ local function putLive(out, live)
     end
     if live.qtySum ~= nil then
         lflags = lflags + LFLAG_QTY_SUM
+    end
+    if live.p05 ~= nil then
+        lflags = lflags + LFLAG_P05
     end
     if live.seenFloor ~= nil then
         lflags = lflags + LFLAG_SEEN
@@ -274,6 +277,9 @@ local function putLive(out, live)
         put(out, Encode.uint(live.listed))
         if live.qtySum ~= nil then
             put(out, Encode.uint(live.qtySum))
+        end
+        if live.p05 ~= nil then
+            put(out, Encode.uint(live.p05))
         end
     end
     if live.seenFloor ~= nil then

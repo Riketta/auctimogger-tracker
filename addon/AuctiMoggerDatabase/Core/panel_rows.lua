@@ -83,6 +83,7 @@ local MARKET_HELP = "The market whose prices the tooltip shows. Other markets sh
 -- two tables to the settings module, so that never happens.
 ---@type table<string, string>
 local LINE_TEXT = {
+    p05 = "Live p05",
     sold = "Sold per day and supply",
     lastSale = "Last sale",
     listed = "Last listed",
@@ -95,6 +96,7 @@ local LINE_TEXT = {
 
 ---@type table<string, string>
 local LINE_HELP = {
+    p05 = "The price under which the cheapest 5% of the listings in the newest snapshot sit: the sniping level, right under the min buyout.",
     sold = "Units sold per day over the last 14 days, and how long the listed stock lasts.",
     lastSale = "How many days ago the item last sold.",
     listed = "How many days ago the item was last seen listed on the auction house.",

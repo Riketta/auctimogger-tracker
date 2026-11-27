@@ -401,12 +401,14 @@ fn attach(
     craft: Option<CraftQuote>,
     deal: Option<DealMark>,
 ) -> ItemRecord {
-    // The live group, straight from the newest snapshot.
+    // The live group, straight from the newest snapshot: the stored `p05`
+    // travels exactly as read, absent when the row predates the column.
     let listed = floor.map(|floor| LiveListing {
         floor: floor.floor_price,
         floor_qty: floor.floor_qty.max(0),
         listed: i64::try_from(floor.listing_count).unwrap_or(i64::MAX),
         qty_sum: (floor.qty_sum > 0).then_some(floor.qty_sum),
+        p05: floor.p05,
     });
     // Read off the facts before the sighting below consumes them.
     let last_listed_day = facts.as_ref().and_then(|facts| facts.last_listed_day);
@@ -616,8 +618,16 @@ mod tests {
         spans
     }
 
+    /// A listing summary of three listings; its `p05` sits a little above the
+    /// floor, distinct from every other figure here.
     fn floor(price: i64, qty: i64) -> SnapshotFloor {
-        SnapshotFloor { floor_price: price, floor_qty: qty, listing_count: 3, qty_sum: 100 }
+        SnapshotFloor {
+            floor_price: price,
+            floor_qty: qty,
+            listing_count: 3,
+            qty_sum: 100,
+            p05: Some(price + 500),
+        }
     }
 
     /// A steady seller: a sold-source value, today's median under the week
@@ -661,7 +671,8 @@ mod tests {
                     floor: 90_000,
                     floor_qty: 5,
                     listed: 3,
-                    qty_sum: Some(100)
+                    qty_sum: Some(100),
+                    p05: Some(90_500),
                 }),
                 // A sighting level with the live floor is that listing, still up.
                 seen: None,
@@ -720,6 +731,7 @@ mod tests {
                     floor_qty: 1,
                     listed: 3,
                     qty_sum: Some(100),
+                    p05: Some(110_500),
                 }),
                 seen: Some(SeenListing { floor: 90_000, qty: 2 }),
                 days_since_listed: Some(0),
@@ -804,6 +816,7 @@ mod tests {
                     floor_qty: 0,
                     listed: 3,
                     qty_sum: Some(100),
+                    p05: Some(90_500),
                 }),
                 seen: None,
                 days_since_listed: Some(0),
@@ -818,6 +831,35 @@ mod tests {
         );
         let bare = attach(spans(), None, None, true, TODAY, None, None);
         assert_eq!(bare, spans_only(spans()));
+    }
+
+    /// The live group carries the snapshot's stored `p05` exactly as read — it
+    /// is not filtered the way `qtySum` is — and a row without one (written
+    /// before the column) leaves it absent rather than inventing a figure.
+    #[test]
+    fn the_live_group_carries_the_stored_p05_and_leaves_an_absent_one_absent() {
+        let listed = |floor: SnapshotFloor| {
+            attach(spans(), None, Some(floor), true, TODAY, None, None)
+                .live
+                .and_then(|live| live.listed)
+        };
+        assert_eq!(listed(floor(90_000, 5)).map(|listing| listing.p05), Some(Some(90_500)));
+        // A pre-column row: no p05, everything else intact.
+        let legacy = listed(SnapshotFloor { p05: None, ..floor(90_000, 5) });
+        assert_eq!(
+            legacy,
+            Some(LiveListing {
+                floor: 90_000,
+                floor_qty: 5,
+                listed: 3,
+                qty_sum: Some(100),
+                p05: None,
+            })
+        );
+        // Nothing carries quantity: `qtySum` reads as absent, `p05` does not
+        // depend on it and stays.
+        let dry = listed(SnapshotFloor { qty_sum: 0, ..floor(90_000, 5) });
+        assert_eq!(dry.map(|listing| (listing.qty_sum, listing.p05)), Some((None, Some(90_500))));
     }
 
     #[test]

@@ -85,7 +85,7 @@ local STUBS = {
 
 -- What registering the options panel creates at the login, after the tooltip:
 -- its frame, then one control per row of the model (Core/panel_rows.lua): the
--- master switch's checkbox, the two preset buttons, eight line checkboxes, Shift
+-- master switch's checkbox, the two preset buttons, nine line checkboxes, Shift
 -- detail's and the coin icons', and the primary-market picker. A font string is
 -- not a frame.
 local PANEL_CREATED = {
@@ -93,6 +93,7 @@ local PANEL_CREATED = {
     "CheckButton",
     "Button",
     "Button",
+    "CheckButton",
     "CheckButton",
     "CheckButton",
     "CheckButton",

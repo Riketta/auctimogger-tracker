@@ -148,10 +148,17 @@ fn spans_only(spans: Vec<(Span, MetricBlock)>) -> ItemRecord {
 }
 
 /// A listed item in the newest snapshot, with nothing seen gone: listed
-/// today, so last listed today.
-fn listing(floor: i64, floor_qty: i64, listed: i64, qty_sum: Option<i64>) -> LiveQuote {
+/// today, so last listed today. `p05` is the live 5th percentile of the
+/// snapshot's listing unit prices.
+fn listing(
+    floor: i64,
+    floor_qty: i64,
+    listed: i64,
+    qty_sum: Option<i64>,
+    p05: Option<i64>,
+) -> LiveQuote {
     LiveQuote {
-        listed: Some(LiveListing { floor, floor_qty, listed, qty_sum }),
+        listed: Some(LiveListing { floor, floor_qty, listed, qty_sum, p05 }),
         seen: None,
         days_since_listed: Some(0),
     }
@@ -198,7 +205,7 @@ fn steady_seller() -> DatabaseEntry {
         item(25),
         Category::Item,
         ItemRecord {
-            live: Some(listing(15000, 1, 58, Some(58))),
+            live: Some(listing(15000, 1, 58, Some(58), Some(15_900))),
             value: Some(ValueQuote {
                 value7: 7030,
                 samples7: 188,
@@ -245,7 +252,7 @@ fn never_sells() -> DatabaseEntry {
         item(117),
         Category::Item,
         ItemRecord {
-            live: Some(listing(9_999_999_999, 1, 1, Some(1))),
+            live: Some(listing(9_999_999_999, 1, 1, Some(1), Some(10_000_000_000))),
             value: Some(ValueQuote {
                 value7: 9_500_000_000,
                 samples7: 3,
@@ -343,7 +350,7 @@ fn losing_craft() -> DatabaseEntry {
         item(191_460),
         Category::Commodity,
         ItemRecord {
-            live: Some(listing(90_000, 100, 3, None)),
+            live: Some(listing(90_000, 100, 3, None, Some(92_000))),
             value: Some(ValueQuote {
                 value7: 80_000,
                 samples7: 21,
@@ -401,7 +408,7 @@ fn bulk_commodity() -> DatabaseEntry {
         item(191_461),
         Category::Commodity,
         ItemRecord {
-            live: Some(listing(12, 200_000, 4321, Some(1_234_567_890))),
+            live: Some(listing(12, 200_000, 4321, Some(1_234_567_890), Some(13))),
             value: Some(ValueQuote {
                 value7: 18,
                 samples7: 30_112,
@@ -481,6 +488,7 @@ fn everything() -> DatabaseEntry {
                     floor_qty: 214,
                     listed: 618,
                     qty_sum: Some(1234),
+                    p05: Some(3_820_000),
                 }),
                 seen: Some(SeenListing { floor: 3_750_000, qty: 5 }),
                 days_since_listed: Some(0),
@@ -508,7 +516,9 @@ fn everything() -> DatabaseEntry {
     )
 }
 
-/// A species with a single variant: full groups, keyed by species.
+/// A species with a single variant: full groups, keyed by species. Its
+/// listing carries no `p05`: a snapshot summary written before that column,
+/// which is every floor row right after the upgrade that added it.
 fn single_variant_pet() -> DatabaseEntry {
     let d1 = ledger(flat(2, 2_500_000), Some(1.0), None, Some(0), Some(0), Some(1));
     let d7 = ledger(flat(12, 2_400_000), Some(1.0), None, Some(0), Some(0), Some(6));
@@ -516,7 +526,7 @@ fn single_variant_pet() -> DatabaseEntry {
         pet(2546),
         Category::Pet,
         ItemRecord {
-            live: Some(listing(2_500_000, 1, 2, Some(2))),
+            live: Some(listing(2_500_000, 1, 2, Some(2), None)),
             value: Some(ValueQuote {
                 value7: 2_400_000,
                 samples7: 12,
@@ -687,6 +697,9 @@ fn oracle_record(out: &mut String, key: i64, record: &ItemRecord) {
             fields.push(format!("listed = {}", listing.listed));
             if let Some(qty_sum) = listing.qty_sum {
                 fields.push(format!("qtySum = {qty_sum}"));
+            }
+            if let Some(p05) = listing.p05 {
+                fields.push(format!("p05 = {p05}"));
             }
         }
         if let Some(seen) = &live.seen {
@@ -862,6 +875,10 @@ fn the_twin_mirrors_the_carrier() {
                     Some(listing) => {
                         assert_eq!(json["live"]["floor"], listing.floor);
                         assert_eq!(json["live"]["floorQty"], listing.floor_qty);
+                        match listing.p05 {
+                            Some(p05) => assert_eq!(json["live"]["p05"], p05),
+                            None => assert!(json["live"].get("p05").is_none()),
+                        }
                     }
                     None => assert!(json["live"].get("floor").is_none(), "gone today: no floor"),
                 }
@@ -940,6 +957,20 @@ fn the_fixture_exercises_every_group_and_flag() {
         record.live.as_ref().and_then(|live| live.days_since_listed)
     }
 
+    /// The live `p05` of a listed record.
+    fn live_p05(record: &ItemRecord) -> Option<i64> {
+        record.live.as_ref().and_then(|live| live.listed.as_ref()).and_then(|listing| listing.p05)
+    }
+
+    /// Listed with a `p05` but without a `qtySum`: the two flags are independent.
+    fn p05_without_sum(record: &ItemRecord) -> bool {
+        record
+            .live
+            .as_ref()
+            .and_then(|live| live.listed.as_ref())
+            .is_some_and(|listing| listing.p05.is_some() && listing.qty_sum.is_none())
+    }
+
     let records = fixture_records();
     let matching = |test: fn(&ItemRecord) -> bool| count_matching(&records, test);
     assert!(matching(|record| record.live.is_some()) >= 8, "live group");
@@ -992,6 +1023,22 @@ fn the_fixture_exercises_every_group_and_flag() {
             .is_some_and(|listing| listing.qty_sum.is_none())
     };
     assert!(matching(listing_without_sum) >= 1, "a listing without a quantity sum");
+    assert!(matching(|record| live_p05(record).is_some()) >= 5, "a live p05");
+    assert!(
+        matching(p05_without_sum) >= 1,
+        "a live p05 without a quantity sum: the flags are independent"
+    );
+    let listing_without_p05 = |record: &ItemRecord| {
+        record
+            .live
+            .as_ref()
+            .and_then(|live| live.listed.as_ref())
+            .is_some_and(|listing| listing.p05.is_none())
+    };
+    assert!(
+        matching(listing_without_p05) >= 1,
+        "a listing without a p05: a snapshot summary from before the column"
+    );
     let sold_median = |record: &ItemRecord| {
         record.value.as_ref().is_some_and(|value| value.sold_median14.is_some())
     };

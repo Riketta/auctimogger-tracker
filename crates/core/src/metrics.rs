@@ -10,6 +10,16 @@ use crate::domain::{
     MetricBlock,
 };
 
+/// The metrics engine's percentile index: the nearest-rank method,
+/// `ceil(fraction · n)` clamped to `[1, n]`, so a span block's `p05` and the
+/// live `p05` of a snapshot agree on which listing they read. `n` is the
+/// sample count and must be at least 1 (an empty population has no index).
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss, clippy::cast_precision_loss)]
+#[must_use]
+pub fn nearest_rank(n: i64, fraction: f64) -> usize {
+    (fraction * n as f64).ceil().clamp(1.0, n as f64) as usize
+}
+
 /// Computes one analytics block from the merged item-day histograms of the
 /// requested window. Returns `None` when there is no data at all.
 ///
@@ -22,8 +32,9 @@ use crate::domain::{
 // Histogram-derived indices are clamped or derived from `samples.len()`, so
 // slicing cannot go out of bounds; a `.get()` fallback would silently corrupt
 // metrics on a logic bug, while a panic fails loudly. Sample counts sit far
-// below every cast boundary; `i64 → f64` only shapes the percentile *index*
-// fraction (prices stay `i64`), mirroring the addon's Lua doubles.
+// below every cast boundary; the `i64 → f64` inside `nearest_rank` only shapes
+// the percentile *index* fraction (prices stay `i64`), mirroring the addon's
+// Lua doubles.
 #[allow(
     clippy::indexing_slicing,
     clippy::cast_possible_wrap,
@@ -61,11 +72,7 @@ pub fn block_from_histograms(
 
     let n = samples.len() as i64;
     let last = (n - 1) as usize;
-    let percentile = |fraction: f64| -> i64 {
-        let idx = (fraction * n as f64).ceil();
-        let idx = idx.clamp(1.0, n as f64) as usize;
-        samples[idx - 1]
-    };
+    let percentile = |fraction: f64| -> i64 { samples[nearest_rank(n, fraction) - 1] };
     let mid = ((n + 1) / 2) as usize; // ceil(n / 2)
                                       // `midpoint` (not `(a + b) / 2`): prices/deviations are non-negative, so
                                       // it floors identically while staying overflow-free (clippy::manual_midpoint).
@@ -251,6 +258,32 @@ mod tests {
         let unsorted = block(&[(500, 50), (100, 10), (400, 40), (200, 20), (300, 30)]);
         let sorted = block(&[(100, 10), (200, 20), (300, 30), (400, 40), (500, 50)]);
         assert_eq!(unsorted, sorted);
+    }
+
+    /// The estimator the span blocks and the live p05 share: nearest rank, so
+    /// the fifth percentile of 21 listings is the second cheapest and of 20 the
+    /// cheapest, and a block reads exactly where its index points.
+    #[test]
+    fn nearest_rank_points_at_the_sample_the_block_reads() {
+        for (n, fraction, expected) in [
+            (1, 0.05, 1),
+            (20, 0.05, 1),
+            (21, 0.05, 2),
+            (4, 0.25, 1),
+            (4, 0.5, 2),
+            (4, 0.75, 3),
+            (5, 0.95, 5),
+        ] {
+            assert_eq!(nearest_rank(n, fraction), expected, "n = {n}, fraction = {fraction}");
+        }
+        // Twenty-one listings at 100, 200, … : the fifth percentile is the
+        // second cheapest and the ninety-fifth the twentieth.
+        let samples: Vec<(i64, i64)> = (0..21).map(|n| (100 * (n + 1), 1)).collect();
+        let block = block(&samples);
+        assert_eq!(nearest_rank(block.n, 0.05), 2);
+        assert_eq!(block.p05, 200);
+        assert_eq!(nearest_rank(block.n, 0.95), 20);
+        assert_eq!(block.p95, 2000);
     }
 
     /// Same evidence merged into one bucket must yield the identical block —

@@ -114,7 +114,13 @@ use rusqlite::Connection;
 /// before the table existed are rebuilt on first read, see
 /// `SnapshotRepository::floors`). The `idx_item_day_window` scan index is
 /// created after the migration ladder instead — it needs the v7 `category`
-/// column and must reach current-version files too.
+/// column and must reach current-version files too. The floor table's `p05`
+/// column is a shape-guarded additive ALTER for the same reason the table
+/// itself rides the `SCHEMA` batch: fresh files get it from the batch, files
+/// already at the current version get it after the ladder, and its pre-column
+/// rows heal on first read like the table's own missing rows. Its partial
+/// `idx_snapshot_floor_unpriced` index follows the column there — it names the
+/// column, so it cannot ride the batch.
 const SCHEMA_VERSION: i64 = 11;
 
 /// One-shot v5 → v6 catalog rebuild: both catalog tables move from bare-id
@@ -297,6 +303,10 @@ CREATE TABLE IF NOT EXISTS snapshot_item_floor (
     floor_qty INTEGER NOT NULL,
     listing_count INTEGER NOT NULL,
     qty_sum INTEGER NOT NULL,
+    -- 5th percentile of the snapshot's listing unit prices (nearest rank).
+    -- NULL on rows written before the column existed, until the snapshot's
+    -- floor rows are rebuilt on first read.
+    p05 INTEGER,
     PRIMARY KEY (snapshot_id, item_ref_id)
 );
 
@@ -728,6 +738,42 @@ impl SqliteStore {
             )
             .map_err(|e| backend("create day-fold window index", e))?;
         }
+        // The live summary's `p05` column. Like the window index it sits
+        // after the ladder, not in a version gate: a fresh file already has it
+        // from `SCHEMA`, a pre-table file gets the whole table from `SCHEMA`,
+        // and a file already at the current version — the ladder is gated on
+        // `version < SCHEMA_VERSION` — only converges here. Idempotent. The
+        // column is nullable; a row written before it reads as `None` until
+        // the snapshot's floor rows heal on first read.
+        if !column_exists(&conn, "snapshot_item_floor", "p05")? {
+            tracing::info!("adding the live p05 column (snapshot_item_floor.p05)");
+            conn.execute_batch("ALTER TABLE snapshot_item_floor ADD COLUMN p05 INTEGER")
+                .map_err(|e| backend("migrate snapshot_item_floor.p05", e))?;
+        }
+        // Every floor read first probes for a row of the snapshot still
+        // carrying NULL `p05` — a pre-column row awaiting its rebuild. This
+        // partial index keeps that probe a seek: without it, proving that no
+        // row is left unhealed walks the snapshot's whole set on every read, and
+        // the single-item `floor()` point read (one call per alert rule) stops
+        // being one. The index is empty once every row is healed. It names the
+        // column, so it is created after the guard above and never in `SCHEMA`:
+        // a pre-column file only gains the column there. Idempotent.
+        let has_unpriced_index = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1)",
+                rusqlite::params!["idx_snapshot_floor_unpriced"],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|flag| flag == 1)
+            .map_err(|e| backend("inspect snapshot floor indexes", e))?;
+        if !has_unpriced_index {
+            tracing::info!("creating the unhealed floor-row index (idx_snapshot_floor_unpriced)");
+            conn.execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_snapshot_floor_unpriced
+                 ON snapshot_item_floor(snapshot_id) WHERE p05 IS NULL",
+            )
+            .map_err(|e| backend("create unhealed floor-row index", e))?;
+        }
         Ok(Self { conn: Mutex::new(conn), archive_dir: archive_dir.to_path_buf(), clock })
     }
 
@@ -1149,15 +1195,16 @@ impl SnapshotRepository for SqliteStore {
         let conn = self.open_transaction();
         // A snapshot recorded before the floor rows existed (an older binary,
         // or this very upgrade) heals on first read: its summary is rebuilt
-        // from the retained listings under the same hold, once.
-        if !snapshot_has_floors(&conn, snapshot_id)? {
+        // from the retained listings under the same hold, once. So does one
+        // whose rows predate the `p05` column.
+        if snapshot_floors_need_rebuild(&conn, snapshot_id)? {
             rebuild_snapshot_floors(&conn, target, Some(kind), snapshot_id)?;
         }
         // The (snapshot, item) primary key serves the whole filter.
         let mut statement = conn
             .prepare(
                 "SELECT r.kind, r.item_id, r.pet_species, r.pet_level, r.pet_quality, r.pet_breed,
-                        f.floor_price, f.floor_qty, f.listing_count, f.qty_sum
+                        f.floor_price, f.floor_qty, f.listing_count, f.qty_sum, f.p05
                  FROM snapshot_item_floor f JOIN item_ref r ON r.id = f.item_ref_id
                  WHERE f.snapshot_id = ?1",
             )
@@ -1193,11 +1240,11 @@ impl SnapshotRepository for SqliteStore {
         let Some(item_ref_id) = lookup_item_ref(&conn, item)? else {
             return Ok(None);
         };
-        if !snapshot_has_floors(&conn, snapshot_id)? {
+        if snapshot_floors_need_rebuild(&conn, snapshot_id)? {
             rebuild_snapshot_floors(&conn, target, None, snapshot_id)?;
         }
         conn.query_row(
-            "SELECT floor_price, floor_qty, listing_count, qty_sum FROM snapshot_item_floor
+            "SELECT floor_price, floor_qty, listing_count, qty_sum, p05 FROM snapshot_item_floor
              WHERE snapshot_id = ?1 AND item_ref_id = ?2",
             rusqlite::params![snapshot_id, item_ref_id],
             |row| {
@@ -1206,6 +1253,7 @@ impl SnapshotRepository for SqliteStore {
                     floor_qty: row.get::<_, i64>(1)?.max(0),
                     listing_count: u64::try_from(row.get::<_, i64>(2)?).unwrap_or(0),
                     qty_sum: row.get(3)?,
+                    p05: row.get(4)?,
                 })
             },
         )
@@ -4370,17 +4418,26 @@ fn lookup_item_ref(conn: &Connection, item: &ItemRef) -> Result<Option<i64>, Sto
 
 /// Per-item listing summary built during one `record` pass (or a rebuild):
 /// the numbers [`SnapshotFloor`] publishes.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct FloorAccumulator {
     floor_price: i64,
     floor_qty: i64,
     listing_count: u64,
     qty_sum: i64,
+    /// Listings per unit price: the population behind `p05`, one sample per
+    /// listing — the same sampling the span blocks use.
+    prices: BTreeMap<i64, u64>,
 }
 
 impl FloorAccumulator {
     fn new(price: i64) -> Self {
-        Self { floor_price: price, floor_qty: 0, listing_count: 0, qty_sum: 0 }
+        Self {
+            floor_price: price,
+            floor_qty: 0,
+            listing_count: 0,
+            qty_sum: 0,
+            prices: BTreeMap::new(),
+        }
     }
 
     /// Folds one listing in. Quantities are non-negative by construction; a
@@ -4396,6 +4453,28 @@ impl FloorAccumulator {
         }
         self.listing_count = self.listing_count.saturating_add(1);
         self.qty_sum = self.qty_sum.saturating_add(quantity);
+        let count = self.prices.entry(price).or_insert(0);
+        *count = count.saturating_add(1);
+    }
+
+    /// The nearest-rank 5th percentile of the observed unit prices, one
+    /// sample per listing: the metrics engine's own index, so the live figure
+    /// and a span block over the same listings agree. Walks the prices in
+    /// ascending order until the cumulative listing count reaches the rank.
+    /// The floor is the fallback for a population the walk never covers, which
+    /// no accumulator with a listing can produce.
+    fn p05(&self) -> i64 {
+        let listings = i64::try_from(self.listing_count).unwrap_or(i64::MAX);
+        let target = u64::try_from(amtracker_core::metrics::nearest_rank(listings, 0.05))
+            .unwrap_or(u64::MAX);
+        let mut seen = 0u64;
+        for (price, count) in &self.prices {
+            seen = seen.saturating_add(*count);
+            if seen >= target {
+                return *price;
+            }
+        }
+        self.floor_price
     }
 }
 
@@ -4423,6 +4502,7 @@ fn stored_floor_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredFloo
             floor_qty: row.get::<_, i64>(7)?.max(0),
             listing_count: u64::try_from(row.get::<_, i64>(8)?).unwrap_or(0),
             qty_sum: row.get(9)?,
+            p05: row.get(10)?,
         },
     })
 }
@@ -4440,8 +4520,8 @@ fn insert_snapshot_floors(
     let mut insert = conn
         .prepare(
             "INSERT OR REPLACE INTO snapshot_item_floor
-                (snapshot_id, item_ref_id, floor_price, floor_qty, listing_count, qty_sum)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                (snapshot_id, item_ref_id, floor_price, floor_qty, listing_count, qty_sum, p05)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .map_err(|e| backend("prepare snapshot floor", e))?;
     for (item_ref_id, summary) in rows {
@@ -4453,15 +4533,23 @@ fn insert_snapshot_floors(
                 summary.floor_qty,
                 i64::try_from(summary.listing_count).unwrap_or(i64::MAX),
                 summary.qty_sum,
+                summary.p05(),
             ])
             .map_err(|e| backend("insert snapshot floor", e))?;
     }
     Ok(())
 }
 
-fn snapshot_has_floors(conn: &Connection, snapshot_id: i64) -> Result<bool, StoreError> {
+/// Whether a snapshot's floor rows need a rebuild before they are read: it has
+/// none at all (recorded before the table existed), or any row written before
+/// the `p05` column. Floor rows only exist while their listings do (the prune
+/// drops them together), so the rebuild always finds its rows, and one rebuild
+/// leaves no NULL behind — it never repeats. The NULL lookup rides the partial
+/// `idx_snapshot_floor_unpriced` index (see `SqliteStore::open`).
+fn snapshot_floors_need_rebuild(conn: &Connection, snapshot_id: i64) -> Result<bool, StoreError> {
     conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM snapshot_item_floor WHERE snapshot_id = ?1)",
+        "SELECT NOT EXISTS (SELECT 1 FROM snapshot_item_floor WHERE snapshot_id = ?1)
+            OR EXISTS (SELECT 1 FROM snapshot_item_floor WHERE snapshot_id = ?1 AND p05 IS NULL)",
         rusqlite::params![snapshot_id],
         |row| row.get::<_, i64>(0),
     )
@@ -4470,7 +4558,8 @@ fn snapshot_has_floors(conn: &Connection, snapshot_id: i64) -> Result<bool, Stor
 }
 
 /// Rebuilds a snapshot's floor rows from its retained listings, so a
-/// snapshot recorded before the table existed converges on first read. One
+/// snapshot recorded before the table existed — or before its `p05` column —
+/// converges on first read. One
 /// bounded pass over that snapshot's own listing rows: `INDEXED BY` pins the
 /// `snapshot_id` index — without statistics the planner also considers the
 /// (target, item, snapshot) index, which this filter can only scan. `kind`

@@ -280,4 +280,21 @@ describe("the golden records' other derived values", function()
         -- A pooled species carries spans only: no live group, so no date.
         assert.is_nil(read("pets", 293).live)
     end)
+
+    it("read the live p05 off the listing it belongs to", function()
+        -- The 5th percentile of the snapshot's listing prices, beside the floor.
+        assert.equals(15900, read("items", 25).live.p05)
+        assert.equals(3820000, read("commodities", 194784).live.p05)
+        -- With a p05 but without a quantity sum: the two flags are independent.
+        local craft = read("commodities", 191460)
+        assert.equals(92000, craft.live.p05)
+        assert.is_nil(craft.live.qtySum)
+        -- A listing from a snapshot summary older than the p05 column.
+        local pet = read("pets", 2546)
+        assert.equals(2500000, pet.live.floor)
+        assert.is_nil(pet.live.p05)
+        -- Nothing listed: no percentile to carry.
+        assert.is_nil(read("items", 2589).live.p05)
+        assert.is_nil(read("items", 194784).live.p05)
+    end)
 end)

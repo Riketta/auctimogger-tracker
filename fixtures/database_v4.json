@@ -97,6 +97,7 @@
         "floorQty": 1,
         "listed": 58,
         "qtySum": 58,
+        "p05": 15900,
         "daysSinceListed": 0
       },
       "value7": 7030,
@@ -167,6 +168,7 @@
         "floorQty": 1,
         "listed": 1,
         "qtySum": 1,
+        "p05": 10000000000,
         "daysSinceListed": 0
       },
       "value7": 9500000000,
@@ -381,6 +383,7 @@
         "floor": 90000,
         "floorQty": 100,
         "listed": 3,
+        "p05": 92000,
         "daysSinceListed": 0
       },
       "value7": 80000,
@@ -487,6 +490,7 @@
         "floorQty": 200000,
         "listed": 4321,
         "qtySum": 1234567890,
+        "p05": 13,
         "daysSinceListed": 0
       },
       "value7": 18,
@@ -624,6 +628,7 @@
         "floorQty": 214,
         "listed": 618,
         "qtySum": 1234,
+        "p05": 3820000,
         "seenFloor": 3750000,
         "seenQty": 5,
         "daysSinceListed": 0

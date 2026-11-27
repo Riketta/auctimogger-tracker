@@ -2936,11 +2936,23 @@ fn record_writes_per_item_snapshot_floors() {
     assert_eq!(floors.len(), 2);
     assert_eq!(
         floors.get(&item(1)),
-        Some(&SnapshotFloor { floor_price: 100, floor_qty: 25, listing_count: 3, qty_sum: 35 })
+        Some(&SnapshotFloor {
+            floor_price: 100,
+            floor_qty: 25,
+            listing_count: 3,
+            qty_sum: 35,
+            p05: Some(100)
+        })
     );
     assert_eq!(
         floors.get(&item(2)),
-        Some(&SnapshotFloor { floor_price: 999, floor_qty: 6, listing_count: 3, qty_sum: 6 })
+        Some(&SnapshotFloor {
+            floor_price: 999,
+            floor_qty: 6,
+            listing_count: 3,
+            qty_sum: 6,
+            p05: Some(999)
+        })
     );
     assert_eq!(
         store.floor(&target, &item(1), id).expect("floor"),
@@ -2999,6 +3011,307 @@ fn floors_rebuild_from_listings_when_rows_are_missing() {
         assert_eq!(rows, 1);
     }
     assert_eq!(store.floor(&target, &item(1), id).expect("floor").map(|f| f.floor_price), Some(90));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The summary's `p05` is the nearest-rank 5th percentile of the snapshot's own
+/// listings, one sample per listing — the estimator the span blocks use: the
+/// second cheapest of twenty-one, the cheapest of twenty, a single listing
+/// itself. It counts listings, not quantity: listings without any still get
+/// one while their quantity sum reads as zero.
+#[test]
+fn floors_carry_the_nearest_rank_p05_of_the_listings() {
+    let dir = temp_dir("floors-p05");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    // Item 1: twenty-one listings at distinct prices 1000 … 1020, recorded in
+    // descending order to prove the order of the listings does not matter.
+    let mut spread: Vec<NormalizedListing> =
+        (0..21).map(|n| listing(100 + n, &item(1), 1000 + n, 3)).collect();
+    spread.reverse();
+    // Item 2: twenty listings at 50 … 69, none carrying a quantity.
+    let flat: Vec<NormalizedListing> =
+        (0..20).map(|n| listing(200 + n, &item(2), 50 + n, 0)).collect();
+    // Item 3: one listing — its percentile is itself.
+    let single = [listing(300, &item(3), 777, 4)];
+    let mut all = spread;
+    all.extend(flat);
+    all.extend(single);
+    let id = store
+        .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 42), &all, b"p05")
+        .expect("record");
+
+    let floors = store.floors(&target, PayloadKind::Commodities, id).expect("floors");
+    assert_eq!(
+        floors.get(&item(1)),
+        Some(&SnapshotFloor {
+            floor_price: 1000,
+            floor_qty: 3,
+            listing_count: 21,
+            qty_sum: 63,
+            p05: Some(1001)
+        }),
+        "ceil(0.05 × 21) = 2: the second cheapest"
+    );
+    assert_eq!(
+        floors.get(&item(2)),
+        Some(&SnapshotFloor {
+            floor_price: 50,
+            floor_qty: 0,
+            listing_count: 20,
+            qty_sum: 0,
+            p05: Some(50)
+        }),
+        "ceil(0.05 × 20) = 1: the cheapest — p05 without any quantity behind it"
+    );
+    assert_eq!(floors.get(&item(3)).map(|f| f.p05), Some(Some(777)));
+    // The point read agrees with the bulk read, p05 included.
+    assert_eq!(store.floor(&target, &item(1), id).expect("floor"), floors.get(&item(1)).copied());
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A floor row written before the `p05` column heals on first read: the
+/// snapshot's rows are rebuilt from its retained listings, `p05` filled and
+/// every other field unchanged, under the bulk read and the single-item read
+/// alike — and once only, since no row is left NULL. A row whose listings are
+/// gone has nothing to rebuild from and reads as `None` instead of failing.
+#[test]
+fn pre_column_floor_rows_heal_on_first_read() {
+    let dir = temp_dir("floors-p05-heal");
+    let db = dir.join("db.sqlite3");
+    let store = open_store(&dir, 1_000_000);
+    let target = TargetId("us-4".into());
+    // Item 2: one listing at 999 and twenty at 1001, so its p05 (the second
+    // cheapest of 21) sits above its floor and a healed row is provable.
+    let mut live = vec![
+        listing(1, &item(1), 100, 20),
+        listing(2, &item(1), 100, 5),
+        listing(3, &item(1), 250, 10),
+        listing(4, &item(2), 999, 1),
+    ];
+    live.extend((0..20).map(|n| listing(100 + n, &item(2), 1001, 2)));
+    let id = store
+        .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 24), &live, b"heal")
+        .expect("record");
+    let before = store.floors(&target, PayloadKind::Commodities, id).expect("floors");
+    assert_eq!(before.get(&item(1)).map(|f| f.p05), Some(Some(100)));
+    assert_eq!(before.get(&item(2)).map(|f| (f.floor_price, f.p05)), Some((999, Some(1001))));
+
+    // Direct handles on the stored shape: null a row's p05, count NULL rows.
+    let null_p05 = |item_id: i64| {
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.execute(
+            "UPDATE snapshot_item_floor SET p05 = NULL
+             WHERE snapshot_id = ?1 AND item_ref_id = (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = ?2)",
+            rusqlite::params![id, item_id],
+        )
+        .expect("null p05");
+    };
+    let null_rows = || -> i64 {
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.query_row(
+            "SELECT COUNT(*) FROM snapshot_item_floor WHERE snapshot_id = ?1 AND p05 IS NULL",
+            [id],
+            |row| row.get(0),
+        )
+        .expect("count null p05")
+    };
+
+    // The pre-column shape: every row has lost its p05.
+    null_p05(1);
+    null_p05(2);
+    assert_eq!(null_rows(), 2);
+
+    // The bulk read heals: exactly the summary it had before, p05 included.
+    let after = store.floors(&target, PayloadKind::Commodities, id).expect("floors");
+    assert_eq!(after, before, "p05 filled, every other field unchanged");
+    assert_eq!(null_rows(), 0, "no row is left NULL");
+
+    // It does not repeat: with nothing left to heal, a later read rebuilds
+    // nothing — a field tampered with after the heal stays as tampered.
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.execute(
+            "UPDATE snapshot_item_floor SET floor_price = 1 WHERE snapshot_id = ?1 AND item_ref_id = (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 1)",
+            [id],
+        )
+        .expect("tamper");
+    }
+    assert_eq!(
+        store.floor(&target, &item(1), id).expect("floor").map(|f| f.floor_price),
+        Some(1),
+        "a healed snapshot is not rebuilt again"
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.execute(
+            "UPDATE snapshot_item_floor SET floor_price = 100 WHERE snapshot_id = ?1 AND item_ref_id = (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 1)",
+            [id],
+        )
+        .expect("restore");
+    }
+
+    // The single-item read heals too: null one row, read that item only.
+    null_p05(2);
+    assert_eq!(null_rows(), 1);
+    assert_eq!(store.floor(&target, &item(2), id).expect("floor"), before.get(&item(2)).copied());
+    assert_eq!(null_rows(), 0);
+
+    // A pre-column row whose listings are gone (the prune dropped them before
+    // this row could heal) has nothing to rebuild from: the read still answers,
+    // with `None` for the figure it cannot know.
+    null_p05(2);
+    {
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        conn.execute(
+            "DELETE FROM listing WHERE snapshot_id = ?1 AND item_ref_id = (SELECT id FROM item_ref WHERE kind = 'item' AND item_id = 2)",
+            [id],
+        )
+        .expect("drop item 2's listings");
+    }
+    let floors = store.floors(&target, PayloadKind::Commodities, id).expect("floors");
+    assert_eq!(
+        floors.get(&item(2)).map(|f| (f.floor_price, f.p05)),
+        Some((999, None)),
+        "no listings to heal from: the row reads back as it lies"
+    );
+    assert_eq!(store.floor(&target, &item(2), id).expect("floor").map(|f| f.p05), Some(None));
+    // Item 1, whose listings are intact, came through the same reads whole.
+    assert_eq!(floors.get(&item(1)), before.get(&item(1)));
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A fresh database carries the `p05` column from the `SCHEMA` batch and the
+/// partial index that serves the heal probe, and no ALTER is needed on either:
+/// opening it again finds both in place. The probe's NULL lookup is a seek on
+/// that index, so a healed snapshot's point read stays a point read.
+#[test]
+fn a_fresh_database_has_the_p05_column() {
+    let dir = temp_dir("floors-p05-fresh");
+    let db = dir.join("db.sqlite3");
+    drop(open_store(&dir, 1_000_000));
+    for _ in 0..2 {
+        let conn = rusqlite::Connection::open(&db).expect("open db");
+        let present: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('snapshot_item_floor') WHERE name = 'p05')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column check");
+        assert_eq!(present, 1, "snapshot_item_floor.p05");
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_snapshot_floor_unpriced')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index check");
+        assert_eq!(indexed, 1, "idx_snapshot_floor_unpriced");
+        let plan: Vec<String> = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN SELECT NOT EXISTS (SELECT 1 FROM snapshot_item_floor WHERE snapshot_id = ?1)
+                    OR EXISTS (SELECT 1 FROM snapshot_item_floor WHERE snapshot_id = ?1 AND p05 IS NULL)",
+            )
+            .expect("plan")
+            .query_map([1], |row| row.get::<_, String>(3))
+            .expect("plan rows")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan steps");
+        assert!(
+            plan.iter().any(|step| step.contains("idx_snapshot_floor_unpriced")),
+            "the NULL lookup seeks the partial index: {plan:?}"
+        );
+        drop(conn);
+        drop(open_store(&dir, 1_000_000));
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A file created at the old shape — the floor table without `p05` or its
+/// index, already stamped v11 — is opened, gains both after the ladder (the
+/// version gate alone would never reach them) and keeps its stamp. Its
+/// pre-column rows hold NULL until the first read heals them from the retained
+/// listings.
+#[test]
+fn an_old_shape_floor_table_gains_the_p05_column_and_its_rows_heal() {
+    let dir = temp_dir("floors-p05-migration");
+    let db = dir.join("db.sqlite3");
+    let target = TargetId("us-4".into());
+    let id = {
+        let store = open_store(&dir, 1_000_000);
+        let live = [
+            listing(1, &item(1), 100, 7),
+            listing(2, &item(1), 90, 3),
+            listing(3, &item(1), 110, 1),
+        ];
+        store
+            .record(&snap(&target, PayloadKind::Commodities, 1_000_000, 3), &live, b"old")
+            .expect("record")
+    };
+    // Downgrade the file to the old shape: drop the column (and the index that
+    // names it — SQLite refuses the column otherwise), keep the v11 stamp.
+    {
+        let conn = rusqlite::Connection::open(&db).expect("downgrade");
+        conn.execute("DROP INDEX IF EXISTS idx_snapshot_floor_unpriced", []).expect("drop index");
+        conn.execute("ALTER TABLE snapshot_item_floor DROP COLUMN p05", []).expect("drop p05");
+        conn.pragma_update(None, "user_version", 11).expect("stamp v11");
+    }
+
+    // Reopening adds the column and the index with the stamp untouched; the
+    // old row survives with NULL in it.
+    let store = open_store(&dir, 1_000_000);
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect");
+        let present: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('snapshot_item_floor') WHERE name = 'p05')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("column check");
+        assert_eq!(present, 1, "the ALTER reached a current-version file");
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT EXISTS (SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = 'idx_snapshot_floor_unpriced')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("index check");
+        assert_eq!(indexed, 1, "and its index, which cannot ride the SCHEMA batch");
+        let rows: (i64, i64) = conn
+            .query_row("SELECT COUNT(*), SUM(p05 IS NULL) FROM snapshot_item_floor", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .expect("row check");
+        assert_eq!(rows, (1, 1), "the pre-column row survives, reading as NULL");
+        let version: i64 =
+            conn.query_row("PRAGMA user_version", [], |row| row.get(0)).expect("version");
+        assert_eq!(version, 11);
+    }
+
+    // The first read heals it from the retained listings: nearest rank over
+    // 90, 100, 110 is the cheapest.
+    assert_eq!(
+        store.floor(&target, &item(1), id).expect("floor"),
+        Some(SnapshotFloor {
+            floor_price: 90,
+            floor_qty: 3,
+            listing_count: 3,
+            qty_sum: 11,
+            p05: Some(90)
+        })
+    );
+    {
+        let conn = rusqlite::Connection::open(&db).expect("inspect");
+        let nulls: i64 = conn
+            .query_row("SELECT SUM(p05 IS NULL) FROM snapshot_item_floor", [], |row| row.get(0))
+            .expect("null check");
+        assert_eq!(nulls, 0, "healed");
+    }
 
     std::fs::remove_dir_all(&dir).ok();
 }
