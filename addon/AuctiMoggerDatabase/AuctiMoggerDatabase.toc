@@ -2,7 +2,7 @@
 ## Title: AuctiMogger Database
 ## Notes: Auction house market database with detailed item tooltips.|n|cffff7d0a/amdb|r for options.
 ## Author: Riketta
-## Version: 0.1.0
+## Version: 0.1.1
 ## Category: Auctions
 ## SavedVariables: AuctiMoggerDatabaseSettings
 ## SavedVariablesPerCharacter: AuctiMoggerDatabaseCharacter

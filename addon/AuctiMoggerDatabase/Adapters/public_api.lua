@@ -85,7 +85,7 @@ local previousBuyout = rawget(_G, "GetAuctionBuyout")
 ---@field record AmdbRecord
 
 --- The version of the addon, and the only carrier version it reads (SPEC 5.2).
-A.VERSION = "0.1.0"
+A.VERSION = "0.1.1"
 A.FEED_VERSION = Market.FEED_VERSION
 
 --- `opts` when it is a table, else nil: junk options are no options.

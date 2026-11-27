@@ -690,7 +690,7 @@ slot placeholders included — so the served addon always matches the served
 feed format.
 
 - `GET /api/addon/manifest` —
-  `{ "addon": "AuctiMoggerDatabase", "version": "0.1.0", "feedVersion": 4,
+  `{ "addon": "AuctiMoggerDatabase", "version": "0.1.1", "feedVersion": 4,
   "files": [ { "path", "sha256", "size" } ] }`. `version` is the addon's
   own version, read from its TOC (`## Version:`) and pinned by a test to the
   addon's `A.VERSION`; `feedVersion` is `DatabaseSnapshot::FEED_VERSION`. The
@@ -801,7 +801,7 @@ addon/
 ## Title: AuctiMogger Database
 ## Notes: Auction house market database with detailed item tooltips.|n|cffff7d0a/amdb|r for options.
 ## Author: Riketta
-## Version: 0.1.0
+## Version: 0.1.1
 ## Category: Auctions
 ## SavedVariables: AuctiMoggerDatabaseSettings
 ## SavedVariablesPerCharacter: AuctiMoggerDatabaseCharacter
@@ -1379,7 +1379,7 @@ The addon's namespace table, published as the global `AuctiMoggerDatabase`:
 
 | Function | Result |
 |---|---|
-| `VERSION`, `FEED_VERSION` | `"0.1.0"`, `4` |
+| `VERSION`, `FEED_VERSION` | `"0.1.1"`, `4` |
 | `GetMarketInfo(item, opts)` | An `AmdbMarketInfo` table, or `nil`. `opts.category` and `opts.market` are optional. |
 | `GetSpans(item, category)` | The v3-shaped span table `{ d1 = {…}, … }`, or `nil` when unknown or stale. |
 | `GetMarkets()` | Array of `{ target, slot, records, generatedAt, ageSeconds, stale }`. |
@@ -1982,6 +1982,8 @@ difference stays.
   field written last. An older addon refuses such a record (a flag bit with no
   meaning) and drops it, so the tracker and the addon move together: deploy the
   tracker, then `addon-sync` or a copy of the new addon, never the reverse.
+  The addon is bumped to 0.1.1 (TOC and `A.VERSION`), so an install of this
+  code is told apart from the 0.1.0 one that drops those records.
 - Prices can read as the client's own coin icons: the `coins` setting (§7.7),
   `/amdb coins on|off`, a panel checkbox. The core never calls
   `GetMoneyString`: `Format.setCoinIcons` takes a renderer the options adapter
