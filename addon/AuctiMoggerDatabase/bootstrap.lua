@@ -180,6 +180,9 @@ local function buildAdapters()
         })
         if ok and type(options) == "table" then
             A.options = options
+            -- The loaded settings said whether prices read as coin icons: the
+            -- formatter follows them before the first tooltip is built.
+            options:syncCoins()
             local registered, err = pcall(options.register, options)
             if not registered then
                 A.Say("the /amdb command could not start: " .. tostring(err), "bad")

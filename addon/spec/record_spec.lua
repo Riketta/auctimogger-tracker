@@ -24,7 +24,7 @@ local NO_SPANS = "record has no span"
 -- mutation sweep). The decoder refuses every one of them at the group's flag
 -- word: two were accepted before the refusal existed, the rest were already
 -- refused later in the record.
-local EMPTY_REFUSALS = 26
+local EMPTY_REFUSALS = 32
 
 local NAMES = { "d1", "d7", "d14", "d30" }
 
@@ -65,6 +65,7 @@ local FIELDS = {
     "live.qtySum",
     "live.seenFloor",
     "live.seenQty",
+    "live.daysSinceListed",
     "value.vflags",
     "value.value7",
     "value.soldMedian14",
@@ -177,7 +178,15 @@ local function kitchenSink()
     d30.qtySold = 121
     return {
         spans = { d1 = d1, d7 = d7, d14 = d14, d30 = d30 },
-        live = { floor = 3805000, floorQty = 214, listed = 618, qtySum = 1234, seenFloor = 3750000, seenQty = 5 },
+        live = {
+            floor = 3805000,
+            floorQty = 214,
+            listed = 618,
+            qtySum = 1234,
+            seenFloor = 3750000,
+            seenQty = 5,
+            daysSinceListed = 12,
+        },
         value7 = 5980000,
         samples7 = 1305,
         soldMedian14 = 6137000,
@@ -251,6 +260,9 @@ local function fromFlags(live, value, evidence, position, vendor, craft, deal, z
         if hasBit(live, 0x04) then
             group.seenFloor = orZero(3750000, zero)
             group.seenQty = orZero(5, zero)
+        end
+        if hasBit(live, 0x08) then
+            group.daysSinceListed = orZero(12, zero)
         end
         record.live = group
     end
@@ -415,6 +427,7 @@ describe("Record.decode: round trips", function()
         assert.equals(3805000, record.live.floor)
         assert.equals(1234, record.live.qtySum)
         assert.equals(5, record.live.seenQty)
+        assert.equals(12, record.live.daysSinceListed)
         assert.equals(274, record.supplyDays)
         assert.equals(8000, record.lowRank30d)
         assert.equals(280150, record.craft.profit)
@@ -429,8 +442,9 @@ describe("Record.decode: round trips", function()
     end)
 
     it("round-trips every group present and absent, with every inner flag", function()
-        -- live without `listed` cannot carry `qtySum`: six flag words are valid.
-        local LIVE = { 0, 1, 3, 4, 5, 7 }
+        -- live without `listed` cannot carry `qtySum`: of the sixteen flag words,
+        -- the twelve without that bit, or with it and `listed`, are valid.
+        local LIVE = { 0, 1, 3, 4, 5, 7, 8, 9, 11, 12, 13, 15 }
         local count = 0
         for zero = 0, 1 do
             local zeroes = zero == 1
@@ -462,9 +476,9 @@ describe("Record.decode: round trips", function()
                 end
             end
         end
-        -- (6 + 1) x (3 + 1) x (7 + 1) x (7 + 1) x 2 x 2 x 2, once with values
-        -- and once with present zeros.
-        assert.equals(45360, count)
+        -- (12 + 1) live flag words x (4 + 1) x (8 + 1) x (8 + 1) x 2 x 2 x 2, once
+        -- with values and once with present zeros.
+        assert.equals(84240, count)
     end)
 
     it("round-trips every span set with every span flag combination", function()
@@ -552,6 +566,7 @@ describe("Record.decode: round trips", function()
                 qtySum = MAX_INTEGER,
                 seenFloor = MAX_INTEGER,
                 seenQty = MAX_INTEGER,
+                daysSinceListed = 65535,
             },
             value7 = MAX_INTEGER,
             soldMedian14 = MAX_INTEGER,
@@ -572,6 +587,7 @@ describe("Record.decode: round trips", function()
         end
         local out = roundTrip(record)
         assert.equals(MAX_INTEGER, out.spans.d1.vwap)
+        assert.equals(65535, out.live.daysSinceListed)
         assert.equals(65535, out.supplyDays)
         assert.equals(65535, out.lowRank30d)
         assert.equals(4294967295, out.deal.scoreBp)
@@ -606,7 +622,7 @@ describe("Record.decode: round trips", function()
         zeroBlock.qtySold = 0
         local record = {
             spans = { d1 = zeroBlock },
-            live = { floor = 0, floorQty = 0, listed = 0, qtySum = 0, seenFloor = 0, seenQty = 0 },
+            live = { floor = 0, floorQty = 0, listed = 0, qtySum = 0, seenFloor = 0, seenQty = 0, daysSinceListed = 0 },
             value7 = 1,
             soldMedian14 = 0,
             samples7 = 0,
@@ -630,6 +646,7 @@ describe("Record.decode: round trips", function()
         assert.is_nil(d1.saleRate180d)
         assert.equals(0, out.live.qtySum)
         assert.equals(0, out.live.seenQty)
+        assert.equals(0, out.live.daysSinceListed)
         assert.equals(0, out.soldMedian14)
         assert.equals(0, out.trendBp)
         assert.equals(0, out.samples7)
@@ -659,9 +676,23 @@ describe("Record.decode: round trips", function()
         assert.is_nil(out.live.floor)
         assert.is_nil(out.live.listed)
         assert.is_nil(out.live.seenFloor)
+        assert.is_nil(out.live.daysSinceListed)
         -- The group costs exactly its one flag word.
         local bare = #Encode.recordBytes(spansOnly(1, 0))
         assert.equals(bare + 1, #Encode.recordBytes(out))
+        local flags = Pack.fromText(Encode.record(out))[1]
+        assert.is_true(hasBit(flags, GROUP_LIVE))
+    end)
+
+    it("writes a live group that holds nothing but the date of the last listing", function()
+        -- Listed days ago and not since: neither a listing nor a gone sighting.
+        local out = roundTrip({ spans = spans(1, 0), live = { daysSinceListed = 3 } })
+        assert.is_nil(out.live.floor)
+        assert.is_nil(out.live.seenFloor)
+        assert.equals(3, out.live.daysSinceListed)
+        -- The group costs its flag word and the one day count.
+        local bare = #Encode.recordBytes(spansOnly(1, 0))
+        assert.equals(bare + 2, #Encode.recordBytes(out))
         local flags = Pack.fromText(Encode.record(out))[1]
         assert.is_true(hasBit(flags, GROUP_LIVE))
     end)
@@ -713,7 +744,15 @@ describe("Record.decode: encoding", function()
         -- Nothing of this record round-trips to itself: that is the point.
         local out = decoded({
             spans = { d1 = zero },
-            live = { floor = -1, floorQty = -2, listed = -3, qtySum = -4, seenFloor = -6, seenQty = -7 },
+            live = {
+                floor = -1,
+                floorQty = -2,
+                listed = -3,
+                qtySum = -4,
+                seenFloor = -6,
+                seenQty = -7,
+                daysSinceListed = -16,
+            },
             value7 = -8,
             samples7 = -9,
             soldMedian14 = -10,
@@ -730,6 +769,7 @@ describe("Record.decode: encoding", function()
         assert.equals(0, d1.qtySold)
         assert.equals(0, out.live.floor)
         assert.equals(0, out.live.seenQty)
+        assert.equals(0, out.live.daysSinceListed)
         assert.equals(0, out.value7)
         assert.equals(0, out.soldMedian14)
         assert.equals(0, out.vendorPrice)
@@ -790,7 +830,7 @@ describe("Record.decode: encoding", function()
                     qtySold = 40,
                 },
             },
-            live = { floor = 100, floorQty = 5, listed = 7 },
+            live = { floor = 100, floorQty = 5, listed = 7, daysSinceListed = 6 },
             value7 = 900,
             soldMedian14 = 950,
             samples7 = 12,
@@ -810,8 +850,8 @@ describe("Record.decode: encoding", function()
             { 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12 },
             Encode.varint(2500),
             { 0, 40 },
-            -- live: lflags, floor, floorQty, listed
-            { 0x01, 100, 5, 7 },
+            -- live: lflags, floor, floorQty, listed, daysSinceListed (last in the group)
+            { 0x09, 100, 5, 7, 6 },
             -- value: vflags, value7, soldMedian14, samples7, trendBp
             { 0x03 },
             Encode.varint(900),
@@ -863,6 +903,9 @@ describe("Record.decode: encoding", function()
                 record.live.seenQty = nil
             end,
             function(record)
+                record.live.daysSinceListed = nil
+            end,
+            function(record)
                 record.spans.d7.median = 0
             end,
             function(record)
@@ -890,7 +933,7 @@ describe("Record.decode: encoding", function()
                 record.extra = 1
             end,
         }
-        assert.equals(13, #variants)
+        assert.equals(14, #variants)
         for _, variant in ipairs(variants) do
             local copy = decoded(KITCHEN)
             assert.is_true(Encode.equal(KITCHEN, copy))
@@ -909,7 +952,7 @@ describe("Record.decode: malformed input", function()
         KITCHEN_TEXT,
         Encode.record(spansOnly(1, 0)),
         Encode.record(spansOnly(15, 31)),
-        Encode.record(fromFlags(7, 3, 7, 7, true, true, true, false)),
+        Encode.record(fromFlags(15, 3, 7, 7, true, true, true, false)),
         Encode.record(fromFlags(0, 0, 0, 0, true, true, true, true)),
     }
     for _, base in ipairs(BASES) do
@@ -1049,7 +1092,7 @@ describe("Record.decode: malformed input", function()
             { bytes = { 0x80, 0x01 }, message = "`flags` sets undefined bits 0x80" },
             { bytes = { 0x00, 0x10 }, message = "`spans` sets undefined bits 0x10" },
             { bytes = { 0x00, 0x01, 0x20 }, message = "`span.sflags` sets undefined bits 0x20" },
-            { bytes = Encode.cat(opening(GROUP_LIVE), 0x08), message = "`live.lflags` sets undefined bits 0x8" },
+            { bytes = Encode.cat(opening(GROUP_LIVE), 0x10), message = "`live.lflags` sets undefined bits 0x10" },
             { bytes = Encode.cat(opening(GROUP_VALUE), 0x04), message = "`value.vflags` sets undefined bits 0x4" },
             {
                 bytes = Encode.cat(opening(GROUP_EVIDENCE), 0x08),
@@ -1137,6 +1180,10 @@ describe("Record.decode: malformed input", function()
     it("refuses values above their field's range, and accepts the ceiling", function()
         local cases = {
             {
+                bytes = Encode.cat(opening(GROUP_LIVE), 0x08, Encode.varint(65536)),
+                message = "`live.daysSinceListed` holds 65536, out of range",
+            },
+            {
                 bytes = Encode.cat(opening(GROUP_EVIDENCE), 0x04, Encode.varint(65536)),
                 message = "`evidence.supplyDays` holds 65536, out of range",
             },
@@ -1174,6 +1221,12 @@ describe("Record.decode: malformed input", function()
         end
         -- The ceilings themselves are valid: a count is checked before its bytes.
         local accepted = {
+            {
+                bytes = Encode.cat(opening(GROUP_LIVE), 0x08, Encode.varint(65535)),
+                read = function(record)
+                    return record.live.daysSinceListed
+                end,
+            },
             {
                 bytes = Encode.cat(opening(GROUP_EVIDENCE), 0x07, Encode.varint(65535), 5, Encode.varint(65535)),
                 read = function(record)

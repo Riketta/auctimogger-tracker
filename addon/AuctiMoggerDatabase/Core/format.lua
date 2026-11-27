@@ -7,7 +7,9 @@ A.Core = A.Core or {}
 -- tiers, and the house colors as WoW escape strings. Every formatter answers
 -- nil for an absent value, so callers render a dash (or skip the line) instead
 -- of printing "nil"; junk that is not a finite number answers nil as well,
--- never an error. Nothing here reads a game global.
+-- never an error. Nothing here reads a game global: while prices read as coin
+-- icons, the renderer an adapter installed (`setCoinIcons`) is what they go
+-- through.
 
 ---@alias AmdbColorName "brand"|"muted"|"dim"|"good"|"warn"|"hot"|"bad"
 ---@alias AmdbAgeTier "muted"|"warn"|"hot"|"stale"
@@ -19,11 +21,18 @@ A.Core = A.Core or {}
 ---@field ageColor fun(seconds: number|nil): AmdbColorName the house color of an age's tier
 ---@field RESET string ends a color run
 ---@field PREFIX string the addon title in the brand color
+---@field setCoinIcons fun(renderer: (fun(copper: number): string)|nil) installs the coin renderer every price goes through, or clears it
 local Format = {}
 A.Core.Format = Format
 
 local HOUR = 3600
 local DAY = 24 * HOUR
+
+-- The coin renderer the adapters install for the `coins` setting (SPEC 7.7): the
+-- client's own money string for a whole, non-negative number of copper. Nil
+-- while prices read as text.
+---@type (fun(copper: number): string)|nil
+local coinIcons = nil
 
 --- SPEC 7.5.4: each channel is round(v * 255), as a two-digit hex value.
 Format.COLORS = {
@@ -97,9 +106,21 @@ function Format.colorize(name, text)
     return color .. body .. Format.RESET
 end
 
+--- Installs the renderer every price goes through, or clears it. The core never
+--- reaches for a game global: an adapter hands in the client's money string
+--- wrapped as `fun(copper) -> string`. A renderer that raises, or answers
+--- anything but a string for one call, is passed over for that call and the
+--- text form stands in: a price is never lost to decoration.
+---@param renderer (fun(copper: number): string)|nil
+function Format.setCoinIcons(renderer)
+    coinIcons = type(renderer) == "function" and renderer or nil
+end
+
 --- Copper as "380g 50s": gold, silver and copper parts only while above zero,
 --- except that an amount of zero reads "0c". A negative amount gets its sign
---- in front. Same shape as the sniper's money text.
+--- in front. Same shape as the sniper's money text. With a coin renderer
+--- installed, the client's money string of the amount stands in for the parts,
+--- the sign in front of it as before.
 ---@param copper number|nil
 ---@return string|nil
 function Format.money(copper)
@@ -110,6 +131,12 @@ function Format.money(copper)
     local total = math.floor(math.abs(amount) + 0.5)
     -- The sign only when something is left: a negative fraction of a copper is zero.
     local sign = amount < 0 and total > 0 and "-" or ""
+    if coinIcons ~= nil then
+        local ok, text = pcall(coinIcons, total)
+        if ok and type(text) == "string" then
+            return sign .. text
+        end
+    end
     local gold = math.floor(total / 10000)
     local silver = math.floor((total % 10000) / 100)
     local rem = total % 100
@@ -127,7 +154,8 @@ function Format.money(copper)
 end
 
 --- `money` with a sign in front: "+190g" for a gain, "-190g" for a loss and
---- "0g" when nothing is left after rounding.
+--- "0g" when nothing is left after rounding (the coin string of zero gold
+--- while prices read as coin icons).
 ---@param copper number|nil
 ---@return string|nil
 function Format.moneySigned(copper)
@@ -135,10 +163,12 @@ function Format.moneySigned(copper)
     if amount == nil then
         return nil
     end
-    local text = Format.money(amount)
-    if text == "0c" then
-        return "0g"
+    if math.floor(math.abs(amount) + 0.5) == 0 then
+        -- The coin string of zero gold while a renderer answers, "0g" otherwise.
+        local zero = Format.money(0)
+        return zero == "0c" and "0g" or zero
     end
+    local text = Format.money(amount)
     if amount < 0 then
         return text
     end

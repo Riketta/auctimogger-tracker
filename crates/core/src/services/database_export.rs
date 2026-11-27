@@ -215,6 +215,7 @@ impl DatabaseExportService {
                         facts.get(&group.member),
                         live.and_then(|market| market.floors.get(&group.member)).copied(),
                         lists_anything,
+                        today,
                         crafts.get(&(group.member.clone(), category)).copied(),
                         deals.get(&group.member).copied(),
                     )
@@ -390,11 +391,13 @@ fn group_blocks(
 /// Assembles the record of one single identity: its span blocks plus every
 /// group its facts, its live listing, its recipe and its rank support. An
 /// optional group is absent, never zero, without the evidence behind it.
+/// `today` is the UTC day number the export dates the last listing against.
 fn attach(
     spans: BTreeMap<Span, MetricBlock>,
     facts: Option<ItemFacts<'_>>,
     floor: Option<SnapshotFloor>,
     snapshot_lists_anything: bool,
+    today: i64,
     craft: Option<CraftQuote>,
     deal: Option<DealMark>,
 ) -> ItemRecord {
@@ -405,6 +408,8 @@ fn attach(
         listed: i64::try_from(floor.listing_count).unwrap_or(i64::MAX),
         qty_sum: (floor.qty_sum > 0).then_some(floor.qty_sum),
     });
+    // Read off the facts before the sighting below consumes them.
+    let last_listed_day = facts.as_ref().and_then(|facts| facts.last_listed_day);
     // Seen today and gone: today's cumulative fold remembers a listing the
     // newest snapshot no longer lists. An equal floor is that listing, still
     // up; and an empty snapshot (a maintenance dump) proves nothing is gone.
@@ -416,7 +421,15 @@ fn attach(
                 && listed.as_ref().is_none_or(|listed| *seen_floor < listed.floor)
         })
         .map(|(floor, qty)| SeenListing { floor, qty: qty.max(0) });
-    let live = (listed.is_some() || seen.is_some()).then_some(LiveQuote { listed, seen });
+    // How long ago the item was last listed: today for anything the newest
+    // snapshot lists, else the age of the hour fold's newest day for it. A day
+    // past today (the clock moved back under the fold) reads as today, never
+    // as a negative age; the count is a month at most, so the cast holds.
+    let days_since_listed =
+        if listed.is_some() { Some(0) } else { last_listed_day.map(|day| (today - day).max(0)) }
+            .map(|days| u16::try_from(days).unwrap_or(u16::MAX));
+    let live = (listed.is_some() || seen.is_some() || days_since_listed.is_some())
+        .then_some(LiveQuote { listed, seen, days_since_listed });
 
     let facts = facts.unwrap_or_default();
     let value = (facts.value7 > 0).then(|| ValueQuote {
@@ -572,6 +585,9 @@ mod tests {
         },
     };
 
+    /// The UTC day number the attach rules date the last listing against.
+    const TODAY: i64 = 20_000;
+
     fn block(n: i64) -> MetricBlock {
         MetricBlock {
             n,
@@ -605,7 +621,8 @@ mod tests {
     }
 
     /// A steady seller: a sold-source value, today's median under the week
-    /// before, ledger evidence, three prior days and a vendor price.
+    /// before, ledger evidence, three prior days and a vendor price. No
+    /// hour-fold date for the last listing unless a test scripts one.
     fn facts() -> ItemFacts<'static> {
         ItemFacts {
             value7: 100_000,
@@ -617,6 +634,7 @@ mod tests {
             counts: Some(SaleCounts { sold: 4, expired: 6 }),
             sold_units: Some(14),
             lows: &[150_000, 140_000, 130_000],
+            last_listed_day: None,
             vendor_price: Some(500),
         }
     }
@@ -625,8 +643,15 @@ mod tests {
     fn a_listed_identity_carries_every_group_its_evidence_supports() {
         let craft = CraftQuote { cost: 50_000, profit: 60_000, expected_profit: 24_000 };
         let deal = DealMark { rank: 3, score_bp: 6_500, discount_bp: 2_500 };
-        let record =
-            attach(spans(), Some(facts()), Some(floor(90_000, 5)), true, Some(craft), Some(deal));
+        let record = attach(
+            spans(),
+            Some(facts()),
+            Some(floor(90_000, 5)),
+            true,
+            TODAY,
+            Some(craft),
+            Some(deal),
+        );
 
         assert_eq!(record.spans.len(), 1);
         assert_eq!(
@@ -640,6 +665,8 @@ mod tests {
                 }),
                 // A sighting level with the live floor is that listing, still up.
                 seen: None,
+                // The newest snapshot lists it: last listed today.
+                days_since_listed: Some(0),
             })
         );
         assert_eq!(
@@ -668,17 +695,23 @@ mod tests {
     #[test]
     fn seen_today_and_gone_needs_a_snapshot_that_lists_something() {
         // Not listed any more, under a snapshot that lists other items: gone.
-        let gone = attach(spans(), Some(facts()), None, true, None, None);
+        let gone = attach(spans(), Some(facts()), None, true, TODAY, None, None);
         assert_eq!(
             gone.live,
-            Some(LiveQuote { listed: None, seen: Some(SeenListing { floor: 90_000, qty: 2 }) })
+            Some(LiveQuote {
+                listed: None,
+                seen: Some(SeenListing { floor: 90_000, qty: 2 }),
+                // No hour-fold row scripted: the sighting alone dates nothing.
+                days_since_listed: None,
+            })
         );
         // The same sighting under an empty snapshot (a maintenance dump)
         // proves nothing is gone.
-        let maintenance = attach(spans(), Some(facts()), None, false, None, None);
+        let maintenance = attach(spans(), Some(facts()), None, false, TODAY, None, None);
         assert_eq!(maintenance.live, None);
         // Listed dearer than the sighting: the cheap one is gone, the rest up.
-        let partly = attach(spans(), Some(facts()), Some(floor(110_000, 1)), true, None, None);
+        let partly =
+            attach(spans(), Some(facts()), Some(floor(110_000, 1)), true, TODAY, None, None);
         assert_eq!(
             partly.live,
             Some(LiveQuote {
@@ -689,13 +722,80 @@ mod tests {
                     qty_sum: Some(100),
                 }),
                 seen: Some(SeenListing { floor: 90_000, qty: 2 }),
+                days_since_listed: Some(0),
             })
+        );
+    }
+
+    /// `daysSinceListed` follows the snapshot first, then the hour fold: today
+    /// for anything the newest snapshot lists, the age of the fold's newest day
+    /// for the rest, absent without a fold row in the low window — and when it
+    /// is the only thing known, it is a live group of its own.
+    #[test]
+    fn days_since_listed_follows_the_snapshot_then_the_fold() {
+        let listed_twelve_days_ago = ItemFacts { last_listed_day: Some(TODAY - 12), ..facts() };
+        let listed = attach(
+            spans(),
+            Some(listed_twelve_days_ago),
+            Some(floor(90_000, 5)),
+            true,
+            TODAY,
+            None,
+            None,
+        );
+        assert_eq!(
+            listed.live.as_ref().map(|live| live.days_since_listed),
+            Some(Some(0)),
+            "the snapshot lists it: today, whatever the fold remembers"
+        );
+
+        // Not listed, not seen today, last listed twelve days ago: the live
+        // group holds that date and nothing else.
+        let stale = ItemFacts { seen_today: None, last_listed_day: Some(TODAY - 12), ..facts() };
+        let stale = attach(spans(), Some(stale), None, true, TODAY, None, None);
+        assert_eq!(
+            stale.live,
+            Some(LiveQuote { listed: None, seen: None, days_since_listed: Some(12) })
+        );
+
+        // Seen today and gone: the sighting already says today, the fold agrees.
+        let gone = attach(
+            spans(),
+            Some(ItemFacts { last_listed_day: Some(TODAY), ..facts() }),
+            None,
+            true,
+            TODAY,
+            None,
+            None,
+        );
+        assert_eq!(
+            gone.live,
+            Some(LiveQuote {
+                listed: None,
+                seen: Some(SeenListing { floor: 90_000, qty: 2 }),
+                days_since_listed: Some(0),
+            })
+        );
+
+        // No fold row: no date — and with nothing listed and nothing seen, no
+        // live group at all.
+        let undated = ItemFacts { seen_today: None, last_listed_day: None, ..facts() };
+        let undated = attach(spans(), Some(undated), None, true, TODAY, None, None);
+        assert_eq!(undated.live, None);
+
+        // A fold day past today (the clock moved back under the fold) is
+        // today, never a negative age.
+        let ahead = ItemFacts { seen_today: None, last_listed_day: Some(TODAY + 3), ..facts() };
+        let ahead = attach(spans(), Some(ahead), None, true, TODAY, None, None);
+        assert_eq!(
+            ahead.live,
+            Some(LiveQuote { listed: None, seen: None, days_since_listed: Some(0) })
         );
     }
 
     #[test]
     fn an_identity_without_a_scan_row_carries_only_what_the_snapshot_knows() {
-        let listed = attach(spans(), None, Some(floor(90_000, 0)), true, None, None);
+        let listed = attach(spans(), None, Some(floor(90_000, 0)), true, TODAY, None, None);
         assert_eq!(
             listed.live,
             Some(LiveQuote {
@@ -706,6 +806,7 @@ mod tests {
                     qty_sum: Some(100),
                 }),
                 seen: None,
+                days_since_listed: Some(0),
             })
         );
         assert!(
@@ -715,7 +816,7 @@ mod tests {
                 && listed.low30.is_none()
                 && listed.vendor_price.is_none()
         );
-        let bare = attach(spans(), None, None, true, None, None);
+        let bare = attach(spans(), None, None, true, TODAY, None, None);
         assert_eq!(bare, spans_only(spans()));
     }
 
@@ -727,6 +828,7 @@ mod tests {
             Some(ItemFacts { value7: 0, ..facts() }),
             Some(floor(90_000, 1)),
             true,
+            TODAY,
             None,
             None,
         );
@@ -741,6 +843,7 @@ mod tests {
             Some(ItemFacts { lows: &[], ..facts() }),
             Some(floor(90_000, 1)),
             true,
+            TODAY,
             None,
             None,
         );
@@ -760,26 +863,35 @@ mod tests {
             Some(ItemFacts { lows: &lows, ..facts() }),
             Some(floor(90_000, 1)),
             true,
+            TODAY,
             None,
             None,
         );
         assert_eq!(month.low_rank_30d_bp, Some(8_000));
         assert_eq!(month.low30, Some(80_000));
         // Without a live floor there is nothing to place inside the month.
-        let unlisted =
-            attach(spans(), Some(ItemFacts { lows: &lows, ..facts() }), None, true, None, None);
+        let unlisted = attach(
+            spans(),
+            Some(ItemFacts { lows: &lows, ..facts() }),
+            None,
+            true,
+            TODAY,
+            None,
+            None,
+        );
         assert_eq!((unlisted.low30, unlisted.low_rank_30d_bp), (Some(80_000), None));
     }
 
     #[test]
     fn days_of_supply_need_listed_quantity_and_sold_units() {
-        let unlisted = attach(spans(), Some(facts()), None, true, None, None);
+        let unlisted = attach(spans(), Some(facts()), None, true, TODAY, None, None);
         assert_eq!(unlisted.supply_days, None, "nothing listed, nothing to clear");
         let unsold = attach(
             spans(),
             Some(ItemFacts { sold_units: Some(0), ..facts() }),
             Some(floor(90_000, 1)),
             true,
+            TODAY,
             None,
             None,
         );
@@ -790,6 +902,7 @@ mod tests {
             Some(ItemFacts { sold_units: Some(1), ..facts() }),
             Some(SnapshotFloor { qty_sum: 10_000_000, ..floor(90_000, 1) }),
             true,
+            TODAY,
             None,
             None,
         );

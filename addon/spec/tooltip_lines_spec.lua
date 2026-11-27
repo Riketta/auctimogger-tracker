@@ -131,7 +131,7 @@ local function example()
                 qtySold = 443,
             }),
         },
-        live = { floor = 3805000, floorQty = 214, listed = 618, qtySum = 1234 },
+        live = { floor = 3805000, floorQty = 214, listed = 618, qtySum = 1234, daysSinceListed = 0 },
         value7 = 4123500,
         samples7 = 214,
         soldMedian14 = 4021000,
@@ -305,6 +305,7 @@ local STANDARD = {
     RATE,
     "Sold | 31.6/day · supply 39d",
     "Last sale | 2d ago",
+    "Last listed | today",
     "30-day low | 350g" .. DIM .. "  · 80% of days higher" .. RESET,
     "30 days | [30 bars]",
     "Crafting | 2100g → +1900g" .. DIM .. "  (exp. " .. RESET .. "+684g" .. DIM .. ")" .. RESET,
@@ -338,6 +339,7 @@ local DETAIL = {
 local TOGGLES = {
     { key = "sold", label = "Sold", count = 1 },
     { key = "lastSale", label = "Last sale", count = 1 },
+    { key = "listed", label = "Last listed", count = 1 },
     { key = "low", label = "30-day low", count = 1 },
     { key = "sparkline", label = "30 days", count = 1 },
     { key = "craft", label = "Crafting", count = 1 },
@@ -620,8 +622,40 @@ describe("the optional lines", function()
         assert.same({ TITLE, "Min buyout", "Market value", "Sale rate (14d)" }, labels(rows))
     end)
 
+    it("Last listed: today, a day ago, and further back", function()
+        local function when(days)
+            local record = packed({ spans = { d1 = span(100) }, live = { daysSinceListed = days } })
+            local rows = TooltipLines.build(record, context())
+            assert.equals("Last listed", rows[5].left)
+            -- Nothing of it is listed: the buyout row says so, and the date follows.
+            assert.equals(DIM .. "not listed" .. RESET, rows[2].right)
+            return rows[5].right
+        end
+        assert.equals("today", when(0))
+        assert.equals("1d ago", when(1))
+        assert.equals("3d ago", when(3))
+        assert.equals("30d ago", when(30))
+    end)
+
+    it("Last listed: left out when the tracker has no date for the listing", function()
+        local rows = TooltipLines.build(worth(100), context())
+        assert.is_false(hasLeft(rows, "Last listed"))
+        assert.same({ TITLE, "Min buyout", "Market value", "Sale rate (14d)" }, labels(rows))
+    end)
+
+    it("Last listed: follows the last sale, and answers another question", function()
+        local record = packed({
+            spans = { d7 = span(100, { daysSinceLastSale = 9 }) },
+            live = { daysSinceListed = 2 },
+        })
+        local rows = TooltipLines.build(record, context())
+        assert.same({ "Last sale", "Last listed" }, { rows[5].left, rows[6].left })
+        assert.equals("9d ago", rows[5].right)
+        assert.equals("2d ago", rows[6].right)
+    end)
+
     it("30-day low: the low, and the share of days that sat higher", function()
-        assert.equals("30-day low | 350g" .. DIM .. "  · 80% of days higher" .. RESET, text(standard()[7]))
+        assert.equals("30-day low | 350g" .. DIM .. "  · 80% of days higher" .. RESET, text(standard()[8]))
     end)
 
     it("30-day low: the low alone without the rank", function()
@@ -636,10 +670,10 @@ describe("the optional lines", function()
     it("Sparkline: the caption, and the daily lows as bars, oldest first", function()
         local record = example()
         local rows = TooltipLines.build(record, context())
-        assert.equals("30 days", rows[8].left)
-        assert.is_nil(rows[8].right)
+        assert.equals("30 days", rows[9].left)
+        assert.is_nil(rows[9].right)
         -- The record's own series, not a copy: bars come from `lows` as decoded.
-        assert.equals(true, rows[8].bars == record.lows)
+        assert.equals(true, rows[9].bars == record.lows)
     end)
 
     it("Sparkline: left out without lows, or with an empty series", function()
@@ -651,7 +685,7 @@ describe("the optional lines", function()
     it("Crafting: the cost, the result and the expected result", function()
         assert.equals(
             "Crafting | 2100g → +1900g" .. DIM .. "  (exp. " .. RESET .. "+684g" .. DIM .. ")" .. RESET,
-            text(standard()[9])
+            text(standard()[10])
         )
     end)
 
@@ -683,7 +717,7 @@ describe("the optional lines", function()
     end)
 
     it("Deal: the rank, the discount and the score, in good", function()
-        assert.equals("Deal | " .. GOOD .. "#12 · 38% under value · score 0.71" .. RESET, text(standard()[10]))
+        assert.equals("Deal | " .. GOOD .. "#12 · 38% under value · score 0.71" .. RESET, text(standard()[11]))
     end)
 
     it("Deal: rounds the score to two digits", function()
@@ -707,9 +741,9 @@ end)
 describe("the other markets", function()
     it("show one line per market that has the item, with the difference to the primary", function()
         local rows = standard()
-        assert.same({ MUTED .. HORDE .. RESET, MUTED .. BLACKWATER .. RESET }, { rows[11].left, rows[12].left })
-        assert.equals("442g 31s  +10%", rows[11].right)
-        assert.equals("382g  -5%", rows[12].right)
+        assert.same({ MUTED .. HORDE .. RESET, MUTED .. BLACKWATER .. RESET }, { rows[12].left, rows[13].left })
+        assert.equals("442g 31s  +10%", rows[12].right)
+        assert.equals("382g  -5%", rows[13].right)
     end)
 
     it("show the value alone when the primary market has none to compare with", function()
@@ -721,14 +755,14 @@ describe("the other markets", function()
         local few =
             { others = { { target = HORDE, record = worth(0) }, { target = BLACKWATER, record = worth(3820000) } } }
         local rows = TooltipLines.build(example(), context(few))
-        assert.equals(11, #rows)
-        assert.equals(MUTED .. BLACKWATER .. RESET, rows[11].left)
+        assert.equals(12, #rows)
+        assert.equals(MUTED .. BLACKWATER .. RESET, rows[12].left)
     end)
 
     it("are absent when the primary is the only market", function()
         local rows = TooltipLines.build(example(), context())
         assert.same(STANDARD[1], text(rows[1]))
-        assert.equals(10, #rows)
+        assert.equals(11, #rows)
         assert.same({
             TITLE,
             "Min buyout",
@@ -736,6 +770,7 @@ describe("the other markets", function()
             "Sale rate (14d)",
             "Sold",
             "Last sale",
+            "Last listed",
             "30-day low",
             "30 days",
             "Crafting",

@@ -526,6 +526,8 @@ fn a_listed_item_carries_its_live_value_evidence_position_and_rank() {
             // Today's fold floor of 110 000 sits above the live floor: the
             // cheap stacks are still up, nothing is "gone".
             seen: None,
+            // The newest snapshot lists it: last listed today.
+            days_since_listed: Some(0),
         })
     );
     assert_eq!(
@@ -569,6 +571,7 @@ fn a_listed_item_carries_its_live_value_evidence_position_and_rank() {
         Some(LiveQuote {
             listed: Some(LiveListing { floor: 180_000, floor_qty: 5, listed: 5, qty_sum: Some(5) }),
             seen: None,
+            days_since_listed: Some(0),
         })
     );
     assert_eq!(
@@ -592,11 +595,17 @@ fn seen_today_gone_dual_category_and_thin_evidence_records() {
     let market = commodity_market();
     let (snapshot, _opportunities) = build(&market, Vec::new());
 
-    // Item 3 folded today at 50 000 and is not in the newest snapshot.
+    // Item 3 folded today at 50 000 and is not in the newest snapshot. Its
+    // fold never went through a snapshot, so the hour fold holds no row for
+    // it: seen today, gone — and nothing to date the last listing.
     let gone = entry(&snapshot, &item(3), Category::Commodity);
     assert_eq!(
         gone.record.live,
-        Some(LiveQuote { listed: None, seen: Some(SeenListing { floor: 50_000, qty: 3 }) })
+        Some(LiveQuote {
+            listed: None,
+            seen: Some(SeenListing { floor: 50_000, qty: 3 }),
+            days_since_listed: None,
+        })
     );
     assert_eq!(
         gone.record.value,
@@ -611,6 +620,7 @@ fn seen_today_gone_dual_category_and_thin_evidence_records() {
         Some(LiveQuote {
             listed: Some(LiveListing { floor: 40_000, floor_qty: 8, listed: 2, qty_sum: Some(8) }),
             seen: None,
+            days_since_listed: Some(0),
         })
     );
     assert!(level.record.deal.is_none(), "two listings of evidence sit under the ranking's floor");
@@ -627,7 +637,11 @@ fn seen_today_gone_dual_category_and_thin_evidence_records() {
     assert_eq!(as_commodity.record.value.as_ref().map(|value| value.value7), Some(1_000));
     assert_eq!(
         as_commodity.record.live,
-        Some(LiveQuote { listed: None, seen: Some(SeenListing { floor: 1_000, qty: 10 }) }),
+        Some(LiveQuote {
+            listed: None,
+            seen: Some(SeenListing { floor: 1_000, qty: 10 }),
+            days_since_listed: None,
+        }),
         "seen today as a commodity, gone"
     );
     let as_item = entry(&snapshot, &item(5), Category::Item);
@@ -643,6 +657,102 @@ fn seen_today_gone_dual_category_and_thin_evidence_records() {
     let mut sorted = snapshot.entries.clone();
     sorted.sort_by(|a, b| a.item.cmp(&b.item).then_with(|| a.category.cmp(&b.category)));
     assert_eq!(snapshot.entries, sorted);
+
+    std::fs::remove_dir_all(&market.dir).ok();
+}
+
+/// `daysSinceListed` dates the last listing off the hour fold: today for what
+/// the newest snapshot lists, the age of the fold's newest day for what is
+/// neither listed nor seen today — a live group holding nothing else — and
+/// absent when the fold holds no row at all. It reaches the twin as well.
+#[test]
+fn days_since_listed_comes_off_the_newest_snapshot_then_the_hour_fold() {
+    let market = Market::open(
+        "days-listed",
+        TargetKind::BlizzardConnectedRealm { region: "us".into(), connected_realm_id: 4 },
+        "retail",
+    );
+    let today = market.today();
+    // Item 1 traded twelve and three days ago, in the snapshots of those days
+    // too (so the hour fold lists it on both), and not since.
+    for offset in [12, 3] {
+        market.fold(&item(1), today - offset, Category::Commodity, 100_000, 5);
+        market.snapshot(
+            PayloadKind::Commodities,
+            NOW - offset * 86_400 + 3_600,
+            None,
+            &[listing(100 + offset, &item(1), 100_000, 1)],
+        );
+    }
+    // Item 2 was listed two days ago and is listed now: the newest snapshot
+    // wins, so it was last listed today.
+    market.fold(&item(2), today - 2, Category::Commodity, 50_000, 5);
+    market.snapshot(
+        PayloadKind::Commodities,
+        NOW - 2 * 86_400 + 3_600,
+        None,
+        &[listing(200, &item(2), 50_000, 1)],
+    );
+    market.fold(&item(2), today, Category::Commodity, 50_000, 5);
+    // The newest snapshot lists item 2 only.
+    market.snapshot(
+        PayloadKind::Commodities,
+        NOW,
+        Some(NOW - 60),
+        &[listing(201, &item(2), 50_000, 1)],
+    );
+    // Item 3 folded a week ago and today, but was never in a snapshot: seen
+    // today and gone, with no hour-fold row to date.
+    market.fold(&item(3), today - 7, Category::Commodity, 70_000, 5);
+    market.fold(&item(3), today, Category::Commodity, 70_000, 5);
+
+    let (snapshot, _opportunities) = build(&market, Vec::new());
+
+    let stale = entry(&snapshot, &item(1), Category::Commodity);
+    assert_eq!(
+        stale.record.live,
+        Some(LiveQuote { listed: None, seen: None, days_since_listed: Some(3) }),
+        "listed three days ago and not since: the live group holds nothing else"
+    );
+    // The fold's two days are the sparkline too, oldest first.
+    assert_eq!(stale.record.lows.as_deref(), Some(&[128_u8, 128][..]));
+
+    let listed = entry(&snapshot, &item(2), Category::Commodity);
+    assert_eq!(
+        listed.record.live,
+        Some(LiveQuote {
+            listed: Some(LiveListing { floor: 50_000, floor_qty: 1, listed: 1, qty_sum: Some(1) }),
+            seen: None,
+            days_since_listed: Some(0),
+        }),
+        "the newest snapshot lists it: today, whatever the fold remembers"
+    );
+
+    let undated = entry(&snapshot, &item(3), Category::Commodity);
+    assert_eq!(
+        undated.record.live,
+        Some(LiveQuote {
+            listed: None,
+            seen: Some(SeenListing { floor: 70_000, qty: 5 }),
+            days_since_listed: None,
+        }),
+        "seen today and gone, but no hour-fold row to date it"
+    );
+
+    let json = FeedCodec.render(&snapshot, FeedFormat::Json).expect("twin");
+    let twin: serde_json::Value = serde_json::from_slice(&json).expect("valid json");
+    let live_of = |id: i64| {
+        twin["items"]
+            .as_array()
+            .expect("items")
+            .iter()
+            .find(|entry| entry["itemID"].as_i64() == Some(id) && entry["category"] == "commodity")
+            .unwrap_or_else(|| panic!("no commodity record for item {id}"))["live"]
+            .clone()
+    };
+    assert_eq!(live_of(1), serde_json::json!({ "daysSinceListed": 3 }));
+    assert_eq!(live_of(2)["daysSinceListed"], 0);
+    assert!(live_of(3).get("daysSinceListed").is_none(), "{}", live_of(3));
 
     std::fs::remove_dir_all(&market.dir).ok();
 }
@@ -718,6 +828,7 @@ fn the_export_renders_losslessly_into_the_carrier_and_its_twin() {
         .expect("item 1's commodity record");
     assert_eq!(one["live"]["floor"], 60_000);
     assert_eq!(one["live"]["qtySum"], 15);
+    assert_eq!(one["live"]["daysSinceListed"], 0, "the newest snapshot lists it");
     assert_eq!(one["value7"], 100_000);
     assert_eq!(one["soldMedian14"], 80_000);
     assert_eq!(one["trendBp"], 1_000);
@@ -795,6 +906,7 @@ fn pet_species_export_per_species_with_groups_only_when_single_variant() {
         Some(LiveQuote {
             listed: Some(LiveListing { floor: 250, floor_qty: 2, listed: 2, qty_sum: Some(2) }),
             seen: None,
+            days_since_listed: Some(0),
         })
     );
     assert_eq!(single.record.value.as_ref().map(|value| value.value7), Some(300));

@@ -2064,6 +2064,16 @@ impl CountingHistory {
             })
             .collect();
     }
+
+    /// Scripts one more daily low row for an item on any day, today included,
+    /// handed over after whatever `set_lows` scripted.
+    fn add_low(&self, item_id: i64, day: i64, min: i64) {
+        self.lows.lock().unwrap().push(amtracker_core::domain::ItemDayLow {
+            item: item(item_id),
+            day,
+            min,
+        });
+    }
 }
 
 impl PriceHistoryRepository for CountingHistory {
@@ -2948,8 +2958,8 @@ fn bulk_block_paths_match_the_per_item_paths() {
 
 /// The fact view is the ranking's own evidence, by identity: the value, today's
 /// median against the days before, the seen-today sighting, the ledger counts,
-/// units sold, the month of lows and the vendor floor — and `None` for an
-/// identity the scan holds no row for.
+/// units sold, the month of lows, the day of the last listing and the vendor
+/// floor — and `None` for an identity the scan holds no row for.
 #[test]
 fn scan_facts_expose_the_rankings_evidence_per_identity() {
     let now = 1_000_000;
@@ -2972,12 +2982,69 @@ fn scan_facts_expose_the_rankings_evidence_per_identity() {
     assert_eq!(one.counts, Some(amtracker_core::domain::SaleCounts { sold: 1, expired: 3 }));
     assert_eq!(one.sold_units, Some(140));
     assert_eq!(one.lows, [120_000, 110_000, 130_000], "oldest day first");
+    // The newest of the three scripted days, whichever way round they arrived.
+    assert_eq!(
+        one.last_listed_day,
+        Some(utc_day(now) - 1),
+        "the newest fold day dates the last listing"
+    );
     assert_eq!(one.vendor_price, None, "the default catalog knows no price");
 
     let two = facts.get(&item(2)).expect("item 2 has a scan row");
-    assert_eq!((two.counts, two.sold_units, two.lows), (None, None, &[][..]));
+    assert_eq!(
+        (two.counts, two.sold_units, two.lows, two.last_listed_day),
+        (None, None, &[][..], None)
+    );
     assert!(facts.get(&item(99)).is_none(), "no row, no facts");
     assert_eq!(facts.computed_at(), now);
+}
+
+/// A fold row for today dates the last listing without entering the low
+/// series: the indicator keeps comparing the live floor against the days
+/// BEFORE today, so a today-row — even one under the live floor — moves
+/// neither the rank nor the sparkline. An identity with nothing but a
+/// today-row is still dated: no series, today as its last listing.
+#[test]
+fn a_today_row_dates_the_last_listing_without_entering_the_lows() {
+    let target = TargetId("us-4".into());
+    let now = 1_000_000;
+    let today = utc_day(now);
+    let (service, history, _sales, _clock) = opportunity_fixture(now);
+    // Item 1: six prior days, all above its 55 000 live floor, then today's
+    // row under it — handed over last, as any store might order its rows.
+    // (`set_lows` scripts newest first; the view hands back oldest first.)
+    history.set_lows(1, today, &[100_000, 90_000, 120_000, 110_000, 95_000, 130_000]);
+    history.add_low(1, today, 40_000);
+    // Item 2: listed in today's fold only.
+    history.add_low(2, today, 70_000);
+
+    let facts = service.facts(&target, Category::Commodity).expect("facts");
+    let one = facts.get(&item(1)).expect("item 1 has a scan row");
+    assert_eq!(
+        one.lows,
+        [130_000, 95_000, 110_000, 120_000, 90_000, 100_000],
+        "today stays out of the series, and the days stay oldest first"
+    );
+    assert_eq!(one.last_listed_day, Some(today), "the newest day wins over the last row's");
+    let two = facts.get(&item(2)).expect("item 2 has a scan row");
+    assert_eq!(
+        (two.lows, two.last_listed_day),
+        (&[][..], Some(today)),
+        "a today-row alone dates it"
+    );
+
+    // The rank still ignores today: all six prior days sit above the floor.
+    let ranked = service
+        .opportunities(&target, Category::Commodity, 0.0, 50, OpportunitySort::Score)
+        .expect("ranked");
+    assert_eq!(ranked[0].item, item(1));
+    assert_eq!(
+        ranked[0].low_rank_30d,
+        Some(1.0),
+        "a today low under the floor is not a prior day's"
+    );
+    assert_eq!(ranked[1].item, item(2));
+    assert_eq!(ranked[1].low_rank_30d, None, "a today-row alone is no history");
 }
 
 /// Ranks derived from a fact view are the ranking's own — the same rows, in

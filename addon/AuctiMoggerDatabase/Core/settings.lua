@@ -15,7 +15,7 @@ A.Core = A.Core or {}
 local Settings = {}
 A.Core.Settings = Settings
 
-Settings.LINE_KEYS = { "sold", "lastSale", "low", "sparkline", "craft", "deal", "markets" }
+Settings.LINE_KEYS = { "sold", "lastSale", "listed", "low", "sparkline", "craft", "deal", "markets" }
 Settings.PRESETS = { "basic", "standard" }
 
 --- On/off state of every optional tooltip line (SPEC 7.7). A key that is
@@ -23,6 +23,7 @@ Settings.PRESETS = { "basic", "standard" }
 ---@class AmdbLineSettings
 ---@field sold boolean
 ---@field lastSale boolean
+---@field listed boolean
 ---@field low boolean
 ---@field sparkline boolean
 ---@field craft boolean
@@ -33,6 +34,7 @@ Settings.PRESETS = { "basic", "standard" }
 ---@class AmdbSettings
 ---@field enabled boolean master switch
 ---@field shiftDetail boolean Shift shows the detail level
+---@field coins boolean prices as the client's coin icons instead of text
 ---@field lines AmdbLineSettings
 
 --- A per-character settings table (`AuctiMoggerDatabaseCharacter`): the
@@ -73,9 +75,11 @@ function Settings.defaults()
     return {
         enabled = true,
         shiftDetail = true,
+        coins = false,
         lines = {
             sold = true,
             lastSale = true,
+            listed = true,
             low = true,
             sparkline = true,
             craft = true,
@@ -99,6 +103,7 @@ function Settings.coerce(saved)
     -- rawget: a metatable is not trusted to answer for saved data.
     settings.enabled = strictBoolean(rawget(saved, "enabled"), settings.enabled)
     settings.shiftDetail = strictBoolean(rawget(saved, "shiftDetail"), settings.shiftDetail)
+    settings.coins = strictBoolean(rawget(saved, "coins"), settings.coins)
     local lines = rawget(saved, "lines")
     if type(lines) == "table" then
         for i = 1, #Settings.LINE_KEYS do
@@ -182,6 +187,17 @@ function Settings.setEnabled(settings, on)
         return false
     end
     settings.enabled = on == true
+    return true
+end
+
+---@param settings AmdbSettings
+---@param on boolean
+---@return boolean ok false when settings is not a table
+function Settings.setCoins(settings, on)
+    if type(settings) ~= "table" then
+        return false
+    end
+    settings.coins = on == true
     return true
 end
 

@@ -46,6 +46,7 @@ local FIELDS = {
     "floorQty",
     "listedNow",
     "seenFloor",
+    "daysSinceListed",
     "value",
     "valueSource",
     "trend",
@@ -230,8 +231,8 @@ describe("public_api", function()
     describe("GetMarketInfo", function()
         it("holds exactly the documented fields: none extra, and none missing where the record has it", function()
             local A = loaded()
-            -- 7.9 spells 29 fields.
-            assert.equals(29, #FIELDS)
+            -- 7.9 spells 30 fields.
+            assert.equals(30, #FIELDS)
             -- The record that carries every group has all of them present.
             sameList(FIELDS, keysOf(A.GetMarketInfo(194784, { category = "commodity" })))
             -- Elsewhere an absent value is an absent key, never a zero or a false.
@@ -243,10 +244,12 @@ describe("public_api", function()
                     assert.is_true(holds(FIELDS, key), key .. " is not a documented field")
                 end
             end
-            -- A record of spans only still carries the identity, market and snapshot fields.
+            -- A record of spans only, dated: still the identity, market and
+            -- snapshot fields, and the one thing its live group holds.
             sameList({
                 "ageSeconds",
                 "category",
+                "daysSinceListed",
                 "generatedAt",
                 "itemID",
                 "market",
@@ -258,6 +261,8 @@ describe("public_api", function()
                 "valueSource",
             }, keysOf(A.GetMarketInfo(194784, { category = "item" })))
             assert.equals(NOW - AUCTIONS_AT, A.GetMarketInfo(194784).snapshotAgeSeconds)
+            -- Listed three days ago and not since.
+            assert.equals(3, A.GetMarketInfo(194784).daysSinceListed)
             -- The one rate the record does carry is a present zero (section 5.7).
             assert.equals(0, A.GetMarketInfo(194784).saleRate)
             assert.is_nil(A.GetMarketInfo(194784).trend)
@@ -278,6 +283,8 @@ describe("public_api", function()
             assert.equals(1, info.floorQty)
             assert.equals(58, info.listedNow)
             assert.is_nil(info.seenFloor)
+            -- Listed now: last listed today.
+            assert.equals(0, info.daysSinceListed)
             assert.equals(7030, info.value)
             assert.equals("listed", info.valueSource)
             assert.equals(55934 / 10000, info.trend)
@@ -311,6 +318,8 @@ describe("public_api", function()
             assert.is_nil(info.floorQty)
             assert.is_nil(info.listedNow)
             assert.equals(2500, info.seenFloor)
+            -- Seen today: last listed today, though nothing of it is listed.
+            assert.equals(0, info.daysSinceListed)
             assert.equals(3200, info.value)
             assert.equals("sold", info.valueSource)
             assert.equals(3200, info.soldMedian14)
@@ -594,13 +603,15 @@ describe("public_api", function()
             assert.equals(9, d1.qtySold)
             assert.is_nil(d1.lows)
             -- A block with the listing stats and a present zero rate: no ledger fields.
+            -- Nothing of it was listed today, so there is no d1 block at all.
             local bare = A.GetSpans(194784)
-            assert.equals(2, bare.d1.n)
-            assert.equals(0, bare.d1.saleRate)
-            assert.is_nil(bare.d1.qtySold)
-            assert.is_nil(bare.d1.saleRate180d)
+            assert.is_nil(bare.d1)
+            assert.equals(5, bare.d7.n)
+            assert.equals(0, bare.d7.saleRate)
+            assert.is_nil(bare.d7.qtySold)
+            assert.is_nil(bare.d7.saleRate180d)
             -- The 12 v3 listing fields, plus the one rate that is present.
-            assert.equals(13, #keysOf(bare.d1))
+            assert.equals(13, #keysOf(bare.d7))
         end)
 
         it("answers a fresh table on every call", function()

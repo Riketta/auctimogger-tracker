@@ -95,9 +95,10 @@ normal for this item, and how do I know this deal is real?"*.
   the AuctiMogger Database addon loads as a market file, about 250 bytes per
   item) and `feed.json` (the same records, decoded); atomic writes;
   `generatedAt` taken from the source's `Last-Modified` so the addon can trust
-  freshness. Every record carries the span blocks, the live listing, the
-  item's value and trend, the sold/expired evidence, the 30-day position, the
-  vendor price and — where they apply — the craft and the deal rank.
+  freshness. Every record carries the span blocks, the live listing and when
+the item was last listed, the item's value and trend, the sold/expired
+  evidence, the 30-day position, the vendor price and — where they apply —
+  the craft and the deal rank.
 - **Watchlist + alerts** — the watchlist page shows live market numbers per entry (batched reads); alert rules (`price-below` and `below-floor` on the cached blocks; `floor-below`, `floor-below-value` and `new-listing-below` on the newest snapshot's live listings — the sniper operands, each fired listing counted once; `sale-rate-above` and `days-since-last-sale-above` on the ledger) are evaluated first after every ingest cycle, with per-rule cooldowns, recorded as event history and delivered via log, Discord webhook or Telegram bot. Each market category only observes while its own feed is younger than `[alerts].max_data_age_secs` (48 h by default, `0` disables) — commodity rules gate on the commodities feed, item/pet rules on the auctions feed — so a silently dead feed can never fire an alert. Alert evaluation runs with ingest cycles: while a source is unreachable, alerts pause with the market itself (data cannot change without successful ingests).
 - **Web UI + JSON API** — dashboard, snapshot browser, name-aware search with
   completions, item detail with interactive 30-day price-band chart (p05–p95,
@@ -472,8 +473,8 @@ A record holds the four span blocks (`d1`/`d7`/`d14`/`d30`: `n, min, p05,
 p25, median, p75, p95, max, mad, vwap, qtySum, listingCount`, `saleRate`,
 `saleRate180d`, `daysSinceLastSale`, `closuresSinceLastSale`, `qtySold`) and
 the groups behind them: the `live` listing (floor, quantity at the floor,
-listings, total quantity, and today's sighting that is already gone), the
-`value` (7-day listing value, 14-day sold median, today's trend in basis
+listings, total quantity, today's sighting that is already gone, and the
+days since the item was last seen listed), the `value` (7-day listing value, 14-day sold median, today's trend in basis
 points), the sold/expired `evidence` with days of supply, the 30-day
 `position` (lowest ask, share of days above the live floor, a one-byte-per-day
 sparkline), the vendor price, the best craft and the deal rank. Every

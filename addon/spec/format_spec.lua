@@ -329,3 +329,79 @@ describe("Format on the sample lines of SPEC 7.6", function()
         assert.equals("2d", Format.age(2 * DAY))
     end)
 end)
+
+describe("Format.setCoinIcons", function()
+    after_each(function()
+        -- Nothing of this leaks into the table tests above or below.
+        Format.setCoinIcons(nil)
+    end)
+
+    it("is off by default: a price reads as text", function()
+        assert.equals("380g 50s", Format.money(3805000))
+        assert.equals("+1900g", Format.moneySigned(19000000))
+    end)
+
+    it("hands the renderer the whole, non-negative amount and keeps the sign in front", function()
+        local seen = {}
+        Format.setCoinIcons(function(copper)
+            seen[#seen + 1] = copper
+            return "<" .. copper .. ">"
+        end)
+        assert.equals("<3805000>", Format.money(3805000))
+        -- Rounded like the text form, to the whole copper.
+        assert.equals("<3805001>", Format.money(3805000.6))
+        assert.equals("-<50000>", Format.money(-50000))
+        assert.same({ 3805000, 3805001, 50000 }, seen)
+        -- The signed form: the sign in front, and zero as the renderer draws it.
+        assert.equals("+<1900000>", Format.moneySigned(1900000))
+        assert.equals("-<1900000>", Format.moneySigned(-1900000))
+        assert.equals("<0>", Format.moneySigned(0))
+        assert.equals("<0>", Format.moneySigned(0.4))
+        assert.equals("<0>", Format.money(0))
+        -- Junk is still no price at all.
+        assert.is_nil(Format.money(nil))
+        assert.is_nil(Format.money("7"))
+        assert.is_nil(Format.moneySigned(0 / 0))
+    end)
+
+    it("accepts a function only, and nil clears the renderer", function()
+        Format.setCoinIcons("junk")
+        assert.equals("1g", Format.money(10000))
+        Format.setCoinIcons(function()
+            return "<x>"
+        end)
+        assert.equals("<x>", Format.money(10000))
+        Format.setCoinIcons(nil)
+        assert.equals("1g", Format.money(10000))
+    end)
+
+    it("passes over a renderer that raises or answers anything but a string", function()
+        Format.setCoinIcons(function(copper)
+            if copper == 7 then
+                error("no coins for seven", 0)
+            end
+            return copper == 8 and 42 or nil
+        end)
+        -- The text form stands in for that one call, and the next call is tried again.
+        assert.equals("7c", Format.money(7))
+        assert.equals("8c", Format.money(8))
+        assert.equals("0c", Format.money(0))
+        assert.equals("0g", Format.moneySigned(0))
+    end)
+
+    it("never hands a negative amount or a fraction to the renderer", function()
+        local smallest = math.huge
+        local widest = 0
+        Format.setCoinIcons(function(copper)
+            smallest = math.min(smallest, copper)
+            widest = math.max(widest, copper)
+            return tostring(copper)
+        end)
+        for _, copper in ipairs({ -9999999, -0.4, 0, 0.4, 0.6, 1, 9999999999, 12345.678 }) do
+            Format.money(copper)
+            Format.moneySigned(copper)
+        end
+        assert.equals(0, smallest)
+        assert.equals(9999999999, widest)
+    end)
+end)

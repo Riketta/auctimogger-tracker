@@ -11,12 +11,14 @@ local TARGET = "forever-eu-pvp-alliance"
 local OTHER = "forever-eu-pvp-horde"
 
 -- The rows in display order: the master switch, the presets, the lines under
--- their title (seven today, then Shift detail), the market under its own, and
--- the status line.
+-- their title (eight today, then Shift detail and the coin icons), the market
+-- under its own, and the status line.
 local KINDS = {
     "check",
     "buttons",
     "header",
+    "check",
+    "check",
     "check",
     "check",
     "check",
@@ -80,7 +82,7 @@ local function pluck(list, field)
 end
 
 --- The checkbox rows of the optional lines: every check that is neither the
---- master switch nor Shift detail.
+--- master switch, Shift detail nor the coin icons.
 ---@param rows table[]
 ---@return table[] lines
 local function lineChecks(rows)
@@ -88,7 +90,7 @@ local function lineChecks(rows)
     local lines = {}
     for index = 1, #checks do
         local key = checks[index].key
-        if key ~= "enabled" and key ~= "shiftDetail" then
+        if key ~= "enabled" and key ~= "shiftDetail" and key ~= "coins" then
             lines[#lines + 1] = checks[index]
         end
     end
@@ -199,11 +201,12 @@ describe("the panel rows", function()
         -- The names of SPEC 7.6, as a player meets them in the tooltip.
         assert.is_true(holds(pluck(lines, "text"), "30-day low"))
         assert.is_true(holds(pluck(lines, "text"), "Crafting"))
+        assert.is_true(holds(pluck(lines, "text"), "Last listed"))
     end)
 
     it("reads Shift detail as the tooltip does: off unless it is literally on", function()
         local function shift(settings)
-            return Rows.build(context(A, { settings = settings }))[11]
+            return Rows.build(context(A, { settings = settings }))[12]
         end
         local row = shift(A.Core.Settings.defaults())
         assert.equals("check", row.kind)
@@ -214,6 +217,22 @@ describe("the panel rows", function()
         assert.is_false(shift({ shiftDetail = "yes" }).on)
         assert.is_false(shift({}).on)
         assert.is_true(shift({ shiftDetail = true }).on)
+    end)
+
+    it("reads the coin icons off unless they are literally on, right after Shift detail", function()
+        local function coins(settings)
+            return Rows.build(context(A, { settings = settings }))[13]
+        end
+        local row = coins(A.Core.Settings.defaults())
+        assert.equals("check", row.kind)
+        assert.equals("coins", row.key)
+        assert.equals("Coin icons for prices", row.text)
+        -- Text is the default form of a price.
+        assert.is_false(row.on)
+        assert.is_not_nil(row.help)
+        assert.is_false(coins({ coins = "yes" }).on)
+        assert.is_false(coins({}).on)
+        assert.is_true(coins({ coins = true }).on)
     end)
 
     it("titles the two sections", function()
@@ -227,7 +246,7 @@ describe("the panel rows", function()
         local row = Rows.build(context(A, {
             markets = { { target = "b" }, { target = "a" }, { target = "c" } },
             primary = "a",
-        }))[13]
+        }))[15]
         assert.equals("market", row.kind)
         assert.equals("Primary market", row.text)
         assert.same({ "b", "a", "c" }, row.choices)
@@ -236,10 +255,10 @@ describe("the panel rows", function()
     end)
 
     it("has nothing to offer without a loaded market, and skips what is not one", function()
-        local row = Rows.build(context(A, { markets = { "junk", { slot = 2 } } }, { primary = true }))[13]
+        local row = Rows.build(context(A, { markets = { "junk", { slot = 2 } } }, { primary = true }))[15]
         assert.same({}, row.choices)
         assert.is_nil(row.target)
-        row = Rows.build(context(A, nil, { markets = true, primary = true }))[13]
+        row = Rows.build(context(A, nil, { markets = true, primary = true }))[15]
         assert.same({}, row.choices)
         assert.is_nil(row.target)
     end)
@@ -264,10 +283,10 @@ describe("the panel rows", function()
             sum = sum + rows[index].height
         end
         assert.equals(sum, Rows.height(rows))
-        -- The model as it is: the switch, the presets, seven lines, Shift
-        -- detail and the picker at 26; two titles at 38; the status at 60.
-        assert.equals(6 + 10 + 11 * 26 + 2 * 38 + 60, Rows.height(rows))
-        assert.equals(438, Rows.height(rows))
+        -- The model as it is: the switch, the presets, eight lines, Shift detail,
+        -- the coin icons and the picker at 26; two titles at 38; the status at 60.
+        assert.equals(6 + 10 + 13 * 26 + 2 * 38 + 60, Rows.height(rows))
+        assert.equals(490, Rows.height(rows))
         assert.equals(Rows.TOP + Rows.BOTTOM, Rows.height({}))
     end)
 

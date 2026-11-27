@@ -147,9 +147,14 @@ fn spans_only(spans: Vec<(Span, MetricBlock)>) -> ItemRecord {
     }
 }
 
-/// A listed item in the newest snapshot, with nothing seen gone.
+/// A listed item in the newest snapshot, with nothing seen gone: listed
+/// today, so last listed today.
 fn listing(floor: i64, floor_qty: i64, listed: i64, qty_sum: Option<i64>) -> LiveQuote {
-    LiveQuote { listed: Some(LiveListing { floor, floor_qty, listed, qty_sum }), seen: None }
+    LiveQuote {
+        listed: Some(LiveListing { floor, floor_qty, listed, qty_sum }),
+        seen: None,
+        days_since_listed: Some(0),
+    }
 }
 
 fn item(id: i64) -> ItemRef {
@@ -299,6 +304,8 @@ fn gone_today() -> DatabaseEntry {
             live: Some(LiveQuote {
                 listed: None,
                 seen: Some(SeenListing { floor: 2500, qty: 20 }),
+                // Seen today: the hour fold lists it today.
+                days_since_listed: Some(0),
             }),
             value: Some(ValueQuote {
                 value7: 3000,
@@ -313,11 +320,15 @@ fn gone_today() -> DatabaseEntry {
     )
 }
 
-/// One side of the dual-category id: spans only, and never a credited sale.
+/// One side of the dual-category id: never a credited sale, and d7 its only
+/// span. Listed three days ago and not since — the one thing its live group
+/// holds. Nothing of it was listed today, so there is no d1 block: the span
+/// set and the date say the same thing.
 fn dual_item_side() -> DatabaseEntry {
-    let d1 = ledger(flat(2, 4_500_000), Some(0.0), None, None, None, None);
     let d7 = ledger(flat(5, 4_400_000), Some(0.0), None, None, None, None);
-    entry(item(194_784), Category::Item, spans_only(vec![(Span::D1, d1), (Span::D7, d7)]))
+    let mut record = spans_only(vec![(Span::D7, d7)]);
+    record.live = Some(LiveQuote { listed: None, seen: None, days_since_listed: Some(3) });
+    entry(item(194_784), Category::Item, record)
 }
 
 /// A craft that loses money: nothing has ever sold (a present zero rate), a
@@ -472,6 +483,7 @@ fn everything() -> DatabaseEntry {
                     qty_sum: Some(1234),
                 }),
                 seen: Some(SeenListing { floor: 3_750_000, qty: 5 }),
+                days_since_listed: Some(0),
             }),
             value: Some(ValueQuote {
                 value7: 5_980_000,
@@ -681,6 +693,9 @@ fn oracle_record(out: &mut String, key: i64, record: &ItemRecord) {
             fields.push(format!("seenFloor = {}", seen.floor));
             fields.push(format!("seenQty = {}", seen.qty));
         }
+        if let Some(days) = live.days_since_listed {
+            fields.push(format!("daysSinceListed = {days}"));
+        }
         let _ = writeln!(out, "            live = {{ {} }},", fields.join(", "));
     }
     if let Some(value) = &record.value {
@@ -854,6 +869,10 @@ fn the_twin_mirrors_the_carrier() {
                     Some(seen) => assert_eq!(json["live"]["seenQty"], seen.qty),
                     None => assert!(json["live"].get("seenQty").is_none()),
                 }
+                match live.days_since_listed {
+                    Some(days) => assert_eq!(json["live"]["daysSinceListed"], u64::from(days)),
+                    None => assert!(json["live"].get("daysSinceListed").is_none()),
+                }
             }
             None => assert_eq!(json["live"], serde_json::Value::Null),
         }
@@ -915,11 +934,19 @@ fn the_fixture_lists_every_table_in_order() {
 /// The fixture must keep exercising every group and every flag of a record;
 /// this fails when an edit to the snapshot quietly drops a case.
 #[test]
+#[allow(clippy::too_many_lines)]
 fn the_fixture_exercises_every_group_and_flag() {
+    fn days_since_listed(record: &ItemRecord) -> Option<u16> {
+        record.live.as_ref().and_then(|live| live.days_since_listed)
+    }
+
     let records = fixture_records();
     let matching = |test: fn(&ItemRecord) -> bool| count_matching(&records, test);
-    assert!(matching(|record| record.live.is_some()) >= 5, "live group");
-    assert!(matching(|record| record.live.is_none()) >= 2, "not listed and not seen");
+    assert!(matching(|record| record.live.is_some()) >= 8, "live group");
+    assert!(
+        matching(|record| record.live.is_none()) >= 1,
+        "spans only: not listed, not seen, never dated"
+    );
     assert!(
         matching(|record| record.live.as_ref().is_some_and(|live| live.listed.is_none())) >= 1,
         "gone today"
@@ -931,6 +958,23 @@ fn the_fixture_exercises_every_group_and_flag() {
     assert!(
         matching(|record| record.live.as_ref().is_some_and(|live| live.seen.is_none())) >= 4,
         "nothing cheaper seen"
+    );
+    assert!(
+        matching(|record| days_since_listed(record).is_some()) >= 8,
+        "a date for the last listing"
+    );
+    assert!(matching(|record| days_since_listed(record) == Some(0)) >= 7, "listed today");
+    assert!(
+        matching(|record| days_since_listed(record).is_some_and(|days| days > 0)) >= 1,
+        "last listed days ago"
+    );
+    assert!(
+        matching(|record| {
+            record.live.as_ref().is_some_and(|live| {
+                live.listed.is_none() && live.seen.is_none() && live.days_since_listed.is_some()
+            })
+        }) >= 1,
+        "a live group holding nothing but the date"
     );
     let quantity_sum = |record: &ItemRecord| {
         record

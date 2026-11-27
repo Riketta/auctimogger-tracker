@@ -55,7 +55,8 @@ const SFLAG_MASK: u64 = 0x1F;
 const LFLAG_LISTED: u64 = 0x01;
 const LFLAG_QTY_SUM: u64 = 0x02;
 const LFLAG_SEEN: u64 = 0x04;
-const LFLAG_MASK: u64 = 0x07;
+const LFLAG_DAYS_LISTED: u64 = 0x08;
+const LFLAG_MASK: u64 = 0x0F;
 
 const VFLAG_SOLD_MEDIAN14: u64 = 0x01;
 const VFLAG_TREND: u64 = 0x02;
@@ -226,7 +227,8 @@ fn put_span(out: &mut Vec<u8>, block: &MetricBlock) {
     }
 }
 
-/// The `live` group: the listing summary, then what was seen and is gone.
+/// The `live` group: the listing summary, then what was seen and is gone,
+/// then how long ago the item was last listed.
 fn put_live(out: &mut Vec<u8>, live: &LiveQuote) {
     let mut lflags = 0;
     if live.listed.is_some() {
@@ -237,6 +239,9 @@ fn put_live(out: &mut Vec<u8>, live: &LiveQuote) {
     }
     if live.seen.is_some() {
         lflags |= LFLAG_SEEN;
+    }
+    if live.days_since_listed.is_some() {
+        lflags |= LFLAG_DAYS_LISTED;
     }
     pack::put_varint(out, lflags);
 
@@ -251,6 +256,9 @@ fn put_live(out: &mut Vec<u8>, live: &LiveQuote) {
     if let Some(seen) = &live.seen {
         put_uint(out, seen.floor);
         put_uint(out, seen.qty);
+    }
+    if let Some(days) = live.days_since_listed {
+        put_uint(out, i64::from(days));
     }
 }
 
@@ -447,7 +455,12 @@ fn read_live(reader: &mut Reader<'_>) -> Result<LiveQuote, PackError> {
     } else {
         None
     };
-    Ok(LiveQuote { listed, seen })
+    let days_since_listed = if lflags & LFLAG_DAYS_LISTED != 0 {
+        Some(reader.uint::<u16>("live.daysSinceListed")?)
+    } else {
+        None
+    };
+    Ok(LiveQuote { listed, seen, days_since_listed })
 }
 
 fn read_value(reader: &mut Reader<'_>) -> Result<ValueQuote, PackError> {
@@ -624,6 +637,8 @@ mod tests {
                     qty_sum: Some(1234),
                 }),
                 seen: Some(SeenListing { floor: 3_750_000, qty: 5 }),
+                // The newest snapshot lists it: last listed today.
+                days_since_listed: Some(0),
             }),
             value: Some(ValueQuote {
                 value7: 5_980_000,
@@ -669,7 +684,7 @@ mod tests {
         assert_eq!(decode(""), Err(PackError::Truncated { field: "flags" }));
     }
 
-    /// One bit per decision: 2^17 records, from a bare span set to every
+    /// One bit per decision: 2^18 records, from a bare span set to every
     /// group at once, each flag on its own and in every combination.
     fn from_bits(bits: u32) -> ItemRecord {
         let on = |bit: u32| bits & (1 << bit) != 0;
@@ -680,8 +695,9 @@ mod tests {
             qty_sum: on(1).then_some(1234),
         });
         let seen = on(2).then_some(SeenListing { floor: 3_750_000, qty: 5 });
-        let live =
-            (listed.is_some() || seen.is_some() || on(3)).then_some(LiveQuote { listed, seen });
+        let days_since_listed = on(17).then_some(12);
+        let live = (listed.is_some() || seen.is_some() || on(3) || days_since_listed.is_some())
+            .then_some(LiveQuote { listed, seen, days_since_listed });
         let value = on(4).then(|| ValueQuote {
             value7: 5_980_000,
             samples7: 1_305,
@@ -715,7 +731,7 @@ mod tests {
 
     #[test]
     fn every_flag_combination_round_trips() {
-        for bits in 0..(1 << 17) {
+        for bits in 0..(1 << 18) {
             let record = from_bits(bits);
             assert_eq!(round_trip(&record), record, "flag bits {bits:#x}");
         }
@@ -789,6 +805,7 @@ mod tests {
             live: Some(LiveQuote {
                 listed: Some(LiveListing { floor: 0, floor_qty: 0, listed: 0, qty_sum: Some(0) }),
                 seen: Some(SeenListing { floor: 0, qty: 0 }),
+                days_since_listed: Some(0),
             }),
             value: Some(ValueQuote {
                 value7: 1,
@@ -816,6 +833,7 @@ mod tests {
         let live = decoded.live.expect("live group");
         assert_eq!(live.listed.as_ref().and_then(|l| l.qty_sum), Some(0));
         assert_eq!(live.seen.as_ref().map(|s| s.qty), Some(0));
+        assert_eq!(live.days_since_listed, Some(0), "listed today is a present zero");
         let value = decoded.value.expect("value group");
         assert_eq!((value.sold_median14, value.trend_bp, value.samples7), (Some(0), Some(0), 0));
         assert_eq!(
@@ -833,7 +851,7 @@ mod tests {
     #[test]
     fn an_empty_live_quote_is_an_empty_group() {
         let record = ItemRecord {
-            live: Some(LiveQuote { listed: None, seen: None }),
+            live: Some(LiveQuote { listed: None, seen: None, days_since_listed: None }),
             ..spans_only(0b0001, 0)
         };
         assert_eq!(round_trip(&record), record);
@@ -862,6 +880,8 @@ mod tests {
                     qty_sum: Some(-4),
                 }),
                 seen: Some(SeenListing { floor: -6, qty: -7 }),
+                // A `u16` on both sides: there is no negative to saturate.
+                days_since_listed: None,
             }),
             value: Some(ValueQuote {
                 value7: -8,
@@ -1008,6 +1028,8 @@ mod tests {
             live: Some(LiveQuote {
                 listed: Some(LiveListing { floor: 100, floor_qty: 5, listed: 7, qty_sum: None }),
                 seen: None,
+                // Last in the live group, after everything seen gone.
+                days_since_listed: Some(6),
             }),
             value: Some(ValueQuote {
                 value7: 900,
@@ -1038,8 +1060,10 @@ mod tests {
         for value in [2500u64, 0, 40] {
             pack::put_varint(&mut expected, value);
         }
-        for value in [0x01u64, 100, 5, 7] {
-            pack::put_varint(&mut expected, value); // live: lflags, floor, floorQty, listed
+        // live: lflags (listed + daysSinceListed), floor, floorQty, listed, then
+        // daysSinceListed, the group's last field.
+        for value in [0x09u64, 100, 5, 7, 6] {
+            pack::put_varint(&mut expected, value);
         }
         for value in [0x03u64, 900, 950, 12] {
             pack::put_varint(&mut expected, value); // value: vflags, value7, soldMedian14, samples7
@@ -1100,8 +1124,8 @@ mod tests {
             (vec![0x00, 0x10], PackError::UnknownFlag { field: "spans", bits: 0x10 }),
             (vec![0x00, 0x01, 0x20], PackError::UnknownFlag { field: "span.sflags", bits: 0x20 }),
             (
-                [opening(GROUP_LIVE), vec![0x08]].concat(),
-                PackError::UnknownFlag { field: "live.lflags", bits: 0x08 },
+                [opening(GROUP_LIVE), vec![0x10]].concat(),
+                PackError::UnknownFlag { field: "live.lflags", bits: 0x10 },
             ),
             (
                 [opening(GROUP_VALUE), vec![0x04]].concat(),
@@ -1210,7 +1234,11 @@ mod tests {
             pack::put_varint(&mut out, value);
             out
         };
-        let cases: [(Vec<u8>, PackError); 6] = [
+        let cases: [(Vec<u8>, PackError); 7] = [
+            (
+                over(GROUP_LIVE, &[0x08, 0x80, 0x80, 0x04]),
+                PackError::OutOfRange { field: "live.daysSinceListed", value: 65_536 },
+            ),
             (
                 over(GROUP_EVIDENCE, &[0x04, 0x80, 0x80, 0x04]),
                 PackError::OutOfRange { field: "evidence.supplyDays", value: 65_536 },

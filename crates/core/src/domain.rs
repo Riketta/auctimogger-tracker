@@ -1017,7 +1017,8 @@ pub struct DatabaseEntry {
 pub struct ItemRecord {
     /// Metric block per span. A record always carries at least one span.
     pub spans: BTreeMap<Span, MetricBlock>,
-    /// What the newest snapshot lists, and what was seen today and is gone.
+    /// What the newest snapshot lists, what was seen today and is gone, and
+    /// how long ago the item was last listed.
     pub live: Option<LiveQuote>,
     /// The item's value: what buyers paid once enough of them did, else what
     /// sellers ask.
@@ -1048,8 +1049,9 @@ pub struct ItemRecord {
     pub deal: Option<DealMark>,
 }
 
-/// The `live` group: what the newest snapshot lists, and what was seen today
-/// and is no longer listed. The group exists when either is known.
+/// The `live` group: what the newest snapshot lists, what was seen today
+/// and is no longer listed, and how long ago the item was last listed. The
+/// group exists when any of the three is known.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LiveQuote {
     /// The item's listings in the newest snapshot; `None` when nothing of the
@@ -1058,6 +1060,10 @@ pub struct LiveQuote {
     /// Today's cheapest listing that is no longer listed (bought or
     /// cancelled); `None` when everything seen today is still listed.
     pub seen: Option<SeenListing>,
+    /// Whole UTC days since the item was last seen listed; 0 when the newest
+    /// snapshot lists it or the hour fold lists it today. Absent without
+    /// hour-fold evidence.
+    pub days_since_listed: Option<u16>,
 }
 
 /// An item's listings in the newest snapshot.

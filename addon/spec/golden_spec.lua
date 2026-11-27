@@ -266,4 +266,18 @@ describe("the golden records' other derived values", function()
         assert.equals(9411 / 10000, bulk:saleRate180d())
         assert.equals(0, bulk:closuresSinceLastSale())
     end)
+
+    it("date the last listing off the newest snapshot, then the hour fold", function()
+        -- Listed now, or seen today and gone: last listed today.
+        assert.equals(0, read("items", 25).live.daysSinceListed)
+        assert.equals(0, read("items", 2589).live.daysSinceListed)
+        assert.equals(0, read("commodities", 194784).live.daysSinceListed)
+        -- Listed three days ago and not since: the one thing its live group holds.
+        local quiet = read("items", 194784)
+        assert.equals(3, quiet.live.daysSinceListed)
+        assert.is_nil(quiet.live.floor)
+        assert.is_nil(quiet.live.seenFloor)
+        -- A pooled species carries spans only: no live group, so no date.
+        assert.is_nil(read("pets", 293).live)
+    end)
 end)

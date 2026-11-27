@@ -48,6 +48,7 @@ local previousBuyout = rawget(_G, "GetAuctionBuyout")
 ---@field floorQty integer|nil units listed at exactly the floor
 ---@field listedNow integer|nil listings in the snapshot
 ---@field seenFloor integer|nil copper: today's cheapest listing that is gone
+---@field daysSinceListed integer|nil whole days since the item was last seen listed; 0 = today
 ---@field value number|nil copper: the record's reference value
 ---@field valueSource string|nil "sold", "listed" or the span name behind `value`
 ---@field trend number|nil fraction, signed
@@ -213,6 +214,7 @@ local function toInfo(located, now)
         floorQty = live ~= nil and live.floorQty or nil,
         listedNow = live ~= nil and live.listed or nil,
         seenFloor = live ~= nil and live.seenFloor or nil,
+        daysSinceListed = live ~= nil and live.daysSinceListed or nil,
         value = record:reference(),
         valueSource = record:valueSource(),
         -- Fractions, not basis points: every field without "Bp" in its name is plain.

@@ -437,6 +437,8 @@ mod twin {
         pub seen_floor: Option<i64>,
         #[serde(skip_serializing_if = "Option::is_none")]
         pub seen_qty: Option<i64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub days_since_listed: Option<u16>,
     }
 
     impl From<&LiveQuote> for Live {
@@ -449,6 +451,7 @@ mod twin {
                 qty_sum: listed.and_then(|listing| listing.qty_sum),
                 seen_floor: live.seen.as_ref().map(|seen| seen.floor),
                 seen_qty: live.seen.as_ref().map(|seen| seen.qty),
+                days_since_listed: live.days_since_listed,
             }
         }
     }
@@ -752,6 +755,7 @@ mod database_tests {
                         qty_sum: Some(1234),
                     }),
                     seen: Some(SeenListing { floor: 3_750_000, qty: 5 }),
+                    days_since_listed: Some(0),
                 }),
                 value: Some(ValueQuote {
                     value7: 4_123_500,
@@ -1132,7 +1136,7 @@ mod database_tests {
         let entry = &value["items"][0];
         assert_eq!(
             entry["live"],
-            serde_json::json!({ "floor": 3_805_000, "floorQty": 214, "listed": 618, "qtySum": 1234, "seenFloor": 3_750_000, "seenQty": 5 })
+            serde_json::json!({ "floor": 3_805_000, "floorQty": 214, "listed": 618, "qtySum": 1234, "seenFloor": 3_750_000, "seenQty": 5, "daysSinceListed": 0 })
         );
         assert_eq!(entry["value7"], 4_123_500);
         assert_eq!(entry["soldMedian14"], 4_021_000);
@@ -1166,6 +1170,7 @@ mod database_tests {
         entry.record.live = Some(LiveQuote {
             listed: Some(LiveListing { floor: 15000, floor_qty: 1, listed: 58, qty_sum: None }),
             seen: None,
+            days_since_listed: None,
         });
         let text = twin_text(&snapshot(vec![entry]));
         assert!(
@@ -1174,8 +1179,11 @@ mod database_tests {
         );
         // Seen today, already gone: no floor at all.
         let mut entry = item(25, Category::Item);
-        entry.record.live =
-            Some(LiveQuote { listed: None, seen: Some(SeenListing { floor: 2500, qty: 20 }) });
+        entry.record.live = Some(LiveQuote {
+            listed: None,
+            seen: Some(SeenListing { floor: 2500, qty: 20 }),
+            days_since_listed: None,
+        });
         let text = twin_text(&snapshot(vec![entry]));
         assert!(
             text.contains(
@@ -1183,6 +1191,45 @@ mod database_tests {
             ),
             "{text}"
         );
+    }
+
+    /// `daysSinceListed` is written last in the live group when it is known —
+    /// also when it is the only thing the group holds — and omitted when it is
+    /// not: never a null, never a zero the tracker did not mean.
+    #[test]
+    fn twin_writes_days_since_listed_when_known_and_omits_it_otherwise() {
+        // Last in the group, after the sighting that is gone.
+        let mut gone = item(25, Category::Item);
+        gone.record.live = Some(LiveQuote {
+            listed: None,
+            seen: Some(SeenListing { floor: 2500, qty: 20 }),
+            days_since_listed: Some(12),
+        });
+        // A live group holding nothing but the date.
+        let mut dated = item(117, Category::Item);
+        dated.record.live =
+            Some(LiveQuote { listed: None, seen: None, days_since_listed: Some(30) });
+        // Listed, but the fold never dated it: no key at all.
+        let mut undated = item(2589, Category::Item);
+        undated.record.live = Some(LiveQuote {
+            listed: Some(LiveListing { floor: 15000, floor_qty: 1, listed: 58, qty_sum: None }),
+            seen: None,
+            days_since_listed: None,
+        });
+        let text = twin_text(&snapshot(vec![gone, dated, undated]));
+        assert!(
+            text.contains(
+                "\"live\": {\n        \"seenFloor\": 2500,\n        \"seenQty\": 20,\n        \"daysSinceListed\": 12\n      }"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("\"live\": {\n        \"daysSinceListed\": 30\n      }"), "{text}");
+        assert!(
+            text.contains("\"live\": {\n        \"floor\": 15000,\n        \"floorQty\": 1,\n        \"listed\": 58\n      }"),
+            "{text}"
+        );
+        assert_eq!(text.matches("daysSinceListed").count(), 2, "{text}");
+        assert!(!text.contains("\"daysSinceListed\": null"), "{text}");
     }
 
     #[test]
@@ -1267,7 +1314,18 @@ mod database_tests {
             .and_then(|rest| rest.split('}').next())
             .expect("the first entry has a live group");
         assert!(
-            keys_in_order(live, &["floor", "floorQty", "listed", "qtySum", "seenFloor", "seenQty"]),
+            keys_in_order(
+                live,
+                &[
+                    "floor",
+                    "floorQty",
+                    "listed",
+                    "qtySum",
+                    "seenFloor",
+                    "seenQty",
+                    "daysSinceListed"
+                ]
+            ),
             "{live}"
         );
         assert!(keys_in_order(&text, &["cost", "profit", "expectedProfit"]), "{text}");

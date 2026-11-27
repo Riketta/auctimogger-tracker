@@ -79,18 +79,22 @@ local STUBS = {
     CHARACTER,
     "Settings",
     "MenuUtil",
+    "GetMoneyString",
     "AuctiMoggerTrackerFeed",
 }
 
 -- What registering the options panel creates at the login, after the tooltip:
 -- its frame, then one control per row of the model (Core/panel_rows.lua): the
--- master switch's checkbox, the two preset buttons, seven line checkboxes and
--- Shift detail's, and the primary-market picker. A font string is not a frame.
+-- master switch's checkbox, the two preset buttons, eight line checkboxes, Shift
+-- detail's and the coin icons', and the primary-market picker. A font string is
+-- not a frame.
 local PANEL_CREATED = {
     "Frame",
     "CheckButton",
     "Button",
     "Button",
+    "CheckButton",
+    "CheckButton",
     "CheckButton",
     "CheckButton",
     "CheckButton",
@@ -240,6 +244,7 @@ describe("bootstrap", function()
             end,
         })
         rawset(_G, "MenuUtil", nil)
+        rawset(_G, "GetMoneyString", nil)
         rawset(_G, "AuctiMoggerTrackerFeed", nil)
     end)
 
@@ -317,6 +322,30 @@ describe("bootstrap", function()
         -- A second login builds nothing twice.
         fire("PLAYER_LOGIN")
         assert.same(CREATED_AT_LOGIN, created)
+    end)
+
+    it("applies the coin icons the saved settings ask for at the login, once the client can draw them", function()
+        rawset(_G, "GetMoneyString", function(copper)
+            return "<" .. tostring(copper) .. ">"
+        end)
+        local A = boot()
+        rawset(_G, SETTINGS, { coins = true })
+        fire("ADDON_LOADED", ADDON)
+        assert.is_true(A.settings.coins)
+        -- Nothing is applied before the adapters are built at the login.
+        assert.equals("1g 23s 45c", A.Core.Format.money(12345))
+        fire("PLAYER_LOGIN")
+        assert.equals("<12345>", A.Core.Format.money(12345))
+    end)
+
+    it("keeps the saved coin icons off where the client has no GetMoneyString", function()
+        local A = boot()
+        rawset(_G, SETTINGS, { coins = true })
+        fire("ADDON_LOADED", ADDON)
+        fire("PLAYER_LOGIN")
+        -- The setting is the player's and survives; the prices stay in text.
+        assert.is_true(A.settings.coins)
+        assert.equals("1g 23s 45c", A.Core.Format.money(12345))
     end)
 
     ----------------------------------------------------------- SavedVariables

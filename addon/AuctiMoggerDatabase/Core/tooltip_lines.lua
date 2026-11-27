@@ -202,6 +202,19 @@ end
 
 --------------------------------------------------- the optional lines, standard
 
+--- A number of days as a when: "today", "1d ago", "Nd ago".
+---@param days integer whole days
+---@return string text
+local function ago(days)
+    if days <= 0 then
+        return "today"
+    end
+    if days == 1 then
+        return "1d ago"
+    end
+    return Format.count(days) .. "d ago"
+end
+
 ---@param record AmdbRecord
 ---@return AmdbTipRow|nil row
 local function soldRow(record)
@@ -223,15 +236,21 @@ local function lastSaleRow(record)
     if days == nil then
         return nil
     end
-    local when
-    if days <= 0 then
-        when = "today"
-    elseif days == 1 then
-        when = "1d ago"
-    else
-        when = Format.count(days) .. "d ago"
+    return { left = "Last sale", right = ago(days) }
+end
+
+--- Last listed: how many days ago the item was last seen listed, which is
+--- another question than when it last sold. The tracker dates it off the
+--- newest snapshot and the hour fold (SPEC 5.6).
+---@param record AmdbRecord
+---@return AmdbTipRow|nil row
+local function listedRow(record)
+    local live = record.live
+    local days = live ~= nil and live.daysSinceListed or nil
+    if days == nil then
+        return nil
     end
-    return { left = "Last sale", right = when }
+    return { left = "Last listed", right = ago(days) }
 end
 
 ---@param record AmdbRecord
@@ -334,6 +353,7 @@ local function standardRows(record, context)
     end
     optional("sold", soldRow)
     optional("lastSale", lastSaleRow)
+    optional("listed", listedRow)
     optional("low", lowRow)
     optional("sparkline", sparklineRow)
     optional("craft", craftRow)

@@ -58,6 +58,7 @@ Compat.optionalGlobals = {
     "IsShiftKeyDown",
     "Settings",
     "MenuUtil",
+    "GetMoneyString",
     "print",
 }
 Compat.optionalEvents = { "MODIFIER_STATE_CHANGED", "PLAYER_LOGOUT" }
@@ -72,6 +73,7 @@ Compat.fallbacks = {
     IsShiftKeyDown = "the detail level is unavailable: tooltips stay at the standard level",
     Settings = "the options panel is skipped with a one-time note; the slash command covers everything",
     MenuUtil = "the primary-market picker of the options panel moves to the next market on each click instead of opening a menu",
+    GetMoneyString = "prices stay in text: /amdb coins on refuses and says so, and the panel's box stays off",
     print = "no chat output; reports still reach /amdb status",
     MODIFIER_STATE_CHANGED = "Shift is read when a tooltip is built: a held or released Shift shows on the next tooltip only",
     PLAYER_LOGOUT = "settings are written back as soon as they change, so nothing is left for the logout to save",

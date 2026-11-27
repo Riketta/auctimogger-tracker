@@ -27,7 +27,7 @@ local Settings = A.Core.Settings
 ---@class AmdbPanelRow
 ---@field kind AmdbPanelRowKind
 ---@field height number pixels the row takes in the frame
----@field key string|nil check: "enabled", "shiftDetail" or an optional line's key
+---@field key string|nil check: "enabled", "shiftDetail", "coins" or an optional line's key
 ---@field text string|nil check, buttons and market: the label; header: the title; status: the line
 ---@field on boolean|nil check: whether the box is checked
 ---@field help string|nil check and market: hover help
@@ -67,6 +67,9 @@ local ENABLE_TEXT = "Enable tooltips"
 local ENABLE_HELP = "The master switch. Off takes the extra tip off every item; same as /amdb off."
 local SHIFT_TEXT = "Hold Shift for detail"
 local SHIFT_HELP = "While Shift is held, a tooltip shows sold medians and spans instead of its lines."
+local COINS_TEXT = "Coin icons for prices"
+local COINS_HELP =
+    "Prices as the client's own gold, silver and copper icons instead of text, in tooltips and chat. Needs a client with GetMoneyString."
 
 -- The preset row and the two headers.
 local PRESET_TEXT = "Preset"
@@ -82,6 +85,7 @@ local MARKET_HELP = "The market whose prices the tooltip shows. Other markets sh
 local LINE_TEXT = {
     sold = "Sold per day and supply",
     lastSale = "Last sale",
+    listed = "Last listed",
     low = "30-day low",
     sparkline = "30-day chart",
     craft = "Crafting",
@@ -93,6 +97,7 @@ local LINE_TEXT = {
 local LINE_HELP = {
     sold = "Units sold per day over the last 14 days, and how long the listed stock lasts.",
     lastSale = "How many days ago the item last sold.",
+    listed = "How many days ago the item was last seen listed on the auction house.",
     low = "The lowest buyout of the last 30 days, and how many of those days were higher.",
     sparkline = "A bar a day: the lowest ask of each of the last 30 days.",
     craft = "What the reagents cost, and the profit of crafting and selling the item.",
@@ -149,9 +154,9 @@ local function header(text)
 end
 
 --- The model of the panel, in display order: the master switch, the presets,
---- the optional lines and Shift detail under one title, the primary market
---- under another, and the status line last. A fresh table on every call, so
---- the caller owns it.
+--- the optional lines with Shift detail and the coin icons under one title, the
+--- primary market under another, and the status line last. A fresh table on
+--- every call, so the caller owns it.
 ---@param context AmdbPanelContext
 ---@return AmdbPanelRow[] rows
 function PanelRows.build(context)
@@ -176,10 +181,11 @@ function PanelRows.build(context)
         local key = Settings.LINE_KEYS[index]
         rows[#rows + 1] = check(key, LINE_TEXT[key] or key, Settings.isLineOn(settings, key), LINE_HELP[key])
     end
-    -- Shift detail is off unless it is literally switched on, as the tooltip
-    -- adapter reads it.
-    local shift = type(settings) == "table" and settings.shiftDetail == true
-    rows[#rows + 1] = check("shiftDetail", SHIFT_TEXT, shift, SHIFT_HELP)
+    -- Shift detail and the coin icons are off unless literally switched on, as
+    -- the adapters read them.
+    local settingsTable = type(settings) == "table" and settings or {}
+    rows[#rows + 1] = check("shiftDetail", SHIFT_TEXT, settingsTable.shiftDetail == true, SHIFT_HELP)
+    rows[#rows + 1] = check("coins", COINS_TEXT, settingsTable.coins == true, COINS_HELP)
 
     rows[#rows + 1] = header(MARKET_TITLE)
     rows[#rows + 1] = {

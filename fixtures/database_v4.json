@@ -96,7 +96,8 @@
         "floor": 15000,
         "floorQty": 1,
         "listed": 58,
-        "qtySum": 58
+        "qtySum": 58,
+        "daysSinceListed": 0
       },
       "value7": 7030,
       "samples7": 188,
@@ -165,7 +166,8 @@
         "floor": 9999999999,
         "floorQty": 1,
         "listed": 1,
-        "qtySum": 1
+        "qtySum": 1,
+        "daysSinceListed": 0
       },
       "value7": 9500000000,
       "samples7": 3,
@@ -265,7 +267,8 @@
       },
       "live": {
         "seenFloor": 2500,
-        "seenQty": 20
+        "seenQty": 20,
+        "daysSinceListed": 0
       },
       "value7": 3000,
       "soldMedian14": 3200,
@@ -279,21 +282,6 @@
       "itemID": 194784,
       "category": "item",
       "spans": {
-        "d1": {
-          "n": 2,
-          "min": 4500000,
-          "p05": 4500000,
-          "p25": 4500000,
-          "median": 4500000,
-          "p75": 4500000,
-          "p95": 4500000,
-          "max": 4500000,
-          "mad": 0,
-          "vwap": 4500000,
-          "qtySum": 2,
-          "listingCount": 2,
-          "saleRate": 0.0
-        },
         "d7": {
           "n": 5,
           "min": 4400000,
@@ -310,7 +298,9 @@
           "saleRate": 0.0
         }
       },
-      "live": null,
+      "live": {
+        "daysSinceListed": 3
+      },
       "craft": null,
       "deal": null
     },
@@ -390,7 +380,8 @@
       "live": {
         "floor": 90000,
         "floorQty": 100,
-        "listed": 3
+        "listed": 3,
+        "daysSinceListed": 0
       },
       "value7": 80000,
       "samples7": 21,
@@ -495,7 +486,8 @@
         "floor": 12,
         "floorQty": 200000,
         "listed": 4321,
-        "qtySum": 1234567890
+        "qtySum": 1234567890,
+        "daysSinceListed": 0
       },
       "value7": 18,
       "soldMedian14": 19,
@@ -633,7 +625,8 @@
         "listed": 618,
         "qtySum": 1234,
         "seenFloor": 3750000,
-        "seenQty": 5
+        "seenQty": 5,
+        "daysSinceListed": 0
       },
       "value7": 5980000,
       "soldMedian14": 6137000,
@@ -758,7 +751,8 @@
         "floor": 2500000,
         "floorQty": 1,
         "listed": 2,
-        "qtySum": 2
+        "qtySum": 2,
+        "daysSinceListed": 0
       },
       "value7": 2400000,
       "soldMedian14": 2450000,

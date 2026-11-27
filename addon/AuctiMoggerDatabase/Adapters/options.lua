@@ -5,13 +5,13 @@ local ADDON, A = ...
 --
 -- Everything a player can change is in one place: the master switch, the
 -- primary market of this character, the optional tooltip lines and their
--- presets, Shift detail. The command answers in chat; the panel shows the same
--- settings as controls in the client's Settings UI, over the same row model
--- (Core/panel_rows.lua) and through the same `apply` methods, so the two can
--- never disagree. The status and a debug dump of one record are the command's
--- alone. Every change is written back to the SavedVariables as it happens, so
--- a crash after a change loses nothing. A command that raises says so instead
--- of showing a Lua error.
+-- presets, Shift detail and the coin icons. The command answers in chat; the
+-- panel shows the same settings as controls in the client's Settings UI, over
+-- the same row model (Core/panel_rows.lua) and through the same `apply`
+-- methods, so the two can never disagree. The status and a debug dump of one
+-- record are the command's alone. Every change is written back to the
+-- SavedVariables as it happens, so a crash after a change loses nothing. A
+-- command that raises says so instead of showing a Lua error.
 
 -- Wiring invariant of the TOC order, failed loudly rather than at the first call.
 assert(type(A.Compat) == "table", ADDON .. ": A.Compat must be set before Adapters/options.lua loads")
@@ -161,6 +161,21 @@ local function fieldLine(fields)
     return table.concat(parts, " · ")
 end
 
+--- The coin renderer of this client (SPEC 7.7, `coins`): its own money string,
+--- without thousands separators, with copper shown whenever there is any, and
+--- zero as the gold coin alone. Nil on a client without `GetMoneyString`. The
+--- API is read on every call and every use: nothing of it is held onto.
+---@return (fun(copper: number): string)|nil renderer
+local function coinRenderer()
+    local money = rawget(_G, "GetMoneyString")
+    if type(money) ~= "function" then
+        return nil
+    end
+    return function(copper)
+        return money(copper, false, false, true)
+    end
+end
+
 --- The commands of SPEC 7.7, as `help` lists them. The line keys are read
 --- from the settings module, so the list cannot drift from it.
 ---@type string[]
@@ -173,6 +188,7 @@ local HELP = {
     "/amdb basic|standard - every optional line off / on",
     "/amdb <line> on|off - one optional line: " .. table.concat(Preferences.LINE_KEYS, ", "),
     "/amdb shift on|off - Shift shows the detail level",
+    "/amdb coins on|off - prices as coin icons instead of text",
     "/amdb decode <item> - every decoded field of the item",
     "/amdb help - this list",
 }
@@ -277,6 +293,14 @@ function Options:handle(msg)
         end
         return
     end
+    if command == "coins" then
+        if argument == "on" or argument == "off" then
+            self:setCoins(argument == "on")
+        else
+            self:usage("coins on|off")
+        end
+        return
+    end
     if command == "decode" then
         self:decode(argument)
         return
@@ -312,6 +336,9 @@ function Options:status()
         "preset " .. presetName(self.settings),
         "shift detail " .. (self.settings.shiftDetail and "on" or "off"),
     }
+    if self.settings.coins == true then
+        state[#state + 1] = "coin icons on"
+    end
     if self.tooltip ~= nil then
         state[#state + 1] = "tooltip hooks: " .. self.tooltip.path
     end
@@ -502,6 +529,43 @@ function Options:setShift(on)
     self:reply("shift detail " .. (on and "on" or "off"))
 end
 
+--- Brings the formatter in line with the `coins` setting: the client's coin
+--- renderer while it is on, the text form otherwise. Called once the settings
+--- are loaded and after every change.
+function Options:syncCoins()
+    Format.setCoinIcons(self.settings.coins == true and coinRenderer() or nil)
+end
+
+--- Applies whether prices read as coin icons, and writes it back at once.
+--- Shared by the command and the panel. Nothing changes on a client without
+--- `GetMoneyString`: the setting stays as it was and the reason comes back.
+---@param on boolean
+---@return boolean ok
+---@return string|nil message why nothing changed
+function Options:applyCoins(on)
+    if on and coinRenderer() == nil then
+        -- The panel's box comes back to the setting, which did not change.
+        self:refreshPanel()
+        return false, "this client has no GetMoneyString: prices stay in text"
+    end
+    Preferences.setCoins(self.settings, on)
+    self:syncCoins()
+    self.persist()
+    self:refreshPanel()
+    return true
+end
+
+--- The command: whether prices read as coin icons.
+---@param on boolean
+function Options:setCoins(on)
+    local ok, message = self:applyCoins(on)
+    if not ok then
+        self:say(warn(message or "prices stay in text"))
+        return
+    end
+    self:reply("coin icons " .. (on and "on" or "off"))
+end
+
 --- Prints every decoded field of one record: the raw numbers, as the wire
 --- carries them.
 ---@param argument string an item id, link or `item:` string; a `battlepet:` string
@@ -586,6 +650,7 @@ function Options:decode(argument)
         { name = "qtySum", value = live ~= nil and live.qtySum or nil },
         { name = "seenFloor", value = live ~= nil and live.seenFloor or nil },
         { name = "seenQty", value = live ~= nil and live.seenQty or nil },
+        { name = "daysSinceListed", value = live ~= nil and live.daysSinceListed or nil },
     }))
     self:say(fieldLine({
         { name = "value7", value = record.value7 },
@@ -1124,7 +1189,7 @@ function Options:dropPanel()
 end
 
 --- A checkbox of the panel was clicked: the key names the master switch, Shift
---- detail or an optional line.
+--- detail, the coin icons or an optional line.
 ---@param key string|nil
 ---@param on boolean
 function Options:onPanelToggle(key, on)
@@ -1132,6 +1197,8 @@ function Options:onPanelToggle(key, on)
         self:applyEnabled(on)
     elseif key == "shiftDetail" then
         self:applyShift(on)
+    elseif key == "coins" then
+        self:applyCoins(on)
     elseif key ~= nil then
         self:applyLine(key, on)
     end

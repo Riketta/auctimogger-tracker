@@ -69,6 +69,7 @@ local OPTIONAL = {
     "IsShiftKeyDown",
     "Settings",
     "MenuUtil",
+    "GetMoneyString",
 }
 
 local STUBS = { "CreateFrame", "GameTooltip", "UIParent", "time", "SlashCmdList", "SLASH_AMDB1", "SLASH_AMDB2" }
@@ -303,14 +304,15 @@ describe("the /amdb command", function()
         it("lists the commands of SPEC 7.7 for a bare /amdb and for help", function()
             local bare = run("")
             local help = run("help")
-            assert.equals(10, #bare)
+            assert.equals(11, #bare)
             assert.same(help, bare)
             assert.equals("/amdb on|off - the tooltip's master switch", bare[1])
             assert.equals("/amdb status - markets, primary market, switch, preset", bare[2])
             assert.equals("/amdb market <id> - this character's primary market", bare[4])
             assert.equals("/amdb basic|standard - every optional line off / on", bare[6])
             assert.equals("/amdb shift on|off - Shift shows the detail level", bare[8])
-            assert.equals("/amdb decode <item> - every decoded field of the item", bare[9])
+            assert.equals("/amdb coins on|off - prices as coin icons instead of text", bare[9])
+            assert.equals("/amdb decode <item> - every decoded field of the item", bare[10])
         end)
 
         it("names every optional line in the help, from the settings module", function()
@@ -323,8 +325,8 @@ describe("the /amdb command", function()
         it("answers an unknown command with a warning and the list", function()
             local answer = run("frobnicate")
             assert.equals(WARN .. "unknown command \"frobnicate\"" .. RESET, answer[1])
-            assert.equals(11, #answer)
-            assert.equals("/amdb help - this list", answer[11])
+            assert.equals(12, #answer)
+            assert.equals("/amdb help - this list", answer[12])
         end)
 
         it("drops color codes and control characters from what it echoes", function()
@@ -484,10 +486,14 @@ describe("the /amdb command", function()
             local withoutMenu = DIM
                 .. "without MenuUtil: the primary-market picker of the options panel moves to the next market on each click instead of opening a menu"
                 .. RESET
+            local withoutCoins = DIM
+                .. "without GetMoneyString: prices stay in text: /amdb coins on refuses and says so, and the panel's box stays off"
+                .. RESET
             local answer = run("status")
             assert.is_true(hasLine(answer, withoutPanel))
             assert.is_true(hasLine(answer, withoutScreening))
             assert.is_true(hasLine(answer, withoutMenu))
+            assert.is_true(hasLine(answer, withoutCoins))
             -- The login line, one market row, then one fallback line per
             -- optional surface that is absent here.
             assert.equals(2 + #OPTIONAL, #answer)
@@ -570,8 +576,9 @@ describe("the /amdb command", function()
             local answer = run("lines")
             assert.equals(TITLE .. " optional tooltip lines (standard)", answer[1])
             assert.equals("  sold" .. GOOD .. "  on" .. RESET, answer[2])
-            assert.equals("  markets" .. GOOD .. "  on" .. RESET, answer[8])
-            assert.equals(9, #answer)
+            assert.equals("  listed" .. GOOD .. "  on" .. RESET, answer[4])
+            assert.equals("  markets" .. GOOD .. "  on" .. RESET, answer[9])
+            assert.equals(10, #answer)
         end)
 
         it("switches one line, and writes it back at once", function()
@@ -587,7 +594,7 @@ describe("the /amdb command", function()
             run("sparkline off")
             local answer = run("lines")
             assert.equals(TITLE .. " optional tooltip lines (custom)", answer[1])
-            assert.equals("  sparkline" .. BAD .. "  off" .. RESET, answer[5])
+            assert.equals("  sparkline" .. BAD .. "  off" .. RESET, answer[6])
         end)
 
         it("answers every key of the settings module", function()
@@ -649,6 +656,104 @@ describe("the /amdb command", function()
         end)
     end)
 
+    ------------------------------------------------------------------- coins
+
+    describe("coins", function()
+        --- A stand-in for the client's money string: it writes its arguments, so
+        --- the test sees exactly what the renderer hands it.
+        local function fakeCoins(copper, separateThousands, checkGoldThreshold, showZeroAsGold)
+            return ("<%d|%s|%s|%s>"):format(
+                copper,
+                tostring(separateThousands),
+                tostring(checkGoldThreshold),
+                tostring(showZeroAsGold)
+            )
+        end
+
+        it("asks for on or off", function()
+            assert.same({ WARN .. "usage: /amdb coins on|off" .. RESET }, run("coins"))
+            assert.same({ WARN .. "usage: /amdb coins on|off" .. RESET }, run("coins maybe"))
+            assert.equals(0, persisted)
+        end)
+
+        it("refuses to switch them on without GetMoneyString, and changes nothing", function()
+            local answer = run("coins on")
+            assert.same({
+                WARN .. "this client has no GetMoneyString: prices stay in text" .. RESET,
+            }, answer)
+            assert.is_false(options.settings.coins)
+            assert.equals(0, persisted)
+            assert.equals("1g 23s 45c", A.Core.Format.money(12345))
+        end)
+
+        it("switches them off without the API too: there is nothing to undo", function()
+            assert.same({ TITLE .. " coin icons off" }, run("coins off"))
+            assert.is_false(options.settings.coins)
+        end)
+
+        it("switches the prices to the client's money string, and writes it back at once", function()
+            rawset(_G, "GetMoneyString", fakeCoins)
+            assert.same({ TITLE .. " coin icons on" }, run("coins on"))
+            assert.is_true(options.settings.coins)
+            assert.equals(1, persisted)
+            local Format = A.Core.Format
+            -- The whole, non-negative amount; no thousands separators; copper shown
+            -- whenever there is any; zero as the gold coin alone.
+            assert.equals("<12345|false|false|true>", Format.money(12345))
+            assert.equals("<12346|false|false|true>", Format.money(12345.6))
+            -- The sign stays in front, and zero keeps its own form.
+            assert.equals("-<500|false|false|true>", Format.money(-500))
+            assert.equals("+<500|false|false|true>", Format.moneySigned(500))
+            assert.equals("-<500|false|false|true>", Format.moneySigned(-500))
+            assert.equals("<0|false|false|true>", Format.moneySigned(0))
+            assert.is_nil(Format.money(nil))
+            assert.same({ TITLE .. " coin icons off" }, run("coins off"))
+            assert.is_false(options.settings.coins)
+            assert.equals("1g 23s 45c", Format.money(12345))
+            assert.equals("0g", Format.moneySigned(0))
+        end)
+
+        it("names the coin icons in the status line only while they are on", function()
+            assert.is_false(mentions(run("status"), "coin icons"))
+            rawset(_G, "GetMoneyString", fakeCoins)
+            run("coins on")
+            assert.equals(
+                TITLE
+                    .. ": "
+                    .. GOOD
+                    .. "on"
+                    .. RESET
+                    .. " · preset standard · shift detail on · coin icons on · tooltip hooks: processor",
+                run("status")[1]
+            )
+            run("coins off")
+            assert.is_false(mentions(run("status"), "coin icons"))
+        end)
+
+        it("follows the loaded settings through syncCoins, the way the bootstrap applies them", function()
+            options.settings.coins = true
+            options:syncCoins()
+            -- The setting says on, but the client has nothing to draw coins with.
+            assert.equals("12s 50c", A.Core.Format.money(1250))
+            rawset(_G, "GetMoneyString", fakeCoins)
+            options:syncCoins()
+            assert.equals("<1250|false|false|true>", A.Core.Format.money(1250))
+            options.settings.coins = false
+            options:syncCoins()
+            assert.equals("12s 50c", A.Core.Format.money(1250))
+        end)
+
+        it("are left alone by the presets, the lines, Shift detail and the master switch", function()
+            rawset(_G, "GetMoneyString", fakeCoins)
+            run("coins on")
+            run("basic")
+            run("shift off")
+            run("off")
+            assert.is_true(options.settings.coins)
+            assert.equals("<1250|false|false|true>", A.Core.Format.money(1250))
+        end)
+    end)
+
     ------------------------------------------------------------------- decode
 
     describe("decode", function()
@@ -678,10 +783,15 @@ describe("the /amdb command", function()
                 "closuresSinceLastSale 0",
                 "qtySold 9",
             }, fieldsOf(answer[2], "d1 "))
-            assert.same(
-                { "floor 15000", "floorQty 1", "listed 58", "qtySum 58", "seenFloor -", "seenQty -" },
-                fieldsOf(answer[6], "live ")
-            )
+            assert.same({
+                "floor 15000",
+                "floorQty 1",
+                "listed 58",
+                "qtySum 58",
+                "seenFloor -",
+                "seenQty -",
+                "daysSinceListed 0",
+            }, fieldsOf(answer[6], "live "))
             -- The value, evidence and position groups, flat as the record holds them.
             assert.same({
                 "value7 7030",
@@ -719,14 +829,19 @@ describe("the /amdb command", function()
         end)
 
         it("reads the item record before the commodity one for an id in both tables", function()
-            -- 194784 is an item with spans only, and a commodity with everything.
+            -- The item record first, though the commodity's is the fuller one: its
+            -- live group holds the date of its last listing and nothing else.
             assert.same({ "194784", "item" }, { decoded("194784") })
+            assert.equals(
+                "live floor - · floorQty - · listed - · qtySum - · seenFloor - · seenQty - · daysSinceListed 3",
+                lines[3]
+            )
         end)
 
         it("reads a battle pet by species", function()
             assert.same({ "2546", "pet" }, { decoded("battlepet:2546") })
             assert.equals(
-                "live floor 2500000 · floorQty 1 · listed 2 · qtySum 2 · seenFloor - · seenQty -",
+                "live floor 2500000 · floorQty 1 · listed 2 · qtySum 2 · seenFloor - · seenQty - · daysSinceListed 0",
                 lines[4]
             )
         end)

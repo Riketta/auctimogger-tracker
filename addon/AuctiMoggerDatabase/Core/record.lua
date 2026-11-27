@@ -45,7 +45,8 @@ local SFLAG_MASK = 0x1F
 local LFLAG_LISTED = 0x01
 local LFLAG_QTY_SUM = 0x02
 local LFLAG_SEEN = 0x04
-local LFLAG_MASK = 0x07
+local LFLAG_DAYS_LISTED = 0x08
+local LFLAG_MASK = 0x0F
 
 local VFLAG_SOLD_MEDIAN14 = 0x01
 local VFLAG_TREND = 0x02
@@ -105,6 +106,7 @@ local REFERENCE_SPANS = { "d7", "d14", "d30", "d1" }
 ---@field qtySum integer|nil units listed in total
 ---@field seenFloor integer|nil copper: today's cheapest listing that is gone
 ---@field seenQty integer|nil units of that listing
+---@field daysSinceListed integer|nil whole days since the item was last seen listed; 0 = today
 
 ---@class AmdbCraft
 ---@field cost integer copper: the reagent cost per make
@@ -118,7 +120,7 @@ local REFERENCE_SPANS = { "d7", "d14", "d30", "d1" }
 
 ---@class AmdbRecord
 ---@field spans table<string, AmdbSpanBlock> d1/d7/d14/d30 -> the v3 span block
----@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, seenFloor, seenQty
+---@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, seenFloor, seenQty, daysSinceListed
 ---@field value7 integer|nil
 ---@field soldMedian14 integer|nil
 ---@field samples7 integer|nil
@@ -213,6 +215,9 @@ local function readLive(reader)
     if hasBit(lflags, LFLAG_SEEN) then
         live.seenFloor = reader:varint("live.seenFloor")
         live.seenQty = reader:varint("live.seenQty")
+    end
+    if hasBit(lflags, LFLAG_DAYS_LISTED) then
+        live.daysSinceListed = reader:uint("live.daysSinceListed", MAX_U16)
     end
     return live
 end

@@ -68,7 +68,7 @@ Locked with the project owner; do not reopen without a new decision.
 | 3 | The sniper's dependency is **optional** (`## OptionalDeps`). | The sniper still works on its own live evidence without the database. |
 | 4 | Records are **packed** into printable strings, not Lua tables. | Verbose tables cost 42 MB per market today (Appendix A); packed is about 2 MB. Loading several markets together is only viable packed. |
 | 5 | **One data file per market.** The addon has six slots; any subset loads. The primary market is bound per character; the others show as cross-market lines. | Markets are independent; the owner runs three. |
-| 6 | The tooltip is an **attached frame of our own** (TSM / OribosExchange style). The game's tooltip is never modified. | Keeps the game tooltip clean and avoids the re-entrancy hazard of inline rendering. |
+| 6 | The tooltip is an **attached frame of our own**, TSM's design. The game's tooltip is never modified. (OribosExchange embeds its lines in the game's tooltip through LibExtraTip — Appendix C — a way the owner considered and left.) | Keeps the game tooltip clean and avoids the re-entrancy hazard of inline rendering. |
 | 7 | Target clients: **Forever (interface 16001) and retail**, both tooltip hook paths. | Owner runs Forever; retail stays compatible. |
 | 8 | Every optional line can be switched off; presets `basic` and `standard`. | "Keep the tooltip clear if the user wants just basic auction info." |
 | 9 | **Feed v3 is removed now**, with no compatibility period. | No real users exist. |
@@ -219,7 +219,7 @@ Lua decoder refuses exactly the same things:
 | The padding is more than 4 bits or not all zero. |
 | A flag word sets a bit with no meaning, or `qtySum` is set without `listed`. |
 | An `evidence` or `position` group is announced in `flags` with a flag word of zero: the encoder leaves such a group out. |
-| `supplyDays` or `lowRank30d` is above 65535; `rank`, `scoreBp` or `discountBp` is above `2^32 − 1`; the `lows` count is above 30. |
+| `supplyDays`, `lowRank30d` or `daysSinceListed` is above 65535; `rank`, `scoreBp` or `discountBp` is above `2^32 − 1`; the `lows` count is above 30. |
 | No span is present, or bytes follow the last field. |
 
 Every text the decoder accepts re-encodes to exactly the same text, which is
@@ -239,8 +239,8 @@ per present span, in order d1, d7, d14, d30:
   [saleRate bp] [saleRate180d bp] [daysSinceLastSale] [closuresSinceLastSale] [qtySold]
 
 live:
-  lflags  varint   0x01 listed  0x02 qtySum  0x04 seenToday
-  [floor] [floorQty] [listed]      [qtySum]      [seenFloor] [seenQty]
+  lflags  varint   0x01 listed  0x02 qtySum  0x04 seenToday  0x08 daysSinceListed
+  [floor] [floorQty] [listed]      [qtySum]      [seenFloor] [seenQty] [daysSinceListed]
 
 value:
   vflags  varint   0x01 soldMedian14  0x02 trendBp
@@ -273,6 +273,8 @@ or depend on another:
 - `qtySum` describes that listing summary, so it is only written inside a
   `listed` group.
 - `seenToday` writes `seenFloor` and `seenQty` together.
+- `daysSinceListed` stands on its own. An item last listed days ago, and
+  neither listed nor seen today, has a `live` group that holds nothing but it.
 
 ### 5.6 Field definitions
 
@@ -287,6 +289,7 @@ the tracker has no evidence — never zero.
 | live | `listed` | newest snapshot | Listings of the item in the snapshot. |
 | live | `qtySum` | newest snapshot | Total quantity listed. |
 | live | `seenFloor`, `seenQty` | prepared scan | Today's cheapest listing that is no longer listed (bought or cancelled). |
+| live | `daysSinceListed` | prepared scan (hour fold) | Whole UTC days since the item was last seen listed: 0 when the newest snapshot lists it or the fold lists it today, else `today −` the newest day the fold lists it on, inside the 30-day low window. `u16`. |
 | value | `value7` | prepared scan | Quantity-weighted 7-day median listing price. Present only when > 0. |
 | value | `soldMedian14` | prepared scan | 14-day quantity-weighted median of sold prices. Present only once ≥ 3 priced units sold. |
 | value | `samples7` | prepared scan | Unique listings behind `value7`. |
@@ -314,14 +317,17 @@ Rules the encoder guarantees:
 - The `craft` group attaches to the output's record in the category the craft
   was priced in, taking the ranked recipe with the highest expected profit.
 - The `deal` group attaches only to ranked live deals.
+- The `live` group exists when anything of it is known: a listing, a sighting, or
+  the date of the last listing. `daysSinceListed` is dated against the export's
+  own `today`, so the hour-old low context cannot be a day off after midnight.
 - A pet species pooled from several variants exports spans only (no other
   group). A species with a single variant gets full groups.
 - The record encoder never fails and never wraps. A negative value in an
   unsigned field (a tracker bug, never real data) is written as 0; a value
   above `2^53 − 1`, and a signed value beyond `±(2^53 − 1)`, saturates there. A
   non-finite rate is left absent rather than written as a zero rate.
-- `supplyDays` and `lowRank30d` are `u16` on both sides; `rank`, `scoreBp` and
-  `discountBp` are `u32`.
+- `daysSinceListed`, `supplyDays` and `lowRank30d` are `u16` on both sides; `rank`,
+  `scoreBp` and `discountBp` are `u32`.
 
 ### 5.7 Absence semantics
 
@@ -329,6 +335,9 @@ Absent and zero are different for every optional field:
 
 - `live` absent — the item is not listed and was not seen today.
 - `live` present without `listed` — seen today, already gone.
+- `daysSinceListed` absent — no hour-fold row for the identity inside the low
+  window (a fresh fold, or nothing listed for 30 days). `0` — listed now, or
+  seen today.
 - `soldCount` absent — no credit-eligible evidence. `soldCount = 0` — evidence
   exists and nothing sold.
 - `supplyDays` absent — no sold evidence, or nothing sold: such stock never
@@ -392,7 +401,7 @@ old" is more useful than an empty one, and the age is always visible.
       "itemID": 194784,
       "category": "commodity",
       "spans": { "d1": { "n": 58, "min": 575, "...": "..." } },
-      "live": { "floor": 3805000, "floorQty": 214, "listed": 618, "qtySum": 1234 },
+      "live": { "floor": 3805000, "floorQty": 214, "listed": 618, "qtySum": 1234, "daysSinceListed": 0 },
       "value7": 4123500,
       "soldMedian14": 4021000,
       "samples7": 214,
@@ -413,7 +422,8 @@ are `null`; absent scalars are omitted.
 The twin is rendered from the decoded records, so it shows exactly what a
 decoder reads: a rate the ranking computes as `34 / 94` appears as `0.3617`. A
 record seen today and gone has `"live": { "seenFloor": …, "seenQty": … }` and
-no floor. Keys come in the order shown above (top level, market, entry, span
+no floor; one last listed days ago has `"live": { "daysSinceListed": 3 }`.
+Keys come in the order shown above (top level, market, entry, span
 block `n` … `qtySold`, live, craft, deal), and span blocks as `d1`, `d7`,
 `d14`, `d30`. The file is pretty-printed with two-space indentation and no
 trailing newline.
@@ -436,8 +446,8 @@ The nine records:
 |---|---|
 | `items[25]` | A steady seller: four spans, listed, a rising trend, sold evidence, a 12-day sparkline, a vendor price. |
 | `items[117]` | A listing that never sells: prices near 10 000 000 000 copper (five-byte varints), a present zero sale rate and zero sold, `supplyDays` 65535, a trend of 0, the top deal. |
-| `items[2589]` | Seen today and gone: a `live` group with `seenFloor`/`seenQty` and no floor; a sold-source value. |
-| `items[194784]` | One side of the dual-category id: spans only, never a credited sale. |
+| `items[2589]` | Seen today and gone: a `live` group with `seenFloor`/`seenQty` and no floor, dated today; a sold-source value. |
+| `items[194784]` | One side of the dual-category id: a d7 span and never a credited sale, and a `live` group that holds nothing but `daysSinceListed` 3 — listed three days ago and not since, so no d1 block. |
 | `commodities[191460]` | A losing craft, a listing without `qtySum`, a one-day sparkline, a rising trend. |
 | `commodities[191461]` | Bulk: quantities past a billion, a full 30-day sparkline, `lowRank30d` 10000, a falling trend. |
 | `commodities[194784]` | The other side of the dual id, and the record with every group: the example of §5.10. |
@@ -508,6 +518,7 @@ pub struct ItemRecord {
 pub struct LiveQuote {
     pub listed: Option<LiveListing>,          // None: seen today, already gone
     pub seen: Option<SeenListing>,
+    pub days_since_listed: Option<u16>,       // daysSinceListed on the wire
 }
 pub struct LiveListing {
     pub floor: i64,
@@ -589,16 +600,21 @@ Algorithm:
    and its `get(&identity)` an `ItemFacts` — `value7`, `sold_median14`,
    `samples7`, `median_now` and `median_prev` (for the trend), today's
    sighting, sold/expired counts, sold units, the 30 daily lows (oldest day
-   first) and the vendor price. An identity without a scan row has no facts
-   and carries only what the snapshot knows. (The ledger recency is not
-   exposed: the span blocks already carry `daysSinceLastSale` and
-   `closuresSinceLastSale`.)
+   first), the day of the last listing and the vendor price. An identity
+   without a scan row has no facts and carries only what the snapshot knows.
+   (The ledger recency is not exposed: the span blocks already carry
+   `daysSinceLastSale` and `closuresSinceLastSale`.)
 4. Live group from `snapshots.floors(target, kind, snapshot_id)` of the newest
    snapshot — **read directly, not from the scan**, so the min buyout never
    lags an ingest cycle. `seenFloor`/`seenQty` attach when today's fold floor
    undercuts the live floor (an equal floor is that listing, still up) and
    the newest snapshot lists anything at all — an empty snapshot proves
-   nothing is gone, exactly as in the missed-deals list.
+   nothing is gone, exactly as in the missed-deals list. `daysSinceListed` is
+   0 for anything the snapshot lists; else `today −` the newest day the hour
+   fold lists the identity on (`ItemFacts::last_listed_day`, today included),
+   which rides the ranking's hourly low context (`LowContext::last_day`, off
+   the same `daily_lows` read — no query of its own); else absent. A day past
+   `today` reads as 0.
 5. `low30` and `lowRank30d` computed with the ranking's own `low_rank`; the
    sparkline scales each low as `round(low × 128 ÷ reference)`, so the
    reference sits at mid-scale and anything above twice it reads as 255.
@@ -883,19 +899,19 @@ Carried over from the sniper's house style:
 | `Core/pack.lua` | `ALPHABET`, `MAX_INTEGER`; `fromText(text)` / `toText(bytes)`; `new(text)` gives a reader over one record: `varint(field)`, `zigzag(field)`, `uint(field, maximum)`, `byte(field)`, `flag(field, allowed)`, `finish()`. A reader raises on malformed input, with the Rust `PackError` text. |
 | `Core/record.lua` | `Record.decode(text) -> record, nil` or `nil, message`; it never throws. Produces `AmdbRecord` (§7.3.1) with the derived methods of §5.8 and refuses exactly what the Rust decoder refuses. |
 | `Core/market.lua` | `Market` (one loaded market) and `Store` (all markets): header validation, registration, lookups, primary binding, freshness tiers, change callbacks (§7.3.2). Pure: `now` is a parameter. |
-| `Core/settings.lua` | `Settings.defaults()`, `coerce(saved)`, `coerceCharacter(saved)`, the per-line and switch setters, `applyPreset(settings, name)`. |
-| `Core/format.lua` | `Format.money`, `moneySigned`, `percent`, `percentBp`, `signedPercentBp`, `count`, `rate`, `age`, `days`, `supplyDays`; `COLORS` (the §7.5.4 table as escape strings), `PREFIX`, `colorize(name, text)`; the tiers `ageTier(seconds)` (muted, warn, hot, stale at 2 h, 12 h, 24 h), `rateTier(fraction)` (good at 0.5 and up, warn at 0.2 and up, else bad) and `trendTier(bp)`; `ageColor(seconds)` is the house color of an age's tier, with `stale` in `bad` — the one table the login line, the tooltip header and `/amdb status` read. |
+| `Core/settings.lua` | `Settings.defaults()`, `coerce(saved)`, `coerceCharacter(saved)`, the per-line and switch setters, `setCoins(settings, on)`, `applyPreset(settings, name)`. |
+| `Core/format.lua` | `Format.money`, `moneySigned`, `percent`, `percentBp`, `signedPercentBp`, `count`, `rate`, `age`, `days`, `supplyDays`; `COLORS` (the §7.5.4 table as escape strings), `PREFIX`, `colorize(name, text)`; the tiers `ageTier(seconds)` (muted, warn, hot, stale at 2 h, 12 h, 24 h), `rateTier(fraction)` (good at 0.5 and up, warn at 0.2 and up, else bad) and `trendTier(bp)`; `ageColor(seconds)` is the house color of an age's tier, with `stale` in `bad` — the one table the login line, the tooltip header and `/amdb status` read. `setCoinIcons(renderer)` installs a coin renderer (`fun(copper) -> string`, handed the whole non-negative amount) that `money` and `moneySigned` go through while it is set, or clears it with nil; the core never reaches for the client's `GetMoneyString` itself, and a renderer that raises or answers anything but a string is passed over for that call. |
 | `Core/resolve.lua` | `Resolve.item(value)`, `Resolve.species(value)` and `Resolve.resolve(value) -> kind, id` from a number, a hyperlink or an `item:` / `battlepet:` string. |
 | `Core/tooltip_lines.lua` | `TooltipLines.build(record, context) -> AmdbTipRow[]`, the pure row builder of §7.6. A row is `left`, `right` (nil: a single line) and, for a sparkline, `bars`. The context carries the ages, the other markets' records, the collapse and Shift flags and the settings; the builder reads no clock. |
 | `Core/anchor.lua` | `Anchor.side(ownerLeft, ownerRight, frameWidth, screenRight) -> "right" | "left"`, the pure side decision of §7.5.3; anything that is not four finite numbers answers the default side. `Anchor.point(side)` is the `SetPoint` arguments; `GAP` 8, `TOP_OFFSET` 10. |
-| `Core/panel_rows.lua` | `PanelRows.build(context) -> AmdbPanelRow[]`, the row model of the options panel (§7.8): the master switch, a button per preset, one checkbox per optional line and Shift detail under a title, the primary-market picker under another, and the status line, each with its label and its hover help. `PanelRows.height(rows)` is the height the frame needs. Pure: the settings, the markets and the status line arrive in the context. |
+| `Core/panel_rows.lua` | `PanelRows.build(context) -> AmdbPanelRow[]`, the row model of the options panel (§7.8): the master switch, a button per preset, one checkbox per optional line, then Shift detail and the coin icons under a title, the primary-market picker under another, and the status line, each with its label and its hover help. `PanelRows.height(rows)` is the height the frame needs. Pure: the settings, the markets and the status line arrive in the context. |
 
 #### 7.3.1 `AmdbRecord`
 
 ```lua
 ---@class AmdbRecord
 ---@field spans table<string, table>     -- d1/d7/d14/d30 -> the v3 span block
----@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, seenFloor, seenQty
+---@field live AmdbLive|nil              -- floor, floorQty, listed, qtySum, seenFloor, seenQty, daysSinceListed
 ---@field value7 integer|nil
 ---@field soldMedian14 integer|nil
 ---@field samples7 integer|nil
@@ -985,7 +1001,7 @@ and a `fallbacks` table with one sentence per optional entry:
 |---|---|
 | Required globals | `CreateFrame`, `GameTooltip`, `UIParent`, `time`, `SlashCmdList` |
 | Required events | `ADDON_LOADED`, `PLAYER_LOGIN` |
-| Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `Settings`, `MenuUtil`, `print` |
+| Optional globals | `TooltipDataProcessor`, `Enum`, `ItemRefTooltip`, `issecretvalue`, `IsShiftKeyDown`, `Settings`, `MenuUtil`, `GetMoneyString`, `print` |
 | Optional events | `MODIFIER_STATE_CHANGED`, `PLAYER_LOGOUT` |
 | Authored | `SLASH_AMDB1`, `SLASH_AMDB2`, the namespace table `AuctiMoggerDatabase`, the attached frame `AuctiMoggerDatabaseTip` (a named frame: the client creates its global, and those of its font strings) |
 
@@ -1032,8 +1048,14 @@ panel (§7.8). `Options.new({ store, settings, character, tooltip, say,
 persist, statusLine })`, `register()`, `run(msg)`, and for the panel
 `registerPanel()` and `refreshPanel()`. Every change of either goes through
 one `apply` method (`applyEnabled`, `applyLine`, `applyPreset`, `applyShift`,
-`applyMarket`) that changes the setting, writes it back and refreshes the
-panel; the command then answers in chat, and the panel says nothing.
+`applyCoins`, `applyMarket`) that changes the setting, writes it back and
+refreshes the panel; the command then answers in chat, and the panel says
+nothing. `applyCoins(on) -> ok, message` refuses `on` on a client without
+`GetMoneyString` and leaves the setting as it was (the panel's box comes back
+to it); `syncCoins()` brings the formatter in line with the setting — the
+client's money string (`GetMoneyString(copper, false, false, true)`: no
+thousands separators, copper whenever there is any, zero as the gold coin)
+through `Format.setCoinIcons` while it is on, the text form otherwise.
 
 **`Adapters/public_api.lua`** — publishes the namespace table as the global `AuctiMoggerDatabase`, and `GetAuctionBuyout` as a global function of its own (§7.9).
 
@@ -1050,7 +1072,9 @@ SavedVariables lifecycle.
 - `PLAYER_LOGIN` → the tooltip adapter, the options and the options panel
   are built once, each under `pcall`: what cannot start is reported in bad
   and left out, and the login goes on. A client without the `Settings` API
-  gets the one-time note of §7.8 instead. Then the status line of §7.11 (a
+  gets the one-time note of §7.8 instead. Once the options exist,
+  `options:syncCoins()` applies the saved `coins` setting before any tooltip
+  is built. Then the status line of §7.11 (a
   pure function of the store and `now`, handed to the panel as well), the
   recorded reports, and `fireUpdate()` with each callback error reported
   once in bad. A login that no `ADDON_LOADED` preceded (a client whose event
@@ -1160,6 +1184,7 @@ Standard level, every optional line on:
  Sale rate (14d)            36%  (34 of 94 sold)
  Sold                       31.6/day · supply 39d
  Last sale                  2d ago
+ Last listed                today
  30-day low                 350g  · 80% of days higher
  30 days                    [ sparkline: 30 bars, lowest daily ask ]
  Crafting                   2100g → +1900g  (exp. +684g)
@@ -1181,6 +1206,7 @@ spec pins each line for line.
 | **Sale rate (14d)** | always | Percent in the rate color + dim `  (soldCount of soldCount + expiredCount sold)` when both counts exist. Without a 14-day rate the label reads `Sale rate (180d)` and the counts are left out: they describe the fortnight. Dim `no evidence` without any rate. |
 | Sold | `sold` on, `soldPerDay()` known | `x.x/day`, then ` · supply Nd` when `supplyDays` is known, or ` · supply ∞` when it is saturated or unbounded. |
 | Last sale | `lastSale` on, `daysSinceLastSale()` known | `today`, `1d ago`, `Nd ago`. |
+| Last listed | `listed` on, `live.daysSinceListed` present | `today`, `1d ago`, `Nd ago`: when the item was last seen listed, which is another question than when it last sold (§5.6). It shows beside `not listed` too: that is where it says most. |
 | 30-day low | `low` on, `low30` known | `money(low30)` + dim `  · N% of days higher` from `lowRank30d`. |
 | Sparkline | `sparkline` on, `lows` present | Caption `30 days`; bars from `lows`. |
 | Crafting | `craft` on, `craft` present | `money(cost) → ±money(profit)` + dim `(exp. ±money(expectedProfit))`; losses in bad. |
@@ -1222,8 +1248,9 @@ Saved in `AuctiMoggerDatabaseSettings` (account):
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `true` | Master switch. |
-| `lines` | absent | Optional line overrides; absent key = on. Keys: `sold`, `lastSale`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
+| `lines` | absent | Optional line overrides; absent key = on. Keys: `sold`, `lastSale`, `listed`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
 | `shiftDetail` | `true` | Shift shows the detail level. |
+| `coins` | `false` | Prices as the client's own coin icons (`GetMoneyString`) instead of text, in tooltips and in chat. Needs the API (§7.4); on a client without it the setting stays off and `/amdb coins on` says why. |
 
 `AuctiMoggerDatabaseCharacter` (per character): `primaryMarket` (string, the
 chosen target id).
@@ -1249,6 +1276,7 @@ options panel shares (§7.8), so the two cannot disagree.
 | `basic` / `standard` | Presets: optional lines all off / all on. |
 | `<line> on` / `<line> off` | Toggle one optional line. |
 | `shift on` / `shift off` | Shift detail. |
+| `coins on` / `coins off` | Prices as coin icons instead of text (§7.4, `applyCoins`). |
 | `decode <item>` | Debug: print every decoded field for the item. |
 | `help` | The list above. |
 
@@ -1257,7 +1285,8 @@ and prints it. Answers reach chat at once: data rows plain, a reply behind the
 addon title. A command that raises says so instead of showing a Lua error.
 
 `/amdb status` opens like the login line (`AuctiMogger Database: on · preset
-standard · shift detail on · tooltip hooks: processor`), prints one row per
+standard · shift detail on · tooltip hooks: processor`; ` · coin icons on`
+follows while they are on), prints one row per
 market (slot, target, records by table, age, `primary`, `stale`, dropped
 records), then every market a slot file could not register, the choice to make
 when the primary is ambiguous or names an unloaded market, each client surface
@@ -1296,6 +1325,7 @@ adapter builds one region per row:
 | Tooltip lines | A title, in the brand color. |
 | One checkbox per optional line | In the settings module's order and state; the label and the hover help of each are in the row model. |
 | Hold Shift for detail | A checkbox: off unless literally on. |
+| Coin icons for prices | A checkbox: off unless literally on. A click that asks for them on a client without `GetMoneyString` changes nothing, and the box comes back off. |
 | Market | A title, in the brand color. |
 | Primary market | A picker button naming the primary market; see below. |
 | The status line | The login line of §7.11, as the clock has it, wrapped within 560 pixels; unwrapped on a client that cannot wrap. |
@@ -1365,7 +1395,7 @@ commodities for a commodity), nil when the header lacks that stamp.
 
 `AmdbMarketInfo` is flat, camelCase and fresh per call: `itemID`, `category`,
 `market`, `generatedAt`, `ageSeconds`, `snapshotAgeSeconds`, `stale`,
-`floorNow`, `floorQty`, `listedNow`, `seenFloor`, `value`, `valueSource`,
+`floorNow`, `floorQty`, `listedNow`, `seenFloor`, `daysSinceListed`, `value`, `valueSource`,
 `trend`, `soldMedian14`, `saleRate`, `saleRate180d`, `soldCount`,
 `expiredCount`, `soldPerDay`, `supplyDays`, `daysSinceLastSale`,
 `closuresSinceLastSale`, `low30`, `lowRank30d`, `vendorPrice`, `craft`, `deal`,
@@ -1514,7 +1544,7 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - `pack.rs`: varint and zigzag round-trips at 0, 127, 128, 2^32 and the
   maximum; the documented byte layout; text vectors pinned against the Lua
   prototype; alphabet membership; padding; non-minimal and over-long varints.
-- `record.rs`: encode → decode round-trip over 2^17 flag combinations and over
+- `record.rs`: encode → decode round-trip over 2^18 flag combinations and over
   every span set with every span flag; both signs, both saturations, a present
   zero; the wire layout written field by field. Malformed inputs are errors,
   never panics: every proper prefix of a record, every one-symbol mutation of
@@ -1523,7 +1553,10 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   every refusal, and the twin's nulls, omissions and key order.
 - Golden fixtures byte-stable (§5.11).
 - `DatabaseExportService`: group attachment rules, pet pooling, rank and
-  craft selection, entries without spans omitted, deterministic order.
+  craft selection, entries without spans omitted, deterministic order; the
+  date of the last listing off the snapshot, then the fold, then absent.
+- Opportunity scan: a today-row dates the last listing without entering the
+  lows, and `low_rank` still ignores today.
 - Scheduler: scans refresh before the feed publishes.
 - Feed routes: a version 3 carrier and twin left on disk are not served (404
   with the reason), nor a carrier of another version or market, nor a truncated
@@ -1549,12 +1582,14 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 - Golden trio (§5.11).
 - `market`: version gate, future rejection, stale flag, duplicate target,
   slot order, primary binding, default category, update callbacks.
-- `settings`: defaults, strict coercion both ways, presets.
+- `settings`: defaults, strict coercion both ways, presets, the coin switch.
 - `panel_rows`: the row order of §7.8; every optional line and every preset of
-  the settings module has its row, named and explained; the switch and Shift
-  read as the tooltip reads them; the market row and the status line; the
-  height.
-- `format`, `resolve`, `anchor`: table tests.
+  the settings module has its row, named and explained; the switch, Shift
+  detail and the coin icons read as off unless literally on; the market row
+  and the status line; the height.
+- `format`, `resolve`, `anchor`: table tests; for `format` also the coin
+  renderer — what it is handed, the sign, zero, junk, a renderer that raises
+  or answers no string, and clearing it.
 - `tooltip_lines`: one test per line for shown and omitted, Shift detail,
   collapsed owner, each toggle; both samples of §7.6 line for line.
 - `extra_tip`: creation, the owner set on every show, the rows, placement in
@@ -1572,13 +1607,15 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
   another tooltip ignored; placed again on the owner's show and resize), Shift
   rebuild, secret values, busy guard, errors reported once.
 - `options`: every command of §7.7, the write-back after each change, and
-  what `status` says without a feed.
+  what `status` says without a feed; `coins` with and without
+  `GetMoneyString`, and `syncCoins` following the setting.
 - `panel` (a spec of its own): the registration against a recording Settings
   API, and the three ways it is left out; one control per row; what a click
   does; the refresh in place and the tick; a replaced row; the picker's menu
-  and its click-cycle; the hover help; a refresh that fails.
+  and its click-cycle; the hover help; a refresh that fails; the coin
+  checkbox, which comes back off on a client without the API.
 - `public_api`: fresh tables per call, `GetAuctionBuyout` chaining, absent
-  addon data.
+  addon data, the documented field set of `GetMarketInfo`.
 
 **Sniper (batch 7, in its own repository)**
 
@@ -1613,7 +1650,10 @@ lua addon/scripts/assert_lls_clean.lua ./addon/lls.log
 2. Hover: a bag item, a chat link, an auction-house browse row, a commodity
    row, an item without data, a pet cage, a battle-pet link.
 3. Press and release Shift while hovering. Run `/amdb basic`, `/amdb standard`
-   and each line toggle. `/amdb off`, `/amdb on`.
+   and each line toggle. `/amdb off`, `/amdb on`. Hover an item that is not
+   listed: `Min buyout` says `not listed` and `Last listed` says how long ago.
+   `/amdb coins on`: prices read as coin icons in the tooltip and in
+   `/amdb decode`; `/amdb coins off`.
 4. `/amdb market <id>`: cross-market lines follow.
 5. Hover a bag item during combat: no blocked-action errors.
 6. Narrow the window so the frame flips to the left side.
@@ -1920,6 +1960,40 @@ it to get the final layout first; the client's own code
 code taints what it reads back from it. The frame is placed again through the
 owner's own hooks instead.
 
+### Follow-up — `Last listed` and coin icons
+
+**Status: implemented; not yet seen in game.** A line-by-line comparison with
+OribosExchange's tooltip (Appendix C) found one signal this tooltip lacked and
+one display option worth having. The owner chose to keep the attached frame as
+it is: OribosExchange writes its lines into the game's own tooltip, and that
+difference stays.
+
+- OribosExchange says how many days ago an item was last *seen*; the tooltip
+  only said when it last *sold*. The record gains `daysSinceListed` in its
+  `live` group (§5.5): 0 for anything the newest snapshot lists or the fold saw
+  today, else the age of the hour fold's newest day for it. It rides the
+  ranking's hourly low context (`LowContext::last_day`, off the same
+  `daily_lows` read), so no query was added (§6.3). The tooltip gains the
+  `Last listed` line (§7.6) with the key `listed` (§7.7), the panel its
+  checkbox, `GetMarketInfo` its field. The golden record `items[194784]` is
+  the one that carries the date alone; its d1 block went with it, since a
+  listing today and a date three days old cannot both be true.
+- The layout change is additive inside v4: bit `0x08` of `live.lflags`, the
+  field written last. An older addon refuses such a record (a flag bit with no
+  meaning) and drops it, so the tracker and the addon move together: deploy the
+  tracker, then `addon-sync` or a copy of the new addon, never the reverse.
+- Prices can read as the client's own coin icons: the `coins` setting (§7.7),
+  `/amdb coins on|off`, a panel checkbox. The core never calls
+  `GetMoneyString`: `Format.setCoinIcons` takes a renderer the options adapter
+  installs (`syncCoins`, at the login and after each change), and a renderer
+  that raises or answers no string is passed over for that call. Without the
+  API the setting stays off and the command says why. `GetMoneyString` joins
+  the compat manifest as an optional global.
+- What OribosExchange has and this addon leaves out, by the owner's choice: a
+  region-wide median and a "sold by vendors" flag (§13).
+- Every §9 gate is green: `addon/scripts/ci_local.sh` (884 tests) and the
+  tracker's fmt, clippy and tests.
+
 ## 12. Risks and mitigations
 
 | Risk | Mitigation |
@@ -1944,8 +2018,8 @@ owner's own hooks instead.
   daily lows carry no day stamps, so a day without a listing leaves no gap.
   Day-stamped lows need a new bulk read.
 - The value, evidence and position groups need a scan row — a listing inside
-  the ranking's 7-day window. An identity last seen 8–30 days ago exports
-  its span blocks and nothing else.
+  the ranking's 7-day window. An identity last seen 8–30 days ago exports its
+  span blocks, the date of its last listing and nothing else.
 - `vendorPrice` reaches a record only while the item is listed in the newest
   snapshot: the ranking's scan loads the vendor prices of the listed items
   alone, and the export adds no catalog read of its own.
@@ -1953,7 +2027,14 @@ owner's own hooks instead.
   whole-market export needs a pre-aggregate.
 - Pets are per species; a multi-variant species exports spans only. The
   tracker holds variant-exact data and OribosExchange derives the breed from
-  the link, so exact pets can be added later.
+  the link, so exact pets can be added later. Battle-pet tooltips
+  (`BattlePetTooltip`, `FloatingBattlePetTooltip`) are not attached to either;
+  OribosExchange hooks both.
+- No region-wide median and no "sold by vendors" flag, both of which
+  OribosExchange's tooltip carries. The first needs data beyond the tracked
+  targets (a median of three realms is not a region); the second needs a
+  vendor catalogue, which the API does not expose (`vendorPrice` is what a
+  vendor pays, not what one charges). Declined by the owner on 2026-11-27.
 - Gear variants (item level, suffix) are not separated: the tracker is
   item-id grain.
 - No in-game inspector window, deals browser or live auction-house refresh.
@@ -2022,7 +2103,15 @@ What moves out of the sniper repository (`Riketta/AuctiMogger` @ `83da07c`):
 - **OribosExchange** (v1.4.20261124) — the model for data delivery: binary
   price records inside Lua strings, decoded per hover; public
   `OEMarketInfo(item, table)` and Tekkub's `GetAuctionBuyout`; per-character
-  line toggles; lines rendered in an attached tooltip.
+  line toggles. Its tooltip lines (`buildExtraTip`, `OribosExchange.lua`
+  384–419: breed and species of a pet, data age once past three days, the
+  realm's four-day median, the region median, days since last seen — or
+  "sold by vendors" — all toggleable) go **into the game's own tooltip**
+  through `LibExtraTip:AddLine` with `embed = true`; it shows no frame of its
+  own. The attached panel here follows TSM and LibExtraTip's extra tip (next
+  entry), not OribosExchange. Its `coins` toggle (`GetMoneyString`) is the
+  model of §7.7's `coins`; its `days since last seen` of §5.6's
+  `daysSinceListed`.
 - **TradeSkillMaster** — the line catalogue users expect: Min Buyout, Market
   Value with trend, Sale Rate, Avg Daily Sold, Crafting Cost with profit,
   Sold min/avg/max, Expired since last sale; every line toggleable.

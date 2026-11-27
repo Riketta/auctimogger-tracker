@@ -52,6 +52,7 @@ local GAME_FACING = {
 	"time",
 	-- optional
 	"Enum",
+	"GetMoneyString",
 	"ItemRefTooltip",
 	"IsShiftKeyDown",
 	"MenuUtil",

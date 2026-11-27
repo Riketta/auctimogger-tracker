@@ -381,6 +381,9 @@ pub struct ItemFacts<'a> {
     /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest asks, oldest day
     /// first; empty without hour-fold history.
     pub lows: &'a [i64],
+    /// UTC day number of the newest day the hour fold lists the identity on,
+    /// today included; `None` without a fold row in the low window.
+    pub last_listed_day: Option<i64>,
     /// Vendor sell price (copper) when the catalog knows one for the item.
     pub vendor_price: Option<i64>,
 }
@@ -399,6 +402,7 @@ impl Default for ItemFacts<'_> {
             counts: None,
             sold_units: None,
             lows: &[],
+            last_listed_day: None,
             vendor_price: None,
         }
     }
@@ -421,6 +425,7 @@ impl ScanFacts {
         // the aligned evidence vectors share the index.
         let index = self.scan.rows.binary_search_by(|row| row.item.cmp(item)).ok()?;
         let row = self.scan.rows.get(index)?;
+        let lows = self.scan.lows.get(item);
         Some(ItemFacts {
             value7: as_copper(row.value7),
             samples7: row.samples7,
@@ -430,7 +435,8 @@ impl ScanFacts {
             seen_today: row.seen_today,
             counts: self.scan.counts.get(index).copied().flatten(),
             sold_units: self.scan.sold_units.get(index).copied().flatten(),
-            lows: self.scan.lows.get(item).map_or(&[], Vec::as_slice),
+            lows: lows.map_or(&[], |context| context.mins.as_slice()),
+            last_listed_day: lows.map(|context| context.last_day),
             vendor_price: self.scan.vendor.get(item).copied(),
         })
     }
@@ -506,6 +512,20 @@ pub struct OverviewData {
     pub most_active: Vec<MoverRow>,
 }
 
+/// One identity's month of daily lows as a prepared scan keeps it: the series
+/// the low indicator counts and the feed's sparkline plots, plus the newest day
+/// the hour fold lists the identity on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LowContext {
+    /// The daily lows of the days BEFORE today, oldest day first (only days
+    /// with a listing appear): today's own low can only match the live floor,
+    /// so it says nothing about the price's place in the month.
+    pub mins: Vec<i64>,
+    /// UTC day number of the newest day the fold lists the identity on, TODAY
+    /// INCLUDED: the date behind the feed's "last listed" figure.
+    pub last_day: i64,
+}
+
 /// Immutable result of one full-market scan, prepared by
 /// [`OpportunityService::refresh`] (scheduler) or the cold-start inline
 /// fallback and shared across requests until the next refresh replaces it.
@@ -536,11 +556,11 @@ pub struct ScanSnapshot {
     /// Median of the known 14-day sale rates in this scan — the neutral
     /// stand-in that ranks items without evidence.
     reliability_prior: f64,
-    /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest ask per identity,
-    /// oldest day first (only days with a listing appear); shared across the
+    /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest ask per identity and
+    /// the newest day the fold lists it on ([`LowContext`]); shared across the
     /// categories of one payload kind and refreshed hourly (see
     /// [`OpportunityService::low_context`]).
-    lows: Arc<HashMap<ItemRef, Vec<i64>>>,
+    lows: Arc<HashMap<ItemRef, LowContext>>,
     /// Vendor sell prices (copper) of the listed items that carry one.
     vendor: Arc<HashMap<ItemRef, i64>>,
 }
@@ -591,7 +611,7 @@ type ScanCache = HashMap<(TargetId, Category), (i64, Arc<ScanSnapshot>)>;
 /// Daily-floor context per (target, payload kind): when it was read plus the
 /// shared map. Keyed by kind because the hour fold is: one read serves the
 /// item and pet categories of the auctions payload.
-type LowCache = HashMap<(TargetId, PayloadKind), (i64, Arc<HashMap<ItemRef, Vec<i64>>>)>;
+type LowCache = HashMap<(TargetId, PayloadKind), (i64, Arc<HashMap<ItemRef, LowContext>>)>;
 
 /// Builds ranked opportunities and the market overview from prepared
 /// full-market scans: the scheduler refreshes them in the background and
@@ -720,7 +740,7 @@ impl OpportunityService {
                 low_rank: scan
                     .lows
                     .get(&row.item)
-                    .and_then(|mins| low_rank(mins, floor.floor_price)),
+                    .and_then(|context| low_rank(&context.mins, floor.floor_price)),
                 vendor: scan.vendor.get(&row.item).copied(),
             };
             let Some(opportunity) =
@@ -868,9 +888,9 @@ impl OpportunityService {
     }
 
     /// One category's prepared scan as a read-only fact view (value, sold
-    /// median, trend baseline, ledger evidence, daily lows and vendor price per
-    /// identity). Serves from the cache like the ranking does; a cold cache
-    /// computes inline.
+    /// median, trend baseline, ledger evidence, daily lows, the day of the last
+    /// listing and the vendor price per identity). Serves from the cache like
+    /// the ranking does; a cold cache computes inline.
     ///
     /// # Errors
     ///
@@ -1060,7 +1080,7 @@ impl OpportunityService {
         target: &TargetId,
         category: Category,
         now: i64,
-    ) -> Result<Arc<HashMap<ItemRef, Vec<i64>>>, StoreError> {
+    ) -> Result<Arc<HashMap<ItemRef, LowContext>>, StoreError> {
         let key = (target.clone(), category.payload_kind());
         {
             let cache = self.lows_cache()?;
@@ -1077,30 +1097,38 @@ impl OpportunityService {
     }
 
     /// The previous [`LOW_RANK_WINDOW_DAYS`] days' lowest ask per identity,
-    /// oldest day first. Today is left out on purpose: the live floor is
-    /// compared against the days BEFORE it (today's own low can only match it).
-    /// The store hands the days over grouped per identity, but their order is
-    /// the store's business — the series is sorted by day here, because the
-    /// feed's sparkline reads it as a time series while the low indicator only
-    /// counts it.
+    /// oldest day first, plus the newest day the fold lists each identity on.
+    /// Today is left out of the series on purpose: the live floor is compared
+    /// against the days BEFORE it (today's own low can only match it). The
+    /// store hands the days over grouped per identity, but their order is the
+    /// store's business — the series is sorted by day here, because the feed's
+    /// sparkline reads it as a time series while the low indicator only counts
+    /// it, and the newest day is a maximum over the rows, never the last one's.
+    /// An identity with nothing but a today-row still gets an entry: no series,
+    /// and today as its last listing.
     fn read_low_context(
         &self,
         target: &TargetId,
         kind: PayloadKind,
         today: i64,
-    ) -> Result<HashMap<ItemRef, Vec<i64>>, StoreError> {
+    ) -> Result<HashMap<ItemRef, LowContext>, StoreError> {
         let lows = self.history.daily_lows(target, kind, today - LOW_RANK_WINDOW_DAYS)?;
-        let mut by_item: HashMap<ItemRef, Vec<(i64, i64)>> = HashMap::new();
+        // Per identity: the days before today as (day, min) pairs, and the
+        // newest day seen so far.
+        let mut by_item: HashMap<ItemRef, (Vec<(i64, i64)>, i64)> = HashMap::new();
         for low in lows {
+            let (days, last_day) = by_item.entry(low.item).or_default();
+            *last_day = (*last_day).max(low.day);
             if low.day < today {
-                by_item.entry(low.item).or_default().push((low.day, low.min));
+                days.push((low.day, low.min));
             }
         }
         Ok(by_item
             .into_iter()
-            .map(|(item, mut days)| {
+            .map(|(item, (mut days, last_day))| {
                 days.sort_unstable_by_key(|(day, _)| *day);
-                (item, days.into_iter().map(|(_, min)| min).collect())
+                let mins = days.into_iter().map(|(_, min)| min).collect();
+                (item, LowContext { mins, last_day })
             })
             .collect())
     }

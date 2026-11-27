@@ -17,6 +17,7 @@
 		"expose",
 		"GameTooltip",
 		"GetAuctionBuyout",
+		"GetMoneyString",
 		"insulate",
 		"issecretvalue",
 		"IsShiftKeyDown",

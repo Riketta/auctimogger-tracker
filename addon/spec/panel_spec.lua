@@ -43,17 +43,19 @@ local LABELS = {
     "Tooltip lines",
     "Sold per day and supply",
     "Last sale",
+    "Last listed",
     "30-day low",
     "30-day chart",
     "Crafting",
     "Deal",
     "Other markets",
     "Hold Shift for detail",
+    "Coin icons for prices",
     "Market",
     "Primary market",
 }
 
-local STUBS = { "CreateFrame", "GameTooltip", "UIParent", "SlashCmdList", "MenuUtil", "Settings" }
+local STUBS = { "CreateFrame", "GameTooltip", "UIParent", "SlashCmdList", "MenuUtil", "Settings", "GetMoneyString" }
 
 --- A frame, a control or a font string: it records what is set on it, so a
 --- test reads a control back. A `Set...` call lands under its own name:
@@ -269,8 +271,9 @@ describe("the options panel", function()
     ---@return boolean every
     local function linesChecked(on)
         local boxes = createdOf("CheckButton")
-        -- The first box is the master switch and the last is Shift detail.
-        for index = 2, #boxes - 1 do
+        -- The first box is the master switch; the last two are Shift detail and
+        -- the coin icons.
+        for index = 2, #boxes - 2 do
             if boxes[index].checked ~= on then
                 return false
             end
@@ -444,7 +447,7 @@ describe("the options panel", function()
             -- Ours until the Settings UI parents it: it must not stand on the screen.
             assert.is_false(frame.shown)
             assert.same({ 600, 0 }, frame.size)
-            assert.equals(438, frame.height)
+            assert.equals(490, frame.height)
             assert.equals("Frame", frame.kind)
             assert.is_nil(frame.template)
             assert.equals(rawget(_G, "UIParent"), frame.parent)
@@ -526,6 +529,8 @@ describe("the options panel", function()
                 "CheckButton",
                 "CheckButton",
                 "CheckButton",
+                "CheckButton",
+                "CheckButton",
                 "Button",
             }, pluck(created, "kind"))
             assert.equals("UICheckButtonTemplate", createdOf("CheckButton")[1].template)
@@ -550,7 +555,7 @@ describe("the options panel", function()
         it("gives the titles the brand color of SPEC 7.5.4, and the labels the client's own", function()
             register()
             assert.same({ 1, 125 / 255, 10 / 255 }, strings[3].textColor)
-            assert.same({ 1, 125 / 255, 10 / 255 }, strings[12].textColor)
+            assert.same({ 1, 125 / 255, 10 / 255 }, strings[14].textColor)
             assert.is_nil(strings[1].textColor)
             assert.equals("GameFontHighlight", strings[1].font)
             assert.equals("GameFontNormal", statusText().font)
@@ -596,7 +601,7 @@ describe("the options panel", function()
             register()
             assert.equals(TARGET, pickerOf().text)
             assert.is_true(pickerOf().enabled)
-            assert.equals("Primary market", strings[13].text)
+            assert.equals("Primary market", strings[15].text)
         end)
 
         it("reads the settings it is registered under", function()
@@ -608,6 +613,8 @@ describe("the options panel", function()
             assert.is_false(checkboxOf("Deal").checked)
             assert.is_true(checkboxOf("Crafting").checked)
             assert.is_false(checkboxOf("Hold Shift for detail").checked)
+            -- Text is the default form of a price.
+            assert.is_false(checkboxOf("Coin icons for prices").checked)
         end)
     end)
 
@@ -643,6 +650,30 @@ describe("the options panel", function()
             box.scripts.OnClick(box)
             assert.is_false(options.settings.shiftDetail)
             assert.equals(1, persisted)
+        end)
+
+        it("on the coin icons switches them, which needs the client's GetMoneyString", function()
+            register()
+            local box = checkboxOf("Coin icons for prices")
+            -- Without the money string nothing changes, and the box comes back off.
+            box.scripts.OnClick(box)
+            assert.is_false(options.settings.coins)
+            assert.is_false(box.checked)
+            assert.equals(0, persisted)
+            assert.equals("12s 50c", A.Core.Format.money(1250))
+            rawset(_G, "GetMoneyString", function()
+                return "coin"
+            end)
+            box.scripts.OnClick(box)
+            assert.is_true(options.settings.coins)
+            assert.is_true(box.checked)
+            assert.equals(1, persisted)
+            assert.equals("coin", A.Core.Format.money(1250))
+            -- And back, through the same path.
+            box.scripts.OnClick(box)
+            assert.is_false(options.settings.coins)
+            assert.is_false(box.checked)
+            assert.equals("12s 50c", A.Core.Format.money(1250))
         end)
 
         it("on a preset button applies the preset, and the line checkboxes follow at once", function()
@@ -747,13 +778,13 @@ describe("the options panel", function()
             assert.is_false(old.shown)
             assert.is_false(oldLabel.shown)
             -- The frame follows the rows: 26 pixels for 60.
-            assert.equals(438 - 26 + 60, options.panel.frame.height)
+            assert.equals(490 - 26 + 60, options.panel.frame.height)
             local standIn = statusText()
             A.Core.PanelRows.build = realBuild
             assert.is_true(options:refreshPanel())
             assert.is_true(checkboxOf("Enable tooltips").shown)
             assert.is_false(standIn.shown)
-            assert.equals(438, options.panel.frame.height)
+            assert.equals(490, options.panel.frame.height)
         end)
 
         it("takes the rows down that a shorter model no longer has", function()
@@ -769,7 +800,7 @@ describe("the options panel", function()
             assert.is_true(options:refreshPanel())
             assert.is_false(status.shown)
             assert.is_nil(options.panel.regions[#rows + 1])
-            assert.equals(438 - 60, options.panel.frame.height)
+            assert.equals(490 - 60, options.panel.frame.height)
             A.Core.PanelRows.build = realBuild
         end)
     end)

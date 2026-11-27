@@ -120,6 +120,7 @@ With the standard preset and every optional line on, the panel reads:
  Sale rate (14d)            36%  (34 of 94 sold)
  Sold                       31.6/day · supply 39d
  Last sale                  2d ago
+ Last listed                today
  30-day low                 350g  · 80% of days higher
  30 days                    [ sparkline: 30 bars, lowest daily ask ]
  Crafting                   2100g → +1900g  (exp. +684g)
@@ -140,6 +141,7 @@ client reports as collapsed shows the three bold lines only.
 | **Sale rate (14d)** | The share of the fortnight's listings that sold, with the counts behind it. Without a 14-day rate the line reads `Sale rate (180d)`. |
 | Sold | Units sold per day, and how long the listed supply lasts at that pace (`supply ∞` when the figure is unbounded). |
 | Last sale | `today`, `1d ago`, `Nd ago`. |
+| Last listed | How many days ago the item was last seen on the auction house — another question than when it last sold. It shows beside `not listed` too, which is where it says most. |
 | 30-day low | The lowest ask of the previous 30 days, and on how many of those days the lowest ask was higher than today's floor. |
 | 30 days | The lowest daily ask of the previous 30 days, oldest first. |
 | Crafting | What one make costs in reagents, the profit at the market value after the auction house cut, and that profit times the sale rate. Losses in red. |
@@ -169,6 +171,11 @@ share one record. Battle pets are looked up by species.
 **Presets.** `standard` shows everything above; `basic` keeps the three bold
 lines. Every other line can be switched on or off on its own.
 
+**Coin icons.** `/amdb coins on` (or the panel's box) draws every price as the
+client's own gold, silver and copper icons instead of `380g 50s` text, in the
+tooltip and in chat. It needs a client with `GetMoneyString`; without it the
+command says so and prices stay as text.
+
 ## Commands
 
 `/amdb`, alias `/auctimoggerdb`.
@@ -181,8 +188,9 @@ lines. Every other line can be switched on or off on its own.
 | `market <target>` | Choose this character's primary market. |
 | `lines` | List the optional lines and their state. |
 | `basic` / `standard` | Presets: the optional lines all off / all on. |
-| `<line> on` / `<line> off` | One optional line: `sold`, `lastSale`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
+| `<line> on` / `<line> off` | One optional line: `sold`, `lastSale`, `listed`, `low`, `sparkline`, `craft`, `deal`, `markets`. |
 | `shift on` / `shift off` | Whether Shift shows the detail block. |
+| `coins on` / `coins off` | Prices as coin icons instead of text. |
 | `decode <item>` | Debug: every decoded field of the item, from an id, a link or an `item:` string. An absent field prints `-`. |
 | `help` | The list above. |
 
@@ -192,8 +200,8 @@ and shared across the account; the primary market is per character.
 ## Options panel
 
 Interface → Options → AddOns → AuctiMogger Database: the master switch, the
-presets, one checkbox per optional line, the Shift detail and the
-primary-market picker. The panel and the command change the same settings
+presets, one checkbox per optional line, the Shift detail, the coin icons and
+the primary-market picker. The panel and the command change the same settings
 through the same path, so a change made in one shows in the other without a
 reload.
 
@@ -212,6 +220,7 @@ the command covers everything.
 | `replaces slot N` | The same market arrived from two slots; the later slot won. | Delete one of the two files. |
 | `dropped: N` | N records of a market failed to decode and were skipped; the rest loaded. | Update the tracker, then download again. |
 | `no options panel on this client — the /amdb command covers everything` | The client has no settings API. | Use `/amdb`. |
+| `this client has no GetMoneyString: prices stay in text` | The client cannot draw coin icons. | Leave prices as text. |
 
 `/amdb status` repeats all of it.
 
@@ -237,10 +246,10 @@ is nil when the addon is absent or disabled.
 `opts.market` are optional and select another pool or another market.
 
 `GetMarketInfo` returns a fresh, flat table — `floorNow`, `floorQty`,
-`listedNow`, `value`, `valueSource`, `trend`, `saleRate`, `saleRate180d`,
-`low30`, `craft`, `deal`, `stale`, `ageSeconds` and the rest — with `nil` for
-every field the tracker has no evidence for. Keep what you need: the next call
-builds a new one.
+`listedNow`, `daysSinceListed`, `value`, `valueSource`, `trend`, `saleRate`,
+`saleRate180d`, `low30`, `craft`, `deal`, `stale`, `ageSeconds` and the rest —
+with `nil` for every field the tracker has no evidence for. Keep what you
+need: the next call builds a new one.
 
 ```lua
 local Database = AuctiMoggerDatabase
